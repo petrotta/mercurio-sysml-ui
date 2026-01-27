@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mercurio.local/schemas/project.schema.json",
+  "title": "Mercurio Project Configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "library": {
+      "description": "Library configuration: use the built-in default library or provide a custom path.",
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "default"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Path to a custom library root."
+            }
+          },
+          "required": ["path"]
+        }
+      ]
+    },
+    "src": {
+      "description": "Source entries to include. Supports explicit file paths, top-level wildcards like \"*.sysml\", or recursive wildcards like \"**/*.sysml\".",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
