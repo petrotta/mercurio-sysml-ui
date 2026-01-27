@@ -1,0 +1,10 @@
+{
+  "name": "mercurio",
+  "version": "0.1.0",
+  "description": "Mercurio SysML Workbench",
+  "private": true,
+  "type": "commonjs",
+  "dependencies": {
+    "monaco-editor": "^0.47.0"
+  }
+}
