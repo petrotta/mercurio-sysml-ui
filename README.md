@@ -1,7 +1,14 @@
-# Tauri + Vanilla
+# Mercurio SysML Workbench
 
-This template should help get you started developing with Tauri in vanilla HTML, CSS and Javascript.
+## Description
+Mercurio is a desktop SysML/KerML workbench built with Tauri. It combines a Rust backend with a web-based UI to let you browse, edit, and analyze model files in a local project workspace.
 
-## Recommended IDE Setup
+![Screenshot](images/img.png)
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+
+## Overview
+- Pick a project root and browse files in the project tree.
+- Edit SysML/KerML sources in a Monaco-based editor.
+- Compile the workspace to build a model tree and surface semantic information.
+- Review parse errors, unresolved references, and symbol details.
+- Toggle library symbols, grouping, and properties in the model view.

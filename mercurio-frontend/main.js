@@ -110,10 +110,10 @@ const state = {
   bufferedContent: new Map(),
 };
 
-const ROOT_STORAGE_KEY = "syster.rootPath";
-const RECENT_PROJECTS_KEY = "syster.recentProjects";
-const PROJECT_LOCATION_KEY = "syster.projectDefaultLocation";
-const THEME_STORAGE_KEY = "syster.theme";
+const ROOT_STORAGE_KEY = "mercurio.rootPath";
+const RECENT_PROJECTS_KEY = "mercurio.recentProjects";
+const PROJECT_LOCATION_KEY = "mercurio.projectDefaultLocation";
+const THEME_STORAGE_KEY = "mercurio.theme";
 const lastCompile = { symbols: [], files: [], unresolved: [], durationMs: null, libraryPath: "" };
 
 const MIN_LEFT = 200;

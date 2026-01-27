@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "identifier": "com.markpetrotta.mercurio",
   "build": {
-    "frontendDist": "../src"
+    "frontendDist": "../mercurio-frontend"
   },
   "app": {
     "withGlobalTauri": true,
