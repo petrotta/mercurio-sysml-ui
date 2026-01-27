@@ -1,0 +1,79 @@
+:root {
+  font-family: "Segoe UI Variable", "Segoe UI", "Tahoma", system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.4;
+  font-weight: 400;
+  color: #d7dae0;
+  background: #1e1f22;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 16px;
+  background: #1e1f22;
+}
+
+.errors-header {
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: #2b2d30;
+  border: 1px solid #3c3f41;
+  margin-bottom: 12px;
+}
+
+.eyebrow {
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.65rem;
+  margin: 0 0 4px;
+  color: #9da0a6;
+}
+
+h1 {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.errors-body {
+  padding: 0;
+}
+
+.errors-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.error-item {
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: #2b2d30;
+  border: 1px solid #3c3f41;
+  cursor: pointer;
+}
+
+.error-item:hover {
+  border-color: #5a5e62;
+}
+
+.error-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.error-meta {
+  font-size: 0.8rem;
+  color: #9da0a6;
+}
+
+.muted {
+  color: #9da0a6;
+}
