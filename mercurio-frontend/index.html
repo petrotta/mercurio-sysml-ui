@@ -225,6 +225,32 @@
         </div>
       </div>
     </div>
+    <div id="export-dialog" class="modal" hidden>
+      <div class="modal-backdrop" data-action="close"></div>
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="export-title">
+        <div class="modal-header">
+          <h3 id="export-title">Export Model</h3>
+        </div>
+        <div class="modal-body">
+          <label class="field">
+            <span class="field-label">Format</span>
+            <select id="export-format">
+              <option value="xmi">XMI (.xmi)</option>
+              <option value="jsonld">JSON-LD (.jsonld)</option>
+              <option value="kpar">KPAR (.kpar)</option>
+            </select>
+          </label>
+          <label class="field checkbox">
+            <input id="export-include-stdlib" type="checkbox" />
+            <span>Include standard library</span>
+          </label>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="ghost" data-action="close">Cancel</button>
+          <button type="button" id="export-run">Export</button>
+        </div>
+      </div>
+    </div>
     <div id="project-info-dialog" class="modal" hidden>
       <div class="modal-backdrop" data-action="close"></div>
       <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="project-info-title">
@@ -239,6 +265,8 @@
             <div class="project-info-value" id="project-info-library">Default (built-in)</div>
             <div class="project-info-label">Sources</div>
             <div class="project-info-value" id="project-info-src">All .sysml / .kerml files (recursive)</div>
+            <div class="project-info-label">Imports</div>
+            <div class="project-info-value" id="project-info-import">None</div>
           </div>
           <div id="project-info-error" class="project-info-error"></div>
           <div id="project-info-create-block" class="project-info-create" hidden>
@@ -280,6 +308,7 @@
       <button type="button" data-action="view-log">View Log…</button>
       <button type="button" data-action="settings">Settings…</button>
       <button type="button" data-action="compile-workspace">Compile</button>
+      <button type="button" data-action="export-model">Export Model...</button>
       <button type="button" data-action="about">About</button>
     </div>
     <div id="settings-dialog" class="modal" hidden>

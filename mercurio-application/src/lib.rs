@@ -14,6 +14,10 @@ use syster::hir::{
 };
 use syster::syntax::SyntaxFile;
 use syster::syntax::parser::parse_with_result;
+use syster::interchange::{
+    detect_format, JsonLd, Kpar, ModelFormat, Xmi, model_from_symbols, restore_ids_from_symbols,
+    symbols_from_model,
+};
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{Emitter, EventTarget, Manager};
 
@@ -43,6 +47,8 @@ enum LibraryConfig {
 struct ProjectConfig {
     library: Option<LibraryConfig>,
     src: Option<Vec<String>>,
+    #[serde(rename = "import")]
+    import_entries: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -628,6 +634,16 @@ fn compile_workspace_sync(
     let mut unresolved = Vec::new();
     let mut analysis_host = AnalysisHost::new();
 
+    if let Some(imports) = project_config
+        .as_ref()
+        .and_then(|config| config.import_entries.as_ref())
+    {
+        let import_files = collect_project_imports(&root_path, imports)?;
+        if !import_files.is_empty() {
+            load_imports_into_host(&mut analysis_host, &import_files)?;
+        }
+    }
+
     let library_config = project_config.and_then(|config| config.library);
     let (stdlib_loader, stdlib_source, stdlib_path_for_log) = match library_config {
         Some(LibraryConfig::Path { path }) => {
@@ -820,30 +836,32 @@ fn compile_workspace_sync(
                     .collect();
             }
 
-            let mut all_paths = analysis_host
-                .files()
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>();
-            all_paths.sort_by(|a, b| {
-                a.to_string_lossy()
-                    .to_lowercase()
-                    .cmp(&b.to_string_lossy().to_lowercase())
-            });
             println!("symbols: start");
-            symbols = Vec::new();
-            for (index, path) in all_paths.iter().enumerate() {
-                check_cancel()?;
-                if let Some(syntax) = analysis_host.files().get(path) {
-                    let file_id = FileId::new(index as u32);
-                    let file_symbols = extract_symbols_unified(file_id, syntax);
-                    symbols.extend(
-                        file_symbols
-                            .into_iter()
-                            .map(|symbol| symbol_to_view(symbol, path)),
-                    );
+            check_cancel()?;
+            let analysis_snapshot = analysis_host.analysis();
+            let mut all_symbols: Vec<_> = analysis_snapshot
+                .symbol_index()
+                .all_symbols()
+                .cloned()
+                .collect();
+            all_symbols.sort_by(|a, b| {
+                let a_path = analysis_snapshot.get_file_path(a.file).unwrap_or("");
+                let b_path = analysis_snapshot.get_file_path(b.file).unwrap_or("");
+                match a_path.cmp(b_path) {
+                    std::cmp::Ordering::Equal => a
+                        .qualified_name
+                        .as_ref()
+                        .cmp(b.qualified_name.as_ref()),
+                    other => other,
                 }
-            }
+            });
+            symbols = all_symbols
+                .into_iter()
+                .map(|symbol| {
+                    let file_path = analysis_snapshot.get_file_path(symbol.file).unwrap_or("");
+                    symbol_to_view(symbol, Path::new(file_path))
+                })
+                .collect();
             println!("symbols: done count={}", symbols.len());
             Ok::<(), String>(())
         }));
@@ -879,6 +897,34 @@ fn cancel_compile(state: tauri::State<'_, AppState>, run_id: u64) -> Result<(), 
     Ok(())
 }
 
+#[tauri::command]
+async fn export_compiled_model(payload: serde_json::Value) -> Result<(), String> {
+    let root = payload
+        .get("root")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'root' argument".to_string())?
+        .to_string();
+    let output = payload
+        .get("output")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'output' argument".to_string())?
+        .to_string();
+    let format = payload
+        .get("format")
+        .and_then(|value| value.as_str())
+        .unwrap_or("xmi")
+        .to_string();
+    let include_stdlib = payload
+        .get("include_stdlib")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        export_model_to_path(root, output, format, include_stdlib)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 fn load_project_config(root: &Path) -> Result<Option<ProjectConfig>, String> {
     let config_path = root.join(".project.json");
     if !config_path.exists() {
@@ -887,6 +933,127 @@ fn load_project_config(root: &Path) -> Result<Option<ProjectConfig>, String> {
     let content = fs::read_to_string(config_path).map_err(|e| e.to_string())?;
     let parsed: ProjectConfig = serde_json::from_str(&content).map_err(|e| e.to_string())?;
     Ok(Some(parsed))
+}
+
+fn export_model_to_path(
+    root: String,
+    output: String,
+    format: String,
+    include_stdlib: bool,
+) -> Result<(), String> {
+    let root_path = PathBuf::from(&root);
+    if !root_path.exists() {
+        return Err("Root path does not exist".to_string());
+    }
+
+    let project_config = load_project_config(&root_path).ok().flatten();
+    let mut analysis_host = AnalysisHost::new();
+
+    if let Some(imports) = project_config
+        .as_ref()
+        .and_then(|config| config.import_entries.as_ref())
+    {
+        let import_files = collect_project_imports(&root_path, imports)?;
+        if !import_files.is_empty() {
+            load_imports_into_host(&mut analysis_host, &import_files)?;
+        }
+    }
+
+    let library_config = project_config.clone().and_then(|config| config.library);
+    let (stdlib_loader, stdlib_path_for_log) = match library_config {
+        Some(LibraryConfig::Path { path }) => {
+            let raw_path = PathBuf::from(&path);
+            let resolved = if raw_path.is_absolute() {
+                raw_path
+            } else {
+                root_path.join(raw_path)
+            };
+            (StdLibLoader::with_path(resolved.clone()), Some(resolved))
+        }
+        Some(LibraryConfig::Default(value)) => {
+            if value.to_lowercase() == "default" {
+                let discovered = resolve_default_stdlib_path(&root_path);
+                (StdLibLoader::new(), Some(discovered))
+            } else {
+                let raw_path = PathBuf::from(&value);
+                let resolved = if raw_path.is_absolute() {
+                    raw_path
+                } else {
+                    root_path.join(raw_path)
+                };
+                (StdLibLoader::with_path(resolved.clone()), Some(resolved))
+            }
+        }
+        None => {
+            let discovered = resolve_default_stdlib_path(&root_path);
+            (StdLibLoader::new(), Some(discovered))
+        }
+    };
+    let stdlib_path_exists = stdlib_path_for_log
+        .as_ref()
+        .map(|path| path.exists() && path.is_dir())
+        .unwrap_or(false);
+    if stdlib_path_exists {
+        stdlib_loader.load_into_host(&mut analysis_host)?;
+    } else {
+        stdlib_loader.load_into_host(&mut analysis_host)?;
+    }
+
+    let mut files = Vec::new();
+    let mut used_project_src = false;
+    if let Some(config) = project_config.clone() {
+        if let Some(src) = config.src {
+            files = collect_project_files(&root_path, &src)?;
+            used_project_src = true;
+        }
+    }
+    if !used_project_src {
+        collect_model_files(&root_path, &mut files)?;
+    }
+
+    for path in &files {
+        let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+        let parse = parse_with_result(&content, path);
+        if parse.content.is_none() || !parse.errors.is_empty() {
+            let name = path.to_string_lossy();
+            return Err(format!("Parse failed for {}", name));
+        }
+        if let Some(syntax) = parse.content {
+            analysis_host.set_file(path.to_path_buf(), syntax);
+        }
+    }
+
+    let analysis = analysis_host.analysis();
+    let mut symbols: Vec<_> = analysis.symbol_index().all_symbols().cloned().collect();
+    if !include_stdlib {
+        if let Some(stdlib_root) = stdlib_path_for_log.as_ref() {
+            symbols.retain(|symbol| {
+                if let Some(file_path) = analysis.get_file_path(symbol.file) {
+                    !is_path_under_root(stdlib_root, file_path)
+                } else {
+                    true
+                }
+            });
+        }
+    }
+    let mut model = model_from_symbols(&symbols);
+    model = restore_ids_from_symbols(model, analysis.symbol_index());
+
+    let format = match format.to_lowercase().as_str() {
+        "sysmlx" | "kermlx" | "xmi" => "xmi",
+        "kpar" => "kpar",
+        "json" | "jsonld" | "json-ld" => "jsonld",
+        other => return Err(format!("Unsupported export format: {}", other)),
+    };
+    let bytes = match format {
+        "xmi" => Xmi.write(&model).map_err(|e| e.to_string())?,
+        "kpar" => Kpar.write(&model).map_err(|e| e.to_string())?,
+        "jsonld" => JsonLd.write(&model).map_err(|e| e.to_string())?,
+        _ => return Err(format!("Unsupported export format: {}", format)),
+    };
+
+    fs::write(&output, bytes).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn collect_project_files(root: &Path, src: &[String]) -> Result<Vec<PathBuf>, String> {
@@ -910,6 +1077,37 @@ fn collect_project_files(root: &Path, src: &[String]) -> Result<Vec<PathBuf>, St
 
         let resolved = resolve_under_root(root, Path::new(pattern))?;
         if resolved.is_file() {
+            let key = resolved.to_string_lossy().to_string();
+            if seen.insert(key.clone()) {
+                out.push(PathBuf::from(key));
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn collect_project_imports(root: &Path, imports: &[String]) -> Result<Vec<PathBuf>, String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    for entry in imports {
+        let pattern = entry.trim();
+        if pattern.is_empty() {
+            continue;
+        }
+        let normalized = pattern.replace('\\', "/");
+        if let Some((recursive, ext)) = parse_ext_pattern(&normalized) {
+            if recursive {
+                collect_model_files_by_extension(root, &ext, &mut out, &mut seen)?;
+            } else {
+                collect_model_files_in_root_by_extension(root, &ext, &mut out, &mut seen)?;
+            }
+            continue;
+        }
+
+        let resolved = resolve_under_root(root, Path::new(pattern))?;
+        if resolved.is_file() && is_import_file(&resolved) {
             let key = resolved.to_string_lossy().to_string();
             if seen.insert(key.clone()) {
                 out.push(PathBuf::from(key));
@@ -1028,6 +1226,20 @@ fn is_model_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_import_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| is_import_extension(ext))
+        .unwrap_or(false)
+}
+
+fn is_import_extension(ext: &str) -> bool {
+    matches!(
+        ext.to_lowercase().as_str(),
+        "xmi" | "sysmlx" | "kermlx" | "kpar" | "jsonld" | "json"
+    )
+}
+
 fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -1056,6 +1268,54 @@ fn resolve_under_root(root: &Path, target: &Path) -> Result<PathBuf, String> {
         return Err("Path is outside the project root".to_string());
     }
     Ok(normalized)
+}
+
+fn is_path_under_root(root: &Path, path: &str) -> bool {
+    let root_norm = root.canonicalize().ok();
+    let path_norm = PathBuf::from(path).canonicalize().ok();
+    if let (Some(root_norm), Some(path_norm)) = (root_norm, path_norm) {
+        return path_norm.starts_with(&root_norm);
+    }
+    let root_str = root.to_string_lossy().to_lowercase();
+    let path_str = path.to_lowercase();
+    if root_str.is_empty() || path_str.is_empty() {
+        return false;
+    }
+    path_str.starts_with(&root_str)
+}
+
+fn import_model_into_host(host: &mut AnalysisHost, path: &Path) -> Result<(), String> {
+    let bytes = fs::read(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+    let format_hint = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("xmi")
+        .to_lowercase();
+    let model = match format_hint.as_str() {
+        "xmi" | "sysmlx" | "kermlx" => Xmi.read(&bytes).map_err(|e| e.to_string())?,
+        "kpar" => Kpar.read(&bytes).map_err(|e| e.to_string())?,
+        "jsonld" | "json" => JsonLd.read(&bytes).map_err(|e| e.to_string())?,
+        _ => {
+            if let Some(format) = detect_format(path) {
+                format.read(&bytes).map_err(|e| e.to_string())?
+            } else {
+                return Err(format!(
+                    "Unsupported import format: {}",
+                    path.display()
+                ));
+            }
+        }
+    };
+    let symbols = symbols_from_model(&model);
+    host.add_symbols_from_model(symbols);
+    Ok(())
+}
+
+fn load_imports_into_host(host: &mut AnalysisHost, import_paths: &[PathBuf]) -> Result<(), String> {
+    for path in import_paths {
+        import_model_into_host(host, path)?;
+    }
+    Ok(())
 }
 
 fn symbol_to_view(symbol: HirSymbol, file_path: &Path) -> SymbolView {
@@ -1150,6 +1410,8 @@ pub fn run() {
             let open_file = MenuItemBuilder::with_id("file.open_file", "Open File...")
                 .accelerator("Ctrl+O")
                 .build(app)?;
+            let export_model = MenuItemBuilder::with_id("file.export_model", "Export Model...")
+                .build(app)?;
             let compile = MenuItemBuilder::with_id("build.compile", "Compile Workspace")
                 .accelerator("Ctrl+Shift+B")
                 .build(app)?;
@@ -1161,6 +1423,8 @@ pub fn run() {
             let file_menu = SubmenuBuilder::new(app, "File")
                 .item(&open_folder)
                 .item(&open_file)
+                .separator()
+                .item(&export_model)
                 .separator()
                 .item(&PredefinedMenuItem::close_window(app, None)?)
                 .build()?;
@@ -1187,6 +1451,7 @@ pub fn run() {
             let action = match event.id().as_ref() {
                 "file.open_folder" => Some("open-folder"),
                 "file.open_file" => Some("open-file"),
+                "file.export_model" => Some("export-model"),
                 "build.compile" => Some("compile-workspace"),
                 "view.toggle_project" => Some("toggle-project"),
                 "help.about" => Some("about"),
@@ -1215,7 +1480,8 @@ pub fn run() {
             window_toggle_maximize,
             window_close,
             compile_workspace,
-            cancel_compile
+            cancel_compile,
+            export_compiled_model
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

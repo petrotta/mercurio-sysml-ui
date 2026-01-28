@@ -63,11 +63,16 @@ let newProjectCreateBtn;
 let logDialogEl;
 let logOutputEl;
 let logRefreshBtn;
+let exportDialogEl;
+let exportFormatEl;
+let exportIncludeStdlibEl;
+let exportRunBtn;
 let projectInfoButton;
 let projectInfoDialogEl;
 let projectInfoFileEl;
 let projectInfoLibraryEl;
 let projectInfoSrcEl;
+let projectInfoImportEl;
 let projectInfoErrorEl;
 let projectInfoCreateBlockEl;
 let projectInfoTemplateEl;
@@ -791,9 +796,9 @@ function joinPath(root, name) {
 
 function normalizeProjectConfig(config) {
   if (!config || typeof config !== "object") {
-    return { library: { type: "default" }, src: [] };
+    return { library: { type: "default" }, src: [], import: [] };
   }
-  const normalized = { library: { type: "default" }, src: [] };
+  const normalized = { library: { type: "default" }, src: [], import: [] };
   if (typeof config.library === "string") {
     if (config.library.toLowerCase() === "default") {
       normalized.library = { type: "default" };
@@ -805,6 +810,9 @@ function normalizeProjectConfig(config) {
   }
   if (Array.isArray(config.src)) {
     normalized.src = config.src.filter((item) => typeof item === "string" && item.trim());
+  }
+  if (Array.isArray(config.import)) {
+    normalized.import = config.import.filter((item) => typeof item === "string" && item.trim());
   }
   return normalized;
 }
@@ -836,6 +844,7 @@ function slugifyName(name) {
 function buildProjectConfigText(useDefaultLibrary) {
   const base = {
     src: ["**/*.sysml", "**/*.kerml"],
+    import: ["**/*.sysmlx", "**/*.kermlx"],
   };
   if (useDefaultLibrary) {
     base.library = "default";
@@ -901,6 +910,26 @@ async function showLogDialog() {
 function hideLogDialog() {
   if (!logDialogEl) return;
   logDialogEl.hidden = true;
+}
+
+function showExportDialog() {
+  if (!exportDialogEl || !exportFormatEl || !exportIncludeStdlibEl) return;
+  exportFormatEl.value = "xmi";
+  exportIncludeStdlibEl.checked = false;
+  exportDialogEl.hidden = false;
+}
+
+function hideExportDialog() {
+  if (!exportDialogEl) return;
+  exportDialogEl.hidden = true;
+}
+
+async function runExportFromDialog() {
+  if (!exportFormatEl || !exportIncludeStdlibEl) return;
+  const format = exportFormatEl.value || "xmi";
+  const includeStdlib = exportIncludeStdlibEl.checked;
+  hideExportDialog();
+  await exportModel(format, includeStdlib);
 }
 
 function showSettingsDialog() {
@@ -984,6 +1013,7 @@ function updateProjectInfoDialog() {
     !projectInfoFileEl ||
     !projectInfoLibraryEl ||
     !projectInfoSrcEl ||
+    !projectInfoImportEl ||
     !projectInfoErrorEl ||
     !projectInfoCreateBlockEl ||
     !projectInfoTemplateEl ||
@@ -1006,12 +1036,14 @@ function updateProjectInfoDialog() {
     projectInfoFileEl.textContent = "No project selected";
     projectInfoLibraryEl.textContent = "Default (built-in)";
     projectInfoSrcEl.textContent = "All .sysml / .kerml files (recursive)";
+    projectInfoImportEl.textContent = "None";
     return;
   }
   if (!state.projectConfigPath) {
     projectInfoFileEl.textContent = "No .project.json found";
     projectInfoLibraryEl.textContent = "Default (built-in)";
     projectInfoSrcEl.textContent = "All .sysml / .kerml files (recursive)";
+    projectInfoImportEl.textContent = "None";
     projectInfoCreateBlockEl.hidden = false;
     projectInfoTemplateEl.disabled = false;
     projectInfoCreateBtn.disabled = false;
@@ -1024,12 +1056,14 @@ function updateProjectInfoDialog() {
     projectInfoFileEl.textContent = state.projectConfigPath;
     projectInfoLibraryEl.textContent = "Default (built-in)";
     projectInfoSrcEl.textContent = "All .sysml / .kerml files (recursive)";
+    projectInfoImportEl.textContent = "None";
     return;
   }
   if (!state.projectConfig) {
     projectInfoFileEl.textContent = state.projectConfigPath;
     projectInfoLibraryEl.textContent = "Default (built-in)";
     projectInfoSrcEl.textContent = "All .sysml / .kerml files (recursive)";
+    projectInfoImportEl.textContent = "None";
     return;
   }
   projectInfoFileEl.textContent = state.projectConfigPath;
@@ -1050,6 +1084,19 @@ function updateProjectInfoDialog() {
     projectInfoSrcEl.appendChild(list);
   } else {
     projectInfoSrcEl.textContent = "All .sysml / .kerml files (recursive)";
+  }
+  projectInfoImportEl.innerHTML = "";
+  if (state.projectConfig.import && state.projectConfig.import.length) {
+    const list = document.createElement("ul");
+    list.className = "project-info-list";
+    state.projectConfig.import.forEach((entry) => {
+      const item = document.createElement("li");
+      item.textContent = entry;
+      list.appendChild(item);
+    });
+    projectInfoImportEl.appendChild(list);
+  } else {
+    projectInfoImportEl.textContent = "None";
   }
 }
 
@@ -1073,6 +1120,10 @@ function getDefaultProjectConfigText() {
   "src": [
     "**/*.sysml",
     "**/*.kerml"
+  ],
+  "import": [
+    "**/*.sysmlx",
+    "**/*.kermlx"
   ]
 }`;
 }
@@ -1649,10 +1700,13 @@ function renderModelTree(symbols, files, unresolved, libraryPath) {
   const libraryRoot = libraryPath || "";
   const projectSymbols = [];
   const librarySymbols = [];
+  const importSymbols = [];
 
   filteredSymbols.forEach((symbol) => {
     const path = symbol?.file_path || "";
-    if (libraryRoot && isPathUnderRoot(path, libraryRoot)) {
+    if (symbol?.file === 0) {
+      importSymbols.push(symbol);
+    } else if (libraryRoot && isPathUnderRoot(path, libraryRoot)) {
       librarySymbols.push(symbol);
     } else {
       projectSymbols.push(symbol);
@@ -1737,6 +1791,10 @@ function renderModelTree(symbols, files, unresolved, libraryPath) {
 
   if (showLibrarySymbols && librarySymbols.length) {
     renderSection("Library", librarySymbols);
+  }
+
+  if (importSymbols.length) {
+    renderSection("Imports", importSymbols);
   }
 
   if (unresolvedRefs.length) {
@@ -2002,6 +2060,55 @@ async function compileWorkspace() {
     if (activeCompileId === runId) {
       activeCompileId = 0;
     }
+  }
+}
+
+async function exportModel(format = "xmi", includeStdlib = false) {
+  if (!state.rootPath) {
+    setCompileStatus("Select a root folder first");
+    return;
+  }
+  if (!dialog?.save) {
+    setCompileStatus("Dialog API not available");
+    return;
+  }
+  const defaultExt = format === "kpar" ? "kpar" : format === "jsonld" ? "jsonld" : "xmi";
+  const defaultPath = joinPath(state.rootPath, `model.${defaultExt}`);
+  const selected = await dialog.save({
+    defaultPath,
+    filters: [
+      { name: "XMI", extensions: ["xmi"] },
+      { name: "KPAR", extensions: ["kpar"] },
+      { name: "JSON-LD", extensions: ["jsonld"] },
+    ],
+  });
+  if (!selected) return;
+  const ext = getExtension(selected);
+  const finalFormat = ext ? ext.toLowerCase() : format;
+  if (!["xmi", "kpar", "jsonld"].includes(finalFormat)) {
+    setCompileStatus(`Unsupported export format: ${finalFormat}`);
+    return;
+  }
+  setCompileStatus("Exporting model...");
+  setCompileFloat("running", "Exporting...", "");
+  try {
+    await invoke("export_compiled_model", {
+      payload: {
+        root: state.rootPath,
+        output: selected,
+        format: finalFormat,
+        include_stdlib: includeStdlib,
+      },
+    });
+    const name = selected.split(/[\\/]/).pop() || selected;
+    setCompileStatus(`Exported ${name}`);
+    setCompileFloat("done", "Export complete", "");
+    setTimeout(() => {
+      hideCompileFloat();
+    }, 700);
+  } catch (error) {
+    setCompileStatus(`Export failed: ${error}`);
+    setCompileFloat("error", "Export failed", String(error || ""));
   }
 }
 
@@ -2315,6 +2422,9 @@ async function handleMenuAction(action) {
   if (action === "compile-workspace") {
     await compileWorkspace();
   }
+  if (action === "export-model") {
+    showExportDialog();
+  }
   if (action === "settings") {
     showSettingsDialog();
   }
@@ -2537,6 +2647,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   projectInfoFileEl = document.querySelector("#project-info-file");
   projectInfoLibraryEl = document.querySelector("#project-info-library");
   projectInfoSrcEl = document.querySelector("#project-info-src");
+  projectInfoImportEl = document.querySelector("#project-info-import");
   projectInfoErrorEl = document.querySelector("#project-info-error");
   projectInfoCreateBlockEl = document.querySelector("#project-info-create-block");
   projectInfoTemplateEl = document.querySelector("#project-info-template");
@@ -2556,6 +2667,10 @@ window.addEventListener("DOMContentLoaded", async () => {
   logDialogEl = document.querySelector("#log-dialog");
   logOutputEl = document.querySelector("#log-output");
   logRefreshBtn = document.querySelector("#log-refresh");
+  exportDialogEl = document.querySelector("#export-dialog");
+  exportFormatEl = document.querySelector("#export-format");
+  exportIncludeStdlibEl = document.querySelector("#export-include-stdlib");
+  exportRunBtn = document.querySelector("#export-run");
   settingsDialogEl = document.querySelector("#settings-dialog");
   settingsThemeEl = document.querySelector("#settings-theme");
   rootPathEl = document.querySelector("#root-path");
@@ -2673,6 +2788,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   logRefreshBtn?.addEventListener("click", async () => {
     await showLogDialog();
   });
+  exportRunBtn?.addEventListener("click", async () => {
+    await runExportFromDialog();
+  });
   newFileDialogEl?.addEventListener("click", (event) => {
     const action = event.target?.dataset?.action;
     if (action === "close") {
@@ -2683,6 +2801,12 @@ window.addEventListener("DOMContentLoaded", async () => {
     const action = event.target?.dataset?.action;
     if (action === "close") {
       hideLogDialog();
+    }
+  });
+  exportDialogEl?.addEventListener("click", (event) => {
+    const action = event.target?.dataset?.action;
+    if (action === "close") {
+      hideExportDialog();
     }
   });
   settingsDialogEl?.addEventListener("click", (event) => {
@@ -2725,6 +2849,11 @@ window.addEventListener("DOMContentLoaded", async () => {
   logDialogEl?.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       hideLogDialog();
+    }
+  });
+  exportDialogEl?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      hideExportDialog();
     }
   });
   settingsDialogEl?.addEventListener("keydown", (event) => {

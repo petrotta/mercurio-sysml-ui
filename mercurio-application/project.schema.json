@@ -31,6 +31,13 @@
       "items": {
         "type": "string"
       }
+    },
+    "import": {
+      "description": "Interchange models to import (sysmlx, kermlx, xmi, kpar, jsonld). Supports explicit file paths, top-level wildcards like \"*.sysmlx\", or recursive wildcards like \"**/*.sysmlx\".",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     }
   }
 }
