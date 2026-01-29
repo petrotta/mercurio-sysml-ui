@@ -5,6 +5,7 @@ use syster::project::StdLibLoader;
 use syster::hir::SemanticChecker;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
 use std::sync::{Arc, Mutex};
 use std::collections::HashSet;
 use syster::base::constants::STDLIB_DIR;
@@ -28,7 +29,7 @@ struct DirEntry {
     is_dir: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct CompileFileResult {
   path: String,
   ok: bool,
@@ -82,11 +83,29 @@ struct AppState {
     watcher: Arc<Mutex<Option<RecommendedWatcher>>>,
     stdlib_cache: Arc<Mutex<Option<StdlibCache>>>,
     canceled_compiles: Arc<Mutex<HashSet<u64>>>,
+    analysis_host: Arc<Mutex<AnalysisHost>>,
+    workspace: Arc<Mutex<WorkspaceState>>,
 }
 
 struct StdlibCache {
     path: PathBuf,
     files: Vec<(PathBuf, SyntaxFile)>,
+}
+
+#[derive(Clone)]
+struct UnsavedFile {
+    path: PathBuf,
+    content: String,
+}
+
+#[derive(Default)]
+struct WorkspaceState {
+    root: Option<PathBuf>,
+    project_files: HashSet<PathBuf>,
+    import_files: HashSet<PathBuf>,
+    stdlib_path: Option<PathBuf>,
+    file_mtimes: std::collections::HashMap<PathBuf, SystemTime>,
+    file_cache: std::collections::HashMap<PathBuf, CompileFileResult>,
 }
 
 struct CancelGuard {
@@ -562,10 +581,31 @@ async fn compile_workspace(
         .or_else(|| payload.get("runld"))
         .and_then(|value| value.as_u64())
         .unwrap_or(0);
+    let allow_parse_errors = payload
+        .get("allow_parse_errors")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let unsaved = payload
+        .get("unsaved")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|entry| {
+                    let path = entry.get("path").and_then(|v| v.as_str())?;
+                    let content = entry.get("content").and_then(|v| v.as_str())?;
+                    Some(UnsavedFile {
+                        path: PathBuf::from(path),
+                        content: content.to_string(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let state = state.inner().clone();
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        compile_workspace_sync(app, state, root, run_id)
+        compile_workspace_sync(app, state, root, run_id, allow_parse_errors, unsaved)
     })
         .await
         .map_err(|e| e.to_string())?
@@ -576,6 +616,8 @@ fn compile_workspace_sync(
     state: AppState,
     root: String,
     run_id: u64,
+    allow_parse_errors: bool,
+    unsaved: Vec<UnsavedFile>,
 ) -> Result<CompileResponse, String> {
     let root_path = PathBuf::from(root);
     if !root_path.exists() {
@@ -632,19 +674,25 @@ fn compile_workspace_sync(
     let mut symbols = Vec::new();
     let mut file_results = Vec::new();
     let mut unresolved = Vec::new();
-    let mut analysis_host = AnalysisHost::new();
 
-    if let Some(imports) = project_config
+    let mut analysis_host = state
+        .analysis_host
+        .lock()
+        .map_err(|_| "Analysis host lock poisoned".to_string())?;
+    let mut workspace = state
+        .workspace
+        .lock()
+        .map_err(|_| "Workspace lock poisoned".to_string())?;
+
+    let import_files = project_config
         .as_ref()
         .and_then(|config| config.import_entries.as_ref())
-    {
-        let import_files = collect_project_imports(&root_path, imports)?;
-        if !import_files.is_empty() {
-            load_imports_into_host(&mut analysis_host, &import_files)?;
-        }
-    }
+        .map(|imports| collect_project_imports(&root_path, imports))
+        .transpose()?
+        .unwrap_or_default();
+    let import_set: HashSet<PathBuf> = import_files.iter().cloned().collect();
 
-    let library_config = project_config.and_then(|config| config.library);
+    let library_config = project_config.clone().and_then(|config| config.library);
     let (stdlib_loader, stdlib_source, stdlib_path_for_log) = match library_config {
         Some(LibraryConfig::Path { path }) => {
             let raw_path = PathBuf::from(&path);
@@ -678,39 +726,80 @@ fn compile_workspace_sync(
             (StdLibLoader::new(), source, Some(discovered))
         }
     };
-    if let Ok(cwd) = std::env::current_dir() {
-        println!("stdlib: cwd={}", cwd.to_string_lossy());
-    }
-    let stdlib_path_exists = stdlib_path_for_log
-        .as_ref()
-        .map(|path| path.exists() && path.is_dir())
-        .unwrap_or(false);
-    println!(
-        "stdlib: loading ({}) exists={}",
-        stdlib_source, stdlib_path_exists
-    );
-    if !stdlib_path_exists {
-        println!("stdlib: path missing; no stdlib files will load");
-    }
-    let stdlib_files_before = analysis_host.file_count();
-    if stdlib_path_exists {
-        if let Some(stdlib_path) = stdlib_path_for_log.as_ref() {
-            let cached_files = load_stdlib_cached(&state, stdlib_path)?;
-            for (path, file) in cached_files {
-                analysis_host.set_file(path, file);
-            }
+    let mut project_set: HashSet<PathBuf> = files.iter().cloned().collect();
+    let needs_reset = workspace.root.as_ref() != Some(&root_path)
+        || workspace.stdlib_path.as_ref() != stdlib_path_for_log.as_ref()
+        || workspace.import_files != import_set;
+
+    if needs_reset {
+        *analysis_host = AnalysisHost::new();
+        workspace.root = Some(root_path.clone());
+        workspace.stdlib_path = stdlib_path_for_log.clone();
+        workspace.import_files = import_set.clone();
+        workspace.project_files.clear();
+        workspace.file_mtimes.clear();
+        workspace.file_cache.clear();
+
+        if !import_files.is_empty() {
+            load_imports_into_host(&mut analysis_host, &import_files)?;
         }
-    } else {
-        stdlib_loader.load_into_host(&mut analysis_host)?;
+
+        if let Ok(cwd) = std::env::current_dir() {
+            println!("stdlib: cwd={}", cwd.to_string_lossy());
+        }
+        let stdlib_path_exists = stdlib_path_for_log
+            .as_ref()
+            .map(|path| path.exists() && path.is_dir())
+            .unwrap_or(false);
+        println!(
+            "stdlib: loading ({}) exists={}",
+            stdlib_source, stdlib_path_exists
+        );
+        if !stdlib_path_exists {
+            println!("stdlib: path missing; no stdlib files will load");
+        }
+        let stdlib_files_before = analysis_host.file_count();
+        if stdlib_path_exists {
+            if let Some(stdlib_path) = stdlib_path_for_log.as_ref() {
+                let cached_files = load_stdlib_cached(&state, stdlib_path)?;
+                for (path, file) in cached_files {
+                    analysis_host.set_file(path, file);
+                }
+            }
+        } else {
+            stdlib_loader.load_into_host(&mut analysis_host)?;
+        }
+        let stdlib_files_after = analysis_host.file_count();
+        let stdlib_file_delta = stdlib_files_after.saturating_sub(stdlib_files_before);
+        println!("stdlib: loaded files={}", stdlib_file_delta);
+        println!("stdlib: symbols=skipped (counting stdlib symbols can overflow the stack)");
     }
-    let stdlib_files_after = analysis_host.file_count();
-    let stdlib_file_delta = stdlib_files_after.saturating_sub(stdlib_files_before);
-    println!("stdlib: loaded files={}", stdlib_file_delta);
-    println!("stdlib: symbols=skipped (counting stdlib symbols can overflow the stack)");
 
     println!("compile: parsing project files count={}", files.len());
     let mut has_parse_errors = false;
     emit_progress("parsing", None, None, Some(files.len()));
+
+    let mut unsaved_map = std::collections::HashMap::new();
+    for entry in unsaved {
+        unsaved_map.insert(entry.path, entry.content);
+    }
+
+    let removed: Vec<PathBuf> = workspace
+        .project_files
+        .difference(&project_set)
+        .cloned()
+        .collect();
+    for path in &removed {
+        analysis_host.remove_file_path(path);
+        workspace.file_mtimes.remove(path);
+        workspace.file_cache.remove(path);
+    }
+    for path in &project_set {
+        if !workspace.project_files.contains(path) {
+            workspace.project_files.insert(path.clone());
+        }
+    }
+
     for (index, path) in files.iter().enumerate() {
         check_cancel()?;
         emit_progress(
@@ -719,38 +808,73 @@ fn compile_workspace_sync(
             Some(index + 1),
             Some(files.len()),
         );
-        let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
-        let parse = parse_with_result(&content, path);
-        let errors = parse
-            .errors
-            .iter()
-            .map(|e| format!("{:?}", e))
-            .collect::<Vec<_>>();
-        let ok = parse.content.is_some() && errors.is_empty();
-        if !ok {
-            has_parse_errors = true;
-        }
-        let mut symbol_count = 0;
 
-        if let Some(syntax) = parse.content {
-            let file_id = FileId::new(index as u32);
-            let file_symbols = extract_symbols_unified(file_id, &syntax);
-            symbol_count = file_symbols.len();
-            analysis_host.set_file(path.to_path_buf(), syntax);
+        let mut should_parse = false;
+        let mut content_override = None;
+        if let Some(content) = unsaved_map.get(path) {
+            should_parse = true;
+            content_override = Some(content.as_str());
+        } else {
+            let meta = fs::metadata(path).map_err(|e| e.to_string())?;
+            let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let known = workspace.file_mtimes.get(path);
+            if known.is_none() || known != Some(&modified) {
+                should_parse = true;
+                workspace.file_mtimes.insert(path.clone(), modified);
+            }
         }
 
-        file_results.push(CompileFileResult {
-            path: path.to_string_lossy().to_string(),
-            ok,
-            errors,
-            symbol_count,
-        });
+        if should_parse || !workspace.file_cache.contains_key(path) {
+            let content = match content_override {
+                Some(value) => value.to_string(),
+                None => fs::read_to_string(path).map_err(|e| e.to_string())?,
+            };
+            let parse = parse_with_result(&content, path);
+            let errors = parse
+                .errors
+                .iter()
+                .map(|e| format!("{:?}", e))
+                .collect::<Vec<_>>();
+            let ok = parse.content.is_some() && errors.is_empty();
+            if !ok {
+                has_parse_errors = true;
+            }
+            let mut symbol_count = 0;
+
+            if let Some(syntax) = parse.content {
+                let file_id = FileId::new(index as u32);
+                let file_symbols = extract_symbols_unified(file_id, &syntax);
+                symbol_count = file_symbols.len();
+                analysis_host.set_file(path.to_path_buf(), syntax);
+            }
+
+            workspace.file_cache.insert(
+                path.to_path_buf(),
+                CompileFileResult {
+                    path: path.to_string_lossy().to_string(),
+                    ok,
+                    errors,
+                    symbol_count,
+                },
+            );
+        } else if let Some(result) = workspace.file_cache.get(path) {
+            if !result.ok {
+                has_parse_errors = true;
+            }
+        }
     }
+
+    file_results = workspace
+        .project_files
+        .iter()
+        .filter_map(|path| workspace.file_cache.get(path).cloned())
+        .collect();
+    file_results.sort_by(|a, b| a.path.cmp(&b.path));
     println!(
         "compile: parsing done host_files={}",
         analysis_host.file_count()
     );
-    if has_parse_errors {
+    if has_parse_errors && !allow_parse_errors {
         return Ok(CompileResponse {
             ok: false,
             files: file_results,
@@ -1402,6 +1526,8 @@ pub fn run() {
             watcher: Arc::new(Mutex::new(None)),
             stdlib_cache: Arc::new(Mutex::new(None)),
             canceled_compiles: Arc::new(Mutex::new(HashSet::new())),
+            analysis_host: Arc::new(Mutex::new(AnalysisHost::new())),
+            workspace: Arc::new(Mutex::new(WorkspaceState::default())),
         })
         .menu(|app| {
             let open_folder = MenuItemBuilder::with_id("file.open_folder", "Open Folder...")

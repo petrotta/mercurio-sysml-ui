@@ -30,6 +30,7 @@ let statusMessageEl;
 let statusFileEl;
 let statusPositionEl;
 let statusUnresolvedEl;
+let statusAutoCompileEl;
 let compileFloatEl;
 let compileFloatMessageEl;
 let compileFloatDetailEl;
@@ -79,16 +80,23 @@ let projectInfoTemplateEl;
 let projectInfoCreateBtn;
 let fsRefreshTimer = null;
 let parseRefreshTimer = null;
+let autoCompileMutedUntil = 0;
+let pendingLineCompile = false;
+let lastCursorLine = null;
 let parseErrorDecorations = [];
 let isSettingEditorValue = false;
 let modelTreeSelectionEl = null;
 let parseErrorsExpanded = false;
-const modelSectionState = { Project: false, Library: false };
+const modelSectionState = { Project: false, Imports: false, Library: false };
+let modelCollapsedNodes = new Set();
+let modelLastKeys = new Set();
+let modelLastOrder = new Map();
 let modelGroupByFile = true;
 let modelUnresolvedSectionEl = null;
 let compileRunId = 0;
 let activeCompileId = 0;
 const canceledCompileIds = new Set();
+const lastEditContentByPath = new Map();
 let settingsDialogEl;
 let settingsThemeEl;
 let currentTheme = "vs-dark";
@@ -119,12 +127,15 @@ const ROOT_STORAGE_KEY = "mercurio.rootPath";
 const RECENT_PROJECTS_KEY = "mercurio.recentProjects";
 const PROJECT_LOCATION_KEY = "mercurio.projectDefaultLocation";
 const THEME_STORAGE_KEY = "mercurio.theme";
+const MODEL_GROUP_KEY = "mercurio.modelGroupByFile";
+const MODEL_LIBRARY_KEY = "mercurio.modelShowLibrary";
+const MODEL_PROPERTIES_KEY = "mercurio.modelShowProperties";
+const MODEL_SECTIONS_KEY = "mercurio.modelSectionState";
 const lastCompile = { symbols: [], files: [], unresolved: [], durationMs: null, libraryPath: "" };
 
 const MIN_LEFT = 200;
 const MIN_RIGHT = 240;
 const MIN_CENTER = 360;
-
 let contextTarget = null;
 let editorTabsMenuTarget = null;
 let editorTabsOverflowItems = [];
@@ -302,6 +313,24 @@ function setCompileStatus(text) {
   }
   if (statusMessageEl) {
     statusMessageEl.textContent = text;
+  }
+}
+
+function setAutoCompileStatus(state, detail) {
+  if (!statusAutoCompileEl) return;
+  const mode = state || "idle";
+  statusAutoCompileEl.dataset.state = mode;
+  if (detail) {
+    statusAutoCompileEl.title = detail;
+  } else {
+    const label = mode === "running"
+      ? "Auto-compile running"
+      : mode === "error"
+      ? "Auto-compile failed"
+      : mode === "success"
+      ? "Auto-compile complete"
+      : "Auto-compile idle";
+    statusAutoCompileEl.title = label;
   }
 }
 
@@ -527,6 +556,41 @@ function loadStoredTheme() {
   return stored;
 }
 
+function loadModelPrefs() {
+  const storedGroup = window.localStorage?.getItem(MODEL_GROUP_KEY);
+  if (storedGroup != null) {
+    modelGroupByFile = storedGroup === "true";
+  }
+  const storedLibrary = window.localStorage?.getItem(MODEL_LIBRARY_KEY);
+  if (storedLibrary != null) {
+    showLibrarySymbols = storedLibrary === "true";
+  }
+  const storedProps = window.localStorage?.getItem(MODEL_PROPERTIES_KEY);
+  if (storedProps != null) {
+    showPropertiesPane = storedProps === "true";
+  }
+  const storedSections = window.localStorage?.getItem(MODEL_SECTIONS_KEY);
+  if (storedSections) {
+    try {
+      const parsed = JSON.parse(storedSections);
+      if (parsed && typeof parsed === "object") {
+        Object.keys(modelSectionState).forEach((key) => {
+          if (typeof parsed[key] === "boolean") {
+            modelSectionState[key] = parsed[key];
+          }
+        });
+      }
+    } catch {}
+  }
+}
+
+function saveModelPrefs() {
+  window.localStorage?.setItem(MODEL_GROUP_KEY, String(modelGroupByFile));
+  window.localStorage?.setItem(MODEL_LIBRARY_KEY, String(showLibrarySymbols));
+  window.localStorage?.setItem(MODEL_PROPERTIES_KEY, String(showPropertiesPane));
+  window.localStorage?.setItem(MODEL_SECTIONS_KEY, JSON.stringify(modelSectionState));
+}
+
 function applyTheme(themeId) {
   const theme = themeId || "vs-dark";
   currentTheme = theme;
@@ -567,6 +631,22 @@ function hideCompileFloat() {
   if (!compileFloatEl) return;
   compileFloatEl.hidden = true;
   compileFloatEl.classList.remove("error", "done");
+}
+
+function maybeAutoCompileOnLineChange() {
+  if (!editor) return;
+  const pos = editor.getPosition();
+  if (!pos) return;
+  const line = pos.lineNumber;
+  const lineChanged = lastCursorLine != null && line !== lastCursorLine;
+  lastCursorLine = line;
+  if (!lineChanged) return;
+  if (!pendingLineCompile) return;
+  if (!state.rootPath) return;
+  if (activeCompileId) return;
+  if (Date.now() < autoCompileMutedUntil) return;
+  pendingLineCompile = false;
+  compileWorkspace({ silent: true, allowParseErrors: true, saveBefore: false, auto: true });
 }
 
 function updateCompileProgress(payload) {
@@ -683,6 +763,7 @@ function renderEditorTabs() {
   editorTabsEl.innerHTML = "";
   if (!state.openFiles.length) {
     editorTabsEl.classList.add("empty");
+    hideEditorTabsOverflowMenu();
     return;
   }
   editorTabsEl.classList.remove("empty");
@@ -694,6 +775,7 @@ function renderEditorTabs() {
   overflowButton.title = "More tabs";
   overflowButton.textContent = "v";
   overflowButton.hidden = true;
+  overflowButton.style.display = "none";
   overflowButton.addEventListener("click", (event) => {
     event.stopPropagation();
     if (!editorTabsOverflowItems.length) return;
@@ -738,7 +820,12 @@ function layoutEditorTabs(tabsList, overflowButton, tabNodes) {
   });
 
   const available = editorTabsEl.clientWidth;
-  if (!available) return;
+  if (!available) {
+    overflowButton.hidden = true;
+    overflowButton.style.display = "none";
+    hideEditorTabsOverflowMenu();
+    return;
+  }
 
   overflowButton.hidden = false;
   const overflowWidth = overflowButton.getBoundingClientRect().width || 28;
@@ -759,10 +846,12 @@ function layoutEditorTabs(tabsList, overflowButton, tabNodes) {
 
   if (!overflowed.length) {
     overflowButton.hidden = true;
+    overflowButton.style.display = "none";
     hideEditorTabsOverflowMenu();
     return;
   }
   overflowButton.hidden = false;
+  overflowButton.style.display = "inline-flex";
   overflowed.forEach((node) => {
     if (node.tab.parentElement === tabsList) {
       tabsList.removeChild(node.tab);
@@ -1560,6 +1649,7 @@ async function openFile(path) {
     }
     const saved = state.lastSavedContent.get(path) ?? content;
     setDirty(path, content !== saved);
+    lastEditContentByPath.set(path, content);
     addOpenFile(path);
     setCurrentFile(path);
     updateCursorStatus();
@@ -1684,6 +1774,19 @@ function formatCount(value, singular, plural) {
 }
 
 function renderModelTree(symbols, files, unresolved, libraryPath) {
+  modelCollapsedNodes = new Set();
+  if (modelTreeEl) {
+    modelTreeEl.querySelectorAll(".model-node.collapsed").forEach((node) => {
+      const key = node.dataset.key;
+      if (key) {
+        modelCollapsedNodes.add(key);
+      }
+    });
+  }
+  const previousKeys = modelLastKeys;
+  modelLastKeys = new Set();
+  const previousOrder = modelLastOrder;
+  modelLastOrder = new Map();
   modelTreeEl.innerHTML = "";
   modelNodeIndex = new Map();
   modelNodeNameIndex = new Map();
@@ -1721,12 +1824,20 @@ function renderModelTree(symbols, files, unresolved, libraryPath) {
     return;
   }
 
+  const fileOrder = new Map();
+  if (Array.isArray(files)) {
+    files.forEach((file, index) => {
+      if (file?.path) {
+        fileOrder.set(file.path, index);
+      }
+    });
+  }
+
   const renderSection = (title, sectionSymbols) => {
     if (!sectionSymbols.length) return;
     const section = document.createElement("div");
     section.className = "model-section";
-    section.classList.toggle("collapsed", modelGroupByFile && modelSectionState[title]);
-    section.classList.toggle("compact", !modelGroupByFile && modelSectionState[title]);
+    section.classList.toggle("collapsed", modelSectionState[title]);
     const header = document.createElement("div");
     header.className = "model-section-header";
     const caret = document.createElement("span");
@@ -1744,9 +1855,9 @@ function renderModelTree(symbols, files, unresolved, libraryPath) {
     header.addEventListener("click", () => {
       const next = !modelSectionState[title];
       modelSectionState[title] = next;
-      section.classList.toggle("collapsed", modelGroupByFile && next);
-      section.classList.toggle("compact", !modelGroupByFile && next);
+      section.classList.toggle("collapsed", next);
       caret.textContent = next ? ">" : "v";
+      saveModelPrefs();
     });
     section.appendChild(header);
 
@@ -1768,10 +1879,11 @@ function renderModelTree(symbols, files, unresolved, libraryPath) {
     const list = document.createElement("ul");
     list.className = "model-tree-list";
     const fileNodes = buildModelTree(sectionSymbols);
-    Array.from(fileNodes.values())
-      .sort((a, b) => a.name.localeCompare(b.name))
+    const nodes = Array.from(fileNodes.values());
+    nodes
+      .sort((a, b) => compareModelNodes(a, b, null, previousOrder, fileOrder))
       .forEach((node) => {
-        list.appendChild(renderModelNode(node, modelGroupByFile));
+        list.appendChild(renderModelNode(node, modelGroupByFile, null, previousOrder, fileOrder));
       });
     section.appendChild(list);
     modelTreeEl.appendChild(section);
@@ -1789,12 +1901,12 @@ function renderModelTree(symbols, files, unresolved, libraryPath) {
     modelTreeEl.appendChild(empty);
   }
 
-  if (showLibrarySymbols && librarySymbols.length) {
-    renderSection("Library", librarySymbols);
-  }
-
   if (importSymbols.length) {
     renderSection("Imports", importSymbols);
+  }
+
+  if (showLibrarySymbols && librarySymbols.length) {
+    renderSection("Library", librarySymbols);
   }
 
   if (unresolvedRefs.length) {
@@ -1834,11 +1946,39 @@ function renderModelTree(symbols, files, unresolved, libraryPath) {
   if (showPropertiesPane) {
     clearPropertiesPane();
   }
+
+  const addedKeys = [];
+  modelLastKeys.forEach((key) => {
+    if (!previousKeys.has(key)) {
+      addedKeys.push(key);
+    }
+  });
+  addedKeys.forEach((key) => {
+    const node = modelTreeEl.querySelector(`.model-node[data-key="${CSS.escape(key)}"]`);
+    if (node) {
+      node.classList.add("added");
+      setTimeout(() => node.classList.remove("added"), 700);
+    }
+  });
+  const removedCount = Array.from(previousKeys).filter((key) => !modelLastKeys.has(key)).length;
+  if (removedCount) {
+    modelTreeEl.classList.add("flash-removed");
+    setTimeout(() => modelTreeEl.classList.remove("flash-removed"), 700);
+  }
 }
 
-function renderModelNode(node, isFile) {
+function renderModelNode(node, isFile, parentKey, previousOrder, fileOrder) {
   const item = document.createElement("li");
   item.className = `model-node${isFile ? " model-file" : ""}`;
+  const nodeKey = getModelNodeKey(node, parentKey);
+  if (nodeKey) {
+    item.dataset.key = nodeKey;
+    modelLastKeys.add(nodeKey);
+    modelLastOrder.set(nodeKey, modelLastOrder.size);
+  }
+  if (nodeKey && modelCollapsedNodes.has(nodeKey)) {
+    item.classList.add("collapsed");
+  }
 
   const row = document.createElement("div");
   row.className = "model-row";
@@ -1854,6 +1994,9 @@ function renderModelNode(node, isFile) {
     badge.className = "kind-badge kind-file";
   } else if (node.symbol) {
     badge.className = `kind-badge kind-${normalizeKind(node.symbol.kind)}`;
+    if (/def/i.test(node.symbol.kind)) {
+      badge.classList.add("kind-def");
+    }
   } else {
     badge.className = "kind-badge kind-other";
   }
@@ -1921,34 +2064,48 @@ function renderModelNode(node, isFile) {
   if (node.children.size) {
     const children = document.createElement("ul");
     children.className = "model-children";
-    Array.from(node.children.values())
-      .sort((a, b) => a.name.localeCompare(b.name))
+    const childNodes = Array.from(node.children.values());
+    childNodes
+      .sort((a, b) => compareModelNodes(a, b, nodeKey, previousOrder, fileOrder))
       .forEach((child) => {
-        children.appendChild(renderModelNode(child, false));
+        children.appendChild(renderModelNode(child, false, nodeKey, previousOrder, fileOrder));
       });
     item.appendChild(children);
+    caret.textContent = item.classList.contains("collapsed") ? ">" : "v";
 
     const toggleCollapsed = (event) => {
       event?.stopPropagation();
       item.classList.toggle("collapsed");
       caret.textContent = item.classList.contains("collapsed") ? ">" : "v";
+      if (nodeKey) {
+        if (item.classList.contains("collapsed")) {
+          modelCollapsedNodes.add(nodeKey);
+        } else {
+          modelCollapsedNodes.delete(nodeKey);
+        }
+      }
     };
 
     caret.addEventListener("click", toggleCollapsed);
     row.addEventListener("dblclick", toggleCollapsed);
   }
 
-  if (node.symbol && node.symbol.file_path) {
+  if (node.symbol) {
     row.addEventListener("click", async (event) => {
       if (event.target === caret) return;
       selectModelRow(row);
-      await openFileAt(
-        node.symbol.file_path,
-        node.symbol.start_line,
-        node.symbol.start_col,
-        node.symbol.end_line,
-        node.symbol.end_col
-      );
+      if (showPropertiesPane) {
+        setPropertiesForSymbol(node.symbol);
+      }
+      if (node.symbol.file_path) {
+        await openFileAt(
+          node.symbol.file_path,
+          node.symbol.start_line,
+          node.symbol.start_col,
+          node.symbol.end_line,
+          node.symbol.end_col
+        );
+      }
     });
   } else {
     row.addEventListener("click", () => {
@@ -1959,6 +2116,64 @@ function renderModelNode(node, isFile) {
   }
 
   return item;
+}
+
+function getModelNodeKey(node, parentKey) {
+  if (node?.symbol?.qualified_name) {
+    return node.symbol.qualified_name;
+  }
+  if (node?.symbol?.file_path) {
+    return node.symbol.file_path;
+  }
+  if (parentKey) {
+    return `${parentKey}::${node.name}`;
+  }
+  return node?.name || "";
+}
+
+function compareModelNodes(a, b, parentKey, previousOrder, fileOrder) {
+  const keyA = getModelNodeKey(a, parentKey);
+  const keyB = getModelNodeKey(b, parentKey);
+  const orderA = getParseOrder(a, fileOrder);
+  const orderB = getParseOrder(b, fileOrder);
+  if (orderA && orderB) {
+    if (orderA.fileIndex !== orderB.fileIndex) {
+      return orderA.fileIndex - orderB.fileIndex;
+    }
+    if (orderA.line !== orderB.line) {
+      return orderA.line - orderB.line;
+    }
+    if (orderA.col !== orderB.col) {
+      return orderA.col - orderB.col;
+    }
+  }
+  const idxA = previousOrder.get(keyA);
+  const idxB = previousOrder.get(keyB);
+  if (idxA != null && idxB != null) {
+    return idxA - idxB;
+  }
+  if (idxA != null) return -1;
+  if (idxB != null) return 1;
+  return a.name.localeCompare(b.name);
+}
+
+function getParseOrder(node, fileOrder) {
+  if (!node) return null;
+  if (node.symbol) {
+    const fileIdx = fileOrder?.get(node.symbol.file_path);
+    const line = typeof node.symbol.start_line === "number" ? node.symbol.start_line : null;
+    const col = typeof node.symbol.start_col === "number" ? node.symbol.start_col : null;
+    if (fileIdx != null && line != null && col != null) {
+      return { fileIndex: fileIdx, line, col };
+    }
+    if (line != null && col != null) {
+      return { fileIndex: 0, line, col };
+    }
+  }
+  if (!node.symbol && fileOrder && fileOrder.has(node.name)) {
+    return { fileIndex: fileOrder.get(node.name), line: 0, col: 0 };
+  }
+  return null;
 }
 
 function setModelTreeCollapsed(collapsed) {
@@ -1977,7 +2192,7 @@ function setModelTreeCollapsed(collapsed) {
   });
 }
 
-async function compileWorkspace() {
+async function compileWorkspace(options = {}) {
   if (!state.rootPath) {
     setCompileStatus("Select a root folder first");
     return;
@@ -1986,46 +2201,87 @@ async function compileWorkspace() {
     setCompileStatus("Compile already running");
     return;
   }
-  compileButton.disabled = true;
-  setCompileStatus("Saving...");
+  pendingLineCompile = false;
+  const silent = Boolean(options.silent);
+  const isAuto = Boolean(options.auto);
+  const allowParseErrors = Boolean(options.allowParseErrors);
+  const saveBefore = options.saveBefore !== false;
+  autoCompileMutedUntil = Date.now() + 1000;
+  if (compileButton) {
+    compileButton.disabled = true;
+  }
+  if (!silent) {
+    setCompileStatus("Saving...");
+  }
   const runId = ++compileRunId;
   activeCompileId = runId;
   canceledCompileIds.delete(runId);
-  setCompileFloat("running", "Saving...", "");
+  if (isAuto) {
+    setAutoCompileStatus("running", "Auto-compile running");
+  }
+  if (!silent) {
+    setCompileFloat("running", "Saving...", "");
+  }
 
   const start = performance.now();
   try {
-    await saveAllOpenFiles();
-    setCompileStatus("Compiling...");
-    setCompileFloat("running", "Compiling...", "");
+    if (saveBefore) {
+      await saveAllOpenFiles();
+    }
+    const unsaved = [];
+    for (const path of state.dirtyFiles) {
+      let content = null;
+      if (path === state.currentFile && editor) {
+        content = editor.getValue();
+      } else {
+        content = state.bufferedContent.get(path);
+      }
+      if (typeof content === "string") {
+        unsaved.push({ path, content });
+      }
+    }
+    if (!silent) {
+      setCompileStatus("Compiling...");
+      setCompileFloat("running", "Compiling...", "");
+    }
     const result = await invoke("compile_workspace", {
-      payload: { root: state.rootPath, run_id: runId },
+      payload: {
+        root: state.rootPath,
+        run_id: runId,
+        allow_parse_errors: allowParseErrors,
+        unsaved,
+      },
     });
     if (canceledCompileIds.has(runId)) {
       return;
     }
     if (result.parse_failed) {
-      const firstError = Array.isArray(result.files)
-        ? result.files.find((file) => !file.ok)
-        : null;
-      const detail = document.createElement("div");
-      if (firstError?.path) {
-        const fileName = firstError.path.split(/[\\/]/).pop() || firstError.path;
-        detail.textContent = `Syntax error in ${fileName}. `;
-        const link = document.createElement("button");
-        link.type = "button";
-        link.className = "compile-float-link";
-        link.textContent = "Open file";
-        link.addEventListener("click", async () => {
-          await openFile(firstError.path);
-        });
-        detail.appendChild(link);
-      } else {
-        detail.textContent = "Syntax errors found.";
+      if (isAuto) {
+        setAutoCompileStatus("error", "Auto-compile failed: syntax errors");
       }
-      setCompileFloat("error", "Build failed", detail);
-      setCompileStatus("Compile failed: syntax errors found.");
-      return;
+      if (!silent) {
+        const firstError = Array.isArray(result.files)
+          ? result.files.find((file) => !file.ok)
+          : null;
+        const detail = document.createElement("div");
+        if (firstError?.path) {
+          const fileName = firstError.path.split(/[\\/]/).pop() || firstError.path;
+          detail.textContent = `Syntax error in ${fileName}. `;
+          const link = document.createElement("button");
+          link.type = "button";
+          link.className = "compile-float-link";
+          link.textContent = "Open file";
+          link.addEventListener("click", async () => {
+            await openFile(firstError.path);
+          });
+          detail.appendChild(link);
+        } else {
+          detail.textContent = "Syntax errors found.";
+        }
+        setCompileFloat("error", "Build failed", detail);
+        setCompileStatus("Compile failed: syntax errors found.");
+        return;
+      }
     }
     lastCompile.symbols = result.symbols || [];
     lastCompile.files = result.files || [];
@@ -2041,21 +2297,34 @@ async function compileWorkspace() {
     const totalSymbols = lastCompile.symbols.length;
     const durationMs = lastCompile.durationMs;
     const perSymbol = totalSymbols ? (durationMs / totalSymbols).toFixed(2) : "0.00";
-    setCompileStatus(`Compiled ${totalSymbols} symbols - ${durationMs.toFixed(0)} ms - ${perSymbol} ms/symbol`);
-    setCompileFloat("done", "Build complete", "");
-    setTimeout(() => {
-      if (compileRunId === runId && !canceledCompileIds.has(runId)) {
-        hideCompileFloat();
-      }
-    }, 700);
+    if (isAuto && !result.parse_failed) {
+      const durationMs = lastCompile.durationMs || 0;
+      setAutoCompileStatus("success", `Auto-compile complete (${durationMs.toFixed(0)} ms)`);
+    }
+    if (!silent) {
+      setCompileStatus(`Compiled ${totalSymbols} symbols - ${durationMs.toFixed(0)} ms - ${perSymbol} ms/symbol`);
+      setCompileFloat("done", "Build complete", "");
+      setTimeout(() => {
+        if (compileRunId === runId && !canceledCompileIds.has(runId)) {
+          hideCompileFloat();
+        }
+      }, 700);
+    }
   } catch (error) {
     if (!canceledCompileIds.has(runId)) {
       lastCompile.durationMs = null;
-      setCompileStatus(`Compile failed: ${error}`);
-      setCompileFloat("error", "Build failed", String(error || ""));
+      if (isAuto) {
+        setAutoCompileStatus("error", `Auto-compile failed: ${error}`);
+      }
+      if (!silent) {
+        setCompileStatus(`Compile failed: ${error}`);
+        setCompileFloat("error", "Build failed", String(error || ""));
+      }
     }
   } finally {
-    compileButton.disabled = false;
+    if (compileButton) {
+      compileButton.disabled = false;
+    }
     canceledCompileIds.delete(runId);
     if (activeCompileId === runId) {
       activeCompileId = 0;
@@ -2674,7 +2943,6 @@ window.addEventListener("DOMContentLoaded", async () => {
   settingsDialogEl = document.querySelector("#settings-dialog");
   settingsThemeEl = document.querySelector("#settings-theme");
   rootPathEl = document.querySelector("#root-path");
-  compileButton = document.querySelector("#compile-button");
   currentFileEl = document.querySelector("#current-file");
   fileTreeEl = document.querySelector("#file-tree");
   modelTreeEl = document.querySelector("#model-tree");
@@ -2691,6 +2959,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   statusFileEl = document.querySelector("#status-file");
   statusPositionEl = document.querySelector("#status-position");
   statusUnresolvedEl = document.querySelector("#status-unresolved");
+  statusAutoCompileEl = document.querySelector("#status-autocompile");
+  setAutoCompileStatus("idle", "Auto-compile idle");
   compileFloatEl = document.querySelector("#compile-float");
   compileFloatMessageEl = document.querySelector("#compile-float-message");
   compileFloatDetailEl = document.querySelector("#compile-float-detail");
@@ -2721,6 +2991,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   restoreModelTreeBtn = document.querySelector("#restore-model-tree");
   updateEditorEmptyState();
   updateRecentProjectsMenu(loadRecentProjects());
+  loadModelPrefs();
   syncPanelToggles();
   updateModelGroupToggle();
   updateModelLibraryToggle();
@@ -2909,6 +3180,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   modelGroupToggleBtn?.addEventListener("click", () => {
     modelGroupByFile = !modelGroupByFile;
     updateModelGroupToggle();
+    saveModelPrefs();
     renderModelTree(
       lastCompile.symbols,
       lastCompile.files,
@@ -2919,6 +3191,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   modelLibraryToggleBtn?.addEventListener("click", () => {
     showLibrarySymbols = !showLibrarySymbols;
     updateModelLibraryToggle();
+    saveModelPrefs();
     renderModelTree(
       lastCompile.symbols,
       lastCompile.files,
@@ -2929,10 +3202,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   modelPropertiesToggleBtn?.addEventListener("click", () => {
     showPropertiesPane = !showPropertiesPane;
     updatePropertiesToggle();
+    saveModelPrefs();
   });
   modelPropertiesCloseBtn?.addEventListener("click", () => {
     showPropertiesPane = false;
     updatePropertiesToggle();
+    saveModelPrefs();
   });
   modelPropertiesSplitEl?.addEventListener("pointerdown", (event) => {
     if (!modelPropertiesEl) return;
@@ -2963,7 +3238,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       renderEditorTabs();
     }
   });
-  compileButton.addEventListener("click", compileWorkspace);
+  compileButton?.addEventListener("click", compileWorkspace);
   compileFloatCancelBtn?.addEventListener("click", () => {
     if (activeCompileId) {
       const runId = activeCompileId;
@@ -3021,15 +3296,27 @@ window.addEventListener("DOMContentLoaded", async () => {
     lineNumbers: "on",
     renderLineHighlight: "line",
   });
-  editor.onDidChangeCursorPosition(() => updateCursorStatus());
+  editor.onDidChangeCursorPosition(() => {
+    updateCursorStatus();
+    maybeAutoCompileOnLineChange();
+  });
   editor.onDidChangeModelContent(() => {
     if (!editor || isSettingEditorValue) return;
     if (!state.currentFile) return;
     const saved = state.lastSavedContent.get(state.currentFile) ?? "";
     const current = editor.getValue();
+    const previous = lastEditContentByPath.get(state.currentFile);
+    const whitespaceOnly =
+      typeof previous === "string" &&
+      previous.replace(/\s+/g, "") === current.replace(/\s+/g, "");
+    lastEditContentByPath.set(state.currentFile, current);
     setDirty(state.currentFile, current !== saved);
     scheduleParseRefresh(state.currentFile);
+    if (!whitespaceOnly) {
+      pendingLineCompile = true;
+    }
   });
+  lastCursorLine = editor.getPosition()?.lineNumber ?? null;
   updateCursorStatus();
   editorReadyResolve?.();
 
@@ -3065,6 +3352,10 @@ window.addEventListener("DOMContentLoaded", async () => {
     } catch (error) {
       setCompileStatus(`Startup path failed: ${error}`);
     }
+    const runInitialCompile = async () => {
+      if (!state.rootPath) return;
+      await compileWorkspace({ silent: true, allowParseErrors: true, saveBefore: false, auto: true });
+    };
     if (startup?.path) {
       if (startup.kind === "dir") {
         await loadRoot(startup.path);
@@ -3075,14 +3366,17 @@ window.addEventListener("DOMContentLoaded", async () => {
         }
         await openFile(startup.path);
       }
+      await runInitialCompile();
       return;
     }
     const savedRoot = window.localStorage?.getItem(ROOT_STORAGE_KEY);
     if (savedRoot) {
       await loadRoot(savedRoot);
+      await runInitialCompile();
     } else {
       const defaultRoot = await invoke("get_default_root");
       await loadRoot(defaultRoot);
+      await runInitialCompile();
     }
   } catch (error) {
     setCompileStatus(`Failed to initialize: ${error}`);

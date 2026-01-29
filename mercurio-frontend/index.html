@@ -36,7 +36,6 @@
           <div class="panel-header">
             <div class="panel-title">
               <span>Project</span>
-              <button id="compile-button" type="button" class="tool-btn" title="Compile workspace (Ctrl+B)">Build</button>
             </div>
             <button id="toggle-project" type="button" class="panel-toggle" title="Collapse project">v</button>
           </div>
@@ -62,8 +61,6 @@
 
         <div class="panel editor-panel empty">
           <div class="panel-header">
-            <span>Editor</span>
-            <span id="current-file" class="hint">No file open</span>
           </div>
           <div class="welcome-pane" id="welcome-pane">
             <h2>Welcome to Mercurio</h2>
@@ -132,6 +129,7 @@
         <span id="status-message">Ready</span>
       </div>
       <div class="status-right">
+        <span id="status-autocompile" class="status-autocompile" title="Auto-compile idle" aria-label="Auto-compile status"></span>
         <span id="status-unresolved" class="status-alert" title="Unresolved references" hidden>!</span>
         <span id="status-file">No file</span>
         <span id="status-position">Ln 1, Col 1</span>
