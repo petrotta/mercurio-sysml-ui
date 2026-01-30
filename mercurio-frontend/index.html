@@ -2,9 +2,32 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <script>
+      (() => {
+        try {
+          const theme = window.localStorage?.getItem("mercurio.theme") || "";
+          const isLight = theme === "vs" || theme === "hc-light";
+          document.documentElement.dataset.theme = isLight ? "light" : "dark";
+        } catch {}
+      })();
+    </script>
+    <style>
+      html {
+        background: #1e1f22;
+        color-scheme: dark;
+      }
+      html[data-theme="light"] {
+        background: #f3f4f7;
+        color-scheme: light;
+      }
+      body {
+        background: transparent;
+      }
+    </style>
     <link rel="stylesheet" href="styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Mercurio SysML Workbench</title>
+    <script src="https://unpkg.com/elkjs@0.9.1/lib/elk.bundled.js" defer></script>
     <script type="module" src="/main.js" defer></script>
   </head>
 
@@ -47,6 +70,9 @@
               </button>
               <button id="new-file" type="button" class="tool-btn" title="New file">+</button>
               <button id="project-info" type="button" class="tool-btn" title="Project info">i</button>
+              <button id="toggle-artifacts" type="button" class="tool-btn" title="Hide diagram files">
+                <span class="icon eye" aria-hidden="true"></span>
+              </button>
               <select id="recent-projects" class="tool-select" title="Recent projects">
                 <option value="">Recent projects</option>
               </select>
@@ -61,6 +87,10 @@
 
         <div class="panel editor-panel empty">
           <div class="panel-header">
+            <div class="panel-title"></div>
+            <button id="diagram-toggle" type="button" class="tool-btn" title="Diagram view" hidden>
+              <span class="icon diagram" aria-hidden="true"></span>
+            </button>
           </div>
           <div class="welcome-pane" id="welcome-pane">
             <h2>Welcome to Mercurio</h2>
@@ -72,6 +102,18 @@
             </ul>
           </div>
           <div class="editor-tabs empty" id="editor-tabs"></div>
+          <div id="diagram-pane" class="diagram-pane">
+            <div class="diagram-toolbar">
+              <div id="diagram-status" class="diagram-status">Diagram view available for SysML files.</div>
+              <div class="diagram-zoom">
+                <button id="diagram-copy" type="button" title="Copy diagram">Copy</button>
+                <button id="diagram-zoom-out" type="button" title="Zoom out">-</button>
+                <button id="diagram-zoom-reset" type="button" title="Reset zoom">100%</button>
+                <button id="diagram-zoom-in" type="button" title="Zoom in">+</button>
+              </div>
+            </div>
+            <svg id="diagram-svg" class="diagram-svg" role="img" aria-label="SysML diagram"></svg>
+          </div>
           <div id="editor" class="editor"></div>
           <button id="parse-toggle" class="parse-toggle" type="button" title="Parse errors" aria-expanded="false" hidden>
             >>
@@ -148,6 +190,9 @@
       <div class="compile-float-actions">
         <button id="compile-float-cancel" type="button">Cancel</button>
       </div>
+    </div>
+    <div id="diagram-context-menu" class="context-menu" role="menu" hidden>
+      <button type="button" data-action="select-tree">Select in model tree</button>
     </div>
     <div id="new-file-dialog" class="modal" hidden>
       <div class="modal-backdrop" data-action="close"></div>

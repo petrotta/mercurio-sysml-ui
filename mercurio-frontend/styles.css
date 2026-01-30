@@ -376,6 +376,14 @@ button:hover {
   background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23c8cbd0' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'><path d='M1.5 4.5h5l1.6 2H14.5v7H1.5z'/><path d='M1.5 4.5v-1.5h4l1.6 1.5'/></svg>");
 }
 
+.tool-btn .icon.eye {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23c8cbd0' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'><path d='M1.5 8s2.5-4 6.5-4 6.5 4 6.5 4-2.5 4-6.5 4-6.5-4-6.5-4z'/><circle cx='8' cy='8' r='2.5'/></svg>");
+}
+
+.tool-btn .icon.diagram {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23c8cbd0' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'><rect x='2.5' y='3' width='4' height='3' rx='1'/><rect x='9.5' y='3' width='4' height='3' rx='1'/><rect x='6' y='10' width='4' height='3' rx='1'/><path d='M4.5 6v2l3 2'/><path d='M11.5 6v2l-3 2'/></svg>");
+}
+
 .welcome-pane {
   display: none;
   flex: 1;
@@ -405,6 +413,20 @@ button:hover {
 .editor-panel.empty .editor-tabs,
 .editor-panel.empty .editor {
   display: none;
+}
+
+.editor-panel.diagram-mode .editor,
+.editor-panel.diagram-mode .parse-toggle,
+.editor-panel.diagram-mode .parse-errors {
+  display: none;
+}
+
+.editor-panel.diagram-mode .editor-tabs {
+  display: none;
+}
+
+.editor-panel.diagram-mode .diagram-pane {
+  display: flex;
 }
 
 .editor-tabs {
@@ -446,6 +468,132 @@ button:hover {
 
 .editor-tabs.empty {
   display: none;
+}
+
+.diagram-pane {
+  flex: 1;
+  display: none;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid #3c3f41;
+  border-radius: 6px;
+  background: #1e1f22;
+  padding: 8px;
+  margin-bottom: 8px;
+  min-height: 200px;
+  height: 100%;
+}
+
+.diagram-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.diagram-status {
+  font-size: 0.75rem;
+  color: #9aa0a6;
+}
+
+.diagram-zoom {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.diagram-zoom button {
+  height: 22px;
+  min-width: 26px;
+  border-radius: 4px;
+  border: 1px solid #3c3f41;
+  background: #2b2d30;
+  color: #c8cbd0;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.diagram-zoom button:hover {
+  background: #313335;
+}
+
+.diagram-zoom #diagram-copy {
+  min-width: 46px;
+  font-weight: 600;
+}
+
+.diagram-svg {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  border-radius: 6px;
+  background: radial-gradient(circle at top, rgba(255, 255, 255, 0.03), transparent 60%);
+}
+
+.diagram-node {
+  fill: #2b2d30;
+  stroke: #5a5e62;
+  stroke-width: 1;
+}
+
+.diagram-node.def {
+  stroke: #8ab4f8;
+  stroke-width: 1.2;
+}
+
+.diagram-node.container {
+  fill: #242629;
+  stroke: #6c7077;
+  stroke-width: 1.2;
+}
+
+.diagram-compartment {
+  stroke: #50545a;
+  stroke-width: 1;
+}
+
+.diagram-attr-title {
+  fill: #b5bac1;
+  font-size: 11px;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.diagram-attr-text {
+  fill: #d6d9df;
+  font-size: 11px;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+}
+
+.diagram-node-label {
+  fill: #e4e6eb;
+  font-size: 12px;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  pointer-events: none;
+}
+
+.diagram-edge {
+  stroke: #8a8f96;
+  stroke-width: 1;
+  fill: none;
+  opacity: 0.85;
+}
+
+.diagram-edge-specialize {
+  stroke: #aab0b6;
+  stroke-width: 1.2;
+}
+
+.diagram-edge-transition {
+  stroke: #8a8f96;
+  stroke-width: 1.2;
+}
+
+.diagram-edge-label {
+  fill: #aab0b6;
+  font-size: 10px;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
 }
 
 .editor-tab {

@@ -1,3 +1,5 @@
+import { initDiagram, updateDiagramData, setDiagramMode } from "./diagram.js";
+
 const { invoke } = window.__TAURI__.core;
 const dialog = window.__TAURI__.dialog;
 const eventApi = window.__TAURI__.event;
@@ -44,6 +46,7 @@ let toggleProjectBtn;
 let toggleModelTreeBtn;
 let restoreProjectBtn;
 let restoreModelTreeBtn;
+let toggleArtifactsBtn;
 let editorTabsEl;
 let editorTabsMenuEl;
 let editorPanelEl;
@@ -53,6 +56,7 @@ let modelCollapseAllBtn;
 let modelGroupToggleBtn;
 let appMenuEl;
 let menuToggleBtn;
+let diagramContextMenuEl;
 let newProjectDialogEl;
 let newProjectLocationEl;
 let newProjectLocationPickEl;
@@ -97,6 +101,7 @@ let compileRunId = 0;
 let activeCompileId = 0;
 const canceledCompileIds = new Set();
 const lastEditContentByPath = new Map();
+let hideArtifactFiles = false;
 let settingsDialogEl;
 let settingsThemeEl;
 let currentTheme = "vs-dark";
@@ -109,6 +114,8 @@ let modelPropertiesCloseBtn;
 let showPropertiesPane = true;
 const modelRowSymbolMap = new WeakMap();
 let modelPropertiesSplitEl;
+let propertiesRenderId = 0;
+let diagramContextTarget = null;
 
 const state = {
   rootPath: "",
@@ -131,6 +138,7 @@ const MODEL_GROUP_KEY = "mercurio.modelGroupByFile";
 const MODEL_LIBRARY_KEY = "mercurio.modelShowLibrary";
 const MODEL_PROPERTIES_KEY = "mercurio.modelShowProperties";
 const MODEL_SECTIONS_KEY = "mercurio.modelSectionState";
+const FILE_TREE_FILTER_KEY = "mercurio.fileTreeHideArtifacts";
 const lastCompile = { symbols: [], files: [], unresolved: [], durationMs: null, libraryPath: "" };
 
 const MIN_LEFT = 200;
@@ -315,7 +323,6 @@ function setCompileStatus(text) {
     statusMessageEl.textContent = text;
   }
 }
-
 function setAutoCompileStatus(state, detail) {
   if (!statusAutoCompileEl) return;
   const mode = state || "idle";
@@ -450,6 +457,12 @@ function updatePropertiesToggle() {
   }
 }
 
+function updateArtifactToggle() {
+  if (!toggleArtifactsBtn) return;
+  toggleArtifactsBtn.title = hideArtifactFiles ? "Show diagram files" : "Hide diagram files";
+  toggleArtifactsBtn.classList.toggle("active", hideArtifactFiles);
+}
+
 function clearPropertiesPane() {
   if (!modelPropertiesBodyEl) return;
   modelPropertiesBodyEl.innerHTML = '<p class="muted">Select a model element to see its properties.</p>';
@@ -461,13 +474,89 @@ function setPropertiesForSymbol(symbol) {
     clearPropertiesPane();
     return;
   }
+  const emptyValue = "???";
+  const properties = Array.isArray(symbol.properties) ? symbol.properties : null;
+  const formatValue = (value) => {
+    if (!value || typeof value !== "object") return "";
+    switch (value.type) {
+      case "text":
+        return value.value ?? "";
+      case "bool":
+        return value.value ? "true" : "false";
+      case "number":
+        return typeof value.value === "number" ? value.value : "";
+      case "list":
+        return Array.isArray(value.items) ? value.items.join(", ") : "";
+      default:
+        return "";
+    }
+  };
+  const toDisplayValue = (value) => {
+    const raw = formatValue(value);
+    return raw === "" || raw == null ? emptyValue : raw;
+  };
+  const appendRows = (target, items) => {
+    items.forEach((row) => {
+      const item = document.createElement("div");
+      item.className = "model-properties-row";
+      const key = document.createElement("div");
+      key.className = "model-properties-key";
+      key.textContent = row.label || row.name || "";
+      const value = document.createElement("div");
+      value.className = "model-properties-value";
+      value.textContent = String(toDisplayValue(row.value));
+      item.appendChild(key);
+      item.appendChild(value);
+      target.appendChild(item);
+    });
+  };
+
+  if (properties && properties.length) {
+    const main = [];
+    const groups = new Map();
+    properties.forEach((prop) => {
+      const group = prop.group;
+      if (group) {
+        if (!groups.has(group)) {
+          groups.set(group, []);
+        }
+        groups.get(group).push(prop);
+      } else {
+        main.push(prop);
+      }
+    });
+
+    const list = document.createElement("div");
+    list.className = "model-properties-list";
+    appendRows(list, main);
+
+    groups.forEach((groupRows, group) => {
+      const details = document.createElement("details");
+      details.className = "model-properties-details";
+      const summary = document.createElement("summary");
+      summary.textContent = group === "parse"
+        ? "Parse info"
+        : group.replace(/[-_]+/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
+      details.appendChild(summary);
+      const groupList = document.createElement("div");
+      groupList.className = "model-properties-list";
+      appendRows(groupList, groupRows);
+      details.appendChild(groupList);
+      list.appendChild(details);
+    });
+
+    modelPropertiesBodyEl.innerHTML = "";
+    modelPropertiesBodyEl.appendChild(list);
+    return;
+  }
+
   const rows = [];
   const parseRows = [];
   const addRow = (key, value) => {
-    rows.push({ key, value: value === "" || value == null ? "—" : value });
+    rows.push({ key, value: value === "" || value == null ? emptyValue : value });
   };
   const addParseRow = (key, value) => {
-    parseRows.push({ key, value: value === "" || value == null ? "—" : value });
+    parseRows.push({ key, value: value === "" || value == null ? emptyValue : value });
   };
   addRow("name", symbol.name);
   addRow("short_name", symbol.short_name || "");
@@ -550,6 +639,7 @@ function setPropertiesForSymbol(symbol) {
   modelPropertiesBodyEl.appendChild(list);
 }
 
+
 function loadStoredTheme() {
   const stored = window.localStorage?.getItem(THEME_STORAGE_KEY);
   if (!stored) return "vs-dark";
@@ -582,6 +672,11 @@ function loadModelPrefs() {
       }
     } catch {}
   }
+
+  const storedFilter = window.localStorage?.getItem(FILE_TREE_FILTER_KEY);
+  if (storedFilter != null) {
+    hideArtifactFiles = storedFilter === "true";
+  }
 }
 
 function saveModelPrefs() {
@@ -589,6 +684,7 @@ function saveModelPrefs() {
   window.localStorage?.setItem(MODEL_LIBRARY_KEY, String(showLibrarySymbols));
   window.localStorage?.setItem(MODEL_PROPERTIES_KEY, String(showPropertiesPane));
   window.localStorage?.setItem(MODEL_SECTIONS_KEY, JSON.stringify(modelSectionState));
+  window.localStorage?.setItem(FILE_TREE_FILTER_KEY, String(hideArtifactFiles));
 }
 
 function applyTheme(themeId) {
@@ -724,6 +820,41 @@ function setCurrentFile(path) {
   }
   renderEditorTabs();
   updateEditorEmptyState();
+  updateDiagramData({ currentFile: state.currentFile, symbols: lastCompile.symbols });
+}
+
+function openDiagramContextMenu(x, y, payload) {
+  if (!diagramContextMenuEl) return;
+  diagramContextTarget = payload;
+  diagramContextMenuEl.hidden = false;
+  const rect = diagramContextMenuEl.getBoundingClientRect();
+  const left = Math.min(x, window.innerWidth - rect.width - 8);
+  const top = Math.min(y, window.innerHeight - rect.height - 8);
+  diagramContextMenuEl.style.left = `${Math.max(8, left)}px`;
+  diagramContextMenuEl.style.top = `${Math.max(8, top)}px`;
+}
+
+function hideDiagramContextMenu() {
+  if (!diagramContextMenuEl) return;
+  diagramContextMenuEl.hidden = true;
+  diagramContextTarget = null;
+}
+
+function selectInModelTree(target) {
+  if (!target || !modelTreeEl) return;
+  const qualified = target.qualifiedName || "";
+  const name = target.name || "";
+  let row = null;
+  if (qualified && modelNodeIndex.has(qualified)) {
+    row = modelNodeIndex.get(qualified);
+  } else if (name && modelNodeNameIndex.has(name)) {
+    row = modelNodeNameIndex.get(name);
+  }
+  if (row) {
+    appEl?.classList.remove("hide-model-tree");
+    syncPanelToggles();
+    selectModelRow(row);
+  }
 }
 
 function updateDirtyIndicator(path, isDirty) {
@@ -1517,8 +1648,25 @@ function renderFileTree(entries) {
     }
   }
   entries.forEach((entry) => {
+    if (shouldHideEntry(entry)) return;
     fileTreeEl.appendChild(createTreeItem(entry));
   });
+}
+
+function shouldHideEntry(entry) {
+  if (!entry || entry.is_dir) return false;
+  if (!hideArtifactFiles) return false;
+  const name = entry.name || "";
+  return name.endsWith(".diagram");
+}
+
+function isDiagramArtifact(path) {
+  return typeof path === "string" && path.toLowerCase().endsWith(".diagram");
+}
+
+function diagramTargetForArtifact(path) {
+  if (!path) return "";
+  return path.replace(/\.diagram$/i, ".sysml");
 }
 
 function createTreeItem(entry) {
@@ -1594,6 +1742,7 @@ function createTreeItem(entry) {
         try {
           const childEntries = await invoke("list_dir", { path: entry.path });
           childEntries.forEach((child) => {
+            if (shouldHideEntry(child)) return;
             children.appendChild(createTreeItem(child));
           });
         } catch (error) {
@@ -1605,6 +1754,18 @@ function createTreeItem(entry) {
     });
   } else {
     row.addEventListener("click", async () => {
+      if (isDiagramArtifact(entry.path)) {
+        const target = diagramTargetForArtifact(entry.path);
+        if (!target) return;
+        const exists = await invoke("path_exists", { path: target });
+        if (!exists) {
+          setCompileStatus("Diagram source not found.");
+          return;
+        }
+        await openFile(target);
+        setDiagramMode(true);
+        return;
+      }
       await openFile(entry.path);
     });
   }
@@ -2294,6 +2455,7 @@ async function compileWorkspace(options = {}) {
       lastCompile.unresolved,
       lastCompile.libraryPath
     );
+    updateDiagramData({ currentFile: state.currentFile, symbols: lastCompile.symbols });
     const totalSymbols = lastCompile.symbols.length;
     const durationMs = lastCompile.durationMs;
     const perSymbol = totalSymbols ? (durationMs / totalSymbols).toFixed(2) : "0.00";
@@ -2961,6 +3123,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   statusUnresolvedEl = document.querySelector("#status-unresolved");
   statusAutoCompileEl = document.querySelector("#status-autocompile");
   setAutoCompileStatus("idle", "Auto-compile idle");
+  diagramContextMenuEl = document.querySelector("#diagram-context-menu");
   compileFloatEl = document.querySelector("#compile-float");
   compileFloatMessageEl = document.querySelector("#compile-float-message");
   compileFloatDetailEl = document.querySelector("#compile-float-detail");
@@ -2970,6 +3133,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   errorsEmptyEl = document.querySelector("#errors-empty");
   errorsSectionEl = document.querySelector("#parse-errors");
   parseToggleEl = document.querySelector("#parse-toggle");
+  toggleArtifactsBtn = document.querySelector("#toggle-artifacts");
   editorTabsEl = document.querySelector("#editor-tabs");
   editorTabsMenuEl = document.querySelector("#editor-tabs-menu");
   editorTabsOverflowMenuEl = document.querySelector("#editor-tabs-overflow-menu");
@@ -2990,12 +3154,31 @@ window.addEventListener("DOMContentLoaded", async () => {
   restoreProjectBtn = document.querySelector("#restore-project");
   restoreModelTreeBtn = document.querySelector("#restore-model-tree");
   updateEditorEmptyState();
+  initDiagram({
+    toggleEl: document.querySelector("#diagram-toggle"),
+    paneEl: document.querySelector("#diagram-pane"),
+    svgEl: document.querySelector("#diagram-svg"),
+    statusEl: document.querySelector("#diagram-status"),
+    zoomInEl: document.querySelector("#diagram-zoom-in"),
+    zoomOutEl: document.querySelector("#diagram-zoom-out"),
+    zoomResetEl: document.querySelector("#diagram-zoom-reset"),
+    copyEl: document.querySelector("#diagram-copy"),
+    editorPanelEl,
+    normalizePath: normalizePathForCompare,
+    readFile: async (path) => invoke("read_file", { path }),
+    writeFile: async (path, content) => invoke("write_file", { path, content }),
+    onSelectInTree: (payload, pos) => {
+      openDiagramContextMenu(pos.x, pos.y, payload);
+    },
+  });
+  updateArtifactToggle();
   updateRecentProjectsMenu(loadRecentProjects());
   loadModelPrefs();
   syncPanelToggles();
   updateModelGroupToggle();
   updateModelLibraryToggle();
   updatePropertiesToggle();
+  updateArtifactToggle();
   currentTheme = loadStoredTheme();
   applyTheme(currentTheme);
   modelTreeEl?.addEventListener("contextmenu", (event) => {
@@ -3204,6 +3387,16 @@ window.addEventListener("DOMContentLoaded", async () => {
     updatePropertiesToggle();
     saveModelPrefs();
   });
+  toggleArtifactsBtn?.addEventListener("click", () => {
+    hideArtifactFiles = !hideArtifactFiles;
+    updateArtifactToggle();
+    saveModelPrefs();
+    if (state.rootPath) {
+      invoke("list_dir", { path: state.rootPath })
+        .then((entries) => renderFileTree(entries))
+        .catch((error) => setCompileStatus(`Refresh failed: ${error}`));
+    }
+  });
   modelPropertiesCloseBtn?.addEventListener("click", () => {
     showPropertiesPane = false;
     updatePropertiesToggle();
@@ -3233,9 +3426,22 @@ window.addEventListener("DOMContentLoaded", async () => {
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
   });
+  diagramContextMenuEl?.addEventListener("click", (event) => {
+    const action = event.target?.dataset?.action;
+    if (action === "select-tree") {
+      selectInModelTree(diagramContextTarget);
+    }
+    hideDiagramContextMenu();
+  });
   window.addEventListener("resize", () => {
     if (state.openFiles.length) {
       renderEditorTabs();
+    }
+  });
+  document.addEventListener("click", (event) => {
+    if (!diagramContextMenuEl || diagramContextMenuEl.hidden) return;
+    if (!event.target.closest("#diagram-context-menu")) {
+      hideDiagramContextMenu();
     }
   });
   compileButton?.addEventListener("click", compileWorkspace);
