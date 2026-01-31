@@ -51,6 +51,7 @@ let editorTabsEl;
 let editorTabsMenuEl;
 let editorPanelEl;
 let editorTabsOverflowMenuEl;
+let trackSymbolToggleBtn;
 let modelExpandAllBtn;
 let modelCollapseAllBtn;
 let modelGroupToggleBtn;
@@ -72,6 +73,7 @@ let exportDialogEl;
 let exportFormatEl;
 let exportIncludeStdlibEl;
 let exportRunBtn;
+let aboutDialogEl;
 let projectInfoButton;
 let projectInfoDialogEl;
 let projectInfoFileEl;
@@ -91,19 +93,207 @@ let parseErrorDecorations = [];
 let isSettingEditorValue = false;
 let modelTreeSelectionEl = null;
 let parseErrorsExpanded = false;
-const modelSectionState = { Project: false, Imports: false, Library: false };
+const modelSectionState = { Project: false, Imports: false, Library: false, Unresolved: false };
 let modelCollapsedNodes = new Set();
 let modelLastKeys = new Set();
 let modelLastOrder = new Map();
 let modelGroupByFile = true;
 let modelUnresolvedSectionEl = null;
-let compileRunId = 0;
-let activeCompileId = 0;
-const canceledCompileIds = new Set();
+const compileManager = {
+  nextId: 0,
+  active: null,
+  pending: null,
+  priority(options) {
+    return options?.auto ? 0 : 1;
+  },
+  isActive(runId, rootAtStart) {
+    return (
+      this.active &&
+      this.active.id === runId &&
+      !this.active.canceled &&
+      this.active.root === rootAtStart &&
+      state.rootPath === rootAtStart
+    );
+  },
+  request(options = {}) {
+    if (!state.rootPath) {
+      setCompileStatus("Select a root folder first");
+      return;
+    }
+    if (this.active) {
+      const incomingPriority = this.priority(options);
+      const activePriority = this.active.isAuto ? 0 : 1;
+      if (incomingPriority < activePriority) {
+        return;
+      }
+      this.pending = { options: { ...options }, priority: incomingPriority };
+      this.cancelActive(incomingPriority > activePriority ? "preempt" : "restart");
+      return;
+    }
+    this.start(options);
+  },
+  cancelActive(reason) {
+    if (!this.active || this.active.canceled) return;
+    this.active.canceled = true;
+    const runId = this.active.id;
+    invoke("cancel_compile", { run_id: runId }).catch(() => {});
+    if (!this.active.silent) {
+      setCompileStatus(reason === "preempt" ? "Canceling previous compile..." : "Restarting compile...");
+      setCompileFloat("running", "Canceling...", "");
+    }
+  },
+  async start(options = {}) {
+    if (!state.rootPath) {
+      setCompileStatus("Select a root folder first");
+      return;
+    }
+    pendingLineCompile = false;
+    const silent = Boolean(options.silent);
+    const isAuto = Boolean(options.auto);
+    const allowParseErrors = Boolean(options.allowParseErrors);
+    const saveBefore = options.saveBefore !== false;
+    autoCompileMutedUntil = Date.now() + 1000;
+    if (compileButton) {
+      compileButton.disabled = true;
+    }
+    if (!silent) {
+      setCompileStatus("Saving...");
+    }
+    const runId = ++this.nextId;
+    const rootAtStart = state.rootPath;
+    this.active = {
+      id: runId,
+      root: rootAtStart,
+      isAuto,
+      silent,
+      canceled: false,
+    };
+    if (isAuto) {
+      setAutoCompileStatus("running", "Auto-compile running");
+    }
+    if (!silent) {
+      setCompileFloat("running", "Saving...", "");
+    }
+
+    const start = performance.now();
+    try {
+      if (saveBefore) {
+        await saveAllOpenFiles();
+      }
+      const unsaved = [];
+      for (const path of state.dirtyFiles) {
+        let content = null;
+        if (path === state.currentFile && editor) {
+          content = editor.getValue();
+        } else {
+          content = state.bufferedContent.get(path);
+        }
+        if (typeof content === "string") {
+          unsaved.push({ path, content });
+        }
+      }
+      if (!silent) {
+        setCompileStatus("Compiling...");
+        setCompileFloat("running", "Compiling...", "");
+      }
+      const result = await invoke("compile_workspace", {
+        payload: {
+          root: rootAtStart,
+          run_id: runId,
+          allow_parse_errors: allowParseErrors,
+          unsaved,
+        },
+      });
+      if (!this.isActive(runId, rootAtStart)) {
+        return;
+      }
+      if (result.parse_failed) {
+        if (isAuto) {
+          setAutoCompileStatus("error", "Auto-compile failed: syntax errors");
+        }
+        if (!silent) {
+          const firstError = Array.isArray(result.files)
+            ? result.files.find((file) => !file.ok)
+            : null;
+          const detail = document.createElement("div");
+          if (firstError?.path) {
+            const fileName = firstError.path.split(/[\\/]/).pop() || firstError.path;
+            detail.textContent = `Syntax error in ${fileName}. `;
+            const link = document.createElement("button");
+            link.type = "button";
+            link.className = "compile-float-link";
+            link.textContent = "Open file";
+            link.addEventListener("click", async () => {
+              await openFile(firstError.path);
+            });
+            detail.appendChild(link);
+          } else {
+            detail.textContent = "Syntax errors found.";
+          }
+          setCompileFloat("error", "Build failed", detail);
+          setCompileStatus("Compile failed: syntax errors found.");
+          return;
+        }
+      }
+      lastCompile.symbols = result.symbols || [];
+      lastCompile.files = result.files || [];
+      lastCompile.unresolved = result.unresolved || [];
+      lastCompile.libraryPath = result.library_path || "";
+      lastCompile.durationMs = performance.now() - start;
+      renderModelTree(
+        lastCompile.symbols,
+        lastCompile.files,
+        lastCompile.unresolved,
+        lastCompile.libraryPath
+      );
+      updateDiagramData({ currentFile: state.currentFile, symbols: lastCompile.symbols });
+      const totalSymbols = lastCompile.symbols.length;
+      const durationMs = lastCompile.durationMs;
+      const perSymbol = totalSymbols ? (durationMs / totalSymbols).toFixed(2) : "0.00";
+      if (isAuto && !result.parse_failed) {
+        const durationMs = lastCompile.durationMs || 0;
+        setAutoCompileStatus("success", `Auto-compile complete (${durationMs.toFixed(0)} ms)`);
+      }
+      if (!silent) {
+        setCompileStatus(
+          `Compiled ${totalSymbols} symbols - ${durationMs.toFixed(0)} ms - ${perSymbol} ms/symbol`
+        );
+        setCompileFloat("done", "Build complete", "");
+        setTimeout(() => {
+          hideCompileFloat();
+        }, 700);
+      }
+    } catch (error) {
+      if (this.isActive(runId, rootAtStart)) {
+        lastCompile.durationMs = null;
+        if (isAuto) {
+          setAutoCompileStatus("error", `Auto-compile failed: ${error}`);
+        }
+        if (!silent) {
+          setCompileStatus(`Compile failed: ${error}`);
+          setCompileFloat("error", "Build failed", String(error || ""));
+        }
+      }
+    } finally {
+      if (compileButton) {
+        compileButton.disabled = false;
+      }
+      if (this.active && this.active.id === runId) {
+        this.active = null;
+      }
+      const pending = this.pending;
+      if (!this.active && pending) {
+        this.pending = null;
+        this.start(pending.options);
+      }
+    }
+  },
+};
 const lastEditContentByPath = new Map();
 let hideArtifactFiles = false;
 let settingsDialogEl;
 let settingsThemeEl;
+let settingsStdlibEl;
 let currentTheme = "vs-dark";
 let modelLibraryToggleBtn;
 let showLibrarySymbols = true;
@@ -116,6 +306,11 @@ const modelRowSymbolMap = new WeakMap();
 let modelPropertiesSplitEl;
 let propertiesRenderId = 0;
 let diagramContextTarget = null;
+let trackSymbolInTree = false;
+let trackSymbolTimer = null;
+let trackSymbolIdleHandle = null;
+let symbolIndexByFile = new Map();
+let lastTrackedAnchor = null;
 
 const state = {
   rootPath: "",
@@ -139,6 +334,7 @@ const MODEL_LIBRARY_KEY = "mercurio.modelShowLibrary";
 const MODEL_PROPERTIES_KEY = "mercurio.modelShowProperties";
 const MODEL_SECTIONS_KEY = "mercurio.modelSectionState";
 const FILE_TREE_FILTER_KEY = "mercurio.fileTreeHideArtifacts";
+const TRACK_SYMBOL_KEY = "mercurio.trackSymbol";
 const lastCompile = { symbols: [], files: [], unresolved: [], durationMs: null, libraryPath: "" };
 
 const MIN_LEFT = 200;
@@ -152,6 +348,8 @@ let pendingOpen = null;
 let modelTreeMenuTarget = null;
 let modelNodeIndex = new Map();
 let modelNodeNameIndex = new Map();
+let modelRenderId = 0;
+let modelSectionRefs = new Map();
 let editorReadyResolve;
 const editorReady = new Promise((resolve) => {
   editorReadyResolve = resolve;
@@ -677,6 +875,10 @@ function loadModelPrefs() {
   if (storedFilter != null) {
     hideArtifactFiles = storedFilter === "true";
   }
+  const storedTrack = window.localStorage?.getItem(TRACK_SYMBOL_KEY);
+  if (storedTrack != null) {
+    trackSymbolInTree = storedTrack === "true";
+  }
 }
 
 function saveModelPrefs() {
@@ -739,14 +941,14 @@ function maybeAutoCompileOnLineChange() {
   if (!lineChanged) return;
   if (!pendingLineCompile) return;
   if (!state.rootPath) return;
-  if (activeCompileId) return;
+  if (compileManager.active) return;
   if (Date.now() < autoCompileMutedUntil) return;
   pendingLineCompile = false;
   compileWorkspace({ silent: true, allowParseErrors: true, saveBefore: false, auto: true });
 }
 
 function updateCompileProgress(payload) {
-  if (!payload || payload.run_id !== activeCompileId) return;
+  if (!payload || !compileManager.active || payload.run_id !== compileManager.active.id) return;
   if (!compileFloatEl || compileFloatEl.hidden) return;
   const stage = payload.stage;
   if (stage === "parsing") {
@@ -821,6 +1023,7 @@ function setCurrentFile(path) {
   renderEditorTabs();
   updateEditorEmptyState();
   updateDiagramData({ currentFile: state.currentFile, symbols: lastCompile.symbols });
+  scheduleTrackSymbol(true);
 }
 
 function openDiagramContextMenu(x, y, payload) {
@@ -869,6 +1072,204 @@ function updateDirtyIndicator(path, isDirty) {
   }
   renderEditorTabs();
   updateEditorEmptyState();
+}
+
+function buildSymbolIndex(symbols) {
+  const index = new Map();
+  symbols.forEach((symbol) => {
+    if (!symbol?.file_path) return;
+    if (!index.has(symbol.file_path)) {
+      index.set(symbol.file_path, []);
+    }
+    index.get(symbol.file_path).push(symbol);
+  });
+  index.forEach((list) => {
+    list.sort((a, b) => {
+      if (a.start_line !== b.start_line) return a.start_line - b.start_line;
+      if (a.start_col !== b.start_col) return a.start_col - b.start_col;
+      if (a.end_line !== b.end_line) return a.end_line - b.end_line;
+      return a.end_col - b.end_col;
+    });
+  });
+  return index;
+}
+
+function positionBeforeOrEqual(aLine, aCol, bLine, bCol) {
+  return aLine < bLine || (aLine === bLine && aCol <= bCol);
+}
+
+function positionAfterOrEqual(aLine, aCol, bLine, bCol) {
+  return aLine > bLine || (aLine === bLine && aCol >= bCol);
+}
+
+function findSymbolAtPosition(filePath, line, col) {
+  const list = symbolIndexByFile.get(filePath);
+  if (!list || !list.length) return null;
+  let lo = 0;
+  let hi = list.length - 1;
+  let last = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const sym = list[mid];
+    if (positionBeforeOrEqual(sym.start_line, sym.start_col, line, col)) {
+      last = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  if (last < 0) return null;
+  let best = null;
+  for (let i = last; i >= 0; i -= 1) {
+    const sym = list[i];
+    if (!positionBeforeOrEqual(sym.start_line, sym.start_col, line, col)) {
+      continue;
+    }
+    if (!positionAfterOrEqual(sym.end_line, sym.end_col, line, col)) {
+      break;
+    }
+    if (!best) {
+      best = sym;
+      continue;
+    }
+    const bestSpan = (best.end_line - best.start_line) * 100000 + (best.end_col - best.start_col);
+    const symSpan = (sym.end_line - sym.start_line) * 100000 + (sym.end_col - sym.start_col);
+    if (symSpan <= bestSpan) {
+      best = sym;
+    }
+  }
+  return best;
+}
+
+function findClosestSymbol(filePath, line, col) {
+  const list = symbolIndexByFile.get(filePath);
+  if (!list || !list.length) return null;
+  const exact = findSymbolAtPosition(filePath, line, col);
+  if (exact) return exact;
+  let lo = 0;
+  let hi = list.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (list[mid].start_line < line) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  const candidates = [];
+  if (lo < list.length) candidates.push(list[lo]);
+  if (lo > 0) candidates.push(list[lo - 1]);
+  if (!candidates.length) return null;
+  let best = candidates[0];
+  let bestDist = Math.abs(best.start_line - line);
+  for (let i = 1; i < candidates.length; i += 1) {
+    const dist = Math.abs(candidates[i].start_line - line);
+    if (dist < bestDist) {
+      best = candidates[i];
+      bestDist = dist;
+    }
+  }
+  return best;
+}
+
+function ensureSectionExpanded(title) {
+  const ref = modelSectionRefs.get(title);
+  if (!ref) return;
+  if (ref.section.classList.contains("collapsed")) {
+    ref.section.classList.remove("collapsed");
+    modelSectionState[title] = false;
+    const caret = ref.section.querySelector(":scope > .model-section-header .model-section-caret");
+    if (caret) {
+      caret.textContent = "v";
+    }
+  }
+  if (ref.list && ref.list.childElementCount === 0 && ref.renderList) {
+    ref.renderList();
+  }
+}
+
+function selectSymbolInModelTree(symbol, attempts = 3) {
+  if (!symbol) return;
+  const row = symbol.qualified_name ? modelNodeIndex.get(symbol.qualified_name) : null;
+  if (row) {
+    appEl?.classList.remove("hide-model-tree");
+    syncPanelToggles();
+    selectModelRow(row);
+    return;
+  }
+  if (attempts <= 0) return;
+  setTimeout(() => selectSymbolInModelTree(symbol, attempts - 1), 60);
+}
+
+function trackSymbolAtCursor(force = false, useViewport = false) {
+  if (!trackSymbolInTree || !editor || !state.currentFile) return;
+  let line = null;
+  let col = 0;
+  if (useViewport) {
+    const ranges = editor.getVisibleRanges();
+    if (ranges && ranges.length) {
+      line = Math.max(0, ranges[0].startLineNumber - 1);
+    }
+  }
+  if (line == null) {
+    const pos = editor.getPosition();
+    if (!pos) return;
+    line = Math.max(0, pos.lineNumber - 1);
+    col = Math.max(0, pos.column - 1);
+  }
+  const anchorKey = `${state.currentFile}:${line}:${useViewport ? "v" : "c"}`;
+  if (!force && anchorKey === lastTrackedAnchor) return;
+  lastTrackedAnchor = anchorKey;
+  const symbol = findClosestSymbol(state.currentFile, line, col);
+  if (!symbol) return;
+  const libraryRoot = lastCompile.libraryPath || "";
+  const section =
+    symbol.file === 0
+      ? "Imports"
+      : libraryRoot && isPathUnderRoot(symbol.file_path, libraryRoot)
+        ? "Library"
+        : "Project";
+  ensureSectionExpanded(section);
+  selectSymbolInModelTree(symbol);
+}
+
+function scheduleTrackSymbol(immediate = false, useViewport = false) {
+  if (!trackSymbolInTree) return;
+  if (trackSymbolTimer) {
+    clearTimeout(trackSymbolTimer);
+    trackSymbolTimer = null;
+  }
+  if (trackSymbolIdleHandle && window.cancelIdleCallback) {
+    window.cancelIdleCallback(trackSymbolIdleHandle);
+    trackSymbolIdleHandle = null;
+  }
+  if (immediate) {
+    trackSymbolAtCursor(true, useViewport);
+    return;
+  }
+  if (window.requestIdleCallback) {
+    trackSymbolIdleHandle = window.requestIdleCallback(
+      () => {
+        trackSymbolIdleHandle = null;
+        trackSymbolAtCursor(false, useViewport);
+      },
+      { timeout: 220 }
+    );
+    return;
+  }
+  trackSymbolTimer = setTimeout(() => {
+    trackSymbolTimer = null;
+    trackSymbolAtCursor(false, useViewport);
+  }, 220);
+}
+
+function updateTrackSymbolToggle() {
+  if (!trackSymbolToggleBtn) return;
+  trackSymbolToggleBtn.classList.toggle("active", trackSymbolInTree);
+  trackSymbolToggleBtn.setAttribute("aria-pressed", trackSymbolInTree ? "true" : "false");
+  trackSymbolToggleBtn.title = trackSymbolInTree
+    ? "Stop tracking cursor in model tree"
+    : "Track cursor in model tree";
 }
 
 function addOpenFile(path) {
@@ -1132,6 +1533,16 @@ function hideLogDialog() {
   logDialogEl.hidden = true;
 }
 
+function showAboutDialog() {
+  if (!aboutDialogEl) return;
+  aboutDialogEl.hidden = false;
+}
+
+function hideAboutDialog() {
+  if (!aboutDialogEl) return;
+  aboutDialogEl.hidden = true;
+}
+
 function showExportDialog() {
   if (!exportDialogEl || !exportFormatEl || !exportIncludeStdlibEl) return;
   exportFormatEl.value = "xmi";
@@ -1155,12 +1566,48 @@ async function runExportFromDialog() {
 function showSettingsDialog() {
   if (!settingsDialogEl || !settingsThemeEl) return;
   settingsThemeEl.value = currentTheme;
+  refreshSettingsStdlib();
   settingsDialogEl.hidden = false;
 }
 
 function hideSettingsDialog() {
   if (!settingsDialogEl) return;
   settingsDialogEl.hidden = true;
+}
+
+async function refreshSettingsStdlib() {
+  if (!settingsStdlibEl) return;
+  settingsStdlibEl.disabled = true;
+  settingsStdlibEl.innerHTML = "";
+  try {
+    const versions = await invoke("list_stdlib_versions");
+    const selected = await invoke("get_default_stdlib");
+    const list = Array.isArray(versions) ? versions : [];
+    if (!list.length) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = "No stdlib versions found";
+      settingsStdlibEl.appendChild(option);
+      return;
+    }
+    list.forEach((version) => {
+      const option = document.createElement("option");
+      option.value = version;
+      option.textContent = version;
+      settingsStdlibEl.appendChild(option);
+    });
+    if (selected && list.includes(selected)) {
+      settingsStdlibEl.value = selected;
+    } else {
+      settingsStdlibEl.value = list[0];
+    }
+    settingsStdlibEl.disabled = false;
+  } catch (error) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "Stdlib unavailable";
+    settingsStdlibEl.appendChild(option);
+  }
 }
 
 function updateProjectFolderStatus(forceError = false) {
@@ -1395,18 +1842,26 @@ async function createNewFileFromDialog() {
 }
 
 
-function closeTabs(paths) {
+async function closeTabs(paths) {
   if (!paths || !paths.length) return;
   const closingCurrent = state.currentFile && paths.includes(state.currentFile);
+  const closed = [];
 
-  paths.forEach((path) => {
+  for (const path of paths) {
+    if (state.dirtyFiles.has(path)) {
+      const ok = await saveFilePath(path);
+      if (!ok) {
+        continue;
+      }
+    }
     removeOpenFile(path);
     state.lastSavedContent.delete(path);
     state.bufferedContent.delete(path);
     setDirty(path, false);
-  });
+    closed.push(path);
+  }
 
-  if (closingCurrent) {
+  if (closingCurrent && closed.includes(state.currentFile)) {
     const next = [...state.fileHistory].reverse().find((item) => state.openFiles.includes(item));
     if (next) {
       void openFile(next);
@@ -1450,6 +1905,29 @@ async function saveCurrentFile() {
     setCompileStatus("Saved");
   } catch (error) {
     setCompileStatus(`Save failed: ${error}`);
+  }
+}
+
+async function saveFilePath(path) {
+  if (!path) return false;
+  let content = null;
+  if (path === state.currentFile && editor) {
+    content = editor.getValue();
+  } else {
+    content = state.bufferedContent.get(path);
+  }
+  if (typeof content !== "string") {
+    return true;
+  }
+  try {
+    await invoke("write_file", { path, content });
+    state.lastSavedContent.set(path, content);
+    state.bufferedContent.delete(path);
+    setDirty(path, false);
+    return true;
+  } catch (error) {
+    setCompileStatus(`Save failed: ${error}`);
+    return false;
   }
 }
 
@@ -1617,8 +2095,12 @@ async function chooseRoot() {
   setCompileStatus("Dialog API not available");
 }
 
-async function loadRoot(path) {
+async function loadRoot(path, options = {}) {
   setCompileStatus("Loading files...");
+  const previousRoot = state.rootPath;
+  if (previousRoot && previousRoot !== path) {
+    clearModelTreeForRootChange();
+  }
   try {
     const entries = await invoke("list_dir", { path });
     setRootPath(path);
@@ -1627,26 +2109,27 @@ async function loadRoot(path) {
     await invoke("set_watch_root", { root: path });
     addRecentProject(path);
     setCompileStatus("Idle");
+    const autoCompile = options.autoCompile !== false;
+    if (autoCompile && previousRoot !== path) {
+      await compileWorkspace({ silent: true, allowParseErrors: true, saveBefore: false, auto: true });
+    }
   } catch (error) {
     setCompileStatus(`Failed to load root: ${error}`);
   }
 }
 
+function clearModelTreeForRootChange() {
+  lastCompile.symbols = [];
+  lastCompile.files = [];
+  lastCompile.unresolved = [];
+  lastCompile.libraryPath = "";
+  lastCompile.durationMs = null;
+  renderModelTree([], [], [], "");
+  updateDiagramData({ currentFile: state.currentFile, symbols: [] });
+}
+
 function renderFileTree(entries) {
   fileTreeEl.innerHTML = "";
-  if (state.rootPath) {
-    const parent = getParentPath(state.rootPath);
-    if (parent && parent !== state.rootPath) {
-      fileTreeEl.appendChild(
-        createTreeItem({
-          name: "..",
-          path: parent,
-          is_dir: true,
-          is_parent: true,
-        })
-      );
-    }
-  }
   entries.forEach((entry) => {
     if (shouldHideEntry(entry)) return;
     fileTreeEl.appendChild(createTreeItem(entry));
@@ -1935,7 +2418,9 @@ function formatCount(value, singular, plural) {
 }
 
 function renderModelTree(symbols, files, unresolved, libraryPath) {
+  const renderId = ++modelRenderId;
   modelCollapsedNodes = new Set();
+  modelSectionRefs = new Map();
   if (modelTreeEl) {
     modelTreeEl.querySelectorAll(".model-node.collapsed").forEach((node) => {
       const key = node.dataset.key;
@@ -1951,6 +2436,7 @@ function renderModelTree(symbols, files, unresolved, libraryPath) {
   modelTreeEl.innerHTML = "";
   modelNodeIndex = new Map();
   modelNodeNameIndex = new Map();
+  symbolIndexByFile = buildSymbolIndex(symbols);
   const filteredSymbols = symbols;
   const unresolvedRefs = Array.isArray(unresolved) ? unresolved : [];
   if (statusUnresolvedEl) {
@@ -1994,6 +2480,73 @@ function renderModelTree(symbols, files, unresolved, libraryPath) {
     });
   }
 
+  let pendingBatches = 0;
+  const finalizeModelTree = () => {
+    if (renderId !== modelRenderId) return;
+    if (pendingBatches > 0) {
+      requestAnimationFrame(finalizeModelTree);
+      return;
+    }
+    const addedKeys = [];
+    modelLastKeys.forEach((key) => {
+      if (!previousKeys.has(key)) {
+        addedKeys.push(key);
+      }
+    });
+    addedKeys.forEach((key) => {
+      const node = modelTreeEl.querySelector(`.model-node[data-key="${CSS.escape(key)}"]`);
+      if (node) {
+        node.classList.add("added");
+        setTimeout(() => node.classList.remove("added"), 700);
+      }
+    });
+    const removedCount = Array.from(previousKeys).filter((key) => !modelLastKeys.has(key)).length;
+    if (removedCount) {
+      modelTreeEl.classList.add("flash-removed");
+      setTimeout(() => modelTreeEl.classList.remove("flash-removed"), 700);
+    }
+  };
+
+  const renderNodeBatch = (
+    list,
+    nodes,
+    startIndex,
+    chunkSize,
+    token,
+    isFile,
+    parentKey,
+    prevOrder,
+    loadingEl
+  ) => {
+    if (token !== modelRenderId) return;
+    const end = Math.min(startIndex + chunkSize, nodes.length);
+    if (loadingEl && loadingEl.parentNode === list) {
+      list.removeChild(loadingEl);
+    }
+    for (let i = startIndex; i < end; i += 1) {
+      list.appendChild(renderModelNode(nodes[i], isFile, parentKey, prevOrder, fileOrder));
+    }
+    if (end < nodes.length) {
+      requestAnimationFrame(() =>
+        renderNodeBatch(list, nodes, end, chunkSize, token, isFile, parentKey, prevOrder, loadingEl)
+      );
+    } else {
+      pendingBatches -= 1;
+    }
+  };
+
+  const renderListBatched = (sectionSymbols, list, token) => {
+    const fileNodes = buildModelTree(sectionSymbols);
+    const nodes = Array.from(fileNodes.values());
+    nodes.sort((a, b) => compareModelNodes(a, b, null, previousOrder, fileOrder));
+    const loading = document.createElement("li");
+    loading.className = "model-loading";
+    loading.textContent = "Loading…";
+    list.appendChild(loading);
+    pendingBatches += 1;
+    renderNodeBatch(list, nodes, 0, 200, token, modelGroupByFile, null, previousOrder, loading);
+  };
+
   const renderSection = (title, sectionSymbols) => {
     if (!sectionSymbols.length) return;
     const section = document.createElement("div");
@@ -2018,6 +2571,9 @@ function renderModelTree(symbols, files, unresolved, libraryPath) {
       modelSectionState[title] = next;
       section.classList.toggle("collapsed", next);
       caret.textContent = next ? ">" : "v";
+      if (!next && list.childElementCount === 0) {
+        renderListBatched(sectionSymbols, list, renderId);
+      }
       saveModelPrefs();
     });
     section.appendChild(header);
@@ -2039,15 +2595,18 @@ function renderModelTree(symbols, files, unresolved, libraryPath) {
 
     const list = document.createElement("ul");
     list.className = "model-tree-list";
-    const fileNodes = buildModelTree(sectionSymbols);
-    const nodes = Array.from(fileNodes.values());
-    nodes
-      .sort((a, b) => compareModelNodes(a, b, null, previousOrder, fileOrder))
-      .forEach((node) => {
-        list.appendChild(renderModelNode(node, modelGroupByFile, null, previousOrder, fileOrder));
-      });
+    if (!modelSectionState[title]) {
+      renderListBatched(sectionSymbols, list, renderId);
+    }
     section.appendChild(list);
     modelTreeEl.appendChild(section);
+    modelSectionRefs.set(title, {
+      section,
+      list,
+      symbols: sectionSymbols,
+      renderId,
+      renderList: () => renderListBatched(sectionSymbols, list, renderId),
+    });
   };
 
   if (projectSymbols.length) {
@@ -2072,13 +2631,37 @@ function renderModelTree(symbols, files, unresolved, libraryPath) {
 
   if (unresolvedRefs.length) {
     const section = document.createElement("div");
-    section.className = "model-unresolved";
+    section.className = "model-section model-unresolved";
+    section.classList.toggle("collapsed", modelSectionState.Unresolved);
     modelUnresolvedSectionEl = section;
 
     const header = document.createElement("div");
-    header.className = "model-section-title";
-    header.textContent = `Unresolved references (${unresolvedRefs.length})`;
+    header.className = "model-section-header";
+    const caret = document.createElement("span");
+    caret.className = "model-section-caret";
+    caret.textContent = modelSectionState.Unresolved ? ">" : "v";
+    const label = document.createElement("span");
+    label.className = "model-section-label";
+    label.textContent = "Unresolved";
+    const count = document.createElement("span");
+    count.className = "model-section-count";
+    count.textContent = `${unresolvedRefs.length}`;
+    header.appendChild(caret);
+    header.appendChild(label);
+    header.appendChild(count);
+    header.addEventListener("click", () => {
+      const next = !modelSectionState.Unresolved;
+      modelSectionState.Unresolved = next;
+      section.classList.toggle("collapsed", next);
+      caret.textContent = next ? ">" : "v";
+      saveModelPrefs();
+    });
     section.appendChild(header);
+
+    const meta = document.createElement("div");
+    meta.className = "model-section-meta";
+    meta.textContent = formatCount(unresolvedRefs.length, "reference", "references");
+    section.appendChild(meta);
 
     const list = document.createElement("ul");
     list.className = "unresolved-list";
@@ -2102,29 +2685,21 @@ function renderModelTree(symbols, files, unresolved, libraryPath) {
 
     section.appendChild(list);
     modelTreeEl.appendChild(section);
+    modelSectionRefs.set("Unresolved", {
+      section,
+      list,
+      symbols: unresolvedRefs,
+      renderId,
+      renderList: () => {},
+    });
   }
 
   if (showPropertiesPane) {
     clearPropertiesPane();
   }
-
-  const addedKeys = [];
-  modelLastKeys.forEach((key) => {
-    if (!previousKeys.has(key)) {
-      addedKeys.push(key);
-    }
-  });
-  addedKeys.forEach((key) => {
-    const node = modelTreeEl.querySelector(`.model-node[data-key="${CSS.escape(key)}"]`);
-    if (node) {
-      node.classList.add("added");
-      setTimeout(() => node.classList.remove("added"), 700);
-    }
-  });
-  const removedCount = Array.from(previousKeys).filter((key) => !modelLastKeys.has(key)).length;
-  if (removedCount) {
-    modelTreeEl.classList.add("flash-removed");
-    setTimeout(() => modelTreeEl.classList.remove("flash-removed"), 700);
+  finalizeModelTree();
+  if (trackSymbolInTree) {
+    scheduleTrackSymbol(true);
   }
 }
 
@@ -2354,144 +2929,7 @@ function setModelTreeCollapsed(collapsed) {
 }
 
 async function compileWorkspace(options = {}) {
-  if (!state.rootPath) {
-    setCompileStatus("Select a root folder first");
-    return;
-  }
-  if (activeCompileId) {
-    setCompileStatus("Compile already running");
-    return;
-  }
-  pendingLineCompile = false;
-  const silent = Boolean(options.silent);
-  const isAuto = Boolean(options.auto);
-  const allowParseErrors = Boolean(options.allowParseErrors);
-  const saveBefore = options.saveBefore !== false;
-  autoCompileMutedUntil = Date.now() + 1000;
-  if (compileButton) {
-    compileButton.disabled = true;
-  }
-  if (!silent) {
-    setCompileStatus("Saving...");
-  }
-  const runId = ++compileRunId;
-  activeCompileId = runId;
-  canceledCompileIds.delete(runId);
-  if (isAuto) {
-    setAutoCompileStatus("running", "Auto-compile running");
-  }
-  if (!silent) {
-    setCompileFloat("running", "Saving...", "");
-  }
-
-  const start = performance.now();
-  try {
-    if (saveBefore) {
-      await saveAllOpenFiles();
-    }
-    const unsaved = [];
-    for (const path of state.dirtyFiles) {
-      let content = null;
-      if (path === state.currentFile && editor) {
-        content = editor.getValue();
-      } else {
-        content = state.bufferedContent.get(path);
-      }
-      if (typeof content === "string") {
-        unsaved.push({ path, content });
-      }
-    }
-    if (!silent) {
-      setCompileStatus("Compiling...");
-      setCompileFloat("running", "Compiling...", "");
-    }
-    const result = await invoke("compile_workspace", {
-      payload: {
-        root: state.rootPath,
-        run_id: runId,
-        allow_parse_errors: allowParseErrors,
-        unsaved,
-      },
-    });
-    if (canceledCompileIds.has(runId)) {
-      return;
-    }
-    if (result.parse_failed) {
-      if (isAuto) {
-        setAutoCompileStatus("error", "Auto-compile failed: syntax errors");
-      }
-      if (!silent) {
-        const firstError = Array.isArray(result.files)
-          ? result.files.find((file) => !file.ok)
-          : null;
-        const detail = document.createElement("div");
-        if (firstError?.path) {
-          const fileName = firstError.path.split(/[\\/]/).pop() || firstError.path;
-          detail.textContent = `Syntax error in ${fileName}. `;
-          const link = document.createElement("button");
-          link.type = "button";
-          link.className = "compile-float-link";
-          link.textContent = "Open file";
-          link.addEventListener("click", async () => {
-            await openFile(firstError.path);
-          });
-          detail.appendChild(link);
-        } else {
-          detail.textContent = "Syntax errors found.";
-        }
-        setCompileFloat("error", "Build failed", detail);
-        setCompileStatus("Compile failed: syntax errors found.");
-        return;
-      }
-    }
-    lastCompile.symbols = result.symbols || [];
-    lastCompile.files = result.files || [];
-    lastCompile.unresolved = result.unresolved || [];
-    lastCompile.libraryPath = result.library_path || "";
-    lastCompile.durationMs = performance.now() - start;
-    renderModelTree(
-      lastCompile.symbols,
-      lastCompile.files,
-      lastCompile.unresolved,
-      lastCompile.libraryPath
-    );
-    updateDiagramData({ currentFile: state.currentFile, symbols: lastCompile.symbols });
-    const totalSymbols = lastCompile.symbols.length;
-    const durationMs = lastCompile.durationMs;
-    const perSymbol = totalSymbols ? (durationMs / totalSymbols).toFixed(2) : "0.00";
-    if (isAuto && !result.parse_failed) {
-      const durationMs = lastCompile.durationMs || 0;
-      setAutoCompileStatus("success", `Auto-compile complete (${durationMs.toFixed(0)} ms)`);
-    }
-    if (!silent) {
-      setCompileStatus(`Compiled ${totalSymbols} symbols - ${durationMs.toFixed(0)} ms - ${perSymbol} ms/symbol`);
-      setCompileFloat("done", "Build complete", "");
-      setTimeout(() => {
-        if (compileRunId === runId && !canceledCompileIds.has(runId)) {
-          hideCompileFloat();
-        }
-      }, 700);
-    }
-  } catch (error) {
-    if (!canceledCompileIds.has(runId)) {
-      lastCompile.durationMs = null;
-      if (isAuto) {
-        setAutoCompileStatus("error", `Auto-compile failed: ${error}`);
-      }
-      if (!silent) {
-        setCompileStatus(`Compile failed: ${error}`);
-        setCompileFloat("error", "Build failed", String(error || ""));
-      }
-    }
-  } finally {
-    if (compileButton) {
-      compileButton.disabled = false;
-    }
-    canceledCompileIds.delete(runId);
-    if (activeCompileId === runId) {
-      activeCompileId = 0;
-    }
-  }
+  compileManager.request(options);
 }
 
 async function exportModel(format = "xmi", includeStdlib = false) {
@@ -2724,7 +3162,7 @@ async function handleEditorTabsMenuAction(action) {
 
   if (action === "close") {
     if (state.currentFile) {
-      closeTabs([state.currentFile]);
+      await closeTabs([state.currentFile]);
     }
     hideEditorTabsMenu();
     return;
@@ -2732,7 +3170,7 @@ async function handleEditorTabsMenuAction(action) {
 
   if (action === "close-all") {
     const toClose = [...state.openFiles];
-    closeTabs(toClose);
+    await closeTabs(toClose);
     hideEditorTabsMenu();
     return;
   }
@@ -2747,7 +3185,7 @@ async function handleEditorTabsMenuAction(action) {
       await openFile(keep);
     }
     const toClose = state.openFiles.filter((path) => path !== keep);
-    closeTabs(toClose);
+    await closeTabs(toClose);
     hideEditorTabsMenu();
   }
 }
@@ -2866,7 +3304,7 @@ async function handleMenuAction(action) {
     await showLogDialog();
   }
   if (action === "about") {
-    window.alert("Mercurio\nPowered by Tauri + Syster");
+    showAboutDialog();
   }
 }
 
@@ -3102,8 +3540,10 @@ window.addEventListener("DOMContentLoaded", async () => {
   exportFormatEl = document.querySelector("#export-format");
   exportIncludeStdlibEl = document.querySelector("#export-include-stdlib");
   exportRunBtn = document.querySelector("#export-run");
+  aboutDialogEl = document.querySelector("#about-dialog");
   settingsDialogEl = document.querySelector("#settings-dialog");
   settingsThemeEl = document.querySelector("#settings-theme");
+  settingsStdlibEl = document.querySelector("#settings-stdlib");
   rootPathEl = document.querySelector("#root-path");
   currentFileEl = document.querySelector("#current-file");
   fileTreeEl = document.querySelector("#file-tree");
@@ -3134,6 +3574,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   errorsSectionEl = document.querySelector("#parse-errors");
   parseToggleEl = document.querySelector("#parse-toggle");
   toggleArtifactsBtn = document.querySelector("#toggle-artifacts");
+  trackSymbolToggleBtn = document.querySelector("#track-symbol-toggle");
   editorTabsEl = document.querySelector("#editor-tabs");
   editorTabsMenuEl = document.querySelector("#editor-tabs-menu");
   editorTabsOverflowMenuEl = document.querySelector("#editor-tabs-overflow-menu");
@@ -3179,6 +3620,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   updateModelLibraryToggle();
   updatePropertiesToggle();
   updateArtifactToggle();
+  updateTrackSymbolToggle();
   currentTheme = loadStoredTheme();
   applyTheme(currentTheme);
   modelTreeEl?.addEventListener("contextmenu", (event) => {
@@ -3305,6 +3747,17 @@ window.addEventListener("DOMContentLoaded", async () => {
       hideLogDialog();
     }
   });
+  aboutDialogEl?.addEventListener("click", (event) => {
+    const action = event.target?.dataset?.action;
+    if (action === "close") {
+      hideAboutDialog();
+    }
+  });
+  aboutDialogEl?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      hideAboutDialog();
+    }
+  });
   exportDialogEl?.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       hideExportDialog();
@@ -3346,6 +3799,15 @@ window.addEventListener("DOMContentLoaded", async () => {
   settingsThemeEl?.addEventListener("change", (event) => {
     const next = event.target.value;
     applyTheme(next);
+  });
+  settingsStdlibEl?.addEventListener("change", async (event) => {
+    const next = event.target.value || "";
+    try {
+      await invoke("set_default_stdlib", { version: next });
+      setCompileStatus("Default stdlib updated");
+    } catch (error) {
+      setCompileStatus(`Failed to update stdlib: ${error}`);
+    }
   });
   parseToggleEl?.addEventListener("click", () => {
     parseErrorsExpanded = !parseErrorsExpanded;
@@ -3397,6 +3859,14 @@ window.addEventListener("DOMContentLoaded", async () => {
         .catch((error) => setCompileStatus(`Refresh failed: ${error}`));
     }
   });
+  trackSymbolToggleBtn?.addEventListener("click", () => {
+    trackSymbolInTree = !trackSymbolInTree;
+    window.localStorage?.setItem(TRACK_SYMBOL_KEY, String(trackSymbolInTree));
+    updateTrackSymbolToggle();
+    if (trackSymbolInTree) {
+      scheduleTrackSymbol(true);
+    }
+  });
   modelPropertiesCloseBtn?.addEventListener("click", () => {
     showPropertiesPane = false;
     updatePropertiesToggle();
@@ -3446,10 +3916,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
   compileButton?.addEventListener("click", compileWorkspace);
   compileFloatCancelBtn?.addEventListener("click", () => {
-    if (activeCompileId) {
-      const runId = activeCompileId;
-      canceledCompileIds.add(runId);
-      invoke("cancel_compile", { run_id: runId }).catch(() => {});
+    if (compileManager.active) {
+      compileManager.cancelActive("preempt");
       setCompileStatus("Compile canceled");
       hideCompileFloat();
       return;
@@ -3480,6 +3948,10 @@ window.addEventListener("DOMContentLoaded", async () => {
       event.preventDefault();
       await saveCurrentFile();
     }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") {
+      event.preventDefault();
+      await showNewProjectDialog();
+    }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "b") {
       event.preventDefault();
       await compileWorkspace();
@@ -3505,6 +3977,10 @@ window.addEventListener("DOMContentLoaded", async () => {
   editor.onDidChangeCursorPosition(() => {
     updateCursorStatus();
     maybeAutoCompileOnLineChange();
+    scheduleTrackSymbol(false);
+  });
+  editor.onDidScrollChange(() => {
+    scheduleTrackSymbol(false, true);
   });
   editor.onDidChangeModelContent(() => {
     if (!editor || isSettingEditorValue) return;
@@ -3564,11 +4040,11 @@ window.addEventListener("DOMContentLoaded", async () => {
     };
     if (startup?.path) {
       if (startup.kind === "dir") {
-        await loadRoot(startup.path);
+        await loadRoot(startup.path, { autoCompile: false });
       } else {
         const parent = getParentPath(startup.path);
         if (parent) {
-          await loadRoot(parent);
+          await loadRoot(parent, { autoCompile: false });
         }
         await openFile(startup.path);
       }
@@ -3577,11 +4053,11 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
     const savedRoot = window.localStorage?.getItem(ROOT_STORAGE_KEY);
     if (savedRoot) {
-      await loadRoot(savedRoot);
+      await loadRoot(savedRoot, { autoCompile: false });
       await runInitialCompile();
     } else {
       const defaultRoot = await invoke("get_default_root");
-      await loadRoot(defaultRoot);
+      await loadRoot(defaultRoot, { autoCompile: false });
       await runInitialCompile();
     }
   } catch (error) {

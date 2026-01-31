@@ -91,6 +91,9 @@
             <button id="diagram-toggle" type="button" class="tool-btn" title="Diagram view" hidden>
               <span class="icon diagram" aria-hidden="true"></span>
             </button>
+            <button id="track-symbol-toggle" type="button" class="tool-btn" title="Track cursor in model tree" aria-pressed="false">
+              <span class="icon target" aria-hidden="true"></span>
+            </button>
           </div>
           <div class="welcome-pane" id="welcome-pane">
             <h2>Welcome to Mercurio</h2>
@@ -370,9 +373,64 @@
               <option value="hc-light">High Contrast Light</option>
             </select>
           </label>
+          <label class="field">
+            <span class="field-label">Default stdlib</span>
+            <select id="settings-stdlib"></select>
+          </label>
         </div>
         <div class="modal-actions">
           <button type="button" class="ghost" data-action="close">Close</button>
+        </div>
+      </div>
+    </div>
+    <div id="about-dialog" class="modal" hidden>
+      <div class="modal-backdrop" data-action="close"></div>
+      <div class="modal-card about-card" role="dialog" aria-modal="true" aria-labelledby="about-title">
+        <div class="about-hero">
+          <div class="about-title-block">
+            <h2 id="about-title">Mercurio SysML Workbench</h2>
+            <p class="about-subtitle">A focused environment for SysML modeling, exploration, and export.</p>
+          </div>
+          <button type="button" class="ghost" data-action="close">Close</button>
+        </div>
+        <div class="about-content">
+          <section class="about-section">
+            <h3>Purpose</h3>
+            <p>
+              Mercurio helps you organize, author, and inspect SysML and KerML models with live parsing,
+              symbol exploration, and export tooling.
+            </p>
+          </section>
+          <section class="about-section">
+            <h3>Key Capabilities</h3>
+            <ul>
+              <li>Model tree navigation with project, imports, library, and unresolved sections.</li>
+              <li>Fast parse and semantic checks with background auto-compile.</li>
+              <li>Diagram previews for SysML artifacts.</li>
+              <li>Export to XMI, KPAR, and JSON-LD.</li>
+            </ul>
+          </section>
+          <section class="about-section">
+            <h3>Built With</h3>
+            <div class="about-grid">
+              <div>
+                <div class="about-label">UI</div>
+                <div>Tauri + Monaco</div>
+              </div>
+              <div>
+                <div class="about-label">Engine</div>
+                <div>Syster</div>
+              </div>
+              <div>
+                <div class="about-label">Project</div>
+                <div>Mercurio</div>
+              </div>
+              <div>
+                <div class="about-label">Platform</div>
+                <div>Desktop</div>
+              </div>
+            </div>
+          </section>
         </div>
       </div>
     </div>

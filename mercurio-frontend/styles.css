@@ -252,6 +252,10 @@ button:hover {
   gap: 8px;
 }
 
+.panel-header > .panel-title {
+  flex: 1;
+}
+
 .panel-toggle {
   width: 24px;
   height: 22px;
@@ -382,6 +386,10 @@ button:hover {
 
 .tool-btn .icon.diagram {
   background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23c8cbd0' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'><rect x='2.5' y='3' width='4' height='3' rx='1'/><rect x='9.5' y='3' width='4' height='3' rx='1'/><rect x='6' y='10' width='4' height='3' rx='1'/><path d='M4.5 6v2l3 2'/><path d='M11.5 6v2l-3 2'/></svg>");
+}
+
+.tool-btn .icon.target {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%23c8cbd0' stroke-width='1.2' stroke-linecap='round' stroke-linejoin='round'><circle cx='8' cy='8' r='4.5'/><circle cx='8' cy='8' r='1.5'/><path d='M8 1.5v2.5'/><path d='M8 12v2.5'/><path d='M1.5 8h2.5'/><path d='M12 8h2.5'/></svg>");
 }
 
 .welcome-pane {
@@ -571,6 +579,18 @@ button:hover {
   font-size: 12px;
   font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
   pointer-events: none;
+}
+
+.diagram-resize-handle {
+  fill: #3c3f41;
+  stroke: #8a8f96;
+  stroke-width: 1;
+  cursor: se-resize;
+}
+
+.diagram-resize-handle:hover {
+  fill: #4b5057;
+  stroke: #b7bcc2;
 }
 
 .diagram-edge {
@@ -948,6 +968,12 @@ button:hover {
   gap: 4px;
 }
 
+.model-loading {
+  font-size: 0.72rem;
+  color: #9aa0a6;
+  padding: 4px 6px;
+}
+
 .model-section {
   margin-bottom: 10px;
 }
@@ -1130,11 +1156,27 @@ body.theme-light .model-properties-split {
   padding-top: 8px;
 }
 
-.model-section-title {
-  font-size: 0.7rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: #9aa0a6;
+.model-section.model-unresolved .model-section-header {
+  border-color: #5b2b2b;
+  color: #ffb4b4;
+}
+
+.model-section.model-unresolved .model-section-header:hover {
+  background: #2a1f22;
+}
+
+.model-section.model-unresolved .model-section-caret,
+.model-section.model-unresolved .model-section-label {
+  color: #ffb4b4;
+}
+
+.model-section.model-unresolved .model-section-count {
+  border-color: #5b2b2b;
+  color: #ffd5d5;
+}
+
+.model-section.model-unresolved .model-section-meta {
+  color: #e8a3a3;
 }
 
 .unresolved-list {
@@ -1143,6 +1185,10 @@ body.theme-light .model-properties-split {
   padding: 0;
   display: grid;
   gap: 6px;
+}
+
+.model-section.collapsed .unresolved-list {
+  display: none;
 }
 
 .unresolved-row {
@@ -1391,6 +1437,79 @@ body.theme-light .model-properties-split {
   box-shadow: 0 18px 40px rgba(0, 0, 0, 0.5);
   display: grid;
   gap: 12px;
+}
+
+.about-card {
+  width: min(1100px, 92vw);
+  height: min(86vh, 900px);
+  padding: 20px 22px;
+  gap: 16px;
+  grid-template-rows: auto 1fr;
+}
+
+.about-hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.about-title-block h2 {
+  margin: 0;
+  font-size: 1.5rem;
+  color: #f0f3f8;
+}
+
+.about-subtitle {
+  margin: 6px 0 0;
+  color: #c0c6d0;
+  font-size: 0.95rem;
+  max-width: 640px;
+}
+
+.about-content {
+  overflow: auto;
+  padding-right: 4px;
+  display: grid;
+  gap: 18px;
+}
+
+.about-section h3 {
+  margin: 0 0 6px;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #9aa0a6;
+}
+
+.about-section p {
+  margin: 0;
+  color: #d7dae0;
+  line-height: 1.5;
+}
+
+.about-section ul {
+  margin: 0;
+  padding-left: 18px;
+  color: #d7dae0;
+  line-height: 1.5;
+  display: grid;
+  gap: 6px;
+}
+
+.about-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px 16px;
+  color: #d7dae0;
+}
+
+.about-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #9aa0a6;
+  margin-bottom: 2px;
 }
 
 .modal-header h3 {
@@ -1844,6 +1963,22 @@ body.theme-light .compile-float {
   background: #ffffff;
   border-color: #d5d7dc;
   color: #2c2f33;
+}
+
+body.theme-light .about-title-block h2 {
+  color: #2c2f33;
+}
+
+body.theme-light .about-subtitle,
+body.theme-light .about-section p,
+body.theme-light .about-section ul,
+body.theme-light .about-grid {
+  color: #3a3f44;
+}
+
+body.theme-light .about-section h3,
+body.theme-light .about-label {
+  color: #6a7076;
 }
 
 body.theme-light button {

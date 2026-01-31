@@ -1,0 +1,8 @@
+{
+  "stdlibs": [
+    {
+      "id": "system-release122025",
+      "zip": "stdlib-packaged/system-release-122025.zip"
+    }
+  ]
+}

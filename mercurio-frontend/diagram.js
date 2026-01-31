@@ -20,7 +20,16 @@ const diagramState = {
   nodePositions: new Map(),
   edges: [],
   symbolById: new Map(),
-  pointerState: { dragging: null, startX: 0, startY: 0, originX: 0, originY: 0 },
+  pointerState: {
+    dragging: null,
+    resizing: null,
+    startX: 0,
+    startY: 0,
+    originX: 0,
+    originY: 0,
+    originW: 0,
+    originH: 0,
+  },
   layoutBounds: { width: 800, height: 600 },
 };
 
@@ -69,6 +78,23 @@ export function initDiagram(options) {
   );
 
   diagramState.svgEl?.addEventListener("pointerdown", (event) => {
+    if (!diagramState.mode) return;
+    const resizeHandle = event.target.closest(".diagram-resize-handle");
+    if (resizeHandle) {
+      const target = resizeHandle.closest("g[data-node-id]");
+      if (!target) return;
+      const nodeId = target.dataset.nodeId;
+      const node = diagramState.nodePositions.get(nodeId);
+      if (!node) return;
+      diagramState.pointerState.resizing = nodeId;
+      diagramState.pointerState.startX = event.clientX;
+      diagramState.pointerState.startY = event.clientY;
+      diagramState.pointerState.originW = node.width;
+      diagramState.pointerState.originH = node.height;
+      diagramState.svgEl.setPointerCapture(event.pointerId);
+      event.preventDefault();
+      return;
+    }
     const target = event.target.closest("g[data-node-id]");
     if (!target) return;
     const nodeId = target.dataset.nodeId;
@@ -84,6 +110,23 @@ export function initDiagram(options) {
   });
 
   diagramState.svgEl?.addEventListener("pointermove", (event) => {
+    const resizingId = diagramState.pointerState.resizing;
+    if (resizingId) {
+      const node = diagramState.nodePositions.get(resizingId);
+      if (!node) return;
+      const dx = (event.clientX - diagramState.pointerState.startX) / diagramState.zoom;
+      const dy = (event.clientY - diagramState.pointerState.startY) / diagramState.zoom;
+      const size = clampNodeSize(
+        node,
+        diagramState.pointerState.originW + dx,
+        diagramState.pointerState.originH + dy
+      );
+      node.width = size.width;
+      node.height = size.height;
+      updateNodeSize(resizingId);
+      updateEdgePaths(resizingId);
+      return;
+    }
     const nodeId = diagramState.pointerState.dragging;
     if (!nodeId) return;
     const node = diagramState.nodePositions.get(nodeId);
@@ -123,15 +166,17 @@ export function initDiagram(options) {
   });
 
   diagramState.svgEl?.addEventListener("pointerup", (event) => {
-    if (!diagramState.pointerState.dragging) return;
+    if (!diagramState.pointerState.dragging && !diagramState.pointerState.resizing) return;
     diagramState.svgEl.releasePointerCapture(event.pointerId);
     diagramState.pointerState.dragging = null;
+    diagramState.pointerState.resizing = null;
     diagramState.pointerState.childOffsets = null;
     void saveDiagramLayout();
   });
 
   diagramState.svgEl?.addEventListener("pointerleave", () => {
     diagramState.pointerState.dragging = null;
+    diagramState.pointerState.resizing = null;
     diagramState.pointerState.childOffsets = null;
   });
 
@@ -566,6 +611,15 @@ function drawDiagram(layout) {
       });
     }
 
+    const handle = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    handle.setAttribute("x", `${node.width - 10}`);
+    handle.setAttribute("y", `${node.height - 10}`);
+    handle.setAttribute("width", "10");
+    handle.setAttribute("height", "10");
+    handle.setAttribute("rx", "2");
+    handle.setAttribute("class", "diagram-resize-handle");
+    group.appendChild(handle);
+
     nodeGroup.appendChild(group);
   };
 
@@ -589,6 +643,9 @@ function drawDiagram(layout) {
       parentId,
       list.map((item) => item.line)
     );
+  });
+  diagramState.nodePositions.forEach((node) => {
+    node.attrLines = attributeLinesByParent.get(node.id) || [];
   });
 
   diagramState.nodePositions.forEach((_node, nodeId) => renderNode(nodeId));
@@ -694,6 +751,66 @@ function updateEdgePaths(onlyNodeId) {
   });
 }
 
+function clampNodeSize(node, width, height) {
+  const parentId = node.parentId;
+  const parent = parentId ? diagramState.nodePositions.get(parentId) : null;
+  const padding = 12;
+  const attrCount = Array.isArray(node.attrLines) ? node.attrLines.length : 0;
+  const minWidth = 80;
+  const minHeight = attrCount ? 24 + 30 + Math.max(0, attrCount - 1) * 14 + 8 : 32;
+  const maxWidth = parent
+    ? parent.x + parent.width - node.x - padding
+    : diagramState.layoutBounds.width - node.x - 20;
+  const maxHeight = parent
+    ? parent.y + parent.height - node.y - padding
+    : diagramState.layoutBounds.height - node.y - 20;
+  return {
+    width: Math.min(Math.max(width, minWidth), maxWidth),
+    height: Math.min(Math.max(height, minHeight), maxHeight),
+  };
+}
+
+function updateNodeSize(nodeId) {
+  if (!diagramState.svgEl) return;
+  const node = diagramState.nodePositions.get(nodeId);
+  if (!node) return;
+  const group = diagramState.svgEl.querySelector(`g[data-node-id="${CSS.escape(nodeId)}"]`);
+  if (!group) return;
+  const rect = group.querySelector("rect.diagram-node");
+  if (rect) {
+    rect.setAttribute("width", node.width);
+    rect.setAttribute("height", node.height);
+  }
+  const label = group.querySelector("text.diagram-node-label");
+  const attrLines = Array.isArray(node.attrLines) ? node.attrLines : [];
+  const headerHeight = attrLines.length ? 24 : node.height;
+  if (label) {
+    label.setAttribute("x", node.width / 2);
+    label.setAttribute("y", attrLines.length ? 16 : node.height / 2 + 4);
+  }
+  const line = group.querySelector("line.diagram-compartment");
+  if (line) {
+    line.setAttribute("x2", `${node.width - 6}`);
+    line.setAttribute("y1", `${headerHeight}`);
+    line.setAttribute("y2", `${headerHeight}`);
+  }
+  const title = group.querySelector("text.diagram-attr-title");
+  if (title) {
+    title.setAttribute("y", `${headerHeight + 14}`);
+  }
+  const attrTexts = group.querySelectorAll("text.diagram-attr-text");
+  if (attrTexts.length) {
+    attrTexts.forEach((text, index) => {
+      text.setAttribute("y", `${headerHeight + 30 + index * 14}`);
+    });
+  }
+  const handle = group.querySelector(".diagram-resize-handle");
+  if (handle) {
+    handle.setAttribute("x", `${node.width - 10}`);
+    handle.setAttribute("y", `${node.height - 10}`);
+  }
+}
+
 function nodePositionsHasChildren(nodeId) {
   for (const node of diagramState.nodePositions.values()) {
     if (node.parentId === nodeId) return true;
@@ -769,6 +886,20 @@ async function applySavedLayout() {
     const x = Number(node.x);
     const y = Number(node.y);
     if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    const width = Number(node.width);
+    const height = Number(node.height);
+    if (Number.isFinite(width)) {
+      const size = clampNodeSize(target, width, target.height);
+      target.width = size.width;
+      target.height = size.height;
+      updateNodeSize(id);
+    }
+    if (Number.isFinite(height)) {
+      const size = clampNodeSize(target, target.width, height);
+      target.width = size.width;
+      target.height = size.height;
+      updateNodeSize(id);
+    }
     const parentId = target.parentId;
     const parent = parentId ? diagramState.nodePositions.get(parentId) : null;
     const padding = 12;
@@ -805,6 +936,8 @@ async function saveDiagramLayout() {
       kind: symbol.kind || "",
       x: node.x,
       y: node.y,
+      width: node.width,
+      height: node.height,
     });
   });
   const payload = {

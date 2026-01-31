@@ -4,8 +4,11 @@ use syster::ide::AnalysisHost;
 use syster::project::StdLibLoader;
 use syster::hir::SemanticChecker;
 use std::fs;
+use std::fs::File;
+use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::time::SystemTime;
+use std::env;
+use std::time::{Instant, SystemTime};
 use std::sync::{Arc, Mutex};
 use std::collections::HashSet;
 use syster::base::constants::STDLIB_DIR;
@@ -20,7 +23,9 @@ use syster::interchange::{
     symbols_from_model,
 };
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
+use tauri::path::BaseDirectory;
 use tauri::{Emitter, EventTarget, Manager};
+use zip::ZipArchive;
 
 #[derive(Serialize)]
 struct DirEntry {
@@ -85,6 +90,19 @@ struct AppState {
     canceled_compiles: Arc<Mutex<HashSet<u64>>>,
     analysis_host: Arc<Mutex<AnalysisHost>>,
     workspace: Arc<Mutex<WorkspaceState>>,
+    stdlib_root: PathBuf,
+    settings_path: PathBuf,
+    settings: Arc<Mutex<AppSettings>>,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct AppSettings {
+    default_stdlib: Option<String>,
+}
+
+struct MercurioPaths {
+    stdlib_root: PathBuf,
+    settings_path: PathBuf,
 }
 
 struct StdlibCache {
@@ -106,6 +124,147 @@ struct WorkspaceState {
     stdlib_path: Option<PathBuf>,
     file_mtimes: std::collections::HashMap<PathBuf, SystemTime>,
     file_cache: std::collections::HashMap<PathBuf, CompileFileResult>,
+}
+
+#[derive(Deserialize)]
+struct PackagedStdlibManifest {
+    stdlibs: Vec<PackagedStdlibEntry>,
+}
+
+#[derive(Deserialize)]
+struct PackagedStdlibEntry {
+    id: String,
+    zip: String,
+}
+
+fn resolve_user_local_dir() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        env::var_os("LOCALAPPDATA")
+            .or_else(|| env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    } else {
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
+}
+
+fn ensure_mercurio_paths() -> Result<MercurioPaths, String> {
+    let root = resolve_user_local_dir().join(".mercurio");
+    let stdlib_root = root.join("stdlib");
+    fs::create_dir_all(&stdlib_root).map_err(|e| e.to_string())?;
+    let settings_path = root.join("settings.json");
+    Ok(MercurioPaths {
+        stdlib_root,
+        settings_path,
+    })
+}
+
+fn load_app_settings(path: &Path) -> AppSettings {
+    match fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => AppSettings::default(),
+    }
+}
+
+fn save_app_settings(path: &Path, settings: &AppSettings) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let payload = serde_json::to_string_pretty(settings).map_err(|e| e.to_string())?;
+    fs::write(path, payload).map_err(|e| e.to_string())
+}
+
+fn sanitize_zip_path(path: &Path) -> Result<PathBuf, String> {
+    let mut clean = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => clean.push(part),
+            Component::CurDir => {}
+            _ => return Err(format!("Invalid zip entry path: {}", path.display())),
+        }
+    }
+    Ok(clean)
+}
+
+fn extract_zip_to_dir(zip_path: &Path, target_dir: &Path) -> Result<(), String> {
+    let file = File::open(zip_path).map_err(|e| e.to_string())?;
+    let mut archive = ZipArchive::new(file).map_err(|e| e.to_string())?;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        let entry_path = Path::new(entry.name());
+        let clean_rel = sanitize_zip_path(entry_path)?;
+        let out_path = target_dir.join(clean_rel);
+        if entry.is_dir() {
+            fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut outfile = File::create(&out_path).map_err(|e| e.to_string())?;
+        io::copy(&mut entry, &mut outfile).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn read_packaged_stdlib_manifest(app: &tauri::AppHandle) -> Result<PackagedStdlibManifest, String> {
+    let manifest_path = app
+        .path()
+        .resolve("stdlib-packaged/manifest.json", BaseDirectory::Resource)
+        .map_err(|e| e.to_string())?;
+    let content = fs::read_to_string(&manifest_path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&content).map_err(|e| e.to_string())
+}
+
+fn list_stdlib_versions_from_root(stdlib_root: &Path) -> Result<Vec<String>, String> {
+    let mut versions = Vec::new();
+    let entries = fs::read_dir(stdlib_root).map_err(|e| e.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                versions.push(name.to_string());
+            }
+        }
+    }
+    versions.sort();
+    Ok(versions)
+}
+
+fn ensure_packaged_stdlibs(
+    app: &tauri::AppHandle,
+    stdlib_root: &Path,
+    settings_path: &Path,
+    settings: &mut AppSettings,
+) -> Result<(), String> {
+    let manifest = read_packaged_stdlib_manifest(app)?;
+    for entry in &manifest.stdlibs {
+        let target_dir = stdlib_root.join(&entry.id);
+        if target_dir.exists() {
+            continue;
+        }
+        let zip_path = app
+            .path()
+            .resolve(&entry.zip, BaseDirectory::Resource)
+            .map_err(|e| e.to_string())?;
+        extract_zip_to_dir(&zip_path, &target_dir)?;
+    }
+    let installed = list_stdlib_versions_from_root(stdlib_root)?;
+    let default_missing = settings
+        .default_stdlib
+        .as_ref()
+        .map(|id| !installed.contains(id))
+        .unwrap_or(true);
+    if default_missing {
+        if let Some(first) = manifest.stdlibs.first().map(|entry| entry.id.clone()) {
+            settings.default_stdlib = Some(first);
+            save_app_settings(settings_path, settings)?;
+        }
+    }
+    Ok(())
 }
 
 struct CancelGuard {
@@ -237,6 +396,42 @@ fn get_default_root() -> Result<String, String> {
                 .map(|s| s.to_string())
                 .ok_or_else(|| "Failed to resolve current directory".to_string())
         })
+}
+
+#[tauri::command]
+fn list_stdlib_versions(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
+    list_stdlib_versions_from_root(&state.stdlib_root)
+}
+
+#[tauri::command]
+fn get_default_stdlib(state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
+    let settings = state
+        .settings
+        .lock()
+        .map_err(|_| "Settings lock poisoned".to_string())?;
+    Ok(settings.default_stdlib.clone())
+}
+
+#[tauri::command]
+fn set_default_stdlib(state: tauri::State<'_, AppState>, version: String) -> Result<(), String> {
+    let trimmed = version.trim().to_string();
+    if !trimmed.is_empty() {
+        let candidate = state.stdlib_root.join(&trimmed);
+        if !candidate.exists() || !candidate.is_dir() {
+            return Err("Stdlib version not found".to_string());
+        }
+    }
+    let mut settings = state
+        .settings
+        .lock()
+        .map_err(|_| "Settings lock poisoned".to_string())?;
+    settings.default_stdlib = if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    };
+    save_app_settings(&state.settings_path, &settings)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -551,10 +746,29 @@ fn discover_stdlib_path() -> PathBuf {
     PathBuf::from(STDLIB_DIR)
 }
 
-fn resolve_default_stdlib_path(root: &Path) -> PathBuf {
+fn resolve_default_stdlib_path(
+    root: &Path,
+    stdlib_root: &Path,
+    default_stdlib: Option<&str>,
+) -> PathBuf {
     let root_stdlib = root.join(STDLIB_DIR);
     if root_stdlib.exists() && root_stdlib.is_dir() {
         return root_stdlib;
+    }
+
+    if let Some(version) = default_stdlib {
+        let candidate = stdlib_root.join(version);
+        if candidate.exists() && candidate.is_dir() {
+            return candidate;
+        }
+    }
+    if let Ok(versions) = list_stdlib_versions_from_root(stdlib_root) {
+        if let Some(first) = versions.first() {
+            let candidate = stdlib_root.join(first);
+            if candidate.exists() && candidate.is_dir() {
+                return candidate;
+            }
+        }
     }
 
     discover_stdlib_path()
@@ -646,10 +860,16 @@ fn compile_workspace_sync(
     allow_parse_errors: bool,
     unsaved: Vec<UnsavedFile>,
 ) -> Result<CompileResponse, String> {
+    let compile_start = Instant::now();
     let root_path = PathBuf::from(root);
     if !root_path.exists() {
         return Err("Root path does not exist".to_string());
     }
+    let default_stdlib = state
+        .settings
+        .lock()
+        .ok()
+        .and_then(|settings| settings.default_stdlib.clone());
 
     let _cancel_guard = CancelGuard {
         canceled: state.canceled_compiles.clone(),
@@ -722,22 +942,37 @@ fn compile_workspace_sync(
     let library_config = project_config.clone().and_then(|config| config.library);
     let (stdlib_loader, stdlib_source, stdlib_path_for_log) = match library_config {
         Some(LibraryConfig::Path { path }) => {
-            let raw_path = PathBuf::from(&path);
-            let resolved = if raw_path.is_absolute() {
-                raw_path
-            } else {
-                root_path.join(raw_path)
-            };
-            let source = format!("path: {}", resolved.to_string_lossy());
-            (StdLibLoader::with_path(resolved.clone()), source, Some(resolved))
-        }
-        Some(LibraryConfig::Default(value)) => {
-            if value.to_lowercase() == "default" {
-                let discovered = resolve_default_stdlib_path(&root_path);
+            if path.trim().is_empty() {
+                let discovered = resolve_default_stdlib_path(
+                    &root_path,
+                    &state.stdlib_root,
+                    default_stdlib.as_deref(),
+                );
                 let source = format!("default: {}", discovered.to_string_lossy());
                 (StdLibLoader::new(), source, Some(discovered))
             } else {
-                let raw_path = PathBuf::from(&value);
+                let raw_path = PathBuf::from(&path);
+                let resolved = if raw_path.is_absolute() {
+                    raw_path
+                } else {
+                    root_path.join(raw_path)
+                };
+                let source = format!("path: {}", resolved.to_string_lossy());
+                (StdLibLoader::with_path(resolved.clone()), source, Some(resolved))
+            }
+        }
+        Some(LibraryConfig::Default(value)) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+                let discovered = resolve_default_stdlib_path(
+                    &root_path,
+                    &state.stdlib_root,
+                    default_stdlib.as_deref(),
+                );
+                let source = format!("default: {}", discovered.to_string_lossy());
+                (StdLibLoader::new(), source, Some(discovered))
+            } else {
+                let raw_path = PathBuf::from(trimmed);
                 let resolved = if raw_path.is_absolute() {
                     raw_path
                 } else {
@@ -748,7 +983,11 @@ fn compile_workspace_sync(
             }
         }
         None => {
-            let discovered = resolve_default_stdlib_path(&root_path);
+            let discovered = resolve_default_stdlib_path(
+                &root_path,
+                &state.stdlib_root,
+                default_stdlib.as_deref(),
+            );
             let source = format!("default: {}", discovered.to_string_lossy());
             (StdLibLoader::new(), source, Some(discovered))
         }
@@ -786,6 +1025,7 @@ fn compile_workspace_sync(
             println!("stdlib: path missing; no stdlib files will load");
         }
         let stdlib_files_before = analysis_host.file_count();
+        let stdlib_start = Instant::now();
         if stdlib_path_exists {
             if let Some(stdlib_path) = stdlib_path_for_log.as_ref() {
                 let cached_files = load_stdlib_cached(&state, stdlib_path)?;
@@ -798,11 +1038,16 @@ fn compile_workspace_sync(
         }
         let stdlib_files_after = analysis_host.file_count();
         let stdlib_file_delta = stdlib_files_after.saturating_sub(stdlib_files_before);
-        println!("stdlib: loaded files={}", stdlib_file_delta);
+        println!(
+            "stdlib: loaded files={} duration_ms={}",
+            stdlib_file_delta,
+            stdlib_start.elapsed().as_millis()
+        );
         println!("stdlib: symbols=skipped (counting stdlib symbols can overflow the stack)");
     }
 
     println!("compile: parsing project files count={}", files.len());
+    let parse_start = Instant::now();
     let mut has_parse_errors = false;
     emit_progress("parsing", None, None, Some(files.len()));
 
@@ -898,10 +1143,16 @@ fn compile_workspace_sync(
         .collect();
     file_results.sort_by(|a, b| a.path.cmp(&b.path));
     println!(
-        "compile: parsing done host_files={}",
-        analysis_host.file_count()
+        "compile: parsing done host_files={} duration_ms={}",
+        analysis_host.file_count(),
+        parse_start.elapsed().as_millis()
     );
     if has_parse_errors && !allow_parse_errors {
+        println!(
+            "compile: parse failed duration_ms={} total_duration_ms={}",
+            parse_start.elapsed().as_millis(),
+            compile_start.elapsed().as_millis()
+        );
         return Ok(CompileResponse {
             ok: false,
             files: file_results,
@@ -918,9 +1169,13 @@ fn compile_workspace_sync(
         let analysis_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             check_cancel()?;
             emit_progress("analysis", None, None, None);
+            let analysis_start = Instant::now();
             println!("analysis: start");
             let _ = analysis_host.analysis();
-            println!("analysis: done");
+            println!(
+                "analysis: done duration_ms={}",
+                analysis_start.elapsed().as_millis()
+            );
             check_cancel()?;
 
             let project_file_ids = files
@@ -933,6 +1188,7 @@ fn compile_workspace_sync(
                 check_cancel()?;
                 let semantic_total = project_file_ids.len();
                 emit_progress("semantic", None, Some(0), Some(semantic_total));
+                let semantic_start = Instant::now();
                 println!("semantic: start");
                 let symbol_index = analysis_host.symbol_index().clone();
                 let canceled_compiles = state.canceled_compiles.clone();
@@ -970,7 +1226,10 @@ fn compile_workspace_sync(
                     .join()
                     .map_err(|_| "Semantic checker thread panicked".to_string())?;
                 let semantic_result = semantic_result?;
-                println!("semantic: done");
+                println!(
+                    "semantic: done duration_ms={}",
+                    semantic_start.elapsed().as_millis()
+                );
                 unresolved = semantic_result
                     .into_iter()
                     .filter(|diag| diag.message.to_lowercase().contains("undefined reference"))
@@ -1026,6 +1285,10 @@ fn compile_workspace_sync(
         }
     }
 
+    println!(
+        "compile: done total_duration_ms={}",
+        compile_start.elapsed().as_millis()
+    );
     Ok(CompileResponse {
         ok: file_results.iter().all(|f| f.ok),
         files: file_results,
@@ -1049,7 +1312,10 @@ fn cancel_compile(state: tauri::State<'_, AppState>, run_id: u64) -> Result<(), 
 }
 
 #[tauri::command]
-async fn export_compiled_model(payload: serde_json::Value) -> Result<(), String> {
+async fn export_compiled_model(
+    state: tauri::State<'_, AppState>,
+    payload: serde_json::Value,
+) -> Result<(), String> {
     let root = payload
         .get("root")
         .and_then(|value| value.as_str())
@@ -1069,8 +1335,9 @@ async fn export_compiled_model(payload: serde_json::Value) -> Result<(), String>
         .get("include_stdlib")
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+    let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
-        export_model_to_path(root, output, format, include_stdlib)
+        export_model_to_path(state, root, output, format, include_stdlib)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1087,6 +1354,7 @@ fn load_project_config(root: &Path) -> Result<Option<ProjectConfig>, String> {
 }
 
 fn export_model_to_path(
+    state: AppState,
     root: String,
     output: String,
     format: String,
@@ -1096,6 +1364,11 @@ fn export_model_to_path(
     if !root_path.exists() {
         return Err("Root path does not exist".to_string());
     }
+    let default_stdlib = state
+        .settings
+        .lock()
+        .ok()
+        .and_then(|settings| settings.default_stdlib.clone());
 
     let project_config = load_project_config(&root_path).ok().flatten();
     let mut analysis_host = AnalysisHost::new();
@@ -1113,20 +1386,34 @@ fn export_model_to_path(
     let library_config = project_config.clone().and_then(|config| config.library);
     let (stdlib_loader, stdlib_path_for_log) = match library_config {
         Some(LibraryConfig::Path { path }) => {
-            let raw_path = PathBuf::from(&path);
-            let resolved = if raw_path.is_absolute() {
-                raw_path
-            } else {
-                root_path.join(raw_path)
-            };
-            (StdLibLoader::with_path(resolved.clone()), Some(resolved))
-        }
-        Some(LibraryConfig::Default(value)) => {
-            if value.to_lowercase() == "default" {
-                let discovered = resolve_default_stdlib_path(&root_path);
+            if path.trim().is_empty() {
+                let discovered = resolve_default_stdlib_path(
+                    &root_path,
+                    &state.stdlib_root,
+                    default_stdlib.as_deref(),
+                );
                 (StdLibLoader::new(), Some(discovered))
             } else {
-                let raw_path = PathBuf::from(&value);
+                let raw_path = PathBuf::from(&path);
+                let resolved = if raw_path.is_absolute() {
+                    raw_path
+                } else {
+                    root_path.join(raw_path)
+                };
+                (StdLibLoader::with_path(resolved.clone()), Some(resolved))
+            }
+        }
+        Some(LibraryConfig::Default(value)) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+                let discovered = resolve_default_stdlib_path(
+                    &root_path,
+                    &state.stdlib_root,
+                    default_stdlib.as_deref(),
+                );
+                (StdLibLoader::new(), Some(discovered))
+            } else {
+                let raw_path = PathBuf::from(trimmed);
                 let resolved = if raw_path.is_absolute() {
                     raw_path
                 } else {
@@ -1136,7 +1423,11 @@ fn export_model_to_path(
             }
         }
         None => {
-            let discovered = resolve_default_stdlib_path(&root_path);
+            let discovered = resolve_default_stdlib_path(
+                &root_path,
+                &state.stdlib_root,
+                default_stdlib.as_deref(),
+            );
             (StdLibLoader::new(), Some(discovered))
         }
     };
@@ -1813,6 +2104,20 @@ fn symbol_kind_label(kind: SymbolKind) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let paths = ensure_mercurio_paths().unwrap_or_else(|err| {
+        eprintln!("mercurio: failed to initialize user data dir: {}", err);
+        let fallback_root = env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(".mercurio");
+        let stdlib_root = fallback_root.join("stdlib");
+        let _ = fs::create_dir_all(&stdlib_root);
+        let settings_path = fallback_root.join("settings.json");
+        MercurioPaths {
+            stdlib_root,
+            settings_path,
+        }
+    });
+    let settings = load_app_settings(&paths.settings_path);
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -1822,6 +2127,24 @@ pub fn run() {
             canceled_compiles: Arc::new(Mutex::new(HashSet::new())),
             analysis_host: Arc::new(Mutex::new(AnalysisHost::new())),
             workspace: Arc::new(Mutex::new(WorkspaceState::default())),
+            stdlib_root: paths.stdlib_root.clone(),
+            settings_path: paths.settings_path.clone(),
+            settings: Arc::new(Mutex::new(settings)),
+        })
+        .setup(|app| {
+            let state = app.state::<AppState>();
+            if let Ok(mut settings) = state.settings.lock() {
+                let handle = app.handle();
+                if let Err(err) = ensure_packaged_stdlibs(
+                    &handle,
+                    &state.stdlib_root,
+                    &state.settings_path,
+                    &mut settings,
+                ) {
+                    eprintln!("mercurio: stdlib extraction failed: {}", err);
+                }
+            }
+            Ok(())
         })
         .menu(|app| {
             let open_folder = MenuItemBuilder::with_id("file.open_folder", "Open Folder...")
@@ -1884,6 +2207,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_default_root,
             get_startup_path,
+            list_stdlib_versions,
+            get_default_stdlib,
+            set_default_stdlib,
             list_dir,
             read_file,
             path_exists,
