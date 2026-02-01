@@ -301,6 +301,10 @@ function isAttributeKind(kind) {
   return /attribute/i.test(kind || "");
 }
 
+function isPackageKind(kind) {
+  return /package/i.test(kind || "");
+}
+
 function findParentBlock(symbol, nodeMap) {
   if (!symbol || !symbol.qualified_name) return null;
   const parts = symbol.qualified_name.split("::").filter(Boolean);
@@ -331,6 +335,18 @@ function findParentState(symbol, nodeMap) {
     parts.pop();
   }
   return null;
+}
+
+function findParentPackage(symbol, nodeMap, symbolById) {
+  if (!symbol || !symbol.qualified_name) return null;
+  const parts = symbol.qualified_name.split("::").filter(Boolean);
+  if (parts.length < 2) return null;
+  parts.pop();
+  const candidate = parts.join("::");
+  if (!nodeMap.has(candidate)) return null;
+  const parentSymbol = symbolById.get(candidate);
+  if (!parentSymbol || !isPackageKind(parentSymbol.kind)) return null;
+  return nodeMap.get(candidate) || null;
 }
 
 async function renderDiagramForCurrentFile() {
@@ -403,6 +419,12 @@ async function renderDiagramForCurrentFile() {
   rawNodes.forEach((node) => {
     const symbol = symbolById.get(node.id);
     if (!symbol) return;
+    if (!isBlockChildKind(symbol.kind) && !isStateKind(symbol.kind)) {
+      const parent = findParentPackage(symbol, nodeMap, symbolById);
+      if (parent) {
+        parentMap.set(node.id, parent.id);
+      }
+    }
     if (isBlockChildKind(symbol.kind)) {
       const parent = findParentBlock(symbol, nodeMap);
       if (parent) {

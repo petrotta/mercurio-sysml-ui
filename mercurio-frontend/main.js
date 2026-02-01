@@ -1,4 +1,14 @@
 import { initDiagram, updateDiagramData, setDiagramMode } from "./diagram.js";
+import {
+  loadEndpoints,
+  saveEndpoints,
+  ensureDefaultEndpoint,
+  resolveActiveEndpoint,
+  setActiveEndpointId,
+  testEndpoint,
+  sendChatMessage,
+  sendEmbeddings,
+} from "./ai.js";
 
 const { invoke } = window.__TAURI__.core;
 const dialog = window.__TAURI__.dialog;
@@ -58,6 +68,7 @@ let modelGroupToggleBtn;
 let appMenuEl;
 let menuToggleBtn;
 let diagramContextMenuEl;
+let aiMessageMenuEl;
 let newProjectDialogEl;
 let newProjectLocationEl;
 let newProjectLocationPickEl;
@@ -302,6 +313,32 @@ let modelPropertiesEl;
 let modelPropertiesBodyEl;
 let modelPropertiesCloseBtn;
 let showPropertiesPane = true;
+let rightPaneToggleEl;
+let rightPaneTitleEl;
+let aiPaneEl;
+let aiMessagesEl;
+let aiInputEl;
+let aiSendBtn;
+let aiStatusEl;
+let aiSettingsOpenBtn;
+let aiSettingsDialogEl;
+let aiPaneSplitEl;
+let aiEndpointListEl;
+let aiEndpointNameEl;
+let aiEndpointTypeEl;
+let aiEndpointBaseEl;
+let aiEndpointModelEl;
+let aiEndpointTokenEl;
+let aiEndpointSaveBtn;
+let aiEndpointDeleteBtn;
+let aiEndpointTestBtn;
+let aiEndpointNewBtn;
+let aiClearBtn;
+let aiApplyDialogEl;
+let aiApplyPathEl;
+let aiApplyCurrentEl;
+let aiApplyProposedEl;
+let aiApplyConfirmBtn;
 const modelRowSymbolMap = new WeakMap();
 let modelPropertiesSplitEl;
 let propertiesRenderId = 0;
@@ -311,6 +348,16 @@ let trackSymbolTimer = null;
 let trackSymbolIdleHandle = null;
 let symbolIndexByFile = new Map();
 let lastTrackedAnchor = null;
+let rightPaneMode = "model";
+let aiApplyPending = null;
+let aiEndpointEditId = "";
+const aiInputHistory = [];
+let aiInputHistoryIndex = -1;
+let aiInputDraft = "";
+let llmInstructions = "";
+let llmHintIndex = null;
+let llmHintSeed = null;
+const LLM_HINT_INDEX_KEY = "mercurio.llm.hints.v1";
 
 const state = {
   rootPath: "",
@@ -335,7 +382,9 @@ const MODEL_PROPERTIES_KEY = "mercurio.modelShowProperties";
 const MODEL_SECTIONS_KEY = "mercurio.modelSectionState";
 const FILE_TREE_FILTER_KEY = "mercurio.fileTreeHideArtifacts";
 const TRACK_SYMBOL_KEY = "mercurio.trackSymbol";
+const RIGHT_PANE_KEY = "mercurio.rightPane";
 const lastCompile = { symbols: [], files: [], unresolved: [], durationMs: null, libraryPath: "" };
+const aiEndpointStatus = new Map();
 
 const MIN_LEFT = 200;
 const MIN_RIGHT = 240;
@@ -903,6 +952,732 @@ function applyTheme(themeId) {
   }
 }
 
+function loadRightPaneMode() {
+  const stored = window.localStorage?.getItem(RIGHT_PANE_KEY);
+  rightPaneMode = stored === "ai" ? "ai" : "model";
+}
+
+function setRightPaneMode(next) {
+  rightPaneMode = next === "ai" ? "ai" : "model";
+  window.localStorage?.setItem(RIGHT_PANE_KEY, rightPaneMode);
+  if (rightPaneTitleEl) {
+    rightPaneTitleEl.textContent = rightPaneMode === "ai" ? "AI" : "Model";
+  }
+  if (appEl) {
+    appEl.classList.toggle("ai-mode", rightPaneMode === "ai");
+  }
+}
+
+function formatParseErrors(path, errors) {
+  if (!errors || !errors.length) {
+    return `No parse errors in ${path}.`;
+  }
+  const maxItems = 20;
+  const lines = errors.slice(0, maxItems).map((err) => {
+    const line = (err.line ?? 0) + 1;
+    const col = (err.column ?? 0) + 1;
+    const kind = err.kind ? ` · ${err.kind}` : "";
+    return `Line ${line}, Col ${col}${kind}: ${err.message}`;
+  });
+  const extra = errors.length > maxItems ? `\n...and ${errors.length - maxItems} more.` : "";
+  return `Parse errors in ${path}:\n${lines.join("\n")}${extra}`;
+}
+
+function renderAiMessage(role, text) {
+  if (!aiMessagesEl) return;
+  const item = document.createElement("div");
+  item.className = `ai-message ${role}`;
+  item.textContent = text;
+  aiMessagesEl.appendChild(item);
+  aiMessagesEl.scrollTop = aiMessagesEl.scrollHeight;
+}
+
+function renderAiEditSummary(path, editText) {
+  if (!aiMessagesEl) return;
+  const item = document.createElement("div");
+  item.className = "ai-message assistant";
+  const name = path ? path.split(/[\\/]/).pop() : "current file";
+  const summary = document.createElement("span");
+  summary.textContent = `Applied edit to ${name}.`;
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "ai-edit-toggle";
+  toggle.textContent = "Show edit";
+  const details = document.createElement("pre");
+  details.className = "ai-edit-details";
+  details.textContent = editText || "";
+  details.hidden = true;
+  item.appendChild(summary);
+  item.appendChild(toggle);
+  item.appendChild(details);
+  aiMessagesEl.appendChild(item);
+  aiMessagesEl.scrollTop = aiMessagesEl.scrollHeight;
+}
+
+function renderAiNewSummary(path, editText) {
+  if (!aiMessagesEl) return;
+  const item = document.createElement("div");
+  item.className = "ai-message assistant";
+  const name = path ? path.split(/[\\/]/).pop() : "new file";
+  const summary = document.createElement("span");
+  summary.textContent = `Created ${name}.`;
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "ai-edit-toggle";
+  toggle.textContent = "Show command";
+  const details = document.createElement("pre");
+  details.className = "ai-edit-details";
+  details.textContent = editText || "";
+  details.hidden = true;
+  item.appendChild(summary);
+  item.appendChild(toggle);
+  item.appendChild(details);
+  aiMessagesEl.appendChild(item);
+  aiMessagesEl.scrollTop = aiMessagesEl.scrollHeight;
+}
+
+function parseNewCommand(text) {
+  const match = text.match(/^\/new\b[:\s-]*/i);
+  if (!match) return null;
+  const rest = text.slice(match[0].length);
+  if (!rest.trim()) return null;
+  const lines = rest.split("\n");
+  let pathPart = lines.shift() || "";
+  let content = lines.join("\n");
+  if (!content) {
+    const colonIndex = pathPart.indexOf(":");
+    if (colonIndex !== -1) {
+      content = pathPart.slice(colonIndex + 1);
+      pathPart = pathPart.slice(0, colonIndex);
+    }
+  }
+  const relPath = pathPart.trim().replace(/^["']|["']$/g, "");
+  if (!relPath) return null;
+  return { relPath, content: content.replace(/^\s*\n?/, "") };
+}
+
+function parseParseCommand(text) {
+  const match = text.match(/^\/parse\b[:\s-]*/i);
+  if (!match) return null;
+  const rest = text.slice(match[0].length).trim();
+  return { relPath: rest || "" };
+}
+
+function parseHintCommand(text) {
+  const match = text.match(/^\/hint\b[:\s-]*/i);
+  if (!match) return null;
+  const rest = text.slice(match[0].length).trim();
+  if (!rest) return { query: "" };
+  if (/^rebuild\b/i.test(rest)) {
+    return { query: "", rebuild: true };
+  }
+  return { query: rest || "" };
+}
+
+function loadHintIndex() {
+  if (llmHintIndex) return llmHintIndex;
+  try {
+    const raw = window.localStorage?.getItem(LLM_HINT_INDEX_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (parsed && Array.isArray(parsed.items)) {
+      llmHintIndex = parsed;
+      return parsed;
+    }
+  } catch {}
+  return null;
+}
+
+function saveHintIndex(index) {
+  llmHintIndex = index;
+  window.localStorage?.setItem(LLM_HINT_INDEX_KEY, JSON.stringify(index));
+}
+
+function cosineSimilarity(a, b) {
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length && i < b.length; i += 1) {
+    const x = a[i];
+    const y = b[i];
+    dot += x * y;
+    normA += x * x;
+    normB += y * y;
+  }
+  if (!normA || !normB) return 0;
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+async function ensureHintSeed() {
+  if (llmHintSeed) return llmHintSeed;
+  try {
+    const raw = await invoke("read_llm_hints");
+    const parsed = JSON.parse(raw || "[]");
+    llmHintSeed = Array.isArray(parsed) ? parsed : [];
+  } catch {
+    llmHintSeed = [];
+  }
+  return llmHintSeed;
+}
+
+async function buildHintIndex() {
+  const endpoint = resolveActiveEndpoint("embeddings");
+  if (!endpoint) {
+    setAiStatus("No embeddings endpoint configured.");
+    return null;
+  }
+  const seed = await ensureHintSeed();
+  if (!seed.length) {
+    setAiStatus("No hint corpus available.");
+    return null;
+  }
+  const texts = seed.map((item) => item.text || "");
+  const embeddings = await sendEmbeddings(endpoint, texts);
+  const items = seed.map((item, idx) => ({
+    id: item.id || `hint-${idx}`,
+    title: item.title || item.id || `Hint ${idx + 1}`,
+    text: item.text || "",
+    embedding: embeddings[idx] || [],
+  }));
+  const index = { items, createdAt: Date.now() };
+  saveHintIndex(index);
+  return index;
+}
+
+async function searchHints(query, maxItems = 5) {
+  const endpoint = resolveActiveEndpoint("embeddings");
+  if (!endpoint) {
+    setAiStatus("No embeddings endpoint configured.");
+    return [];
+  }
+  let index = loadHintIndex();
+  if (!index || !Array.isArray(index.items) || !index.items.length) {
+    index = await buildHintIndex();
+  }
+  if (!index) return [];
+  const [queryEmbedding] = await sendEmbeddings(endpoint, [query]);
+  if (!queryEmbedding) return [];
+  const scored = index.items.map((item) => ({
+    item,
+    score: cosineSimilarity(queryEmbedding, item.embedding || []),
+  }));
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, maxItems).map((entry) => entry.item);
+}
+
+function setAiStatus(text) {
+  if (!aiStatusEl) return;
+  aiStatusEl.textContent = text || "";
+}
+
+function buildAiChatMessages(content, hintText = "") {
+  const history = Array.from(aiMessagesEl.querySelectorAll(".ai-message")).map((node) => {
+    const role = node.classList.contains("assistant") ? "assistant" : "user";
+    return { role, content: node.textContent || "" };
+  });
+  const system = {
+    role: "system",
+    content:
+      "You are the Mercurio assistant. You can edit the current open file with /edit and create new files inside the current project with /new <path>. Respond normally otherwise.",
+  };
+  const instructionMessage = llmInstructions
+    ? { role: "system", content: llmInstructions }
+    : null;
+  const hintMessage = hintText ? { role: "system", content: hintText } : null;
+  if (state.currentFile && editor) {
+    const fileContent = editor.getValue();
+    const pos = editor.getPosition();
+    const cursorLine = pos ? pos.lineNumber : 1;
+    const cursorCol = pos ? pos.column : 1;
+    const context = `Current file: ${state.currentFile}\n\n${fileContent}`;
+    const cursor = `Cursor position: line ${cursorLine}, column ${cursorCol}`;
+    return [
+      system,
+      ...(instructionMessage ? [instructionMessage] : []),
+      ...(hintMessage ? [hintMessage] : []),
+      { role: "user", content: context },
+      { role: "user", content: cursor },
+      ...history,
+      { role: "user", content },
+    ];
+  }
+  return [
+    system,
+    ...(instructionMessage ? [instructionMessage] : []),
+    ...(hintMessage ? [hintMessage] : []),
+    ...history,
+    { role: "user", content },
+  ];
+}
+
+async function sendAiMessage() {
+  if (!aiInputEl) return;
+  const rawContent = aiInputEl.value;
+  const content = rawContent.trim();
+  if (!content) return;
+  aiInputHistory.push(rawContent);
+  aiInputHistoryIndex = -1;
+  aiInputDraft = "";
+  const normalized = content.replace(/^[\uFEFF\u200B]+/, "");
+  const normalizedSlash = normalized.replace(/^[\uFF0F]/, "/");
+  const hintCommand = parseHintCommand(normalizedSlash);
+  if (hintCommand) {
+    aiInputEl.value = "";
+    renderAiMessage("user", content);
+    if (hintCommand.rebuild) {
+      try {
+        const index = await buildHintIndex();
+        if (index) {
+          renderAiMessage("assistant", "Hint index rebuilt.");
+        } else {
+          renderAiMessage("assistant", "Hint index rebuild failed.");
+        }
+      } catch (error) {
+        setAiStatus(`Hint rebuild failed: ${error}`);
+      }
+      return;
+    }
+    if (!hintCommand.query) {
+      setAiStatus("Provide a hint query after /hint.");
+      return;
+    }
+    try {
+      const hints = await searchHints(hintCommand.query, 5);
+      if (!hints.length) {
+        renderAiMessage("assistant", "No hints found.");
+      } else {
+        const lines = hints.map(
+          (hint, idx) => `${idx + 1}. ${hint.title}\n${hint.text.trim()}`
+        );
+        renderAiMessage("assistant", `Hints:\n${lines.join("\n\n")}`);
+      }
+    } catch (error) {
+      setAiStatus(`Hint search failed: ${error}`);
+    }
+    return;
+  }
+  const parseCommand = parseParseCommand(normalizedSlash);
+  if (parseCommand) {
+    if (!state.rootPath && !state.currentFile) {
+      setAiStatus("Select a project root first.");
+      return;
+    }
+    aiInputEl.value = "";
+    renderAiMessage("user", content);
+    let targetPath = "";
+    if (!parseCommand.relPath) {
+      if (!state.currentFile) {
+        setAiStatus("Open a file or provide a relative path.");
+        return;
+      }
+      targetPath = state.currentFile;
+    } else {
+      const rel = parseCommand.relPath.replace(/^["']|["']$/g, "");
+      if (/^[A-Za-z]:[\\/]|^\\\\|^\//.test(rel)) {
+        setAiStatus("Use a relative path inside the current project.");
+        return;
+      }
+      targetPath = joinPath(state.rootPath, rel);
+    }
+    try {
+      let payload;
+      if (targetPath === state.currentFile && editor) {
+        const fileContent = editor.getValue();
+        payload = await invoke("get_parse_errors_for_content", { path: targetPath, content: fileContent });
+      } else {
+        payload = await invoke("get_parse_errors", { path: targetPath });
+      }
+      const errors = payload?.errors || [];
+      renderAiMessage("assistant", formatParseErrors(targetPath, errors));
+    } catch (error) {
+      setAiStatus(`Parse failed: ${error}`);
+    }
+    return;
+  }
+  const newCommand = parseNewCommand(normalizedSlash);
+  if (newCommand) {
+    aiInputEl.value = "";
+    if (!state.rootPath) {
+      setAiStatus("Select a project root first.");
+      return;
+    }
+    renderAiMessage("user", content);
+    const created = await applyAiNewFile(
+      newCommand.relPath,
+      newCommand.content,
+      `Created ${newCommand.relPath.split(/[\\/]/).pop()}.`
+    );
+    if (!created) {
+      setAiStatus("Create failed.");
+    }
+    return;
+  }
+  const editMatch = normalizedSlash.match(/^\/edit\b[:\s-]*/i);
+  if (editMatch) {
+    if (!state.currentFile) {
+      setAiStatus("Open a file to apply edits.");
+      return;
+    }
+    aiInputEl.value = "";
+    const instruction = normalizedSlash.slice(editMatch[0].length).trim();
+    if (!instruction) {
+      setAiStatus("Provide edit instructions after /edit.");
+      return;
+    }
+    renderAiMessage("user", content);
+    await requestAiEditForPath(state.currentFile, instruction, {
+      applyImmediately: true,
+      announce: `Applied edit to ${state.currentFile.split(/[\\/]/).pop()}.`,
+    });
+    return;
+  }
+  const endpoint = resolveActiveEndpoint("chat");
+  if (!endpoint) {
+    setAiStatus("No chat endpoint configured.");
+    return;
+  }
+  aiInputEl.value = "";
+  renderAiMessage("user", content);
+  setAiStatus("Sending...");
+  try {
+    let hintText = "";
+    try {
+      const hints = await searchHints(content, 3);
+      if (hints.length) {
+        const lines = hints.map((hint, idx) => `${idx + 1}. ${hint.title}\n${hint.text.trim()}`);
+        hintText = `Relevant hints:\n${lines.join("\n\n")}`;
+      }
+    } catch {}
+    const messages = buildAiChatMessages(content, hintText);
+    const reply = await sendChatMessage(endpoint, messages);
+    const replyText = reply || "(no response)";
+    const normalizedReply = replyText.replace(/^[\uFEFF\u200B]+/, "").replace(/^[\uFF0F]/, "/");
+    const newReply = parseNewCommand(normalizedReply);
+    if (newReply) {
+      const created = await applyAiNewFile(newReply.relPath, newReply.content);
+      if (created) {
+        renderAiNewSummary(joinPath(state.rootPath, newReply.relPath), normalizedReply);
+      } else {
+        renderAiMessage("assistant", replyText);
+      }
+    } else {
+      const replyEdit = normalizedReply.match(/^\/edit\b[:\s-]*/i);
+      if (replyEdit && state.currentFile) {
+        const instruction = normalizedReply.slice(replyEdit[0].length).trim();
+        if (instruction) {
+          const applied = await requestAiEditForPath(state.currentFile, instruction, {
+            applyImmediately: true,
+          });
+          if (applied) {
+            renderAiEditSummary(state.currentFile, normalizedReply);
+          } else {
+            renderAiMessage("assistant", replyText);
+          }
+        }
+      } else {
+        renderAiMessage("assistant", replyText);
+      }
+    }
+    setAiStatus("");
+  } catch (error) {
+    setAiStatus(`AI error: ${error}`);
+  }
+}
+
+function normalizeAiFileContent(text) {
+  if (!text) return "";
+  const trimmed = text.trim();
+  if (trimmed.startsWith("```")) {
+    const lines = trimmed.split("\n");
+    if (lines.length >= 2) {
+      lines.shift();
+      if (lines[lines.length - 1].startsWith("```")) {
+        lines.pop();
+      }
+      return lines.join("\n").trim();
+    }
+  }
+  return text;
+}
+
+function showAiApplyDialog(payload) {
+  if (!aiApplyDialogEl || !aiApplyPathEl || !aiApplyCurrentEl || !aiApplyProposedEl) return;
+  aiApplyPending = payload;
+  aiApplyPathEl.textContent = payload.path;
+  aiApplyCurrentEl.value = payload.current || "";
+  aiApplyProposedEl.value = payload.proposed || "";
+  aiApplyDialogEl.hidden = false;
+}
+
+function hideAiApplyDialog() {
+  if (!aiApplyDialogEl) return;
+  aiApplyDialogEl.hidden = true;
+  aiApplyPending = null;
+}
+
+async function getContentForEdit(path) {
+  if (path === state.currentFile && editor) {
+    return editor.getValue();
+  }
+  if (state.bufferedContent.has(path)) {
+    return state.bufferedContent.get(path) ?? "";
+  }
+  return invoke("read_file", { path });
+}
+
+async function requestAiEditForPath(path, instruction, options = {}) {
+  const endpoint = resolveActiveEndpoint("chat");
+  if (!endpoint) {
+    setAiStatus("No chat endpoint configured.");
+    return false;
+  }
+  const current = await getContentForEdit(path);
+  setAiStatus("Preparing edit...");
+  try {
+    const messages = [
+      {
+        role: "system",
+        content:
+          "You are editing a text file for Mercurio. Return the full updated file content only. Do not include markdown fences, explanations, or commentary.",
+      },
+      {
+        role: "user",
+        content: `File: ${path}\n\nInstruction:\n${instruction}\n\nCurrent content:\n${current}`,
+      },
+    ];
+    const reply = await sendChatMessage(endpoint, messages);
+    const proposed = normalizeAiFileContent(reply || "");
+    if (options.applyImmediately) {
+      return await applyAiEditImmediate(path, proposed, options);
+    }
+    showAiApplyDialog({ path, current, proposed });
+    setAiStatus("");
+    return true;
+  } catch (error) {
+    setAiStatus(`AI error: ${error}`);
+    return false;
+  }
+}
+
+async function applyAiEdit() {
+  if (!aiApplyPending || !aiApplyProposedEl) return;
+  const path = aiApplyPending.path;
+  const content = aiApplyProposedEl.value;
+  try {
+    await invoke("write_file", { path, content });
+    state.lastSavedContent.set(path, content);
+    state.bufferedContent.delete(path);
+    setDirty(path, false);
+    lastEditContentByPath.set(path, content);
+    if (path === state.currentFile && editor) {
+      isSettingEditorValue = true;
+      editor.setValue(content);
+      isSettingEditorValue = false;
+    }
+    handleProgrammaticEdit(path);
+    hideAiApplyDialog();
+    setAiStatus("Applied edit.");
+  } catch (error) {
+    setAiStatus(`Apply failed: ${error}`);
+  }
+}
+
+async function applyAiEditImmediate(path, content, options = {}) {
+  try {
+    await invoke("write_file", { path, content });
+    state.lastSavedContent.set(path, content);
+    state.bufferedContent.delete(path);
+    setDirty(path, false);
+    lastEditContentByPath.set(path, content);
+    if (path === state.currentFile && editor) {
+      isSettingEditorValue = true;
+      editor.setValue(content);
+      isSettingEditorValue = false;
+    }
+    handleProgrammaticEdit(path);
+    if (options.announce) {
+      renderAiMessage("assistant", options.announce);
+    }
+    setAiStatus("Applied edit.");
+    return true;
+  } catch (error) {
+    setAiStatus(`Apply failed: ${error}`);
+    return false;
+  }
+}
+
+async function applyAiNewFile(relPath, content, announceText) {
+  if (!state.rootPath) {
+    setAiStatus("Select a project root first.");
+    return false;
+  }
+  if (!relPath) return false;
+  const fullPath = joinPath(state.rootPath, relPath);
+  const rootNorm = normalizePathForCompare(state.rootPath);
+  const fileNorm = normalizePathForCompare(fullPath);
+  if (!fileNorm.startsWith(rootNorm)) {
+    setAiStatus("New files must be inside the current project.");
+    return false;
+  }
+  try {
+    await invoke("write_file", { path: fullPath, content: content || "" });
+    if (state.rootPath) {
+      invoke("list_dir", { path: state.rootPath })
+        .then((entries) => renderFileTree(entries))
+        .catch(() => {});
+    }
+    handleProgrammaticEdit(fullPath);
+    if (announceText) {
+      renderAiMessage("assistant", announceText);
+    }
+    return true;
+  } catch (error) {
+    setAiStatus(`Create failed: ${error}`);
+    return false;
+  }
+}
+
+function handleProgrammaticEdit(path) {
+  if (!path) return;
+  scheduleParseRefresh(path);
+  if (!state.rootPath) return;
+  if (compileManager.active) return;
+  compileWorkspace({ silent: true, allowParseErrors: true, saveBefore: false, auto: true });
+}
+
+function refreshAiEndpointSelects() {
+  const endpoints = ensureDefaultEndpoint();
+  const activeChat = resolveActiveEndpoint("chat");
+  aiEndpointEditId = aiEndpointEditId || activeChat?.id || endpoints[0]?.id || "";
+  fillEndpointEditor(aiEndpointEditId);
+  renderEndpointList();
+}
+
+function fillEndpointEditor(id) {
+  const endpoints = loadEndpoints();
+  const endpoint = endpoints.find((item) => item.id === id);
+  if (!endpoint) {
+    if (aiEndpointNameEl) aiEndpointNameEl.value = "";
+    if (aiEndpointTypeEl) aiEndpointTypeEl.value = "chat";
+    if (aiEndpointBaseEl) aiEndpointBaseEl.value = "https://api.openai.com/v1";
+    if (aiEndpointModelEl) aiEndpointModelEl.value = "";
+    if (aiEndpointTokenEl) aiEndpointTokenEl.value = "";
+    return;
+  }
+  if (aiEndpointNameEl) aiEndpointNameEl.value = endpoint.name || "";
+  if (aiEndpointTypeEl) aiEndpointTypeEl.value = endpoint.type || "chat";
+  if (aiEndpointBaseEl) aiEndpointBaseEl.value = endpoint.baseUrl || "";
+  if (aiEndpointModelEl) aiEndpointModelEl.value = endpoint.model || "";
+  if (aiEndpointTokenEl) aiEndpointTokenEl.value = endpoint.apiKey || "";
+}
+
+function renderEndpointList() {
+  if (!aiEndpointListEl) return;
+  const endpoints = loadEndpoints();
+  aiEndpointListEl.innerHTML = "";
+  if (!endpoints.length) {
+    const empty = document.createElement("div");
+    empty.className = "muted";
+    empty.textContent = "No endpoints configured.";
+    aiEndpointListEl.appendChild(empty);
+    return;
+  }
+  const activeChat = resolveActiveEndpoint("chat");
+  const activeEmbed = resolveActiveEndpoint("embeddings");
+  endpoints.forEach((endpoint) => {
+    const row = document.createElement("div");
+    row.className = `ai-endpoint-row${aiEndpointEditId === endpoint.id ? " active" : ""}`;
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = endpoint.type === "embeddings" ? "ai-embed-selected" : "ai-chat-selected";
+    radio.checked =
+      (endpoint.type === "chat" && activeChat?.id === endpoint.id) ||
+      (endpoint.type === "embeddings" && activeEmbed?.id === endpoint.id);
+    radio.addEventListener("change", () => {
+      setActiveEndpointId(endpoint.type, endpoint.id);
+      renderEndpointList();
+    });
+    const info = document.createElement("div");
+    info.innerHTML = `<div>${endpoint.name}</div><div class="ai-endpoint-url">${endpoint.baseUrl || ""}</div>`;
+    const type = document.createElement("div");
+    type.className = "ai-endpoint-type";
+    type.textContent = endpoint.type;
+    const status = document.createElement("div");
+    const statusValue = aiEndpointStatus.get(endpoint.id);
+    status.className = `ai-endpoint-status ${statusValue === "pass" ? "pass" : statusValue === "fail" ? "fail" : ""}`;
+    status.textContent = statusValue ? statusValue : "";
+    row.appendChild(radio);
+    row.appendChild(info);
+    row.appendChild(type);
+    row.appendChild(status);
+    row.addEventListener("click", (event) => {
+      if (event.target === radio) return;
+      aiEndpointEditId = endpoint.id;
+      fillEndpointEditor(aiEndpointEditId);
+      renderEndpointList();
+    });
+    aiEndpointListEl.appendChild(row);
+  });
+}
+
+function upsertEndpoint() {
+  if (!aiEndpointNameEl || !aiEndpointTypeEl || !aiEndpointBaseEl || !aiEndpointModelEl) return;
+  const endpoints = loadEndpoints();
+  const selectedId = aiEndpointEditId;
+  const nextId = selectedId && endpoints.some((item) => item.id === selectedId)
+    ? selectedId
+    : `endpoint-${Date.now()}`;
+  const payload = {
+    id: nextId,
+    name: aiEndpointNameEl.value.trim() || "Endpoint",
+    type: aiEndpointTypeEl.value,
+    baseUrl: aiEndpointBaseEl.value.trim(),
+    model: aiEndpointModelEl.value.trim(),
+    apiKey: aiEndpointTokenEl?.value.trim() || "",
+  };
+  const updated = endpoints.filter((item) => item.id !== payload.id);
+  updated.push(payload);
+  saveEndpoints(updated);
+  if (payload.type === "chat") {
+    setActiveEndpointId("chat", payload.id);
+  }
+  if (payload.type === "embeddings") {
+    setActiveEndpointId("embeddings", payload.id);
+  }
+  aiEndpointEditId = payload.id;
+  refreshAiEndpointSelects();
+  setAiStatus("Endpoint saved.");
+}
+
+async function testCurrentEndpoint() {
+  const endpoints = loadEndpoints();
+  const id = aiEndpointEditId;
+  const endpoint = endpoints.find((item) => item.id === id);
+  if (!endpoint) return;
+  setAiStatus("Testing endpoint...");
+  try {
+    await testEndpoint(endpoint);
+    aiEndpointStatus.set(id, "pass");
+    renderEndpointList();
+    setAiStatus("Endpoint OK.");
+  } catch (error) {
+    aiEndpointStatus.set(id, "fail");
+    renderEndpointList();
+    setAiStatus(`Endpoint failed: ${error}`);
+  }
+}
+
+function deleteCurrentEndpoint() {
+  const id = aiEndpointEditId;
+  if (!id) return;
+  const endpoints = loadEndpoints().filter((item) => item.id !== id);
+  saveEndpoints(endpoints);
+  aiEndpointStatus.delete(id);
+  aiEndpointEditId = "";
+  refreshAiEndpointSelects();
+  setAiStatus("Endpoint deleted.");
+}
+
 function setCompileFloat(state, message, detail) {
   if (!compileFloatEl || !compileFloatMessageEl || !compileFloatDetailEl || !compileFloatCancelBtn) {
     return;
@@ -1041,6 +1816,23 @@ function hideDiagramContextMenu() {
   if (!diagramContextMenuEl) return;
   diagramContextMenuEl.hidden = true;
   diagramContextTarget = null;
+}
+
+function openAiMessageMenu(x, y, text) {
+  if (!aiMessageMenuEl) return;
+  aiMessageMenuEl.dataset.text = text || "";
+  aiMessageMenuEl.hidden = false;
+  const rect = aiMessageMenuEl.getBoundingClientRect();
+  const left = Math.min(x, window.innerWidth - rect.width - 8);
+  const top = Math.min(y, window.innerHeight - rect.height - 8);
+  aiMessageMenuEl.style.left = `${Math.max(8, left)}px`;
+  aiMessageMenuEl.style.top = `${Math.max(8, top)}px`;
+}
+
+function hideAiMessageMenu() {
+  if (!aiMessageMenuEl) return;
+  aiMessageMenuEl.hidden = true;
+  delete aiMessageMenuEl.dataset.text;
 }
 
 function selectInModelTree(target) {
@@ -1573,6 +2365,17 @@ function showSettingsDialog() {
 function hideSettingsDialog() {
   if (!settingsDialogEl) return;
   settingsDialogEl.hidden = true;
+}
+
+function showAiSettingsDialog() {
+  if (!aiSettingsDialogEl) return;
+  refreshAiEndpointSelects();
+  aiSettingsDialogEl.hidden = false;
+}
+
+function hideAiSettingsDialog() {
+  if (!aiSettingsDialogEl) return;
+  aiSettingsDialogEl.hidden = true;
 }
 
 async function refreshSettingsStdlib() {
@@ -3544,6 +4347,23 @@ window.addEventListener("DOMContentLoaded", async () => {
   settingsDialogEl = document.querySelector("#settings-dialog");
   settingsThemeEl = document.querySelector("#settings-theme");
   settingsStdlibEl = document.querySelector("#settings-stdlib");
+  aiSettingsDialogEl = document.querySelector("#ai-settings-dialog");
+  aiSettingsOpenBtn = document.querySelector("#ai-settings-open");
+  aiEndpointListEl = document.querySelector("#ai-endpoint-list");
+  aiEndpointNameEl = document.querySelector("#ai-endpoint-name");
+  aiEndpointTypeEl = document.querySelector("#ai-endpoint-type");
+  aiEndpointBaseEl = document.querySelector("#ai-endpoint-base");
+  aiEndpointModelEl = document.querySelector("#ai-endpoint-model");
+  aiEndpointTokenEl = document.querySelector("#ai-endpoint-token");
+  aiEndpointSaveBtn = document.querySelector("#ai-endpoint-save");
+  aiEndpointDeleteBtn = document.querySelector("#ai-endpoint-delete");
+  aiEndpointTestBtn = document.querySelector("#ai-endpoint-test");
+  aiEndpointNewBtn = document.querySelector("#ai-endpoint-new");
+  aiApplyDialogEl = document.querySelector("#ai-apply-dialog");
+  aiApplyPathEl = document.querySelector("#ai-apply-path");
+  aiApplyCurrentEl = document.querySelector("#ai-apply-current-content");
+  aiApplyProposedEl = document.querySelector("#ai-apply-proposed");
+  aiApplyConfirmBtn = document.querySelector("#ai-apply-confirm");
   rootPathEl = document.querySelector("#root-path");
   currentFileEl = document.querySelector("#current-file");
   fileTreeEl = document.querySelector("#file-tree");
@@ -3564,6 +4384,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   statusAutoCompileEl = document.querySelector("#status-autocompile");
   setAutoCompileStatus("idle", "Auto-compile idle");
   diagramContextMenuEl = document.querySelector("#diagram-context-menu");
+  aiMessageMenuEl = document.querySelector("#ai-message-menu");
   compileFloatEl = document.querySelector("#compile-float");
   compileFloatMessageEl = document.querySelector("#compile-float-message");
   compileFloatDetailEl = document.querySelector("#compile-float-detail");
@@ -3575,6 +4396,15 @@ window.addEventListener("DOMContentLoaded", async () => {
   parseToggleEl = document.querySelector("#parse-toggle");
   toggleArtifactsBtn = document.querySelector("#toggle-artifacts");
   trackSymbolToggleBtn = document.querySelector("#track-symbol-toggle");
+  rightPaneToggleEl = document.querySelector("#right-pane-toggle");
+  rightPaneTitleEl = document.querySelector("#right-pane-title");
+  aiPaneEl = document.querySelector("#ai-pane");
+  aiMessagesEl = document.querySelector("#ai-messages");
+  aiPaneSplitEl = document.querySelector("#ai-pane-split");
+  aiInputEl = document.querySelector("#ai-input");
+  aiSendBtn = document.querySelector("#ai-send");
+  aiStatusEl = document.querySelector("#ai-status");
+  aiClearBtn = document.querySelector("#ai-clear");
   editorTabsEl = document.querySelector("#editor-tabs");
   editorTabsMenuEl = document.querySelector("#editor-tabs-menu");
   editorTabsOverflowMenuEl = document.querySelector("#editor-tabs-overflow-menu");
@@ -3615,6 +4445,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   updateArtifactToggle();
   updateRecentProjectsMenu(loadRecentProjects());
   loadModelPrefs();
+  loadRightPaneMode();
   syncPanelToggles();
   updateModelGroupToggle();
   updateModelLibraryToggle();
@@ -3623,6 +4454,13 @@ window.addEventListener("DOMContentLoaded", async () => {
   updateTrackSymbolToggle();
   currentTheme = loadStoredTheme();
   applyTheme(currentTheme);
+  setRightPaneMode(rightPaneMode);
+  refreshAiEndpointSelects();
+  try {
+    llmInstructions = await invoke("read_llm_instructions");
+  } catch {
+    llmInstructions = "";
+  }
   modelTreeEl?.addEventListener("contextmenu", (event) => {
     if (!event.target.closest(".model-row")) {
       event.preventDefault();
@@ -3711,6 +4549,12 @@ window.addEventListener("DOMContentLoaded", async () => {
       hideSettingsDialog();
     }
   });
+  aiSettingsDialogEl?.addEventListener("click", (event) => {
+    const action = event.target?.dataset?.action;
+    if (action === "close") {
+      hideAiSettingsDialog();
+    }
+  });
   newProjectDialogEl?.addEventListener("click", (event) => {
     const action = event.target?.dataset?.action;
     if (action === "close") {
@@ -3766,6 +4610,22 @@ window.addEventListener("DOMContentLoaded", async () => {
   settingsDialogEl?.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       hideSettingsDialog();
+    }
+  });
+  aiSettingsDialogEl?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      hideAiSettingsDialog();
+    }
+  });
+  aiApplyDialogEl?.addEventListener("click", (event) => {
+    const action = event.target?.dataset?.action;
+    if (action === "close") {
+      hideAiApplyDialog();
+    }
+  });
+  aiApplyDialogEl?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      hideAiApplyDialog();
     }
   });
   newProjectLocationPickEl?.addEventListener("click", async () => {
@@ -3859,6 +4719,100 @@ window.addEventListener("DOMContentLoaded", async () => {
         .catch((error) => setCompileStatus(`Refresh failed: ${error}`));
     }
   });
+  rightPaneToggleEl?.addEventListener("click", () => {
+    setRightPaneMode(rightPaneMode === "ai" ? "model" : "ai");
+  });
+  aiSettingsOpenBtn?.addEventListener("click", () => {
+    showAiSettingsDialog();
+  });
+  aiSendBtn?.addEventListener("click", sendAiMessage);
+  aiClearBtn?.addEventListener("click", () => {
+    if (aiMessagesEl) {
+      aiMessagesEl.innerHTML = "";
+    }
+    setAiStatus("");
+  });
+  aiMessagesEl?.addEventListener("contextmenu", (event) => {
+    const target = event.target.closest(".ai-message");
+    if (!target) return;
+    event.preventDefault();
+    openAiMessageMenu(event.clientX, event.clientY, target.textContent || "");
+  });
+  aiMessagesEl?.addEventListener("click", (event) => {
+    const toggle = event.target.closest(".ai-edit-toggle");
+    if (!toggle) return;
+    const message = toggle.closest(".ai-message");
+    const details = message?.querySelector(".ai-edit-details");
+    if (!details) return;
+    details.hidden = !details.hidden;
+    toggle.textContent = details.hidden ? "Show edit" : "Hide edit";
+  });
+  aiInputEl?.addEventListener("keydown", (event) => {
+    if (event.ctrlKey && !event.shiftKey && !event.altKey && event.key === "ArrowUp") {
+      if (!aiInputHistory.length) return;
+      event.preventDefault();
+      if (aiInputHistoryIndex < 0) {
+        aiInputDraft = aiInputEl.value;
+        aiInputHistoryIndex = aiInputHistory.length;
+      }
+      aiInputHistoryIndex = Math.max(0, aiInputHistoryIndex - 1);
+      aiInputEl.value = aiInputHistory[aiInputHistoryIndex] || "";
+      aiInputEl.setSelectionRange(aiInputEl.value.length, aiInputEl.value.length);
+      return;
+    }
+    if (event.ctrlKey && !event.shiftKey && !event.altKey && event.key === "ArrowDown") {
+      if (aiInputHistoryIndex < 0) return;
+      event.preventDefault();
+      aiInputHistoryIndex = Math.min(aiInputHistory.length, aiInputHistoryIndex + 1);
+      if (aiInputHistoryIndex >= aiInputHistory.length) {
+        aiInputEl.value = aiInputDraft;
+        aiInputHistoryIndex = -1;
+      } else {
+        aiInputEl.value = aiInputHistory[aiInputHistoryIndex] || "";
+      }
+      aiInputEl.setSelectionRange(aiInputEl.value.length, aiInputEl.value.length);
+      return;
+    }
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      sendAiMessage();
+    }
+  });
+  aiEndpointSaveBtn?.addEventListener("click", upsertEndpoint);
+  aiEndpointDeleteBtn?.addEventListener("click", deleteCurrentEndpoint);
+  aiEndpointTestBtn?.addEventListener("click", testCurrentEndpoint);
+  aiEndpointNewBtn?.addEventListener("click", () => {
+    aiEndpointEditId = "";
+    fillEndpointEditor("");
+    renderEndpointList();
+  });
+  aiApplyConfirmBtn?.addEventListener("click", applyAiEdit);
+  aiPaneSplitEl?.addEventListener("pointerdown", (event) => {
+    if (!aiInputEl || !aiPaneEl) return;
+    const startY = event.clientY;
+    const startHeight = aiInputEl.getBoundingClientRect().height;
+    const paneHeight = aiPaneEl.getBoundingClientRect().height;
+    const minHeight = 120;
+    const maxHeight = Math.max(minHeight, paneHeight - 140);
+    appEl?.classList.add("dragging");
+    aiPaneSplitEl.setPointerCapture(event.pointerId);
+
+    const onMove = (moveEvent) => {
+      const delta = startY - moveEvent.clientY;
+      const next = Math.min(maxHeight, Math.max(minHeight, startHeight + delta));
+      aiInputEl.style.flex = "0 0 auto";
+      aiInputEl.style.height = `${next}px`;
+    };
+
+    const onUp = () => {
+      appEl?.classList.remove("dragging");
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  });
   trackSymbolToggleBtn?.addEventListener("click", () => {
     trackSymbolInTree = !trackSymbolInTree;
     window.localStorage?.setItem(TRACK_SYMBOL_KEY, String(trackSymbolInTree));
@@ -3903,6 +4857,21 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
     hideDiagramContextMenu();
   });
+  aiMessageMenuEl?.addEventListener("click", async (event) => {
+    const action = event.target?.dataset?.action;
+    if (action === "copy") {
+      const text = aiMessageMenuEl?.dataset?.text || "";
+      if (text && navigator.clipboard?.writeText) {
+        try {
+          await navigator.clipboard.writeText(text);
+          setAiStatus("Copied message.");
+        } catch {
+          setAiStatus("Copy failed.");
+        }
+      }
+    }
+    hideAiMessageMenu();
+  });
   window.addEventListener("resize", () => {
     if (state.openFiles.length) {
       renderEditorTabs();
@@ -3912,6 +4881,12 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (!diagramContextMenuEl || diagramContextMenuEl.hidden) return;
     if (!event.target.closest("#diagram-context-menu")) {
       hideDiagramContextMenu();
+    }
+  });
+  document.addEventListener("click", (event) => {
+    if (!aiMessageMenuEl || aiMessageMenuEl.hidden) return;
+    if (!event.target.closest("#ai-message-menu")) {
+      hideAiMessageMenu();
     }
   });
   compileButton?.addEventListener("click", compileWorkspace);

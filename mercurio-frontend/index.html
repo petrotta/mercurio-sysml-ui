@@ -87,7 +87,9 @@
 
         <div class="panel editor-panel empty">
           <div class="panel-header">
-            <div class="panel-title"></div>
+            <div class="panel-title">
+              <div class="editor-tabs empty" id="editor-tabs"></div>
+            </div>
             <button id="diagram-toggle" type="button" class="tool-btn" title="Diagram view" hidden>
               <span class="icon diagram" aria-hidden="true"></span>
             </button>
@@ -104,7 +106,6 @@
               <li>Right-click files for project actions.</li>
             </ul>
           </div>
-          <div class="editor-tabs empty" id="editor-tabs"></div>
           <div id="diagram-pane" class="diagram-pane">
             <div class="diagram-toolbar">
               <div id="diagram-status" class="diagram-status">Diagram view available for SysML files.</div>
@@ -137,7 +138,12 @@
 
         <div class="panel output-panel">
           <div class="panel-header">
-            <span>Model Tree</span>
+            <div class="panel-title">
+              <button id="right-pane-toggle" class="panel-title-btn" type="button" title="Toggle AI / Model Tree">
+                <span id="right-pane-title">Model</span>
+                <span class="panel-title-caret" aria-hidden="true">▼</span>
+              </button>
+            </div>
             <div class="model-toolbar">
               <button id="model-group-toggle" type="button" class="icon-toggle" title="Group by file">
                 <span class="icon file" aria-hidden="true"></span>
@@ -151,6 +157,9 @@
               <button id="model-expand-all" type="button" title="Expand all">+</button>
               <button id="model-collapse-all" type="button" title="Collapse all">-</button>
             </div>
+            <button id="ai-settings-open" type="button" class="icon-toggle ai-only" title="AI settings">
+              <span class="icon gear" aria-hidden="true"></span>
+            </button>
             <button id="toggle-model-tree" type="button" class="panel-toggle" title="Collapse model tree">v</button>
           </div>
           <div id="model-tree" class="model-tree">
@@ -164,6 +173,17 @@
             </div>
             <div id="model-properties-body" class="model-properties-body">
               <p class="muted">Select a model element to see its properties.</p>
+            </div>
+          </div>
+          <div id="ai-pane" class="ai-pane">
+            <div class="ai-messages" id="ai-messages"></div>
+            <div id="ai-pane-split" class="ai-pane-split" aria-hidden="true"></div>
+            <div class="ai-input">
+              <textarea id="ai-input" rows="3" placeholder="Ask about your model or generate SysML..."></textarea>
+              <div class="ai-actions">
+                <div id="ai-status" class="ai-status"></div>
+                <button id="ai-clear" type="button" class="ghost">Clear</button>
+              </div>
             </div>
           </div>
         </div>
@@ -196,6 +216,9 @@
     </div>
     <div id="diagram-context-menu" class="context-menu" role="menu" hidden>
       <button type="button" data-action="select-tree">Select in model tree</button>
+    </div>
+    <div id="ai-message-menu" class="context-menu" role="menu" hidden>
+      <button type="button" data-action="copy">Copy</button>
     </div>
     <div id="new-file-dialog" class="modal" hidden>
       <div class="modal-backdrop" data-action="close"></div>
@@ -431,6 +454,82 @@
               </div>
             </div>
           </section>
+        </div>
+      </div>
+    </div>
+    <div id="ai-settings-dialog" class="modal" hidden>
+      <div class="modal-backdrop" data-action="close"></div>
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="ai-settings-title">
+        <div class="modal-header">
+          <h3 id="ai-settings-title">AI Settings</h3>
+        </div>
+        <div class="modal-body">
+          <div class="field-group">
+            <div class="field-group-title">AI Endpoints</div>
+            <div class="ai-endpoint-list" id="ai-endpoint-list"></div>
+            <div class="field-grid">
+              <label class="field">
+                <span class="field-label">Name</span>
+                <input id="ai-endpoint-name" type="text" placeholder="OpenAI" />
+              </label>
+              <label class="field">
+                <span class="field-label">Type</span>
+                <select id="ai-endpoint-type">
+                  <option value="chat">Chat</option>
+                  <option value="embeddings">Embeddings</option>
+                </select>
+              </label>
+              <label class="field">
+                <span class="field-label">Base URL</span>
+                <input id="ai-endpoint-base" type="text" placeholder="https://api.openai.com/v1" />
+              </label>
+              <label class="field">
+                <span class="field-label">Model</span>
+                <input id="ai-endpoint-model" type="text" placeholder="gpt-5.1" />
+              </label>
+              <label class="field">
+                <span class="field-label">Token</span>
+                <input id="ai-endpoint-token" type="password" placeholder="sk-..." />
+              </label>
+            </div>
+            <div class="field-inline">
+              <button id="ai-endpoint-new" type="button" class="ghost">New</button>
+              <button id="ai-endpoint-save" type="button">Save</button>
+              <button id="ai-endpoint-delete" type="button" class="ghost">Delete</button>
+              <button id="ai-endpoint-test" type="button">Test</button>
+            </div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="ghost" data-action="close">Close</button>
+        </div>
+      </div>
+    </div>
+    <div id="ai-apply-dialog" class="modal" hidden>
+      <div class="modal-backdrop" data-action="close"></div>
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="ai-apply-title">
+        <div class="modal-header">
+          <h3 id="ai-apply-title">Apply AI Edit</h3>
+        </div>
+        <div class="modal-body">
+          <div class="field">
+            <span class="field-label">Target file</span>
+            <div id="ai-apply-path" class="field-value">No file</div>
+          </div>
+          <div class="field-grid ai-apply-grid">
+            <label class="field">
+              <span class="field-label">Current content</span>
+              <textarea id="ai-apply-current-content" rows="10" readonly></textarea>
+            </label>
+            <label class="field">
+              <span class="field-label">Proposed content</span>
+              <textarea id="ai-apply-proposed" rows="10"></textarea>
+            </label>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="ghost" data-action="close">Cancel</button>
+          <button type="button" id="ai-apply-confirm">Apply</button>
         </div>
       </div>
     </div>

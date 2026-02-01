@@ -490,6 +490,28 @@ fn read_file(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn read_llm_instructions(app: tauri::AppHandle) -> Result<String, String> {
+    app.path()
+        .resolve("llm/instructions.md", tauri::path::BaseDirectory::Resource)
+        .map_err(|e| e.to_string())
+        .and_then(|path| fs::read_to_string(path).map_err(|e| e.to_string()))
+}
+
+#[tauri::command]
+fn read_llm_hints(app: tauri::AppHandle) -> Result<String, String> {
+    let resource_path = app
+        .path()
+        .resolve("llm/hints.json", tauri::path::BaseDirectory::Resource)
+        .map_err(|e| e.to_string())?;
+    if let Ok(content) = fs::read_to_string(&resource_path) {
+        return Ok(content);
+    }
+    let dev_root = std::env::current_dir().map_err(|e| e.to_string())?;
+    let dev_path = dev_root.join("mercurio-application").join("llm").join("hints.json");
+    fs::read_to_string(dev_path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn path_exists(path: String) -> Result<bool, String> {
     Ok(PathBuf::from(path).exists())
 }
@@ -2227,7 +2249,9 @@ pub fn run() {
             window_close,
             compile_workspace,
             cancel_compile,
-            export_compiled_model
+            export_compiled_model,
+            read_llm_instructions,
+            read_llm_hints
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
