@@ -30,10 +30,12 @@
     <script type="module" src="/main.js" defer></script>
   </head>
 
-  <body>
+  <body class="booting">
     <div class="titlebar" data-tauri-drag-region>
       <div class="titlebar-left">
-        <span class="app-mark"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAWAAAABkCAIAAAA35X25AAAD70lEQVR4Xu3bz2scZRjA8f4/g1Lwr5CqVNRWKhW8ighKJZRIpfiDStFDQsRb6EGl+OPSXtRWUtRje02xsLlYCFQsLAQqBOKLL6zLvvNsdifamWE+Lx8Kzcy+h8nTLzOz9Fj1xHGAWsfKHwFkAgGEBAIICQQQEgggJBBASCCAkEAAIYEAQgIBhAQCCAkEEBIIICQQQEgggJBAACGBAEICAYQEAggJBBASCCAkEEBIIICQQAAhgQBCAgGEBAIICQQQEgggJBBASCCAkEAAIYEAQgIBhAQCCAkEEBIIICQQw3XmlbPffPvdnw8fHtSt/f397e276YQL71188vhT5ceZcfvOnb29vbOvvlYeWsQzz5188OCP0WinPNQigRiok8+/mKZ5tgrBSqV44aXT5SZMS0lN16pZI3Id8tUuj7ZIIAbq3DsrG599Pt+1a9dHo508tWn60x1HuQ8Tb719rlkjputw6ePL5QktEggOsXJ+NT+G/HbvnmeN+Ro0ost1qASCRbz+xpudneCuWaoRHa9DJRCDksbx+x9+nEzknDUej7e2bk3P98+//Jp+fuPmT+W2zFiwEd2vQyUQw5HGcfG3kpOV7h3yx9fWN9Jfd3d3y50pHdqIXtShEojhSPcOB//cGnzx5Vfl+8gZm5tXJu8d8sdX372Qp7ncmVpzGtGXOlQCMRx5IlMdykO10uBOF0EgGqhtRI/qUHUqEJc/+fTRo7/yhWu20i/j6tWvy51J8iVKdwfloVozRRCIZmYa0a86VJ0KRLqbzRfuKCv9GsqdqQSiPdON6Fcdqk4F4ukTz66tb5TPw0s59fKZcmcqgWjVpBF59aUOVacCwf8qj6ZAtCI9WUz+z0t6jq79XqObBGIoBKIt0+8dyneWHScQQ5EHVCAes5m3krXfa3SZQAxFnlGBeJxqv7PoVyMEYijymB4xENvbd8szqVVbh6xHjRCIofhPArG2vlGeSWlOHbK+NEIghuKIgVg5v1o76JQOrUPWi0YIxFAcMRAsaME6ZN1vhEAMxXg8ToO4uXmlPFTr4vsfCMSylqpD1vFGCMRQbG3dSlOYxjcNbro7mC/V4ff799P56c9yK2o1qEPW5UYIxFCkycuzu9T68KNL5VbUalaHbLoR5dEWCcSApCkcjXb+/dc/d6V7B3VYymi0c9CoDlluRKpMeahFAgGEBAIICQQQEgggJBBASCCAkEAAIYEAQgIBhAQCCAkEEBIIICQQQEgggJBAACGBAEICAYQEAggJBBASCCAkEEBIIICQQAAhgQBCAgGEBAIICQQQEgggJBBASCCAkEAAIYEAQgIBhAQCCAkEEBIIICQQQEgggNDfRWVFgC440QYAAAAASUVORK5CYII=" alt="Mercurio" /></span>
+        <span class="app-mark" aria-hidden="true">
+          <img src="/app-icon.png" alt="" />
+        </span>
         <button class="menu-button" id="menu-file" type="button" aria-expanded="false" data-tauri-drag-region="false">File</button>
         <button class="menu-button" id="menu-edit" type="button" aria-expanded="false" data-tauri-drag-region="false">Edit</button>
         <button class="menu-button" id="menu-view" type="button" aria-expanded="false" data-tauri-drag-region="false">View</button>
@@ -116,11 +118,8 @@
             </div>
             <div class="diagram-canvas" id="diagram-canvas">
               <svg id="diagram-svg" class="diagram-svg" role="img" aria-label="SysML diagram"></svg>
-              <div class="diagram-scrollbar diagram-scrollbar-x" id="diagram-scrollbar-x">
-                <div class="diagram-scroll-thumb"></div>
-              </div>
-              <div class="diagram-scrollbar diagram-scrollbar-y" id="diagram-scrollbar-y">
-                <div class="diagram-scroll-thumb"></div>
+              <div id="diagram-minimap" class="diagram-minimap">
+                <svg id="diagram-minimap-svg" class="diagram-minimap-svg" aria-label="Diagram minimap"></svg>
               </div>
             </div>
           </div>
@@ -188,7 +187,6 @@
               <textarea id="ai-input" rows="3" placeholder="Ask about your model or generate SysML..."></textarea>
               <div class="ai-actions">
                 <div id="ai-status" class="ai-status"></div>
-                <button id="ai-clear" type="button" class="ghost">Clear</button>
               </div>
             </div>
           </div>
@@ -225,6 +223,7 @@
     </div>
     <div id="ai-message-menu" class="context-menu" role="menu" hidden>
       <button type="button" data-action="copy">Copy</button>
+      <button type="button" data-action="clear">Clear chat</button>
     </div>
     <div id="new-file-dialog" class="modal" hidden>
       <div class="modal-backdrop" data-action="close"></div>

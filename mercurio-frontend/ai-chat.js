@@ -55,18 +55,26 @@ function cosineSimilarity(a, b) {
   return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
+function joinPath(...parts) {
+  return parts
+    .filter((part) => typeof part === "string" && part.length)
+    .map((part, index) => (index === 0 ? part.replace(/[\\/]+$/, "") : part.replace(/^[\\/]+/, "")))
+    .join("\\");
+}
+
 export function initAiChat(options) {
   const {
     invoke,
     elements,
     getState,
+    getProjectFiles,
     getEditor,
     onEdit,
     onNew,
     onParse,
     setStatus: externalSetStatus,
   } = options;
-  const { messagesEl, inputEl, statusEl, clearBtn, messageMenuEl } = elements;
+  const { messagesEl, inputEl, statusEl, messageMenuEl } = elements;
 
   let llmInstructions = "";
   let llmHintIndex = null;
@@ -82,6 +90,13 @@ export function initAiChat(options) {
     externalSetStatus?.(text || "");
   };
 
+  let activeController = null;
+  const setProcessing = (active) => {
+    if (statusEl) {
+      statusEl.classList.toggle("working", active);
+    }
+  };
+
   const renderMessage = (role, text) => {
     if (!messagesEl) return;
     const item = document.createElement("div");
@@ -92,6 +107,38 @@ export function initAiChat(options) {
       item.textContent = text;
     }
     messagesEl.appendChild(item);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return item;
+  };
+
+  const renderPendingResponse = () => {
+    if (!messagesEl) return null;
+    const item = document.createElement("div");
+    item.className = "ai-message assistant pending";
+    const dots = document.createElement("span");
+    dots.className = "ai-pending-dots";
+    dots.innerHTML = "<span>.</span><span>.</span><span>.</span>";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "ai-pending-cancel";
+    cancel.textContent = "Cancel";
+    cancel.addEventListener("click", () => {
+      if (activeController) {
+        activeController.abort();
+      }
+    });
+    item.appendChild(dots);
+    item.appendChild(cancel);
+    messagesEl.appendChild(item);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return item;
+  };
+
+  const replacePendingResponse = (pendingEl, text) => {
+    if (!pendingEl || !messagesEl) return;
+    pendingEl.classList.remove("pending");
+    pendingEl.innerHTML = "";
+    pendingEl.appendChild(renderMarkdown(text || ""));
     messagesEl.scrollTop = messagesEl.scrollHeight;
   };
 
@@ -241,7 +288,36 @@ export function initAiChat(options) {
     return scored.slice(0, maxItems).map((entry) => entry.item);
   };
 
-  const buildChatMessages = (content, hintText = "") => {
+  const loadProjectContext = async (currentPath) => {
+    const files = typeof getProjectFiles === "function" ? getProjectFiles() : [];
+    if (!Array.isArray(files) || !files.length) return "";
+    const candidates = files.filter((path) => {
+      if (!path || path === currentPath) return false;
+      return /\.kerml$|\.sysml$/i.test(path);
+    });
+    if (!candidates.length) return "";
+    const maxFiles = 8;
+    const maxTotal = 60000;
+    const maxPerFile = 8000;
+    let total = 0;
+    const chunks = [];
+    for (const path of candidates.slice(0, maxFiles)) {
+      if (total >= maxTotal) break;
+      try {
+        const raw = await invoke("read_file", { path });
+        if (!raw) continue;
+        const clipped = raw.slice(0, Math.min(maxPerFile, maxTotal - total));
+        total += clipped.length;
+        chunks.push(`File: ${path}\n${clipped}`);
+      } catch {
+        // ignore read errors
+      }
+    }
+    if (!chunks.length) return "";
+    return `Other project files (truncated):\n\n${chunks.join("\n\n")}`;
+  };
+
+  const buildChatMessages = async (content, hintText = "") => {
     const history = Array.from(messagesEl.querySelectorAll(".ai-message")).map((node) => {
       const role = node.classList.contains("assistant") ? "assistant" : "user";
       return { role, content: node.textContent || "" };
@@ -264,23 +340,41 @@ export function initAiChat(options) {
       const cursorCol = pos ? pos.column : 1;
       const context = `Current file: ${state.currentFile}\n\n${fileContent}`;
       const cursor = `Cursor position: line ${cursorLine}, column ${cursorCol}`;
+      const projectContext = await loadProjectContext(state.currentFile);
       return [
         system,
         ...(instructionMessage ? [instructionMessage] : []),
         ...(hintMessage ? [hintMessage] : []),
         { role: "user", content: context },
         { role: "user", content: cursor },
+        ...(projectContext ? [{ role: "user", content: projectContext }] : []),
         ...history,
         { role: "user", content },
       ];
     }
+    const projectContext = await loadProjectContext("");
     return [
       system,
       ...(instructionMessage ? [instructionMessage] : []),
       ...(hintMessage ? [hintMessage] : []),
+      ...(projectContext ? [{ role: "user", content: projectContext }] : []),
       ...history,
       { role: "user", content },
     ];
+  };
+
+  const parseFilesCommand = (text) => {
+    const match = text.match(/^\/files\b[:\s-]*/i);
+    if (!match) return null;
+    const rest = text.slice(match[0].length).trim();
+    return { filter: rest };
+  };
+
+  const parseReadCommand = (text) => {
+    const match = text.match(/^\/read\b[:\s-]*/i);
+    if (!match) return null;
+    const rest = text.slice(match[0].length).trim();
+    return { relPath: rest };
   };
 
   const renderMarkdown = (text) => {
@@ -461,6 +555,55 @@ export function initAiChat(options) {
       return;
     }
 
+    const filesCommand = parseFilesCommand(normalizedSlash);
+    if (filesCommand) {
+      inputEl.value = "";
+      renderMessage("user", content);
+      const list = typeof getProjectFiles === "function" ? getProjectFiles() : [];
+      const filter = filesCommand.filter.toLowerCase();
+      const filtered = Array.isArray(list)
+        ? list.filter((path) => {
+          if (!filter) return true;
+          return String(path).toLowerCase().includes(filter);
+        })
+        : [];
+      if (!filtered.length) {
+        renderMessage("assistant", "No files found.");
+      } else {
+        const lines = filtered.slice(0, 500).map((path, idx) => `${idx + 1}. ${path}`);
+        renderMessage("assistant", `Files:\n${lines.join("\n")}`);
+      }
+      return;
+    }
+
+    const readCommand = parseReadCommand(normalizedSlash);
+    if (readCommand) {
+      inputEl.value = "";
+      renderMessage("user", content);
+      const relPath = readCommand.relPath.replace(/^["']|["']$/g, "");
+      if (!relPath) {
+        setStatus("Provide a relative path after /read.");
+        return;
+      }
+      if (/^[A-Za-z]:[\\/]|^\\\\|^\//.test(relPath)) {
+        setStatus("Use a relative path inside the current project.");
+        return;
+      }
+      const state = getState();
+      if (!state?.rootPath) {
+        setStatus("Select a project root first.");
+        return;
+      }
+      try {
+        const fullPath = joinPath(state.rootPath, relPath);
+        const raw = await invoke("read_file", { path: fullPath });
+        renderMessage("assistant", `File: ${relPath}\n\n${raw || ""}`);
+      } catch (error) {
+        setStatus(`Read failed: ${error}`);
+      }
+      return;
+    }
+
     const newCommand = parseNewCommand(normalizedSlash);
     if (newCommand) {
       inputEl.value = "";
@@ -493,7 +636,10 @@ export function initAiChat(options) {
     }
     inputEl.value = "";
     renderMessage("user", content);
-    setStatus("Sending...");
+    activeController = new AbortController();
+    setProcessing(true);
+    setStatus("Thinking...");
+    const pendingEl = renderPendingResponse();
     try {
       let hintText = "";
       try {
@@ -503,8 +649,8 @@ export function initAiChat(options) {
           hintText = `Relevant hints:\n${lines.join("\n\n")}`;
         }
       } catch {}
-      const messages = buildChatMessages(content, hintText);
-      const reply = await sendChatMessage(endpoint, messages);
+      const messages = await buildChatMessages(content, hintText);
+      const reply = await sendChatMessage(endpoint, messages, { signal: activeController.signal });
       const replyText = reply || "(no response)";
       const normalizedReply = replyText.replace(/^[\uFEFF\u200B]+/, "").replace(/^[\uFF0F]/, "/");
       const replyNew = parseNewCommand(normalizedReply);
@@ -512,8 +658,9 @@ export function initAiChat(options) {
         const created = await onNew?.(replyNew.relPath, replyNew.content);
         if (created) {
           renderNewSummary(replyNew.relPath, normalizedReply);
+          if (pendingEl) pendingEl.remove();
         } else {
-          renderMessage("assistant", replyText);
+          replacePendingResponse(pendingEl, replyText);
         }
       } else {
         const replyEdit = normalizedReply.match(/^\/edit\b[:\s-]*/i);
@@ -522,18 +669,27 @@ export function initAiChat(options) {
           if (instruction) {
             const applied = await onEdit?.(instruction);
             if (applied) {
+              if (pendingEl) pendingEl.remove();
               renderEditSummary(getState()?.currentFile, normalizedReply);
             } else {
-              renderMessage("assistant", replyText);
+              replacePendingResponse(pendingEl, replyText);
             }
           }
         } else {
-          renderMessage("assistant", replyText);
+          replacePendingResponse(pendingEl, replyText);
         }
       }
       setStatus("");
     } catch (error) {
-      setStatus(`AI error: ${error}`);
+      if (pendingEl) pendingEl.remove();
+      if (error?.name === "AbortError") {
+        setStatus("Canceled");
+      } else {
+        setStatus(`AI error: ${error}`);
+      }
+    } finally {
+      activeController = null;
+      setProcessing(false);
     }
   };
 
@@ -569,17 +725,11 @@ export function initAiChat(options) {
         handleMessage();
       }
     });
-    clearBtn?.addEventListener("click", () => {
-      if (messagesEl) {
-        messagesEl.innerHTML = "";
-      }
-      setStatus("");
-    });
     messagesEl?.addEventListener("contextmenu", (event) => {
+      if (!messageMenuEl) return;
       const target = event.target.closest(".ai-message");
-      if (!target || !messageMenuEl) return;
       event.preventDefault();
-      messageMenuEl.dataset.text = target.textContent || "";
+      messageMenuEl.dataset.text = target?.textContent || "";
       messageMenuEl.hidden = false;
       const rect = messageMenuEl.getBoundingClientRect();
       const left = Math.min(event.clientX, window.innerWidth - rect.width - 8);
@@ -608,6 +758,12 @@ export function initAiChat(options) {
             setStatus("Copy failed.");
           }
         }
+      }
+      if (action === "clear") {
+        if (messagesEl) {
+          messagesEl.innerHTML = "";
+        }
+        setStatus("");
       }
       if (messageMenuEl) {
         messageMenuEl.hidden = true;

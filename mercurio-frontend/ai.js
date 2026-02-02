@@ -114,7 +114,7 @@ async function testEndpoint(endpoint) {
   return true;
 }
 
-async function sendChatMessage(endpoint, messages) {
+async function sendChatMessage(endpoint, messages, options = {}) {
   const baseUrl = normalizeBaseUrl(endpoint.baseUrl);
   const headers = {
     "Content-Type": "application/json",
@@ -125,6 +125,7 @@ async function sendChatMessage(endpoint, messages) {
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers,
+    signal: options.signal,
     body: JSON.stringify({
       model: endpoint.model,
       messages,

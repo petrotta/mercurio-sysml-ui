@@ -9,11 +9,8 @@ const diagramState = {
   autoLayoutEl: null,
   copyEl: null,
   canvasEl: null,
-  scrollXEl: null,
-  scrollYEl: null,
-  scrollXThumbEl: null,
-  scrollYThumbEl: null,
-  scrollDrag: null,
+  minimapEl: null,
+  minimapSvgEl: null,
   editorPanelEl: null,
   normalizePath: (value) => value || "",
   readFile: null,
@@ -32,21 +29,22 @@ const diagramState = {
   pointerState: {
     dragging: null,
     resizing: null,
+    panning: false,
     startX: 0,
     startY: 0,
     originX: 0,
     originY: 0,
     originW: 0,
     originH: 0,
+    panOriginX: 0,
+    panOriginY: 0,
     downNodeId: null,
     downCollapseId: null,
     moved: false,
   },
   layoutBounds: { width: 800, height: 600 },
+  contentBounds: { minX: 0, minY: 0, maxX: 800, maxY: 600 },
   gridSize: 24,
-  viewportFrame: null,
-  viewportHandle: null,
-  viewportResizing: null,
   elkLoadPromise: null,
   log: null,
 };
@@ -62,10 +60,8 @@ export function initDiagram(options) {
   diagramState.autoLayoutEl = options.autoLayoutEl || null;
   diagramState.copyEl = options.copyEl || null;
   diagramState.canvasEl = options.canvasEl || null;
-  diagramState.scrollXEl = options.scrollXEl || null;
-  diagramState.scrollYEl = options.scrollYEl || null;
-  diagramState.scrollXThumbEl = diagramState.scrollXEl?.querySelector(".diagram-scroll-thumb") || null;
-  diagramState.scrollYThumbEl = diagramState.scrollYEl?.querySelector(".diagram-scroll-thumb") || null;
+  diagramState.minimapEl = options.minimapEl || null;
+  diagramState.minimapSvgEl = options.minimapSvgEl || null;
   diagramState.editorPanelEl = options.editorPanelEl || null;
   diagramState.readFile = typeof options.readFile === "function" ? options.readFile : null;
   diagramState.writeFile = typeof options.writeFile === "function" ? options.writeFile : null;
@@ -95,74 +91,26 @@ export function initDiagram(options) {
     await copyDiagramToClipboard();
   });
 
-  if (diagramState.scrollXEl) {
-    diagramState.scrollXEl.addEventListener("pointerdown", (event) => {
-      const thumb = event.target.closest(".diagram-scroll-thumb");
-      if (!thumb) return;
-      const state = getScrollState("x");
-      if (!state) return;
-      diagramState.scrollDrag = {
-        axis: "x",
-        startPos: event.clientX,
-        startScroll: state.scroll,
-        trackLen: state.trackLen,
-        thumbLen: state.thumbLen,
-        maxScroll: state.maxScroll,
-      };
-      diagramState.scrollXEl.setPointerCapture(event.pointerId);
-      event.preventDefault();
-    });
-  }
-  if (diagramState.scrollYEl) {
-    diagramState.scrollYEl.addEventListener("pointerdown", (event) => {
-      const thumb = event.target.closest(".diagram-scroll-thumb");
-      if (!thumb) return;
-      const state = getScrollState("y");
-      if (!state) return;
-      diagramState.scrollDrag = {
-        axis: "y",
-        startPos: event.clientY,
-        startScroll: state.scroll,
-        trackLen: state.trackLen,
-        thumbLen: state.thumbLen,
-        maxScroll: state.maxScroll,
-      };
-      diagramState.scrollYEl.setPointerCapture(event.pointerId);
-      event.preventDefault();
-    });
-  }
-
   diagramState.svgEl?.addEventListener(
     "wheel",
     (event) => {
       if (!diagramState.mode) return;
       event.preventDefault();
-      const delta = event.deltaY < 0 ? 0.1 : -0.1;
-      setDiagramZoom(diagramState.zoom + delta);
+      const zooming = event.ctrlKey || event.metaKey;
+      if (zooming) {
+        const delta = event.deltaY < 0 ? 0.1 : -0.1;
+        setDiagramZoom(diagramState.zoom + delta, { x: event.clientX, y: event.clientY });
+        return;
+      }
+      diagramState.pan.x += event.deltaX / diagramState.zoom;
+      diagramState.pan.y += event.deltaY / diagramState.zoom;
+      updateCameraView();
     },
     { passive: false }
   );
 
   diagramState.svgEl?.addEventListener("pointerdown", (event) => {
     if (!diagramState.mode) return;
-    const viewportHandle = event.target.closest(".diagram-viewport-handle");
-    if (viewportHandle) {
-      const bounds = getVisibleBounds();
-      if (bounds) {
-        diagramState.viewportResizing = {
-          startX: event.clientX,
-          startY: event.clientY,
-          startW: bounds.width,
-          startH: bounds.height,
-          startMinX: bounds.minX,
-          startMinY: bounds.minY,
-        };
-        diagramState.svgEl.setPointerCapture(event.pointerId);
-        diagramState.pointerState.moved = true;
-        event.preventDefault();
-        return;
-      }
-    }
     const collapseTarget = event.target.closest(".diagram-collapse");
     if (collapseTarget) {
       diagramState.pointerState.downCollapseId = collapseTarget.dataset.nodeId || null;
@@ -175,6 +123,16 @@ export function initDiagram(options) {
     diagramState.pointerState.moved = false;
     const downTarget = event.target.closest("g[data-node-id]");
     diagramState.pointerState.downNodeId = downTarget ? downTarget.dataset.nodeId : null;
+    if (!downTarget && event.button === 0) {
+      diagramState.pointerState.panning = true;
+      diagramState.pointerState.startX = event.clientX;
+      diagramState.pointerState.startY = event.clientY;
+      diagramState.pointerState.panOriginX = diagramState.pan.x;
+      diagramState.pointerState.panOriginY = diagramState.pan.y;
+      diagramState.svgEl.setPointerCapture(event.pointerId);
+      event.preventDefault();
+      return;
+    }
     const resizeHandle = event.target.closest(".diagram-resize-handle");
     if (resizeHandle) {
       const target = resizeHandle.closest("g[data-node-id]");
@@ -205,45 +163,33 @@ export function initDiagram(options) {
     diagramState.svgEl.setPointerCapture(event.pointerId);
   });
 
-  diagramState.svgEl?.addEventListener("pointermove", (event) => {
-    if (diagramState.scrollDrag) {
-      const drag = diagramState.scrollDrag;
-      const delta = (drag.axis === "x" ? event.clientX : event.clientY) - drag.startPos;
-      const travel = Math.max(1, drag.trackLen - drag.thumbLen);
-      const scrollDelta = (delta / travel) * drag.maxScroll;
-      const nextScroll = Math.min(Math.max(drag.startScroll + scrollDelta, 0), drag.maxScroll);
-      if (drag.axis === "x") {
-        diagramState.pan.x = -nextScroll;
-      } else {
-        diagramState.pan.y = -nextScroll;
-      }
-      updateDiagramViewportTransform();
-      return;
+  diagramState.minimapEl?.addEventListener("pointerdown", (event) => {
+    if (!diagramState.mode) return;
+    const rect = diagramState.minimapEl.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const bounds = diagramState.contentBounds || computeContentBounds();
+    const width = Math.max(1, bounds.maxX - bounds.minX);
+    const height = Math.max(1, bounds.maxY - bounds.minY);
+    const x = bounds.minX + ((event.clientX - rect.left) / rect.width) * width;
+    const y = bounds.minY + ((event.clientY - rect.top) / rect.height) * height;
+    const visible = getVisibleBounds();
+    if (visible) {
+      diagramState.pan.x = x - visible.width / 2;
+      diagramState.pan.y = y - visible.height / 2;
+      updateCameraView();
     }
-    if (diagramState.viewportResizing) {
-      const dx = (event.clientX - diagramState.viewportResizing.startX) / diagramState.zoom;
-      const dy = (event.clientY - diagramState.viewportResizing.startY) / diagramState.zoom;
-      const svgRect = diagramState.svgEl.getBoundingClientRect();
-      const minSize = 200;
-      const maxW = Math.max(minSize, diagramState.layoutBounds.width);
-      const maxH = Math.max(minSize, diagramState.layoutBounds.height);
-      const nextW = Math.min(
-        Math.max(diagramState.viewportResizing.startW + dx, minSize),
-        maxW
-      );
-      const nextH = Math.min(
-        Math.max(diagramState.viewportResizing.startH + dy, minSize),
-        maxH
-      );
-      const zoomX = svgRect.width / nextW;
-      const zoomY = svgRect.height / nextH;
-      const nextZoom = Math.min(2.5, Math.max(0.4, Math.min(zoomX, zoomY)));
-      diagramState.zoom = nextZoom;
-      diagramState.pan = {
-        x: -diagramState.viewportResizing.startMinX,
-        y: -diagramState.viewportResizing.startMinY,
-      };
-      updateDiagramViewportTransform();
+  });
+
+  diagramState.svgEl?.addEventListener("pointermove", (event) => {
+    if (diagramState.pointerState.panning) {
+      const dx = event.clientX - diagramState.pointerState.startX;
+      const dy = event.clientY - diagramState.pointerState.startY;
+      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) {
+        diagramState.pointerState.moved = true;
+      }
+      diagramState.pan.x = diagramState.pointerState.panOriginX - dx / diagramState.zoom;
+      diagramState.pan.y = diagramState.pointerState.panOriginY - dy / diagramState.zoom;
+      updateCameraView();
       return;
     }
     const resizingId = diagramState.pointerState.resizing;
@@ -264,8 +210,10 @@ export function initDiagram(options) {
       );
       node.width = size.width;
       node.height = size.height;
+      expandContentBoundsForNode(node);
       updateNodeSize(resizingId);
       updateEdgePaths(resizingId);
+      updateMinimap();
       return;
     }
     const nodeId = diagramState.pointerState.dragging;
@@ -279,24 +227,25 @@ export function initDiagram(options) {
     if (!node) return;
     const dxScaled = dx / diagramState.zoom;
     const dyScaled = dy / diagramState.zoom;
-    const parentId = node.parentId;
-    const parent = parentId ? diagramState.nodePositions.get(parentId) : null;
-    const padding = 12;
-    const minX = parent ? parent.x + padding : 20;
-    const minY = parent ? parent.y + padding + 18 : 20;
-    const dragBounds = getDragBounds();
-    const maxX = parent
-      ? parent.x + parent.width - node.width - padding
-      : dragBounds.width - node.width - 20;
-    const maxY = parent
-      ? parent.y + parent.height - node.height - padding
-      : dragBounds.height - node.height - 20;
     const snapped = snapPoint({
       x: diagramState.pointerState.originX + dxScaled,
       y: diagramState.pointerState.originY + dyScaled,
     });
-    node.x = Math.min(Math.max(snapped.x, minX), maxX);
-    node.y = Math.min(Math.max(snapped.y, minY), maxY);
+    const parentId = node.parentId;
+    const parent = parentId ? diagramState.nodePositions.get(parentId) : null;
+    if (parent) {
+      const padding = 12;
+      const minX = parent.x + padding;
+      const minY = parent.y + padding + 18;
+      const maxX = parent.x + parent.width - node.width - padding;
+      const maxY = parent.y + parent.height - node.height - padding;
+      node.x = Math.min(Math.max(snapped.x, minX), maxX);
+      node.y = Math.min(Math.max(snapped.y, minY), maxY);
+    } else {
+      node.x = snapped.x;
+      node.y = snapped.y;
+      expandContentBoundsForNode(node);
+    }
     const group = diagramState.svgEl.querySelector(`g[data-node-id="${CSS.escape(nodeId)}"]`);
     if (group) {
       group.setAttribute("transform", `translate(${node.x} ${node.y})`);
@@ -308,6 +257,7 @@ export function initDiagram(options) {
         const snappedChild = snapPoint({ x: node.x + offset.dx, y: node.y + offset.dy });
         child.x = snappedChild.x;
         child.y = snappedChild.y;
+        expandContentBoundsForNode(child);
         const childGroup = diagramState.svgEl.querySelector(`g[data-node-id="${CSS.escape(childId)}"]`);
         if (childGroup) {
           childGroup.setAttribute("transform", `translate(${child.x} ${child.y})`);
@@ -315,21 +265,10 @@ export function initDiagram(options) {
       });
     }
     updateEdgePaths(nodeId);
+    updateMinimap();
   });
 
   diagramState.svgEl?.addEventListener("pointerup", (event) => {
-    if (diagramState.scrollDrag) {
-      if (diagramState.scrollDrag.axis === "x") {
-        diagramState.scrollXEl?.releasePointerCapture(event.pointerId);
-      } else {
-        diagramState.scrollYEl?.releasePointerCapture(event.pointerId);
-      }
-      diagramState.scrollDrag = null;
-    }
-    if (diagramState.viewportResizing) {
-      diagramState.viewportResizing = null;
-      diagramState.svgEl.releasePointerCapture(event.pointerId);
-    }
     const hadDrag = diagramState.pointerState.dragging || diagramState.pointerState.resizing;
     if (hadDrag) {
       diagramState.svgEl.releasePointerCapture(event.pointerId);
@@ -337,6 +276,10 @@ export function initDiagram(options) {
       diagramState.pointerState.resizing = null;
       diagramState.pointerState.childOffsets = null;
       void saveDiagramLayout();
+    }
+    if (diagramState.pointerState.panning) {
+      diagramState.pointerState.panning = false;
+      diagramState.svgEl.releasePointerCapture(event.pointerId);
     }
     if (diagramState.pointerState.downCollapseId) {
       const dx = event.clientX - diagramState.pointerState.startX;
@@ -380,8 +323,7 @@ export function initDiagram(options) {
     diagramState.pointerState.moved = false;
     diagramState.pointerState.downNodeId = null;
     diagramState.pointerState.downCollapseId = null;
-    diagramState.viewportResizing = null;
-    diagramState.scrollDrag = null;
+    diagramState.pointerState.panning = false;
   });
 
   diagramState.svgEl?.addEventListener("contextmenu", (event) => {
@@ -405,6 +347,11 @@ export function initDiagram(options) {
     const nodeId = collapseButton.dataset.nodeId;
     if (!nodeId) return;
     toggleCollapse(nodeId);
+  });
+
+  window.addEventListener("resize", () => {
+    if (!diagramState.mode) return;
+    updateCameraView();
   });
 
   updateDiagramToggle();
@@ -435,7 +382,6 @@ export function setDiagramMode(enabled) {
   diagramState.editorPanelEl.classList.toggle("diagram-mode", next);
   diagramState.toggleEl.classList.toggle("active", next);
   if (next) {
-    fitDiagramToView();
     void renderDiagramForCurrentFile();
   }
 }
@@ -523,13 +469,27 @@ function toggleCollapse(nodeId) {
   setCollapsedState(nodeId, next);
 }
 
-function setDiagramZoom(value) {
+function setDiagramZoom(value, anchor) {
   const next = Math.min(Math.max(value, 0.4), 2.5);
-  diagramState.zoom = next;
+  if (next === diagramState.zoom) return;
+  if (anchor && diagramState.svgEl) {
+    const rect = diagramState.svgEl.getBoundingClientRect();
+    if (rect.width && rect.height) {
+      const worldX = diagramState.pan.x + (anchor.x - rect.left) / diagramState.zoom;
+      const worldY = diagramState.pan.y + (anchor.y - rect.top) / diagramState.zoom;
+      diagramState.zoom = next;
+      diagramState.pan.x = worldX - (anchor.x - rect.left) / next;
+      diagramState.pan.y = worldY - (anchor.y - rect.top) / next;
+    } else {
+      diagramState.zoom = next;
+    }
+  } else {
+    diagramState.zoom = next;
+  }
   if (diagramState.zoomResetEl) {
     diagramState.zoomResetEl.textContent = `${Math.round(next * 100)}%`;
   }
-  updateDiagramViewportTransform();
+  updateCameraView();
 }
 
 function snapValue(value) {
@@ -544,93 +504,68 @@ function snapPoint(point) {
   };
 }
 
-function getScrollState(axis) {
-  const canvas = diagramState.canvasEl;
-  if (!canvas) return null;
-  const rect = canvas.getBoundingClientRect();
-  if (!rect.width || !rect.height) return null;
-  const visibleWidth = rect.width / diagramState.zoom;
-  const visibleHeight = rect.height / diagramState.zoom;
-  const contentWidth = Math.max(diagramState.layoutBounds.width, visibleWidth);
-  const contentHeight = Math.max(diagramState.layoutBounds.height, visibleHeight);
-  if (axis === "x") {
-    const maxScroll = Math.max(0, contentWidth - visibleWidth);
-    const scroll = Math.min(Math.max(-diagramState.pan.x, 0), maxScroll);
-    return { visible: visibleWidth, content: contentWidth, scroll, maxScroll, trackLen: rect.width };
+function computeContentBounds() {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  diagramState.nodePositions.forEach((node) => {
+    minX = Math.min(minX, node.x);
+    minY = Math.min(minY, node.y);
+    maxX = Math.max(maxX, node.x + node.width);
+    maxY = Math.max(maxY, node.y + node.height);
+  });
+  if (!Number.isFinite(minX) || !Number.isFinite(minY)) {
+    return { minX: 0, minY: 0, maxX: 800, maxY: 600 };
   }
-  const maxScroll = Math.max(0, contentHeight - visibleHeight);
-  const scroll = Math.min(Math.max(-diagramState.pan.y, 0), maxScroll);
-  return { visible: visibleHeight, content: contentHeight, scroll, maxScroll, trackLen: rect.height };
+  const padding = 80;
+  return {
+    minX: minX - padding,
+    minY: minY - padding,
+    maxX: maxX + padding,
+    maxY: maxY + padding,
+  };
 }
 
-function updateScrollbars() {
-  const xState = getScrollState("x");
-  if (diagramState.scrollXEl && diagramState.scrollXThumbEl && xState) {
-    if (xState.maxScroll <= 1) {
-      diagramState.scrollXEl.style.opacity = "0";
-    } else {
-      diagramState.scrollXEl.style.opacity = "1";
-      const trackLen = xState.trackLen - 20;
-      const thumbLen = Math.max(18, Math.round((xState.visible / xState.content) * trackLen));
-      const travel = Math.max(1, trackLen - thumbLen);
-      const left = Math.round((xState.scroll / xState.maxScroll) * travel);
-      diagramState.scrollXThumbEl.style.width = `${thumbLen}px`;
-      diagramState.scrollXThumbEl.style.height = "8px";
-      diagramState.scrollXThumbEl.style.left = `${left + 1}px`;
-      diagramState.scrollXThumbEl.style.top = "1px";
-    }
-  }
-  const yState = getScrollState("y");
-  if (diagramState.scrollYEl && diagramState.scrollYThumbEl && yState) {
-    if (yState.maxScroll <= 1) {
-      diagramState.scrollYEl.style.opacity = "0";
-    } else {
-      diagramState.scrollYEl.style.opacity = "1";
-      const trackLen = yState.trackLen - 20;
-      const thumbLen = Math.max(18, Math.round((yState.visible / yState.content) * trackLen));
-      const travel = Math.max(1, trackLen - thumbLen);
-      const top = Math.round((yState.scroll / yState.maxScroll) * travel);
-      diagramState.scrollYThumbEl.style.height = `${thumbLen}px`;
-      diagramState.scrollYThumbEl.style.width = "8px";
-      diagramState.scrollYThumbEl.style.top = `${top + 1}px`;
-      diagramState.scrollYThumbEl.style.left = "1px";
-    }
-  }
+function refreshContentBounds() {
+  const bounds = computeContentBounds();
+  diagramState.contentBounds = bounds;
+  diagramState.layoutBounds = {
+    width: Math.max(1, bounds.maxX - bounds.minX),
+    height: Math.max(1, bounds.maxY - bounds.minY),
+  };
 }
 
-function updateDiagramViewportTransform() {
+function expandContentBoundsForNode(node) {
+  if (!node) return;
+  const bounds = diagramState.contentBounds || computeContentBounds();
+  const padding = 80;
+  const minX = node.x - padding;
+  const minY = node.y - padding;
+  const maxX = node.x + node.width + padding;
+  const maxY = node.y + node.height + padding;
+  bounds.minX = Math.min(bounds.minX, minX);
+  bounds.minY = Math.min(bounds.minY, minY);
+  bounds.maxX = Math.max(bounds.maxX, maxX);
+  bounds.maxY = Math.max(bounds.maxY, maxY);
+  diagramState.contentBounds = bounds;
+  diagramState.layoutBounds = {
+    width: Math.max(1, bounds.maxX - bounds.minX),
+    height: Math.max(1, bounds.maxY - bounds.minY),
+  };
+}
+
+function updateCameraView() {
   if (!diagramState.svgEl) return;
-  const viewport = diagramState.svgEl.querySelector("#diagram-viewport");
-  if (!viewport) return;
-  viewport.setAttribute(
-    "transform",
-    `translate(${diagramState.pan.x} ${diagramState.pan.y}) scale(${diagramState.zoom})`
-  );
-  updateViewportFrame();
-  updateScrollbars();
-}
-
-function getVisibleBounds() {
-  if (!diagramState.svgEl) return null;
   const rect = diagramState.svgEl.getBoundingClientRect();
-  if (!rect.width || !rect.height) return null;
-  const minX = -diagramState.pan.x;
-  const minY = -diagramState.pan.y;
-  const width = rect.width / diagramState.zoom;
-  const height = rect.height / diagramState.zoom;
-  return { minX, minY, width, height };
-}
-
-function updateViewportFrame() {
-  if (!diagramState.viewportFrame || !diagramState.viewportHandle) return;
-  const bounds = getVisibleBounds();
-  if (!bounds) return;
-  diagramState.viewportFrame.setAttribute("x", bounds.minX);
-  diagramState.viewportFrame.setAttribute("y", bounds.minY);
-  diagramState.viewportFrame.setAttribute("width", bounds.width);
-  diagramState.viewportFrame.setAttribute("height", bounds.height);
-  diagramState.viewportHandle.setAttribute("x", bounds.minX + bounds.width - 10);
-  diagramState.viewportHandle.setAttribute("y", bounds.minY + bounds.height - 10);
+  if (!rect.width || !rect.height) return;
+  const viewWidth = rect.width / diagramState.zoom;
+  const viewHeight = rect.height / diagramState.zoom;
+  diagramState.svgEl.setAttribute(
+    "viewBox",
+    `${diagramState.pan.x} ${diagramState.pan.y} ${viewWidth} ${viewHeight}`
+  );
+  updateMinimap();
 }
 
 function getElkInstance() {
@@ -1081,7 +1016,6 @@ function drawDiagram(layout) {
   const height = (layout.height || 600) + 40;
   diagramState.layoutBounds = { width, height };
   diagramState.svgEl.setAttribute("preserveAspectRatio", "xMidYMid meet");
-  updateScrollbars();
 
   diagramState.nodePositions = new Map();
   diagramState.edges = [];
@@ -1093,15 +1027,6 @@ function drawDiagram(layout) {
   edgeGroup.classList.add("diagram-edges");
   const nodeGroup = document.createElementNS("http://www.w3.org/2000/svg", "g");
   nodeGroup.classList.add("diagram-nodes");
-
-  const viewportFrame = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-  viewportFrame.setAttribute("class", "diagram-viewport-frame");
-  const viewportHandle = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-  viewportHandle.setAttribute("class", "diagram-viewport-handle");
-  viewportHandle.setAttribute("width", "10");
-  viewportHandle.setAttribute("height", "10");
-  diagramState.viewportFrame = viewportFrame;
-  diagramState.viewportHandle = viewportHandle;
 
   const flattenNodes = (node, offsetX, offsetY, parentId) => {
     const x = (node.x || 0) + offsetX;
@@ -1165,8 +1090,9 @@ function drawDiagram(layout) {
     const isPackage = kindText.includes("package");
     const isPartDef = kindText.includes("part def");
     const isRequirement = isRequirementKind(kindText);
+    const isContainer = nodePositionsHasChildren(node.id);
     const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
-    if (isPackage || isPartDef || isRequirement) {
+    if (isPackage || isPartDef || isRequirement || isContainer) {
       label.setAttribute("x", "28");
       label.setAttribute("y", "18");
       label.setAttribute("text-anchor", "start");
@@ -1187,7 +1113,7 @@ function drawDiagram(layout) {
       appendTypeIcon(group, kindText);
     }
 
-    if (isPackage) {
+    if (isPackage || isContainer) {
       const headerLine = document.createElementNS("http://www.w3.org/2000/svg", "line");
       headerLine.setAttribute("x1", "6");
       headerLine.setAttribute("x2", `${node.width - 6}`);
@@ -1196,16 +1122,18 @@ function drawDiagram(layout) {
       headerLine.setAttribute("class", "diagram-package-header");
       group.appendChild(headerLine);
 
-      const folder = document.createElementNS("http://www.w3.org/2000/svg", "path");
-      folder.setAttribute(
-        "d",
-        "M 6 6 H 14 L 16 9 H 24 V 20 H 6 Z"
-      );
-      folder.setAttribute("class", "diagram-package-icon");
-      group.appendChild(folder);
+      if (isPackage) {
+        const folder = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        folder.setAttribute(
+          "d",
+          "M 6 6 H 14 L 16 9 H 24 V 20 H 6 Z"
+        );
+        folder.setAttribute("class", "diagram-package-icon");
+        group.appendChild(folder);
+      }
     }
 
-    if (nodePositionsHasChildren(node.id)) {
+    if (isContainer) {
       const collapseGroup = document.createElementNS("http://www.w3.org/2000/svg", "g");
       collapseGroup.setAttribute("class", "diagram-collapse");
       collapseGroup.dataset.nodeId = node.id;
@@ -1365,11 +1293,10 @@ function drawDiagram(layout) {
   viewport.appendChild(defs);
   viewport.appendChild(edgeGroup);
   viewport.appendChild(nodeGroup);
-  viewport.appendChild(viewportFrame);
-  viewport.appendChild(viewportHandle);
   diagramState.svgEl.appendChild(viewport);
   updateEdgePaths();
   updateEdgesHidden();
+  refreshContentBounds();
   fitDiagramToView();
 }
 
@@ -1465,13 +1392,8 @@ function clampNodeSize(node, width, height) {
   const sections = Array.isArray(node.compartmentSections) ? node.compartmentSections : [];
   const minWidth = 80;
   const minHeight = sections.length ? measureCompartmentHeight(sections) : 32;
-  const dragBounds = getDragBounds();
-  const maxWidth = parent
-    ? parent.x + parent.width - node.x - padding
-    : dragBounds.width - node.x - 20;
-  const maxHeight = parent
-    ? parent.y + parent.height - node.y - padding
-    : dragBounds.height - node.y - 20;
+  const maxWidth = parent ? parent.x + parent.width - node.x - padding : Number.POSITIVE_INFINITY;
+  const maxHeight = parent ? parent.y + parent.height - node.y - padding : Number.POSITIVE_INFINITY;
   return {
     width: Math.min(Math.max(width, minWidth), maxWidth),
     height: Math.min(Math.max(height, minHeight), maxHeight),
@@ -1495,9 +1417,11 @@ function updateNodeSize(nodeId) {
   if (label) {
     if (label.classList.contains("diagram-node-label-package")) {
       const kindText = (node._kind || "").toLowerCase();
+      const isContainer = nodePositionsHasChildren(nodeId);
       const useHeaderX = kindText.includes("package")
         || kindText.includes("part def")
-        || isRequirementKind(kindText);
+        || isRequirementKind(kindText)
+        || isContainer;
       label.setAttribute("x", useHeaderX ? "28" : "10");
       label.setAttribute("y", "18");
     } else {
@@ -1506,8 +1430,17 @@ function updateNodeSize(nodeId) {
     }
   }
   group
-    .querySelectorAll(".diagram-compartment, .diagram-attr-title, .diagram-attr-text")
+    .querySelectorAll(".diagram-compartment, .diagram-attr-title, .diagram-attr-text, .diagram-package-header")
     .forEach((el) => el.remove());
+  if (nodePositionsHasChildren(nodeId) || (node._kind || "").toLowerCase().includes("package")) {
+    const headerLine = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    headerLine.setAttribute("x1", "6");
+    headerLine.setAttribute("x2", `${node.width - 6}`);
+    headerLine.setAttribute("y1", "24");
+    headerLine.setAttribute("y2", "24");
+    headerLine.setAttribute("class", "diagram-package-header");
+    group.appendChild(headerLine);
+  }
   if (sections.length) {
     renderCompartments(group, node, sections, headerHeight);
   }
@@ -1611,17 +1544,19 @@ async function applySavedLayout() {
     }
     const clampParentId = target.parentId;
     const parent = clampParentId ? diagramState.nodePositions.get(clampParentId) : null;
-    const padding = 12;
-    const minX = parent ? parent.x + padding : 20;
-    const minY = parent ? parent.y + padding + 18 : 20;
-    const maxX = parent
-      ? parent.x + parent.width - target.width - padding
-      : diagramState.layoutBounds.width - target.width - 20;
-    const maxY = parent
-      ? parent.y + parent.height - target.height - padding
-      : diagramState.layoutBounds.height - target.height - 20;
-    target.x = Math.min(Math.max(x, minX), maxX);
-    target.y = Math.min(Math.max(y, minY), maxY);
+    if (parent) {
+      const padding = 12;
+      const minX = parent.x + padding;
+      const minY = parent.y + padding + 18;
+      const maxX = parent.x + parent.width - target.width - padding;
+      const maxY = parent.y + parent.height - target.height - padding;
+      target.x = Math.min(Math.max(x, minX), maxX);
+      target.y = Math.min(Math.max(y, minY), maxY);
+    } else {
+      target.x = x;
+      target.y = y;
+      expandContentBoundsForNode(target);
+    }
     const group = diagramState.svgEl.querySelector(`g[data-node-id="${CSS.escape(id)}"]`);
     if (group) {
       group.setAttribute("transform", `translate(${target.x} ${target.y})`);
@@ -1629,6 +1564,8 @@ async function applySavedLayout() {
   });
 
   updateEdgePaths();
+  refreshContentBounds();
+  updateCameraView();
 }
 
 async function saveDiagramLayout() {
@@ -1638,7 +1575,8 @@ async function saveDiagramLayout() {
   const nodes = [];
   diagramState.nodePositions.forEach((node, id) => {
     const symbol = diagramState.symbolById.get(id);
-    if (!symbol || isAttributeKind(symbol.kind)) return;
+    const parentSymbol = node.parentId ? diagramState.symbolById.get(node.parentId) : null;
+    if (!symbol || isCompartmentItemSymbol(symbol, parentSymbol)) return;
     nodes.push({
       qualified_name: symbol.qualified_name || "",
       name: symbol.name || "",
@@ -1717,13 +1655,6 @@ function captureChildOffsets(nodeId) {
   return offsets;
 }
 
-function getDragBounds() {
-  const visible = getVisibleBounds();
-  const width = Math.max(diagramState.layoutBounds.width, visible?.width || 0);
-  const height = Math.max(diagramState.layoutBounds.height, visible?.height || 0);
-  return { width, height };
-}
-
 function isSpecializeEdge(edge) {
   const label = (edge.label || "").toLowerCase();
   return label.includes("specialize") || label.includes("specialization");
@@ -1764,18 +1695,73 @@ function fitDiagramToView() {
   const rect = diagramState.svgEl.getBoundingClientRect();
   const svgWidth = rect.width || diagramState.layoutBounds.width;
   const svgHeight = rect.height || diagramState.layoutBounds.height;
-  diagramState.svgEl.setAttribute("viewBox", `0 0 ${svgWidth} ${svgHeight}`);
-  const scale = Math.min(
-    svgWidth / diagramState.layoutBounds.width,
-    svgHeight / diagramState.layoutBounds.height
-  );
+  const bounds = diagramState.contentBounds || computeContentBounds();
+  const contentWidth = Math.max(1, bounds.maxX - bounds.minX);
+  const contentHeight = Math.max(1, bounds.maxY - bounds.minY);
+  const scale = Math.min(svgWidth / contentWidth, svgHeight / contentHeight);
   const zoom = Math.max(0.4, Math.min(2.5, scale * 0.95));
-  const offsetX = (svgWidth - diagramState.layoutBounds.width * zoom) / 2;
-  const offsetY = (svgHeight - diagramState.layoutBounds.height * zoom) / 2;
+  const viewWidth = svgWidth / zoom;
+  const viewHeight = svgHeight / zoom;
+  const extraX = (viewWidth - contentWidth) / 2;
+  const extraY = (viewHeight - contentHeight) / 2;
   diagramState.pan = {
-    x: offsetX / zoom,
-    y: offsetY / zoom,
+    x: bounds.minX - extraX,
+    y: bounds.minY - extraY,
   };
   setDiagramZoom(zoom);
-  updateViewportFrame();
+}
+function getVisibleBounds() {
+  if (!diagramState.svgEl) return null;
+  const rect = diagramState.svgEl.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  const width = rect.width / diagramState.zoom;
+  const height = rect.height / diagramState.zoom;
+  return { minX: diagramState.pan.x, minY: diagramState.pan.y, width, height };
+}
+
+function updateMinimap() {
+  const minimapSvg = diagramState.minimapSvgEl;
+  const minimapEl = diagramState.minimapEl;
+  if (!minimapSvg || !minimapEl) return;
+  const rect = minimapEl.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  const bounds = diagramState.contentBounds || computeContentBounds();
+  const width = Math.max(1, bounds.maxX - bounds.minX);
+  const height = Math.max(1, bounds.maxY - bounds.minY);
+  minimapSvg.setAttribute("viewBox", `${bounds.minX} ${bounds.minY} ${width} ${height}`);
+  minimapSvg.innerHTML = "";
+
+  const frame = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+  frame.setAttribute("x", `${bounds.minX}`);
+  frame.setAttribute("y", `${bounds.minY}`);
+  frame.setAttribute("width", `${width}`);
+  frame.setAttribute("height", `${height}`);
+  frame.setAttribute("fill", "none");
+  frame.setAttribute("stroke", "rgba(120,126,134,0.35)");
+  frame.setAttribute("stroke-width", "1");
+  minimapSvg.appendChild(frame);
+
+  diagramState.nodePositions.forEach((node) => {
+    const symbol = diagramState.symbolById.get(node.id);
+    const parentSymbol = node.parentId ? diagramState.symbolById.get(node.parentId) : null;
+    if (symbol && isCompartmentItemSymbol(symbol, parentSymbol)) return;
+    const rectEl = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    rectEl.setAttribute("x", `${node.x}`);
+    rectEl.setAttribute("y", `${node.y}`);
+    rectEl.setAttribute("width", `${node.width}`);
+    rectEl.setAttribute("height", `${node.height}`);
+    rectEl.setAttribute("class", "diagram-minimap-node");
+    minimapSvg.appendChild(rectEl);
+  });
+
+  const visible = getVisibleBounds();
+  if (visible) {
+    const viewport = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    viewport.setAttribute("x", `${visible.minX}`);
+    viewport.setAttribute("y", `${visible.minY}`);
+    viewport.setAttribute("width", `${visible.width}`);
+    viewport.setAttribute("height", `${visible.height}`);
+    viewport.setAttribute("class", "diagram-minimap-viewport");
+    minimapSvg.appendChild(viewport);
+  }
 }
