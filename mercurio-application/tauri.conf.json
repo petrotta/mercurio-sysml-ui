@@ -4,7 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.markpetrotta.mercurio",
   "build": {
-    "frontendDist": "../mercurio-frontend"
+    "frontendDist": "../mercurio-frontend-react/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm --prefix ..\\mercurio\\mercurio-frontend-react run build"
   },
   "app": {
     "withGlobalTauri": true,

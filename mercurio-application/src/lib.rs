@@ -531,6 +531,39 @@ fn create_dir(root: String, parent: String, name: String) -> Result<String, Stri
 }
 
 #[tauri::command]
+fn create_package(payload: serde_json::Value) -> Result<(), String> {
+    let root = payload
+        .get("root")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'root' argument".to_string())?
+        .to_string();
+    let file = payload
+        .get("file")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'file' argument".to_string())?
+        .to_string();
+    let name = payload
+        .get("name")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'name' argument".to_string())?
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        return Err("Package name is required".to_string());
+    }
+    let root_path = PathBuf::from(root);
+    let target_path = resolve_under_root(&root_path, Path::new(&file))?;
+    let mut content = fs::read_to_string(&target_path).unwrap_or_default();
+    if !content.ends_with('\n') && !content.is_empty() {
+        content.push('\n');
+    }
+    content.push('\n');
+    content.push_str(&format!("package {} {{\n}}\n", name));
+    fs::write(&target_path, content).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 fn rename_path(root: String, path: String, new_name: String) -> Result<String, String> {
     if new_name.trim().is_empty() {
         return Err("New name is required".to_string());
@@ -2216,6 +2249,7 @@ pub fn run() {
             write_file,
             create_file,
             create_dir,
+            create_package,
             rename_path,
             delete_path,
             set_watch_root,
