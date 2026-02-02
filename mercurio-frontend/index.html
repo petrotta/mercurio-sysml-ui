@@ -27,23 +27,20 @@
     <link rel="stylesheet" href="styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Mercurio SysML Workbench</title>
-    <script src="https://unpkg.com/elkjs@0.9.1/lib/elk.bundled.js" defer></script>
     <script type="module" src="/main.js" defer></script>
   </head>
 
   <body>
     <div class="titlebar" data-tauri-drag-region>
       <div class="titlebar-left">
-        <span class="app-mark">M</span>
-        <span class="app-title">Mercurio SysML Workbench</span>
-        <button class="menu-toggle" id="menu-toggle" type="button" title="Menu" aria-expanded="false" data-tauri-drag-region="false">
-          <span></span>
-          <span></span>
-          <span></span>
-        </button>
+        <span class="app-mark"><img src="assets/app-icon.png" alt="Mercurio" /></span>
+        <button class="menu-button" id="menu-file" type="button" aria-expanded="false" data-tauri-drag-region="false">File</button>
+        <button class="menu-button" id="menu-edit" type="button" aria-expanded="false" data-tauri-drag-region="false">Edit</button>
+        <button class="menu-button" id="menu-view" type="button" aria-expanded="false" data-tauri-drag-region="false">View</button>
+        <button class="menu-button" id="menu-compile" type="button" aria-expanded="false" data-tauri-drag-region="false">Compile</button>
+        <button class="menu-button" id="menu-help" type="button" aria-expanded="false" data-tauri-drag-region="false">Help</button>
       </div>
       <div class="titlebar-center" data-tauri-drag-region>
-        <span class="titlebar-project" id="titlebar-project">No project</span>
       </div>
       <div class="titlebar-right" data-tauri-drag-region="false">
         <button class="titlebar-btn" id="window-minimize" type="button" title="Minimize" data-tauri-drag-region="false">-</button>
@@ -110,13 +107,22 @@
             <div class="diagram-toolbar">
               <div id="diagram-status" class="diagram-status">Diagram view available for SysML files.</div>
               <div class="diagram-zoom">
+                <button id="diagram-autolayout" type="button" title="Auto-layout diagram">Layout</button>
                 <button id="diagram-copy" type="button" title="Copy diagram">Copy</button>
                 <button id="diagram-zoom-out" type="button" title="Zoom out">-</button>
                 <button id="diagram-zoom-reset" type="button" title="Reset zoom">100%</button>
                 <button id="diagram-zoom-in" type="button" title="Zoom in">+</button>
               </div>
             </div>
-            <svg id="diagram-svg" class="diagram-svg" role="img" aria-label="SysML diagram"></svg>
+            <div class="diagram-canvas" id="diagram-canvas">
+              <svg id="diagram-svg" class="diagram-svg" role="img" aria-label="SysML diagram"></svg>
+              <div class="diagram-scrollbar diagram-scrollbar-x" id="diagram-scrollbar-x">
+                <div class="diagram-scroll-thumb"></div>
+              </div>
+              <div class="diagram-scrollbar diagram-scrollbar-y" id="diagram-scrollbar-y">
+                <div class="diagram-scroll-thumb"></div>
+              </div>
+            </div>
           </div>
           <div id="editor" class="editor"></div>
           <button id="parse-toggle" class="parse-toggle" type="button" title="Parse errors" aria-expanded="false" hidden>
@@ -279,20 +285,42 @@
         </div>
       </div>
     </div>
-    <div id="log-dialog" class="modal" hidden>
-      <div class="modal-backdrop" data-action="close"></div>
-      <div class="modal-card log-card" role="dialog" aria-modal="true" aria-labelledby="log-title">
-        <div class="modal-header">
-          <h3 id="log-title">Log</h3>
-        </div>
-        <div class="modal-body">
-          <pre id="log-output" class="log-output"></pre>
-        </div>
-        <div class="modal-actions">
+    <div id="log-dialog" class="floating-log" hidden>
+      <div class="floating-log-header" role="dialog" aria-modal="true" aria-labelledby="log-title">
+        <h3 id="log-title">Log</h3>
+        <div class="floating-log-actions">
           <button type="button" id="log-refresh">Refresh</button>
           <button type="button" class="ghost" data-action="close">Close</button>
         </div>
       </div>
+      <div class="floating-log-body">
+        <div class="log-filters">
+          <label class="field">
+            <span class="field-label">Severity</span>
+            <select id="log-level-filter">
+              <option value="all">All</option>
+              <option value="INFO">Info</option>
+              <option value="WARN">Warn</option>
+              <option value="ERROR">Error</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field-label">Type</span>
+            <select id="log-type-filter">
+              <option value="all">All</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field-label">Sort</span>
+            <select id="log-sort">
+              <option value="desc">Newest first</option>
+              <option value="asc">Oldest first</option>
+            </select>
+          </label>
+        </div>
+        <div id="log-output" class="log-output"></div>
+      </div>
+      <div class="floating-log-resizer" aria-hidden="true"></div>
     </div>
     <div id="export-dialog" class="modal" hidden>
       <div class="modal-backdrop" data-action="close"></div>

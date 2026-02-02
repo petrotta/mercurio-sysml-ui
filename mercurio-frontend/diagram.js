@@ -6,7 +6,14 @@ const diagramState = {
   zoomInEl: null,
   zoomOutEl: null,
   zoomResetEl: null,
+  autoLayoutEl: null,
   copyEl: null,
+  canvasEl: null,
+  scrollXEl: null,
+  scrollYEl: null,
+  scrollXThumbEl: null,
+  scrollYThumbEl: null,
+  scrollDrag: null,
   editorPanelEl: null,
   normalizePath: (value) => value || "",
   readFile: null,
@@ -20,6 +27,8 @@ const diagramState = {
   nodePositions: new Map(),
   edges: [],
   symbolById: new Map(),
+  selectedId: null,
+  collapsedNodes: new Set(),
   pointerState: {
     dragging: null,
     resizing: null,
@@ -29,8 +38,17 @@ const diagramState = {
     originY: 0,
     originW: 0,
     originH: 0,
+    downNodeId: null,
+    downCollapseId: null,
+    moved: false,
   },
   layoutBounds: { width: 800, height: 600 },
+  gridSize: 24,
+  viewportFrame: null,
+  viewportHandle: null,
+  viewportResizing: null,
+  elkLoadPromise: null,
+  log: null,
 };
 
 export function initDiagram(options) {
@@ -41,11 +59,19 @@ export function initDiagram(options) {
   diagramState.zoomInEl = options.zoomInEl || null;
   diagramState.zoomOutEl = options.zoomOutEl || null;
   diagramState.zoomResetEl = options.zoomResetEl || null;
+  diagramState.autoLayoutEl = options.autoLayoutEl || null;
   diagramState.copyEl = options.copyEl || null;
+  diagramState.canvasEl = options.canvasEl || null;
+  diagramState.scrollXEl = options.scrollXEl || null;
+  diagramState.scrollYEl = options.scrollYEl || null;
+  diagramState.scrollXThumbEl = diagramState.scrollXEl?.querySelector(".diagram-scroll-thumb") || null;
+  diagramState.scrollYThumbEl = diagramState.scrollYEl?.querySelector(".diagram-scroll-thumb") || null;
   diagramState.editorPanelEl = options.editorPanelEl || null;
   diagramState.readFile = typeof options.readFile === "function" ? options.readFile : null;
   diagramState.writeFile = typeof options.writeFile === "function" ? options.writeFile : null;
   diagramState.onSelectInTree = typeof options.onSelectInTree === "function" ? options.onSelectInTree : null;
+  diagramState.onSelectSymbol = typeof options.onSelectSymbol === "function" ? options.onSelectSymbol : null;
+  diagramState.log = typeof options.log === "function" ? options.log : null;
   if (typeof options.normalizePath === "function") {
     diagramState.normalizePath = options.normalizePath;
   }
@@ -62,9 +88,49 @@ export function initDiagram(options) {
   diagramState.zoomResetEl?.addEventListener("click", () => {
     fitDiagramToView();
   });
+  diagramState.autoLayoutEl?.addEventListener("click", () => {
+    void relayoutDiagram(true);
+  });
   diagramState.copyEl?.addEventListener("click", async () => {
     await copyDiagramToClipboard();
   });
+
+  if (diagramState.scrollXEl) {
+    diagramState.scrollXEl.addEventListener("pointerdown", (event) => {
+      const thumb = event.target.closest(".diagram-scroll-thumb");
+      if (!thumb) return;
+      const state = getScrollState("x");
+      if (!state) return;
+      diagramState.scrollDrag = {
+        axis: "x",
+        startPos: event.clientX,
+        startScroll: state.scroll,
+        trackLen: state.trackLen,
+        thumbLen: state.thumbLen,
+        maxScroll: state.maxScroll,
+      };
+      diagramState.scrollXEl.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    });
+  }
+  if (diagramState.scrollYEl) {
+    diagramState.scrollYEl.addEventListener("pointerdown", (event) => {
+      const thumb = event.target.closest(".diagram-scroll-thumb");
+      if (!thumb) return;
+      const state = getScrollState("y");
+      if (!state) return;
+      diagramState.scrollDrag = {
+        axis: "y",
+        startPos: event.clientY,
+        startScroll: state.scroll,
+        trackLen: state.trackLen,
+        thumbLen: state.thumbLen,
+        maxScroll: state.maxScroll,
+      };
+      diagramState.scrollYEl.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    });
+  }
 
   diagramState.svgEl?.addEventListener(
     "wheel",
@@ -79,6 +145,36 @@ export function initDiagram(options) {
 
   diagramState.svgEl?.addEventListener("pointerdown", (event) => {
     if (!diagramState.mode) return;
+    const viewportHandle = event.target.closest(".diagram-viewport-handle");
+    if (viewportHandle) {
+      const bounds = getVisibleBounds();
+      if (bounds) {
+        diagramState.viewportResizing = {
+          startX: event.clientX,
+          startY: event.clientY,
+          startW: bounds.width,
+          startH: bounds.height,
+          startMinX: bounds.minX,
+          startMinY: bounds.minY,
+        };
+        diagramState.svgEl.setPointerCapture(event.pointerId);
+        diagramState.pointerState.moved = true;
+        event.preventDefault();
+        return;
+      }
+    }
+    const collapseTarget = event.target.closest(".diagram-collapse");
+    if (collapseTarget) {
+      diagramState.pointerState.downCollapseId = collapseTarget.dataset.nodeId || null;
+      diagramState.pointerState.startX = event.clientX;
+      diagramState.pointerState.startY = event.clientY;
+      diagramState.pointerState.moved = false;
+      event.preventDefault();
+      return;
+    }
+    diagramState.pointerState.moved = false;
+    const downTarget = event.target.closest("g[data-node-id]");
+    diagramState.pointerState.downNodeId = downTarget ? downTarget.dataset.nodeId : null;
     const resizeHandle = event.target.closest(".diagram-resize-handle");
     if (resizeHandle) {
       const target = resizeHandle.closest("g[data-node-id]");
@@ -110,16 +206,61 @@ export function initDiagram(options) {
   });
 
   diagramState.svgEl?.addEventListener("pointermove", (event) => {
+    if (diagramState.scrollDrag) {
+      const drag = diagramState.scrollDrag;
+      const delta = (drag.axis === "x" ? event.clientX : event.clientY) - drag.startPos;
+      const travel = Math.max(1, drag.trackLen - drag.thumbLen);
+      const scrollDelta = (delta / travel) * drag.maxScroll;
+      const nextScroll = Math.min(Math.max(drag.startScroll + scrollDelta, 0), drag.maxScroll);
+      if (drag.axis === "x") {
+        diagramState.pan.x = -nextScroll;
+      } else {
+        diagramState.pan.y = -nextScroll;
+      }
+      updateDiagramViewportTransform();
+      return;
+    }
+    if (diagramState.viewportResizing) {
+      const dx = (event.clientX - diagramState.viewportResizing.startX) / diagramState.zoom;
+      const dy = (event.clientY - diagramState.viewportResizing.startY) / diagramState.zoom;
+      const svgRect = diagramState.svgEl.getBoundingClientRect();
+      const minSize = 200;
+      const maxW = Math.max(minSize, diagramState.layoutBounds.width);
+      const maxH = Math.max(minSize, diagramState.layoutBounds.height);
+      const nextW = Math.min(
+        Math.max(diagramState.viewportResizing.startW + dx, minSize),
+        maxW
+      );
+      const nextH = Math.min(
+        Math.max(diagramState.viewportResizing.startH + dy, minSize),
+        maxH
+      );
+      const zoomX = svgRect.width / nextW;
+      const zoomY = svgRect.height / nextH;
+      const nextZoom = Math.min(2.5, Math.max(0.4, Math.min(zoomX, zoomY)));
+      diagramState.zoom = nextZoom;
+      diagramState.pan = {
+        x: -diagramState.viewportResizing.startMinX,
+        y: -diagramState.viewportResizing.startMinY,
+      };
+      updateDiagramViewportTransform();
+      return;
+    }
     const resizingId = diagramState.pointerState.resizing;
     if (resizingId) {
+      const dx = event.clientX - diagramState.pointerState.startX;
+      const dy = event.clientY - diagramState.pointerState.startY;
+      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) {
+        diagramState.pointerState.moved = true;
+      }
       const node = diagramState.nodePositions.get(resizingId);
       if (!node) return;
-      const dx = (event.clientX - diagramState.pointerState.startX) / diagramState.zoom;
-      const dy = (event.clientY - diagramState.pointerState.startY) / diagramState.zoom;
+      const dxScaled = dx / diagramState.zoom;
+      const dyScaled = dy / diagramState.zoom;
       const size = clampNodeSize(
         node,
-        diagramState.pointerState.originW + dx,
-        diagramState.pointerState.originH + dy
+        snapValue(diagramState.pointerState.originW + dxScaled),
+        snapValue(diagramState.pointerState.originH + dyScaled)
       );
       node.width = size.width;
       node.height = size.height;
@@ -129,23 +270,33 @@ export function initDiagram(options) {
     }
     const nodeId = diagramState.pointerState.dragging;
     if (!nodeId) return;
+    const dx = event.clientX - diagramState.pointerState.startX;
+    const dy = event.clientY - diagramState.pointerState.startY;
+    if (Math.abs(dx) > 2 || Math.abs(dy) > 2) {
+      diagramState.pointerState.moved = true;
+    }
     const node = diagramState.nodePositions.get(nodeId);
     if (!node) return;
-    const dx = (event.clientX - diagramState.pointerState.startX) / diagramState.zoom;
-    const dy = (event.clientY - diagramState.pointerState.startY) / diagramState.zoom;
+    const dxScaled = dx / diagramState.zoom;
+    const dyScaled = dy / diagramState.zoom;
     const parentId = node.parentId;
     const parent = parentId ? diagramState.nodePositions.get(parentId) : null;
     const padding = 12;
     const minX = parent ? parent.x + padding : 20;
     const minY = parent ? parent.y + padding + 18 : 20;
+    const dragBounds = getDragBounds();
     const maxX = parent
       ? parent.x + parent.width - node.width - padding
-      : diagramState.layoutBounds.width - node.width - 20;
+      : dragBounds.width - node.width - 20;
     const maxY = parent
       ? parent.y + parent.height - node.height - padding
-      : diagramState.layoutBounds.height - node.height - 20;
-    node.x = Math.min(Math.max(diagramState.pointerState.originX + dx, minX), maxX);
-    node.y = Math.min(Math.max(diagramState.pointerState.originY + dy, minY), maxY);
+      : dragBounds.height - node.height - 20;
+    const snapped = snapPoint({
+      x: diagramState.pointerState.originX + dxScaled,
+      y: diagramState.pointerState.originY + dyScaled,
+    });
+    node.x = Math.min(Math.max(snapped.x, minX), maxX);
+    node.y = Math.min(Math.max(snapped.y, minY), maxY);
     const group = diagramState.svgEl.querySelector(`g[data-node-id="${CSS.escape(nodeId)}"]`);
     if (group) {
       group.setAttribute("transform", `translate(${node.x} ${node.y})`);
@@ -154,8 +305,9 @@ export function initDiagram(options) {
       diagramState.pointerState.childOffsets.forEach((offset, childId) => {
         const child = diagramState.nodePositions.get(childId);
         if (!child) return;
-        child.x = node.x + offset.dx;
-        child.y = node.y + offset.dy;
+        const snappedChild = snapPoint({ x: node.x + offset.dx, y: node.y + offset.dy });
+        child.x = snappedChild.x;
+        child.y = snappedChild.y;
         const childGroup = diagramState.svgEl.querySelector(`g[data-node-id="${CSS.escape(childId)}"]`);
         if (childGroup) {
           childGroup.setAttribute("transform", `translate(${child.x} ${child.y})`);
@@ -166,18 +318,70 @@ export function initDiagram(options) {
   });
 
   diagramState.svgEl?.addEventListener("pointerup", (event) => {
-    if (!diagramState.pointerState.dragging && !diagramState.pointerState.resizing) return;
-    diagramState.svgEl.releasePointerCapture(event.pointerId);
-    diagramState.pointerState.dragging = null;
-    diagramState.pointerState.resizing = null;
-    diagramState.pointerState.childOffsets = null;
-    void saveDiagramLayout();
+    if (diagramState.scrollDrag) {
+      if (diagramState.scrollDrag.axis === "x") {
+        diagramState.scrollXEl?.releasePointerCapture(event.pointerId);
+      } else {
+        diagramState.scrollYEl?.releasePointerCapture(event.pointerId);
+      }
+      diagramState.scrollDrag = null;
+    }
+    if (diagramState.viewportResizing) {
+      diagramState.viewportResizing = null;
+      diagramState.svgEl.releasePointerCapture(event.pointerId);
+    }
+    const hadDrag = diagramState.pointerState.dragging || diagramState.pointerState.resizing;
+    if (hadDrag) {
+      diagramState.svgEl.releasePointerCapture(event.pointerId);
+      diagramState.pointerState.dragging = null;
+      diagramState.pointerState.resizing = null;
+      diagramState.pointerState.childOffsets = null;
+      void saveDiagramLayout();
+    }
+    if (diagramState.pointerState.downCollapseId) {
+      const dx = event.clientX - diagramState.pointerState.startX;
+      const dy = event.clientY - diagramState.pointerState.startY;
+      if (Math.abs(dx) < 4 && Math.abs(dy) < 4) {
+        toggleCollapse(diagramState.pointerState.downCollapseId);
+      }
+      diagramState.pointerState.downCollapseId = null;
+      diagramState.pointerState.moved = false;
+      diagramState.pointerState.downNodeId = null;
+      return;
+    }
+    if (!diagramState.pointerState.moved) {
+      if (event.target.closest(".diagram-collapse")) {
+        diagramState.pointerState.moved = false;
+        diagramState.pointerState.downNodeId = null;
+        return;
+      }
+      const nodeId = diagramState.pointerState.downNodeId;
+      if (nodeId) {
+        setDiagramSelection(nodeId);
+        const symbol = diagramState.symbolById.get(nodeId);
+        const payload = {
+          qualifiedName: symbol?.qualified_name || "",
+          name: symbol?.name || "",
+        };
+        diagramState.onSelectSymbol?.(payload);
+      } else {
+        setDiagramSelection(null);
+      }
+    }
+    diagramState.pointerState.moved = false;
+    diagramState.pointerState.downNodeId = null;
+    diagramState.pointerState.downCollapseId = null;
   });
 
   diagramState.svgEl?.addEventListener("pointerleave", () => {
     diagramState.pointerState.dragging = null;
     diagramState.pointerState.resizing = null;
     diagramState.pointerState.childOffsets = null;
+    diagramState.pointerState.moved = false;
+    diagramState.pointerState.downNodeId = null;
+    diagramState.pointerState.downCollapseId = null;
+    diagramState.viewportResizing = null;
+    diagramState.scrollDrag = null;
   });
 
   diagramState.svgEl?.addEventListener("contextmenu", (event) => {
@@ -194,6 +398,15 @@ export function initDiagram(options) {
     diagramState.onSelectInTree?.(payload, { x: event.clientX, y: event.clientY });
   });
 
+  diagramState.svgEl?.addEventListener("click", (event) => {
+    if (!diagramState.mode) return;
+    const collapseButton = event.target.closest(".diagram-collapse");
+    if (!collapseButton) return;
+    const nodeId = collapseButton.dataset.nodeId;
+    if (!nodeId) return;
+    toggleCollapse(nodeId);
+  });
+
   updateDiagramToggle();
 }
 
@@ -208,6 +421,10 @@ export function updateDiagramData({ currentFile, symbols }) {
   if (diagramState.mode) {
     void renderDiagramForCurrentFile();
   }
+}
+
+export function relayoutDiagram(persist = false) {
+  return renderDiagramForCurrentFile({ skipSaved: true, persist });
 }
 
 export function setDiagramMode(enabled) {
@@ -246,6 +463,58 @@ function setDiagramStatus(text) {
   diagramState.statusEl.hidden = !text;
 }
 
+function setDiagramSelection(nodeId) {
+  if (diagramState.selectedId === nodeId) return;
+  if (diagramState.selectedId && diagramState.svgEl) {
+    const prev = diagramState.svgEl.querySelector(
+      `g[data-node-id="${CSS.escape(diagramState.selectedId)}"] rect.diagram-node`
+    );
+    if (prev) prev.classList.remove("selected");
+  }
+  diagramState.selectedId = nodeId || null;
+  if (diagramState.selectedId && diagramState.svgEl) {
+    const next = diagramState.svgEl.querySelector(
+      `g[data-node-id="${CSS.escape(diagramState.selectedId)}"] rect.diagram-node`
+    );
+    if (next) next.classList.add("selected");
+  }
+}
+
+function setCollapsedState(nodeId, collapsed) {
+  if (!diagramState.svgEl) return;
+  const group = diagramState.svgEl.querySelector(`g[data-node-id="${CSS.escape(nodeId)}"]`);
+  if (!group) return;
+  group.classList.toggle("collapsed", collapsed);
+  const collapseLabel = group.querySelector(".diagram-collapse-label");
+  if (collapseLabel) {
+    collapseLabel.textContent = collapsed ? "+" : "-";
+  }
+  const hideDescendants = (parentId) => {
+    const children = diagramState.svgEl.querySelectorAll(
+      `g[data-parent-id="${CSS.escape(parentId)}"]`
+    );
+    children.forEach((child) => {
+      child.classList.toggle("diagram-hidden", collapsed);
+      if (collapsed) {
+        hideDescendants(child.dataset.nodeId);
+      }
+    });
+  };
+  hideDescendants(nodeId);
+  updateEdgeVisibility();
+}
+
+function toggleCollapse(nodeId) {
+  if (!nodeId) return;
+  const next = !diagramState.collapsedNodes.has(nodeId);
+  if (next) {
+    diagramState.collapsedNodes.add(nodeId);
+  } else {
+    diagramState.collapsedNodes.delete(nodeId);
+  }
+  setCollapsedState(nodeId, next);
+}
+
 function setDiagramZoom(value) {
   const next = Math.min(Math.max(value, 0.4), 2.5);
   diagramState.zoom = next;
@@ -253,6 +522,72 @@ function setDiagramZoom(value) {
     diagramState.zoomResetEl.textContent = `${Math.round(next * 100)}%`;
   }
   updateDiagramViewportTransform();
+}
+
+function snapValue(value) {
+  const size = diagramState.gridSize || 1;
+  return Math.round(value / size) * size;
+}
+
+function snapPoint(point) {
+  return {
+    x: snapValue(point.x),
+    y: snapValue(point.y),
+  };
+}
+
+function getScrollState(axis) {
+  const canvas = diagramState.canvasEl;
+  if (!canvas) return null;
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  const visibleWidth = rect.width / diagramState.zoom;
+  const visibleHeight = rect.height / diagramState.zoom;
+  const contentWidth = Math.max(diagramState.layoutBounds.width, visibleWidth);
+  const contentHeight = Math.max(diagramState.layoutBounds.height, visibleHeight);
+  if (axis === "x") {
+    const maxScroll = Math.max(0, contentWidth - visibleWidth);
+    const scroll = Math.min(Math.max(-diagramState.pan.x, 0), maxScroll);
+    return { visible: visibleWidth, content: contentWidth, scroll, maxScroll, trackLen: rect.width };
+  }
+  const maxScroll = Math.max(0, contentHeight - visibleHeight);
+  const scroll = Math.min(Math.max(-diagramState.pan.y, 0), maxScroll);
+  return { visible: visibleHeight, content: contentHeight, scroll, maxScroll, trackLen: rect.height };
+}
+
+function updateScrollbars() {
+  const xState = getScrollState("x");
+  if (diagramState.scrollXEl && diagramState.scrollXThumbEl && xState) {
+    if (xState.maxScroll <= 1) {
+      diagramState.scrollXEl.style.opacity = "0";
+    } else {
+      diagramState.scrollXEl.style.opacity = "1";
+      const trackLen = xState.trackLen - 20;
+      const thumbLen = Math.max(18, Math.round((xState.visible / xState.content) * trackLen));
+      const travel = Math.max(1, trackLen - thumbLen);
+      const left = Math.round((xState.scroll / xState.maxScroll) * travel);
+      diagramState.scrollXThumbEl.style.width = `${thumbLen}px`;
+      diagramState.scrollXThumbEl.style.height = "8px";
+      diagramState.scrollXThumbEl.style.left = `${left + 1}px`;
+      diagramState.scrollXThumbEl.style.top = "1px";
+    }
+  }
+  const yState = getScrollState("y");
+  if (diagramState.scrollYEl && diagramState.scrollYThumbEl && yState) {
+    if (yState.maxScroll <= 1) {
+      diagramState.scrollYEl.style.opacity = "0";
+    } else {
+      diagramState.scrollYEl.style.opacity = "1";
+      const trackLen = yState.trackLen - 20;
+      const thumbLen = Math.max(18, Math.round((yState.visible / yState.content) * trackLen));
+      const travel = Math.max(1, trackLen - thumbLen);
+      const top = Math.round((yState.scroll / yState.maxScroll) * travel);
+      diagramState.scrollYThumbEl.style.height = `${thumbLen}px`;
+      diagramState.scrollYThumbEl.style.width = "8px";
+      diagramState.scrollYThumbEl.style.top = `${top + 1}px`;
+      diagramState.scrollYThumbEl.style.left = "1px";
+    }
+  }
 }
 
 function updateDiagramViewportTransform() {
@@ -263,6 +598,31 @@ function updateDiagramViewportTransform() {
     "transform",
     `translate(${diagramState.pan.x} ${diagramState.pan.y}) scale(${diagramState.zoom})`
   );
+  updateViewportFrame();
+  updateScrollbars();
+}
+
+function getVisibleBounds() {
+  if (!diagramState.svgEl) return null;
+  const rect = diagramState.svgEl.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  const minX = -diagramState.pan.x;
+  const minY = -diagramState.pan.y;
+  const width = rect.width / diagramState.zoom;
+  const height = rect.height / diagramState.zoom;
+  return { minX, minY, width, height };
+}
+
+function updateViewportFrame() {
+  if (!diagramState.viewportFrame || !diagramState.viewportHandle) return;
+  const bounds = getVisibleBounds();
+  if (!bounds) return;
+  diagramState.viewportFrame.setAttribute("x", bounds.minX);
+  diagramState.viewportFrame.setAttribute("y", bounds.minY);
+  diagramState.viewportFrame.setAttribute("width", bounds.width);
+  diagramState.viewportFrame.setAttribute("height", bounds.height);
+  diagramState.viewportHandle.setAttribute("x", bounds.minX + bounds.width - 10);
+  diagramState.viewportHandle.setAttribute("y", bounds.minY + bounds.height - 10);
 }
 
 function getElkInstance() {
@@ -271,6 +631,69 @@ function getElkInstance() {
     getElkInstance.instance = new window.ELK();
   }
   return getElkInstance.instance;
+}
+
+function logDiagram(level, kind, message) {
+  if (diagramState.log) {
+    diagramState.log(level, kind, message);
+  }
+}
+
+function ensureElkLoaded() {
+  if (window.ELK) return Promise.resolve(true);
+  if (diagramState.elkLoadPromise) return diagramState.elkLoadPromise;
+  const base = document.baseURI || window.location?.href || "";
+  const candidates = [
+    "/assets/elk/elk.bundled.js",
+    "./assets/elk/elk.bundled.js",
+    new URL("assets/elk/elk.bundled.js", base).toString(),
+    "https://unpkg.com/elkjs@0.9.1/lib/elk.bundled.js",
+  ];
+  const evalElkScript = async (src) => {
+    const response = await fetch(src, { cache: "no-cache" });
+    if (!response.ok) {
+      throw new Error(`fetch failed ${response.status}`);
+    }
+    const code = await response.text();
+    const prevDefine = window.define;
+    const prevRequire = window.require;
+    try {
+      window.define = undefined;
+      window.require = undefined;
+      const fn = new Function(code);
+      fn();
+    } finally {
+      window.define = prevDefine;
+      window.require = prevRequire;
+    }
+  };
+  diagramState.elkLoadPromise = new Promise((resolve) => {
+    const tryNext = (index) => {
+      if (index >= candidates.length) {
+        diagramState.elkLoadPromise = null;
+        logDiagram("ERROR", "diagram", "ELK bundle failed to load");
+        resolve(false);
+        return;
+      }
+      const src = candidates[index];
+      evalElkScript(src)
+        .then(() => {
+          if (window.ELK) {
+            logDiagram("INFO", "diagram", `ELK loaded from ${src}`);
+            resolve(true);
+            return;
+          }
+          logDiagram("WARN", "diagram", `ELK script did not register from ${src}`);
+          tryNext(index + 1);
+        })
+        .catch((error) => {
+          logDiagram("WARN", "diagram", `Failed to load ELK from ${src}: ${error}`);
+          tryNext(index + 1);
+        });
+    };
+    tryNext(0);
+  });
+  return diagramState.elkLoadPromise;
 }
 
 function measureDiagramLabel(text) {
@@ -285,71 +708,78 @@ function measureDiagramLabel(text) {
   return { width: width + 20, height: 28 };
 }
 
-function isBlockKind(kind) {
-  return /part def|block/i.test(kind || "");
+function measureDiagramAttr(text) {
+  if (!measureDiagramAttr.canvas) {
+    measureDiagramAttr.canvas = document.createElement("canvas");
+  }
+  const ctx = measureDiagramAttr.canvas.getContext("2d");
+  if (!ctx) return { width: 80, height: 18 };
+  ctx.font = '11px "IBM Plex Sans", "Segoe UI", sans-serif';
+  const metrics = ctx.measureText(text);
+  const width = Math.ceil(metrics.width);
+  return { width: width + 20, height: 18 };
 }
 
-function isBlockChildKind(kind) {
-  return /part(?! def)|attribute/i.test(kind || "");
+function isPartUsageKind(kind) {
+  return /part(?! def)/i.test(kind || "");
 }
 
-function isStateKind(kind) {
-  return /state/i.test(kind || "");
+function isPortKind(kind) {
+  return /port/i.test(kind || "");
 }
 
 function isAttributeKind(kind) {
   return /attribute/i.test(kind || "");
 }
 
-function isPackageKind(kind) {
-  return /package/i.test(kind || "");
+function isRequirementKind(kind) {
+  return /requirement/i.test(kind || "");
 }
 
-function findParentBlock(symbol, nodeMap) {
+function appendTypeIcon(group, kindText) {
+  const ns = "http://www.w3.org/2000/svg";
+  const iconGroup = document.createElementNS(ns, "g");
+  iconGroup.setAttribute("class", "diagram-type-icon");
+  iconGroup.setAttribute("transform", "translate(6 6)");
+  let path = null;
+  if (kindText.includes("part def")) {
+    path = document.createElementNS(ns, "path");
+    path.setAttribute("d", "M 2 4 H 10 V 12 H 2 Z M 4 2 H 12 V 10");
+    iconGroup.classList.add("type-part-def");
+  } else if (isPartUsageKind(kindText)) {
+    path = document.createElementNS(ns, "rect");
+    path.setAttribute("x", "2");
+    path.setAttribute("y", "3");
+    path.setAttribute("width", "9");
+    path.setAttribute("height", "7");
+    iconGroup.classList.add("type-part");
+  } else if (isRequirementKind(kindText)) {
+    path = document.createElementNS(ns, "path");
+    path.setAttribute("d", "M 2 2 H 10 L 12 4 V 12 H 2 Z M 10 2 V 4 H 12");
+    iconGroup.classList.add("type-requirement");
+  }
+  if (!path) return;
+  iconGroup.appendChild(path);
+  group.appendChild(iconGroup);
+}
+
+function findNearestParent(symbol, nodeMap) {
   if (!symbol || !symbol.qualified_name) return null;
   const parts = symbol.qualified_name.split("::").filter(Boolean);
   if (parts.length < 2) return null;
   parts.pop();
   while (parts.length) {
     const candidate = parts.join("::");
-    const parent = nodeMap.get(candidate);
-    if (parent && isBlockKind(parent._kind)) {
-      return parent;
+    if (nodeMap.has(candidate)) {
+      return nodeMap.get(candidate) || null;
     }
     parts.pop();
   }
   return null;
 }
 
-function findParentState(symbol, nodeMap) {
-  if (!symbol || !symbol.qualified_name) return null;
-  const parts = symbol.qualified_name.split("::").filter(Boolean);
-  if (parts.length < 2) return null;
-  parts.pop();
-  while (parts.length) {
-    const candidate = parts.join("::");
-    const parent = nodeMap.get(candidate);
-    if (parent && isStateKind(parent._kind)) {
-      return parent;
-    }
-    parts.pop();
-  }
-  return null;
-}
-
-function findParentPackage(symbol, nodeMap, symbolById) {
-  if (!symbol || !symbol.qualified_name) return null;
-  const parts = symbol.qualified_name.split("::").filter(Boolean);
-  if (parts.length < 2) return null;
-  parts.pop();
-  const candidate = parts.join("::");
-  if (!nodeMap.has(candidate)) return null;
-  const parentSymbol = symbolById.get(candidate);
-  if (!parentSymbol || !isPackageKind(parentSymbol.kind)) return null;
-  return nodeMap.get(candidate) || null;
-}
-
-async function renderDiagramForCurrentFile() {
+async function renderDiagramForCurrentFile(options = {}) {
+  const { skipSaved, persist } = options;
   if (!diagramState.paneEl || !diagramState.svgEl) return;
   const renderId = ++diagramState.renderId;
   diagramState.svgEl.innerHTML = "";
@@ -360,7 +790,15 @@ async function renderDiagramForCurrentFile() {
   }
   const elk = getElkInstance();
   if (!elk) {
-    setDiagramStatus("Diagram layout engine unavailable.");
+    setDiagramStatus("Loading diagram engine...");
+    ensureElkLoaded().then((loaded) => {
+      if (!loaded) {
+        setDiagramStatus("Diagram layout engine unavailable.");
+        return;
+      }
+      if (!diagramState.mode || renderId !== diagramState.renderId) return;
+      void renderDiagramForCurrentFile();
+    });
     return;
   }
 
@@ -382,11 +820,13 @@ async function renderDiagramForCurrentFile() {
   const rawNodes = nodes.map((symbol, index) => {
     const id = symbol.qualified_name || `${symbol.name || "symbol"}:${symbol.start_line}:${index}`;
     const label = symbol.name || id;
-    const size = measureDiagramLabel(label);
+    const size = isPartUsageKind(symbol.kind) || isPortKind(symbol.kind)
+      ? measureDiagramAttr(label)
+      : measureDiagramLabel(label);
     return {
       id,
-      width: Math.max(80, size.width),
-      height: Math.max(32, size.height),
+      width: Math.max(isPartUsageKind(symbol.kind) || isPortKind(symbol.kind) ? 64 : 80, size.width),
+      height: Math.max(isPartUsageKind(symbol.kind) || isPortKind(symbol.kind) ? 26 : 32, size.height),
       labels: [{ text: label }],
       _kind: symbol.kind || "",
     };
@@ -419,25 +859,38 @@ async function renderDiagramForCurrentFile() {
   rawNodes.forEach((node) => {
     const symbol = symbolById.get(node.id);
     if (!symbol) return;
-    if (!isBlockChildKind(symbol.kind) && !isStateKind(symbol.kind)) {
-      const parent = findParentPackage(symbol, nodeMap, symbolById);
-      if (parent) {
-        parentMap.set(node.id, parent.id);
-      }
+    const parent = findNearestParent(symbol, nodeMap);
+    if (parent) {
+      parentMap.set(node.id, parent.id);
     }
-    if (isBlockChildKind(symbol.kind)) {
-      const parent = findParentBlock(symbol, nodeMap);
-      if (parent) {
-        parentMap.set(node.id, parent.id);
-      }
-      return;
+  });
+
+  const attrLinesByParentId = new Map();
+  rawNodes.forEach((node) => {
+    const symbol = symbolById.get(node.id);
+    if (!symbol || !isAttributeKind(symbol.kind)) return;
+    const parentId = parentMap.get(node.id);
+    if (!parentId) return;
+    const line = formatAttributeLine(symbol);
+    if (!attrLinesByParentId.has(parentId)) {
+      attrLinesByParentId.set(parentId, []);
     }
-    if (isStateKind(symbol.kind)) {
-      const parent = findParentState(symbol, nodeMap);
-      if (parent) {
-        parentMap.set(node.id, parent.id);
+    attrLinesByParentId.get(parentId).push(line);
+  });
+  attrLinesByParentId.forEach((lines, parentId) => {
+    const parent = nodeMap.get(parentId);
+    if (!parent) return;
+    const attrCount = lines.length;
+    const minHeight = 24 + 30 + Math.max(0, attrCount - 1) * 14 + 8;
+    parent.height = Math.max(parent.height || 0, minHeight);
+    let maxWidth = parent.width || 0;
+    lines.forEach((line) => {
+      const size = measureDiagramAttr(line);
+      if (size.width > maxWidth) {
+        maxWidth = size.width;
       }
-    }
+    });
+    parent.width = Math.max(parent.width || 0, maxWidth, 120);
   });
 
   const rootChildren = [];
@@ -510,6 +963,7 @@ async function renderDiagramForCurrentFile() {
     layoutOptions: {
       "elk.algorithm": "layered",
       "elk.direction": "RIGHT",
+      "elk.hierarchyHandling": "INCLUDE_CHILDREN",
       "elk.layered.spacing.nodeNodeBetweenLayers": "40",
       "elk.spacing.nodeNode": "30",
     },
@@ -522,7 +976,11 @@ async function renderDiagramForCurrentFile() {
     if (renderId !== diagramState.renderId) return;
     setDiagramStatus("");
     drawDiagram(layout);
-    await applySavedLayout();
+    if (!skipSaved) {
+      await applySavedLayout();
+    } else if (persist) {
+      await saveDiagramLayout();
+    }
   } catch (error) {
     if (renderId !== diagramState.renderId) return;
     setDiagramStatus(`Diagram layout failed: ${error}`);
@@ -532,13 +990,16 @@ async function renderDiagramForCurrentFile() {
 function drawDiagram(layout) {
   if (!diagramState.svgEl) return;
   diagramState.svgEl.innerHTML = "";
+  diagramState.selectedId = null;
   const width = (layout.width || 800) + 40;
   const height = (layout.height || 600) + 40;
   diagramState.layoutBounds = { width, height };
   diagramState.svgEl.setAttribute("preserveAspectRatio", "xMidYMid meet");
+  updateScrollbars();
 
   diagramState.nodePositions = new Map();
   diagramState.edges = [];
+  diagramState.collapsedNodes.clear();
 
   const viewport = document.createElementNS("http://www.w3.org/2000/svg", "g");
   viewport.setAttribute("id", "diagram-viewport");
@@ -546,6 +1007,15 @@ function drawDiagram(layout) {
   edgeGroup.classList.add("diagram-edges");
   const nodeGroup = document.createElementNS("http://www.w3.org/2000/svg", "g");
   nodeGroup.classList.add("diagram-nodes");
+
+  const viewportFrame = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+  viewportFrame.setAttribute("class", "diagram-viewport-frame");
+  const viewportHandle = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+  viewportHandle.setAttribute("class", "diagram-viewport-handle");
+  viewportHandle.setAttribute("width", "10");
+  viewportHandle.setAttribute("height", "10");
+  diagramState.viewportFrame = viewportFrame;
+  diagramState.viewportHandle = viewportHandle;
 
   const flattenNodes = (node, offsetX, offsetY, parentId) => {
     const x = (node.x || 0) + offsetX;
@@ -594,18 +1064,78 @@ function drawDiagram(layout) {
     if (nodePositionsHasChildren(node.id)) {
       rect.classList.add("container");
     }
+    const kindText = (symbol?.kind || node._kind || "").toLowerCase();
+    const isMiniChild = (isPartUsageKind(kindText) || isPortKind(kindText)) && node.parentId;
+    if (isMiniChild) {
+      rect.classList.add("mini");
+    }
     group.appendChild(rect);
 
     const attributeLines = attributeLinesByParent.get(node.id) || [];
     const headerHeight = attributeLines.length ? 24 : node.height;
 
+    const isPackage = kindText.includes("package");
+    const isPartDef = kindText.includes("part def");
     const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
-    label.setAttribute("x", node.width / 2);
-    label.setAttribute("y", attributeLines.length ? 16 : node.height / 2 + 4);
-    label.setAttribute("text-anchor", "middle");
-    label.setAttribute("class", "diagram-node-label");
+    if (isPackage || isPartDef) {
+      label.setAttribute("x", isPackage || isPartDef ? "28" : "10");
+      label.setAttribute("y", "18");
+      label.setAttribute("text-anchor", "start");
+      label.setAttribute("class", "diagram-node-label diagram-node-label-package");
+    } else {
+      label.setAttribute("x", node.width / 2);
+      label.setAttribute("y", attributeLines.length ? 16 : node.height / 2 + 4);
+      label.setAttribute("text-anchor", "middle");
+      label.setAttribute(
+        "class",
+        isMiniChild ? "diagram-node-label diagram-node-label-mini" : "diagram-node-label"
+      );
+    }
     label.textContent = node.label;
     group.appendChild(label);
+
+    if (isPartDef || isPartUsageKind(kindText) || isRequirementKind(kindText)) {
+      appendTypeIcon(group, kindText);
+    }
+
+    if (isPackage) {
+      const headerLine = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      headerLine.setAttribute("x1", "6");
+      headerLine.setAttribute("x2", `${node.width - 6}`);
+      headerLine.setAttribute("y1", "24");
+      headerLine.setAttribute("y2", "24");
+      headerLine.setAttribute("class", "diagram-package-header");
+      group.appendChild(headerLine);
+
+      const folder = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      folder.setAttribute(
+        "d",
+        "M 6 6 H 14 L 16 9 H 24 V 20 H 6 Z"
+      );
+      folder.setAttribute("class", "diagram-package-icon");
+      group.appendChild(folder);
+    }
+
+    if (nodePositionsHasChildren(node.id)) {
+      const collapseGroup = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      collapseGroup.setAttribute("class", "diagram-collapse");
+      collapseGroup.dataset.nodeId = node.id;
+      collapseGroup.setAttribute("transform", `translate(${node.width - 20} 8)`);
+      const collapseRect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      collapseRect.setAttribute("width", "14");
+      collapseRect.setAttribute("height", "14");
+      collapseRect.setAttribute("rx", "3");
+      collapseRect.setAttribute("class", "diagram-collapse-btn");
+      const collapseLabel = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      collapseLabel.setAttribute("x", "7");
+      collapseLabel.setAttribute("y", "11");
+      collapseLabel.setAttribute("text-anchor", "middle");
+      collapseLabel.setAttribute("class", "diagram-collapse-label");
+      collapseLabel.textContent = diagramState.collapsedNodes.has(node.id) ? "+" : "-";
+      collapseGroup.appendChild(collapseRect);
+      collapseGroup.appendChild(collapseLabel);
+      group.appendChild(collapseGroup);
+    }
 
     if (attributeLines.length) {
       const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
@@ -633,14 +1163,16 @@ function drawDiagram(layout) {
       });
     }
 
-    const handle = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-    handle.setAttribute("x", `${node.width - 10}`);
-    handle.setAttribute("y", `${node.height - 10}`);
-    handle.setAttribute("width", "10");
-    handle.setAttribute("height", "10");
-    handle.setAttribute("rx", "2");
-    handle.setAttribute("class", "diagram-resize-handle");
-    group.appendChild(handle);
+    if (!isMiniChild) {
+      const handle = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      handle.setAttribute("x", `${node.width - 10}`);
+      handle.setAttribute("y", `${node.height - 10}`);
+      handle.setAttribute("width", "10");
+      handle.setAttribute("height", "10");
+      handle.setAttribute("rx", "2");
+      handle.setAttribute("class", "diagram-resize-handle");
+      group.appendChild(handle);
+    }
 
     nodeGroup.appendChild(group);
   };
@@ -737,11 +1269,31 @@ function drawDiagram(layout) {
     edgeEls.set(edge.id, path);
   });
 
+  const updateEdgesHidden = () => {
+    diagramState.edges.forEach((edge) => {
+      const sourceHidden = diagramState.svgEl
+        .querySelector(`g[data-node-id="${CSS.escape(edge.source)}"]`)
+        ?.classList.contains("diagram-hidden");
+      const targetHidden = diagramState.svgEl
+        .querySelector(`g[data-node-id="${CSS.escape(edge.target)}"]`)
+        ?.classList.contains("diagram-hidden");
+      const path = diagramState.svgEl.querySelector(
+        `.diagram-edge[data-edge-id="${CSS.escape(edge.id)}"]`
+      );
+      if (path) {
+        path.classList.toggle("diagram-hidden", sourceHidden || targetHidden);
+      }
+    });
+  };
+
   viewport.appendChild(defs);
   viewport.appendChild(edgeGroup);
   viewport.appendChild(nodeGroup);
+  viewport.appendChild(viewportFrame);
+  viewport.appendChild(viewportHandle);
   diagramState.svgEl.appendChild(viewport);
   updateEdgePaths();
+  updateEdgesHidden();
   fitDiagramToView();
 }
 
@@ -773,6 +1325,24 @@ function updateEdgePaths(onlyNodeId) {
   });
 }
 
+function updateEdgeVisibility() {
+  if (!diagramState.svgEl) return;
+  diagramState.edges.forEach((edge) => {
+    const sourceHidden = diagramState.svgEl
+      .querySelector(`g[data-node-id="${CSS.escape(edge.source)}"]`)
+      ?.classList.contains("diagram-hidden");
+    const targetHidden = diagramState.svgEl
+      .querySelector(`g[data-node-id="${CSS.escape(edge.target)}"]`)
+      ?.classList.contains("diagram-hidden");
+    const path = diagramState.svgEl.querySelector(
+      `.diagram-edge[data-edge-id="${CSS.escape(edge.id)}"]`
+    );
+    if (path) {
+      path.classList.toggle("diagram-hidden", sourceHidden || targetHidden);
+    }
+  });
+}
+
 function clampNodeSize(node, width, height) {
   const parentId = node.parentId;
   const parent = parentId ? diagramState.nodePositions.get(parentId) : null;
@@ -780,12 +1350,13 @@ function clampNodeSize(node, width, height) {
   const attrCount = Array.isArray(node.attrLines) ? node.attrLines.length : 0;
   const minWidth = 80;
   const minHeight = attrCount ? 24 + 30 + Math.max(0, attrCount - 1) * 14 + 8 : 32;
+  const dragBounds = getDragBounds();
   const maxWidth = parent
     ? parent.x + parent.width - node.x - padding
-    : diagramState.layoutBounds.width - node.x - 20;
+    : dragBounds.width - node.x - 20;
   const maxHeight = parent
     ? parent.y + parent.height - node.y - padding
-    : diagramState.layoutBounds.height - node.y - 20;
+    : dragBounds.height - node.y - 20;
   return {
     width: Math.min(Math.max(width, minWidth), maxWidth),
     height: Math.min(Math.max(height, minHeight), maxHeight),
@@ -807,8 +1378,14 @@ function updateNodeSize(nodeId) {
   const attrLines = Array.isArray(node.attrLines) ? node.attrLines : [];
   const headerHeight = attrLines.length ? 24 : node.height;
   if (label) {
-    label.setAttribute("x", node.width / 2);
-    label.setAttribute("y", attrLines.length ? 16 : node.height / 2 + 4);
+    if (label.classList.contains("diagram-node-label-package")) {
+      const isPackage = (node._kind || "").toLowerCase().includes("package");
+      label.setAttribute("x", isPackage ? "28" : "10");
+      label.setAttribute("y", "18");
+    } else {
+      label.setAttribute("x", node.width / 2);
+      label.setAttribute("y", attrLines.length ? 16 : node.height / 2 + 4);
+    }
   }
   const line = group.querySelector("line.diagram-compartment");
   if (line) {
@@ -1018,12 +1595,23 @@ function captureChildOffsets(nodeId) {
   const offsets = new Map();
   const parent = diagramState.nodePositions.get(nodeId);
   if (!parent) return offsets;
-  diagramState.nodePositions.forEach((node) => {
-    if (node.parentId === nodeId) {
-      offsets.set(node.id, { dx: node.x - parent.x, dy: node.y - parent.y });
-    }
-  });
+  const visit = (currentId) => {
+    diagramState.nodePositions.forEach((node) => {
+      if (node.parentId === currentId) {
+        offsets.set(node.id, { dx: node.x - parent.x, dy: node.y - parent.y });
+        visit(node.id);
+      }
+    });
+  };
+  visit(nodeId);
   return offsets;
+}
+
+function getDragBounds() {
+  const visible = getVisibleBounds();
+  const width = Math.max(diagramState.layoutBounds.width, visible?.width || 0);
+  const height = Math.max(diagramState.layoutBounds.height, visible?.height || 0);
+  return { width, height };
 }
 
 function isSpecializeEdge(edge) {
@@ -1079,4 +1667,5 @@ function fitDiagramToView() {
     y: offsetY / zoom,
   };
   setDiagramZoom(zoom);
+  updateViewportFrame();
 }

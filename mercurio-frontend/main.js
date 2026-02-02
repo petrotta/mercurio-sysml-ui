@@ -1,14 +1,10 @@
 import { initDiagram, updateDiagramData, setDiagramMode } from "./diagram.js";
 import {
-  loadEndpoints,
-  saveEndpoints,
-  ensureDefaultEndpoint,
   resolveActiveEndpoint,
-  setActiveEndpointId,
-  testEndpoint,
   sendChatMessage,
-  sendEmbeddings,
 } from "./ai.js";
+import { initAiChat } from "./ai-chat.js";
+import { initAiEndpoints } from "./ai-endpoints.js";
 
 const { invoke } = window.__TAURI__.core;
 const dialog = window.__TAURI__.dialog;
@@ -66,7 +62,11 @@ let modelExpandAllBtn;
 let modelCollapseAllBtn;
 let modelGroupToggleBtn;
 let appMenuEl;
-let menuToggleBtn;
+let menuFileBtn;
+let menuEditBtn;
+let menuViewBtn;
+let menuCompileBtn;
+let menuHelpBtn;
 let diagramContextMenuEl;
 let aiMessageMenuEl;
 let newProjectDialogEl;
@@ -80,6 +80,9 @@ let newProjectCreateBtn;
 let logDialogEl;
 let logOutputEl;
 let logRefreshBtn;
+let logLevelFilterEl;
+let logTypeFilterEl;
+let logSortEl;
 let exportDialogEl;
 let exportFormatEl;
 let exportIncludeStdlibEl;
@@ -350,14 +353,14 @@ let symbolIndexByFile = new Map();
 let lastTrackedAnchor = null;
 let rightPaneMode = "model";
 let aiApplyPending = null;
-let aiEndpointEditId = "";
-const aiInputHistory = [];
-let aiInputHistoryIndex = -1;
-let aiInputDraft = "";
-let llmInstructions = "";
-let llmHintIndex = null;
-let llmHintSeed = null;
-const LLM_HINT_INDEX_KEY = "mercurio.llm.hints.v1";
+let aiChat = null;
+let aiEndpoints = null;
+let logEntries = [];
+let logRefreshTimer = null;
+
+function logFrontend(level, kind, message) {
+  invoke?.("log_frontend", { level, kind, message }).catch(() => {});
+}
 
 const state = {
   rootPath: "",
@@ -384,7 +387,6 @@ const FILE_TREE_FILTER_KEY = "mercurio.fileTreeHideArtifacts";
 const TRACK_SYMBOL_KEY = "mercurio.trackSymbol";
 const RIGHT_PANE_KEY = "mercurio.rightPane";
 const lastCompile = { symbols: [], files: [], unresolved: [], durationMs: null, libraryPath: "" };
-const aiEndpointStatus = new Map();
 
 const MIN_LEFT = 200;
 const MIN_RIGHT = 240;
@@ -983,405 +985,9 @@ function formatParseErrors(path, errors) {
   return `Parse errors in ${path}:\n${lines.join("\n")}${extra}`;
 }
 
-function renderAiMessage(role, text) {
-  if (!aiMessagesEl) return;
-  const item = document.createElement("div");
-  item.className = `ai-message ${role}`;
-  item.textContent = text;
-  aiMessagesEl.appendChild(item);
-  aiMessagesEl.scrollTop = aiMessagesEl.scrollHeight;
-}
-
-function renderAiEditSummary(path, editText) {
-  if (!aiMessagesEl) return;
-  const item = document.createElement("div");
-  item.className = "ai-message assistant";
-  const name = path ? path.split(/[\\/]/).pop() : "current file";
-  const summary = document.createElement("span");
-  summary.textContent = `Applied edit to ${name}.`;
-  const toggle = document.createElement("button");
-  toggle.type = "button";
-  toggle.className = "ai-edit-toggle";
-  toggle.textContent = "Show edit";
-  const details = document.createElement("pre");
-  details.className = "ai-edit-details";
-  details.textContent = editText || "";
-  details.hidden = true;
-  item.appendChild(summary);
-  item.appendChild(toggle);
-  item.appendChild(details);
-  aiMessagesEl.appendChild(item);
-  aiMessagesEl.scrollTop = aiMessagesEl.scrollHeight;
-}
-
-function renderAiNewSummary(path, editText) {
-  if (!aiMessagesEl) return;
-  const item = document.createElement("div");
-  item.className = "ai-message assistant";
-  const name = path ? path.split(/[\\/]/).pop() : "new file";
-  const summary = document.createElement("span");
-  summary.textContent = `Created ${name}.`;
-  const toggle = document.createElement("button");
-  toggle.type = "button";
-  toggle.className = "ai-edit-toggle";
-  toggle.textContent = "Show command";
-  const details = document.createElement("pre");
-  details.className = "ai-edit-details";
-  details.textContent = editText || "";
-  details.hidden = true;
-  item.appendChild(summary);
-  item.appendChild(toggle);
-  item.appendChild(details);
-  aiMessagesEl.appendChild(item);
-  aiMessagesEl.scrollTop = aiMessagesEl.scrollHeight;
-}
-
-function parseNewCommand(text) {
-  const match = text.match(/^\/new\b[:\s-]*/i);
-  if (!match) return null;
-  const rest = text.slice(match[0].length);
-  if (!rest.trim()) return null;
-  const lines = rest.split("\n");
-  let pathPart = lines.shift() || "";
-  let content = lines.join("\n");
-  if (!content) {
-    const colonIndex = pathPart.indexOf(":");
-    if (colonIndex !== -1) {
-      content = pathPart.slice(colonIndex + 1);
-      pathPart = pathPart.slice(0, colonIndex);
-    }
-  }
-  const relPath = pathPart.trim().replace(/^["']|["']$/g, "");
-  if (!relPath) return null;
-  return { relPath, content: content.replace(/^\s*\n?/, "") };
-}
-
-function parseParseCommand(text) {
-  const match = text.match(/^\/parse\b[:\s-]*/i);
-  if (!match) return null;
-  const rest = text.slice(match[0].length).trim();
-  return { relPath: rest || "" };
-}
-
-function parseHintCommand(text) {
-  const match = text.match(/^\/hint\b[:\s-]*/i);
-  if (!match) return null;
-  const rest = text.slice(match[0].length).trim();
-  if (!rest) return { query: "" };
-  if (/^rebuild\b/i.test(rest)) {
-    return { query: "", rebuild: true };
-  }
-  return { query: rest || "" };
-}
-
-function loadHintIndex() {
-  if (llmHintIndex) return llmHintIndex;
-  try {
-    const raw = window.localStorage?.getItem(LLM_HINT_INDEX_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (parsed && Array.isArray(parsed.items)) {
-      llmHintIndex = parsed;
-      return parsed;
-    }
-  } catch {}
-  return null;
-}
-
-function saveHintIndex(index) {
-  llmHintIndex = index;
-  window.localStorage?.setItem(LLM_HINT_INDEX_KEY, JSON.stringify(index));
-}
-
-function cosineSimilarity(a, b) {
-  let dot = 0;
-  let normA = 0;
-  let normB = 0;
-  for (let i = 0; i < a.length && i < b.length; i += 1) {
-    const x = a[i];
-    const y = b[i];
-    dot += x * y;
-    normA += x * x;
-    normB += y * y;
-  }
-  if (!normA || !normB) return 0;
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
-}
-
-async function ensureHintSeed() {
-  if (llmHintSeed) return llmHintSeed;
-  try {
-    const raw = await invoke("read_llm_hints");
-    const parsed = JSON.parse(raw || "[]");
-    llmHintSeed = Array.isArray(parsed) ? parsed : [];
-  } catch {
-    llmHintSeed = [];
-  }
-  return llmHintSeed;
-}
-
-async function buildHintIndex() {
-  const endpoint = resolveActiveEndpoint("embeddings");
-  if (!endpoint) {
-    setAiStatus("No embeddings endpoint configured.");
-    return null;
-  }
-  const seed = await ensureHintSeed();
-  if (!seed.length) {
-    setAiStatus("No hint corpus available.");
-    return null;
-  }
-  const texts = seed.map((item) => item.text || "");
-  const embeddings = await sendEmbeddings(endpoint, texts);
-  const items = seed.map((item, idx) => ({
-    id: item.id || `hint-${idx}`,
-    title: item.title || item.id || `Hint ${idx + 1}`,
-    text: item.text || "",
-    embedding: embeddings[idx] || [],
-  }));
-  const index = { items, createdAt: Date.now() };
-  saveHintIndex(index);
-  return index;
-}
-
-async function searchHints(query, maxItems = 5) {
-  const endpoint = resolveActiveEndpoint("embeddings");
-  if (!endpoint) {
-    setAiStatus("No embeddings endpoint configured.");
-    return [];
-  }
-  let index = loadHintIndex();
-  if (!index || !Array.isArray(index.items) || !index.items.length) {
-    index = await buildHintIndex();
-  }
-  if (!index) return [];
-  const [queryEmbedding] = await sendEmbeddings(endpoint, [query]);
-  if (!queryEmbedding) return [];
-  const scored = index.items.map((item) => ({
-    item,
-    score: cosineSimilarity(queryEmbedding, item.embedding || []),
-  }));
-  scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, maxItems).map((entry) => entry.item);
-}
-
 function setAiStatus(text) {
   if (!aiStatusEl) return;
   aiStatusEl.textContent = text || "";
-}
-
-function buildAiChatMessages(content, hintText = "") {
-  const history = Array.from(aiMessagesEl.querySelectorAll(".ai-message")).map((node) => {
-    const role = node.classList.contains("assistant") ? "assistant" : "user";
-    return { role, content: node.textContent || "" };
-  });
-  const system = {
-    role: "system",
-    content:
-      "You are the Mercurio assistant. You can edit the current open file with /edit and create new files inside the current project with /new <path>. Respond normally otherwise.",
-  };
-  const instructionMessage = llmInstructions
-    ? { role: "system", content: llmInstructions }
-    : null;
-  const hintMessage = hintText ? { role: "system", content: hintText } : null;
-  if (state.currentFile && editor) {
-    const fileContent = editor.getValue();
-    const pos = editor.getPosition();
-    const cursorLine = pos ? pos.lineNumber : 1;
-    const cursorCol = pos ? pos.column : 1;
-    const context = `Current file: ${state.currentFile}\n\n${fileContent}`;
-    const cursor = `Cursor position: line ${cursorLine}, column ${cursorCol}`;
-    return [
-      system,
-      ...(instructionMessage ? [instructionMessage] : []),
-      ...(hintMessage ? [hintMessage] : []),
-      { role: "user", content: context },
-      { role: "user", content: cursor },
-      ...history,
-      { role: "user", content },
-    ];
-  }
-  return [
-    system,
-    ...(instructionMessage ? [instructionMessage] : []),
-    ...(hintMessage ? [hintMessage] : []),
-    ...history,
-    { role: "user", content },
-  ];
-}
-
-async function sendAiMessage() {
-  if (!aiInputEl) return;
-  const rawContent = aiInputEl.value;
-  const content = rawContent.trim();
-  if (!content) return;
-  aiInputHistory.push(rawContent);
-  aiInputHistoryIndex = -1;
-  aiInputDraft = "";
-  const normalized = content.replace(/^[\uFEFF\u200B]+/, "");
-  const normalizedSlash = normalized.replace(/^[\uFF0F]/, "/");
-  const hintCommand = parseHintCommand(normalizedSlash);
-  if (hintCommand) {
-    aiInputEl.value = "";
-    renderAiMessage("user", content);
-    if (hintCommand.rebuild) {
-      try {
-        const index = await buildHintIndex();
-        if (index) {
-          renderAiMessage("assistant", "Hint index rebuilt.");
-        } else {
-          renderAiMessage("assistant", "Hint index rebuild failed.");
-        }
-      } catch (error) {
-        setAiStatus(`Hint rebuild failed: ${error}`);
-      }
-      return;
-    }
-    if (!hintCommand.query) {
-      setAiStatus("Provide a hint query after /hint.");
-      return;
-    }
-    try {
-      const hints = await searchHints(hintCommand.query, 5);
-      if (!hints.length) {
-        renderAiMessage("assistant", "No hints found.");
-      } else {
-        const lines = hints.map(
-          (hint, idx) => `${idx + 1}. ${hint.title}\n${hint.text.trim()}`
-        );
-        renderAiMessage("assistant", `Hints:\n${lines.join("\n\n")}`);
-      }
-    } catch (error) {
-      setAiStatus(`Hint search failed: ${error}`);
-    }
-    return;
-  }
-  const parseCommand = parseParseCommand(normalizedSlash);
-  if (parseCommand) {
-    if (!state.rootPath && !state.currentFile) {
-      setAiStatus("Select a project root first.");
-      return;
-    }
-    aiInputEl.value = "";
-    renderAiMessage("user", content);
-    let targetPath = "";
-    if (!parseCommand.relPath) {
-      if (!state.currentFile) {
-        setAiStatus("Open a file or provide a relative path.");
-        return;
-      }
-      targetPath = state.currentFile;
-    } else {
-      const rel = parseCommand.relPath.replace(/^["']|["']$/g, "");
-      if (/^[A-Za-z]:[\\/]|^\\\\|^\//.test(rel)) {
-        setAiStatus("Use a relative path inside the current project.");
-        return;
-      }
-      targetPath = joinPath(state.rootPath, rel);
-    }
-    try {
-      let payload;
-      if (targetPath === state.currentFile && editor) {
-        const fileContent = editor.getValue();
-        payload = await invoke("get_parse_errors_for_content", { path: targetPath, content: fileContent });
-      } else {
-        payload = await invoke("get_parse_errors", { path: targetPath });
-      }
-      const errors = payload?.errors || [];
-      renderAiMessage("assistant", formatParseErrors(targetPath, errors));
-    } catch (error) {
-      setAiStatus(`Parse failed: ${error}`);
-    }
-    return;
-  }
-  const newCommand = parseNewCommand(normalizedSlash);
-  if (newCommand) {
-    aiInputEl.value = "";
-    if (!state.rootPath) {
-      setAiStatus("Select a project root first.");
-      return;
-    }
-    renderAiMessage("user", content);
-    const created = await applyAiNewFile(
-      newCommand.relPath,
-      newCommand.content,
-      `Created ${newCommand.relPath.split(/[\\/]/).pop()}.`
-    );
-    if (!created) {
-      setAiStatus("Create failed.");
-    }
-    return;
-  }
-  const editMatch = normalizedSlash.match(/^\/edit\b[:\s-]*/i);
-  if (editMatch) {
-    if (!state.currentFile) {
-      setAiStatus("Open a file to apply edits.");
-      return;
-    }
-    aiInputEl.value = "";
-    const instruction = normalizedSlash.slice(editMatch[0].length).trim();
-    if (!instruction) {
-      setAiStatus("Provide edit instructions after /edit.");
-      return;
-    }
-    renderAiMessage("user", content);
-    await requestAiEditForPath(state.currentFile, instruction, {
-      applyImmediately: true,
-      announce: `Applied edit to ${state.currentFile.split(/[\\/]/).pop()}.`,
-    });
-    return;
-  }
-  const endpoint = resolveActiveEndpoint("chat");
-  if (!endpoint) {
-    setAiStatus("No chat endpoint configured.");
-    return;
-  }
-  aiInputEl.value = "";
-  renderAiMessage("user", content);
-  setAiStatus("Sending...");
-  try {
-    let hintText = "";
-    try {
-      const hints = await searchHints(content, 3);
-      if (hints.length) {
-        const lines = hints.map((hint, idx) => `${idx + 1}. ${hint.title}\n${hint.text.trim()}`);
-        hintText = `Relevant hints:\n${lines.join("\n\n")}`;
-      }
-    } catch {}
-    const messages = buildAiChatMessages(content, hintText);
-    const reply = await sendChatMessage(endpoint, messages);
-    const replyText = reply || "(no response)";
-    const normalizedReply = replyText.replace(/^[\uFEFF\u200B]+/, "").replace(/^[\uFF0F]/, "/");
-    const newReply = parseNewCommand(normalizedReply);
-    if (newReply) {
-      const created = await applyAiNewFile(newReply.relPath, newReply.content);
-      if (created) {
-        renderAiNewSummary(joinPath(state.rootPath, newReply.relPath), normalizedReply);
-      } else {
-        renderAiMessage("assistant", replyText);
-      }
-    } else {
-      const replyEdit = normalizedReply.match(/^\/edit\b[:\s-]*/i);
-      if (replyEdit && state.currentFile) {
-        const instruction = normalizedReply.slice(replyEdit[0].length).trim();
-        if (instruction) {
-          const applied = await requestAiEditForPath(state.currentFile, instruction, {
-            applyImmediately: true,
-          });
-          if (applied) {
-            renderAiEditSummary(state.currentFile, normalizedReply);
-          } else {
-            renderAiMessage("assistant", replyText);
-          }
-        }
-      } else {
-        renderAiMessage("assistant", replyText);
-      }
-    }
-    setAiStatus("");
-  } catch (error) {
-    setAiStatus(`AI error: ${error}`);
-  }
 }
 
 function normalizeAiFileContent(text) {
@@ -1545,139 +1151,6 @@ function handleProgrammaticEdit(path) {
   compileWorkspace({ silent: true, allowParseErrors: true, saveBefore: false, auto: true });
 }
 
-function refreshAiEndpointSelects() {
-  const endpoints = ensureDefaultEndpoint();
-  const activeChat = resolveActiveEndpoint("chat");
-  aiEndpointEditId = aiEndpointEditId || activeChat?.id || endpoints[0]?.id || "";
-  fillEndpointEditor(aiEndpointEditId);
-  renderEndpointList();
-}
-
-function fillEndpointEditor(id) {
-  const endpoints = loadEndpoints();
-  const endpoint = endpoints.find((item) => item.id === id);
-  if (!endpoint) {
-    if (aiEndpointNameEl) aiEndpointNameEl.value = "";
-    if (aiEndpointTypeEl) aiEndpointTypeEl.value = "chat";
-    if (aiEndpointBaseEl) aiEndpointBaseEl.value = "https://api.openai.com/v1";
-    if (aiEndpointModelEl) aiEndpointModelEl.value = "";
-    if (aiEndpointTokenEl) aiEndpointTokenEl.value = "";
-    return;
-  }
-  if (aiEndpointNameEl) aiEndpointNameEl.value = endpoint.name || "";
-  if (aiEndpointTypeEl) aiEndpointTypeEl.value = endpoint.type || "chat";
-  if (aiEndpointBaseEl) aiEndpointBaseEl.value = endpoint.baseUrl || "";
-  if (aiEndpointModelEl) aiEndpointModelEl.value = endpoint.model || "";
-  if (aiEndpointTokenEl) aiEndpointTokenEl.value = endpoint.apiKey || "";
-}
-
-function renderEndpointList() {
-  if (!aiEndpointListEl) return;
-  const endpoints = loadEndpoints();
-  aiEndpointListEl.innerHTML = "";
-  if (!endpoints.length) {
-    const empty = document.createElement("div");
-    empty.className = "muted";
-    empty.textContent = "No endpoints configured.";
-    aiEndpointListEl.appendChild(empty);
-    return;
-  }
-  const activeChat = resolveActiveEndpoint("chat");
-  const activeEmbed = resolveActiveEndpoint("embeddings");
-  endpoints.forEach((endpoint) => {
-    const row = document.createElement("div");
-    row.className = `ai-endpoint-row${aiEndpointEditId === endpoint.id ? " active" : ""}`;
-    const radio = document.createElement("input");
-    radio.type = "radio";
-    radio.name = endpoint.type === "embeddings" ? "ai-embed-selected" : "ai-chat-selected";
-    radio.checked =
-      (endpoint.type === "chat" && activeChat?.id === endpoint.id) ||
-      (endpoint.type === "embeddings" && activeEmbed?.id === endpoint.id);
-    radio.addEventListener("change", () => {
-      setActiveEndpointId(endpoint.type, endpoint.id);
-      renderEndpointList();
-    });
-    const info = document.createElement("div");
-    info.innerHTML = `<div>${endpoint.name}</div><div class="ai-endpoint-url">${endpoint.baseUrl || ""}</div>`;
-    const type = document.createElement("div");
-    type.className = "ai-endpoint-type";
-    type.textContent = endpoint.type;
-    const status = document.createElement("div");
-    const statusValue = aiEndpointStatus.get(endpoint.id);
-    status.className = `ai-endpoint-status ${statusValue === "pass" ? "pass" : statusValue === "fail" ? "fail" : ""}`;
-    status.textContent = statusValue ? statusValue : "";
-    row.appendChild(radio);
-    row.appendChild(info);
-    row.appendChild(type);
-    row.appendChild(status);
-    row.addEventListener("click", (event) => {
-      if (event.target === radio) return;
-      aiEndpointEditId = endpoint.id;
-      fillEndpointEditor(aiEndpointEditId);
-      renderEndpointList();
-    });
-    aiEndpointListEl.appendChild(row);
-  });
-}
-
-function upsertEndpoint() {
-  if (!aiEndpointNameEl || !aiEndpointTypeEl || !aiEndpointBaseEl || !aiEndpointModelEl) return;
-  const endpoints = loadEndpoints();
-  const selectedId = aiEndpointEditId;
-  const nextId = selectedId && endpoints.some((item) => item.id === selectedId)
-    ? selectedId
-    : `endpoint-${Date.now()}`;
-  const payload = {
-    id: nextId,
-    name: aiEndpointNameEl.value.trim() || "Endpoint",
-    type: aiEndpointTypeEl.value,
-    baseUrl: aiEndpointBaseEl.value.trim(),
-    model: aiEndpointModelEl.value.trim(),
-    apiKey: aiEndpointTokenEl?.value.trim() || "",
-  };
-  const updated = endpoints.filter((item) => item.id !== payload.id);
-  updated.push(payload);
-  saveEndpoints(updated);
-  if (payload.type === "chat") {
-    setActiveEndpointId("chat", payload.id);
-  }
-  if (payload.type === "embeddings") {
-    setActiveEndpointId("embeddings", payload.id);
-  }
-  aiEndpointEditId = payload.id;
-  refreshAiEndpointSelects();
-  setAiStatus("Endpoint saved.");
-}
-
-async function testCurrentEndpoint() {
-  const endpoints = loadEndpoints();
-  const id = aiEndpointEditId;
-  const endpoint = endpoints.find((item) => item.id === id);
-  if (!endpoint) return;
-  setAiStatus("Testing endpoint...");
-  try {
-    await testEndpoint(endpoint);
-    aiEndpointStatus.set(id, "pass");
-    renderEndpointList();
-    setAiStatus("Endpoint OK.");
-  } catch (error) {
-    aiEndpointStatus.set(id, "fail");
-    renderEndpointList();
-    setAiStatus(`Endpoint failed: ${error}`);
-  }
-}
-
-function deleteCurrentEndpoint() {
-  const id = aiEndpointEditId;
-  if (!id) return;
-  const endpoints = loadEndpoints().filter((item) => item.id !== id);
-  saveEndpoints(endpoints);
-  aiEndpointStatus.delete(id);
-  aiEndpointEditId = "";
-  refreshAiEndpointSelects();
-  setAiStatus("Endpoint deleted.");
-}
-
 function setCompileFloat(state, message, detail) {
   if (!compileFloatEl || !compileFloatMessageEl || !compileFloatDetailEl || !compileFloatCancelBtn) {
     return;
@@ -1816,23 +1289,6 @@ function hideDiagramContextMenu() {
   if (!diagramContextMenuEl) return;
   diagramContextMenuEl.hidden = true;
   diagramContextTarget = null;
-}
-
-function openAiMessageMenu(x, y, text) {
-  if (!aiMessageMenuEl) return;
-  aiMessageMenuEl.dataset.text = text || "";
-  aiMessageMenuEl.hidden = false;
-  const rect = aiMessageMenuEl.getBoundingClientRect();
-  const left = Math.min(x, window.innerWidth - rect.width - 8);
-  const top = Math.min(y, window.innerHeight - rect.height - 8);
-  aiMessageMenuEl.style.left = `${Math.max(8, left)}px`;
-  aiMessageMenuEl.style.top = `${Math.max(8, top)}px`;
-}
-
-function hideAiMessageMenu() {
-  if (!aiMessageMenuEl) return;
-  aiMessageMenuEl.hidden = true;
-  delete aiMessageMenuEl.dataset.text;
 }
 
 function selectInModelTree(target) {
@@ -2312,17 +1768,130 @@ async function createNewProject() {
   }
 }
 
+function parseLogLine(line) {
+  const match = line.match(/^\[(.+?)\]\s+\[(.+?)\]\s+\[(.+?)\]\s+(.*)$/);
+  if (!match) {
+    return { raw: line, timestamp: "", level: "INFO", kind: "general", message: line };
+  }
+  return {
+    raw: line,
+    timestamp: match[1],
+    level: match[2],
+    kind: match[3],
+    message: match[4],
+  };
+}
+
+function formatRelativeTime(ts) {
+  const seconds = Number(ts);
+  if (!Number.isFinite(seconds)) return "";
+  const diff = Math.max(0, Date.now() - seconds * 1000);
+  if (diff < 60_000) {
+    return `${Math.max(1, Math.round(diff / 1000))}s ago`;
+  }
+  if (diff < 3_600_000) {
+    return `${Math.round(diff / 60_000)}m ago`;
+  }
+  return `${Math.round(diff / 3_600_000)}h ago`;
+}
+
+function renderLogOutput() {
+  if (!logOutputEl) return;
+  const previousTop = logOutputEl.scrollTop;
+  const previousHeight = logOutputEl.scrollHeight || 1;
+  const previousRatio = previousTop / previousHeight;
+  const level = logLevelFilterEl?.value || "all";
+  const kind = logTypeFilterEl?.value || "all";
+  const sort = logSortEl?.value || "desc";
+  const filtered = logEntries.filter((entry) => {
+    const levelMatch = level === "all" || entry.level === level;
+    const kindMatch = kind === "all" || entry.kind === kind;
+    return levelMatch && kindMatch;
+  });
+  filtered.sort((a, b) => {
+    const aTime = Number(a.timestamp) || 0;
+    const bTime = Number(b.timestamp) || 0;
+    return sort === "asc" ? aTime - bTime : bTime - aTime;
+  });
+  logOutputEl.innerHTML = "";
+  const header = document.createElement("div");
+  header.className = "log-row log-row-header";
+  header.innerHTML = `
+    <div class="log-cell">Time</div>
+    <div class="log-cell">Level</div>
+    <div class="log-cell">Type</div>
+    <div class="log-cell">Message</div>
+  `;
+  logOutputEl.appendChild(header);
+  filtered.forEach((entry) => {
+    const row = document.createElement("div");
+    row.className = "log-row";
+    const time = document.createElement("div");
+    time.className = "log-cell";
+    time.textContent = formatRelativeTime(entry.timestamp);
+    const levelCell = document.createElement("div");
+    levelCell.className = `log-cell log-level ${entry.level}`;
+    levelCell.textContent = entry.level;
+    const typeCell = document.createElement("div");
+    typeCell.className = "log-cell";
+    typeCell.textContent = entry.kind;
+    const message = document.createElement("div");
+    message.className = "log-cell";
+    message.textContent = entry.message;
+    row.appendChild(time);
+    row.appendChild(levelCell);
+    row.appendChild(typeCell);
+    row.appendChild(message);
+    logOutputEl.appendChild(row);
+  });
+  logOutputEl.scrollTop = logOutputEl.scrollHeight * previousRatio;
+}
+
+function updateLogTypeOptions() {
+  if (!logTypeFilterEl) return;
+  const kinds = Array.from(new Set(logEntries.map((entry) => entry.kind))).sort();
+  const current = logTypeFilterEl.value || "all";
+  logTypeFilterEl.innerHTML = "";
+  const allOption = document.createElement("option");
+  allOption.value = "all";
+  allOption.textContent = "All";
+  logTypeFilterEl.appendChild(allOption);
+  kinds.forEach((value) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    logTypeFilterEl.appendChild(option);
+  });
+  logTypeFilterEl.value = kinds.includes(current) ? current : "all";
+}
+
 async function showLogDialog() {
   if (!logDialogEl || !logOutputEl) return;
   const lines = await invoke("get_logs");
-  logOutputEl.textContent = Array.isArray(lines) ? lines.join("\n") : "";
-  logOutputEl.scrollTop = logOutputEl.scrollHeight;
+  logEntries = Array.isArray(lines) ? lines.map(parseLogLine) : [];
+  updateLogTypeOptions();
+  renderLogOutput();
   logDialogEl.hidden = false;
+  if (!logRefreshTimer) {
+    logRefreshTimer = setInterval(async () => {
+      if (!logDialogEl || logDialogEl.hidden) return;
+      try {
+        const next = await invoke("get_logs");
+        logEntries = Array.isArray(next) ? next.map(parseLogLine) : [];
+        updateLogTypeOptions();
+        renderLogOutput();
+      } catch {}
+    }, 1500);
+  }
 }
 
 function hideLogDialog() {
   if (!logDialogEl) return;
   logDialogEl.hidden = true;
+  if (logRefreshTimer) {
+    clearInterval(logRefreshTimer);
+    logRefreshTimer = null;
+  }
 }
 
 function showAboutDialog() {
@@ -2369,7 +1938,7 @@ function hideSettingsDialog() {
 
 function showAiSettingsDialog() {
   if (!aiSettingsDialogEl) return;
-  refreshAiEndpointSelects();
+  aiEndpoints?.refresh();
   aiSettingsDialogEl.hidden = false;
 }
 
@@ -3266,6 +2835,26 @@ function renderModelTree(symbols, files, unresolved, libraryPath) {
     }
   });
 
+  if (libraryRoot) {
+    logFrontend(
+      "INFO",
+      "model",
+      `Model tree: library root=${libraryRoot} project=${projectSymbols.length} library=${librarySymbols.length} import=${importSymbols.length}`
+    );
+    if (!librarySymbols.length) {
+      const sample = filteredSymbols.find((symbol) => symbol?.file_path)?.file_path || "";
+      if (sample) {
+        logFrontend("WARN", "model", `Model tree: no library symbols found; sample path=${sample}`);
+      }
+    }
+  } else {
+    logFrontend(
+      "WARN",
+      "model",
+      `Model tree: library root missing (project=${projectSymbols.length} library=${librarySymbols.length} import=${importSymbols.length})`
+    );
+  }
+
   if (!projectSymbols.length && !librarySymbols.length && !unresolvedRefs.length) {
     const empty = document.createElement("p");
     empty.className = "muted";
@@ -4019,34 +3608,102 @@ function setupEditorTabsMenu() {
 }
 
 function showAppMenu(x, y) {
-  if (!appMenuEl || !menuToggleBtn) return;
+  if (!appMenuEl) return;
   appMenuEl.hidden = false;
   const rect = appMenuEl.getBoundingClientRect();
   const left = Math.min(x, window.innerWidth - rect.width - 8);
   const top = Math.min(y, window.innerHeight - rect.height - 8);
   appMenuEl.style.left = `${Math.max(8, left)}px`;
   appMenuEl.style.top = `${Math.max(8, top)}px`;
-  menuToggleBtn.setAttribute("aria-expanded", "true");
 }
 
 function hideAppMenu() {
   if (!appMenuEl) return;
   appMenuEl.hidden = true;
-  menuToggleBtn?.setAttribute("aria-expanded", "false");
+  menuFileBtn?.setAttribute("aria-expanded", "false");
+  menuEditBtn?.setAttribute("aria-expanded", "false");
+  menuViewBtn?.setAttribute("aria-expanded", "false");
+  menuCompileBtn?.setAttribute("aria-expanded", "false");
+  menuHelpBtn?.setAttribute("aria-expanded", "false");
+}
+
+function buildAppMenu(items) {
+  if (!appMenuEl) return;
+  appMenuEl.innerHTML = "";
+  items.forEach((item) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = item.label;
+    if (item.disabled) {
+      button.classList.add("disabled");
+      button.disabled = true;
+    } else if (item.action) {
+      button.dataset.action = item.action;
+    }
+    appMenuEl.appendChild(button);
+  });
+}
+
+function openTopMenu(button, items) {
+  if (!button || !appMenuEl) return;
+  if (!appMenuEl.hidden && button.getAttribute("aria-expanded") === "true") {
+    hideAppMenu();
+    return;
+  }
+  buildAppMenu(items);
+  const rect = button.getBoundingClientRect();
+  showAppMenu(rect.left, rect.bottom + 4);
+  button.setAttribute("aria-expanded", "true");
 }
 
 function setupAppMenu() {
-  if (!appMenuEl || !menuToggleBtn) return;
+  if (!appMenuEl) return;
   hideAppMenu();
 
-  menuToggleBtn.addEventListener("click", (event) => {
+  const fileItems = [
+    { label: "New Project…", action: "new-project" },
+    { label: "Open Project…", action: "open-folder" },
+  ];
+  const editItems = [
+    { label: "Undo", disabled: true },
+    { label: "Redo", disabled: true },
+    { label: "Cut", disabled: true },
+    { label: "Copy", disabled: true },
+    { label: "Paste", disabled: true },
+  ];
+  const viewItems = [
+    { label: "View Log…", action: "view-log" },
+    { label: "Settings…", action: "settings" },
+    { label: "Toggle Project Panel", action: "toggle-project" },
+    { label: "Toggle Model Tree", action: "toggle-model-tree" },
+  ];
+  const compileItems = [
+    { label: "Compile Workspace", action: "compile-workspace" },
+    { label: "Export Model…", action: "export-model" },
+  ];
+  const helpItems = [
+    { label: "About", action: "about" },
+  ];
+
+  menuFileBtn?.addEventListener("click", (event) => {
     event.stopPropagation();
-    if (!appMenuEl.hidden) {
-      hideAppMenu();
-      return;
-    }
-    const rect = menuToggleBtn.getBoundingClientRect();
-    showAppMenu(rect.left, rect.bottom + 4);
+    openTopMenu(menuFileBtn, fileItems);
+  });
+  menuEditBtn?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openTopMenu(menuEditBtn, editItems);
+  });
+  menuViewBtn?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openTopMenu(menuViewBtn, viewItems);
+  });
+  menuCompileBtn?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openTopMenu(menuCompileBtn, compileItems);
+  });
+  menuHelpBtn?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openTopMenu(menuHelpBtn, helpItems);
   });
 
   appMenuEl.addEventListener("click", async (event) => {
@@ -4057,7 +3714,7 @@ function setupAppMenu() {
   });
 
   document.addEventListener("click", (event) => {
-    if (!appMenuEl.contains(event.target) && event.target !== menuToggleBtn) {
+    if (!appMenuEl.contains(event.target)) {
       hideAppMenu();
     }
   });
@@ -4074,6 +3731,16 @@ function setupAppMenu() {
 async function handleMenuAction(action) {
   if (action === "open-folder") {
     await chooseRoot();
+  }
+  if (action === "toggle-project") {
+    appEl.classList.toggle("hide-project");
+    syncPanelToggles();
+    return;
+  }
+  if (action === "toggle-model-tree") {
+    appEl.classList.toggle("hide-model-tree");
+    syncPanelToggles();
+    return;
   }
   if (action === "open-file") {
     if (!dialog?.open) {
@@ -4339,6 +4006,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   logDialogEl = document.querySelector("#log-dialog");
   logOutputEl = document.querySelector("#log-output");
   logRefreshBtn = document.querySelector("#log-refresh");
+  logLevelFilterEl = document.querySelector("#log-level-filter");
+  logTypeFilterEl = document.querySelector("#log-type-filter");
+  logSortEl = document.querySelector("#log-sort");
   exportDialogEl = document.querySelector("#export-dialog");
   exportFormatEl = document.querySelector("#export-format");
   exportIncludeStdlibEl = document.querySelector("#export-include-stdlib");
@@ -4419,7 +4089,11 @@ window.addEventListener("DOMContentLoaded", async () => {
   modelPropertiesCloseBtn = document.querySelector("#model-properties-close");
   modelPropertiesSplitEl = document.querySelector("#model-properties-split");
   appMenuEl = document.querySelector("#app-menu");
-  menuToggleBtn = document.querySelector("#menu-toggle");
+  menuFileBtn = document.querySelector("#menu-file");
+  menuEditBtn = document.querySelector("#menu-edit");
+  menuViewBtn = document.querySelector("#menu-view");
+  menuCompileBtn = document.querySelector("#menu-compile");
+  menuHelpBtn = document.querySelector("#menu-help");
   toggleProjectBtn = document.querySelector("#toggle-project");
   toggleModelTreeBtn = document.querySelector("#toggle-model-tree");
   restoreProjectBtn = document.querySelector("#restore-project");
@@ -4433,13 +4107,24 @@ window.addEventListener("DOMContentLoaded", async () => {
     zoomInEl: document.querySelector("#diagram-zoom-in"),
     zoomOutEl: document.querySelector("#diagram-zoom-out"),
     zoomResetEl: document.querySelector("#diagram-zoom-reset"),
+    autoLayoutEl: document.querySelector("#diagram-autolayout"),
     copyEl: document.querySelector("#diagram-copy"),
+    canvasEl: document.querySelector("#diagram-canvas"),
+    scrollXEl: document.querySelector("#diagram-scrollbar-x"),
+    scrollYEl: document.querySelector("#diagram-scrollbar-y"),
     editorPanelEl,
     normalizePath: normalizePathForCompare,
     readFile: async (path) => invoke("read_file", { path }),
     writeFile: async (path, content) => invoke("write_file", { path, content }),
     onSelectInTree: (payload, pos) => {
       openDiagramContextMenu(pos.x, pos.y, payload);
+    },
+    onSelectSymbol: (payload) => {
+      if (!trackSymbolInTree) return;
+      selectInModelTree(payload);
+    },
+    log: (level, kind, message) => {
+      invoke?.("log_frontend", { level, kind, message }).catch(() => {});
     },
   });
   updateArtifactToggle();
@@ -4455,12 +4140,81 @@ window.addEventListener("DOMContentLoaded", async () => {
   currentTheme = loadStoredTheme();
   applyTheme(currentTheme);
   setRightPaneMode(rightPaneMode);
-  refreshAiEndpointSelects();
-  try {
-    llmInstructions = await invoke("read_llm_instructions");
-  } catch {
-    llmInstructions = "";
-  }
+  aiEndpoints = initAiEndpoints({
+    elements: {
+      listEl: aiEndpointListEl,
+      nameEl: aiEndpointNameEl,
+      typeEl: aiEndpointTypeEl,
+      baseEl: aiEndpointBaseEl,
+      modelEl: aiEndpointModelEl,
+      tokenEl: aiEndpointTokenEl,
+      saveBtn: aiEndpointSaveBtn,
+      deleteBtn: aiEndpointDeleteBtn,
+      testBtn: aiEndpointTestBtn,
+      newBtn: aiEndpointNewBtn,
+    },
+    setStatus: setAiStatus,
+  });
+  aiEndpoints.refresh();
+  aiEndpoints.bind();
+  aiChat = initAiChat({
+    invoke,
+    elements: {
+      messagesEl: aiMessagesEl,
+      inputEl: aiInputEl,
+      statusEl: aiStatusEl,
+      clearBtn: aiClearBtn,
+      messageMenuEl: aiMessageMenuEl,
+    },
+    getState: () => state,
+    getEditor: () => editor,
+    onEdit: async (instruction) => {
+      if (!state.currentFile) {
+        setAiStatus("Open a file to apply edits.");
+        return false;
+      }
+      return requestAiEditForPath(state.currentFile, instruction, { applyImmediately: true });
+    },
+    onNew: async (relPath, content) => applyAiNewFile(relPath, content),
+    onParse: async (relPath) => {
+      if (!state.rootPath && !state.currentFile) {
+        setAiStatus("Select a project root first.");
+        return "";
+      }
+      let targetPath = "";
+      if (!relPath) {
+        if (!state.currentFile) {
+          setAiStatus("Open a file or provide a relative path.");
+          return "";
+        }
+        targetPath = state.currentFile;
+      } else {
+        const clean = relPath.replace(/^["']|["']$/g, "");
+        if (/^[A-Za-z]:[\\/]|^\\\\|^\//.test(clean)) {
+          setAiStatus("Use a relative path inside the current project.");
+          return "";
+        }
+        targetPath = joinPath(state.rootPath, clean);
+      }
+      try {
+        let payload;
+        if (targetPath === state.currentFile && editor) {
+          const fileContent = editor.getValue();
+          payload = await invoke("get_parse_errors_for_content", { path: targetPath, content: fileContent });
+        } else {
+          payload = await invoke("get_parse_errors", { path: targetPath });
+        }
+        const errors = payload?.errors || [];
+        return formatParseErrors(targetPath, errors);
+      } catch (error) {
+        setAiStatus(`Parse failed: ${error}`);
+        return "";
+      }
+    },
+    setStatus: setAiStatus,
+  });
+  aiChat.bind();
+  await aiChat.loadInstructions();
   modelTreeEl?.addEventListener("contextmenu", (event) => {
     if (!event.target.closest(".model-row")) {
       event.preventDefault();
@@ -4522,6 +4276,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   logRefreshBtn?.addEventListener("click", async () => {
     await showLogDialog();
   });
+  logLevelFilterEl?.addEventListener("change", renderLogOutput);
+  logTypeFilterEl?.addEventListener("change", renderLogOutput);
+  logSortEl?.addEventListener("change", renderLogOutput);
   exportRunBtn?.addEventListener("click", async () => {
     await runExportFromDialog();
   });
@@ -4536,6 +4293,32 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (action === "close") {
       hideLogDialog();
     }
+  });
+  logDialogEl?.querySelector(".floating-log-header")?.addEventListener("pointerdown", (event) => {
+    if (!logDialogEl) return;
+    if (event.target.closest("button")) return;
+    const rect = logDialogEl.getBoundingClientRect();
+    const offsetX = event.clientX - rect.left;
+    const offsetY = event.clientY - rect.top;
+    logDialogEl.classList.add("dragging");
+    logDialogEl.setPointerCapture(event.pointerId);
+
+    const onMove = (moveEvent) => {
+      const left = Math.max(8, moveEvent.clientX - offsetX);
+      const top = Math.max(8, moveEvent.clientY - offsetY);
+      logDialogEl.style.left = `${left}px`;
+      logDialogEl.style.top = `${top}px`;
+      logDialogEl.style.right = "auto";
+    };
+
+    const onUp = () => {
+      logDialogEl.classList.remove("dragging");
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
   });
   exportDialogEl?.addEventListener("click", (event) => {
     const action = event.target?.dataset?.action;
@@ -4725,67 +4508,6 @@ window.addEventListener("DOMContentLoaded", async () => {
   aiSettingsOpenBtn?.addEventListener("click", () => {
     showAiSettingsDialog();
   });
-  aiSendBtn?.addEventListener("click", sendAiMessage);
-  aiClearBtn?.addEventListener("click", () => {
-    if (aiMessagesEl) {
-      aiMessagesEl.innerHTML = "";
-    }
-    setAiStatus("");
-  });
-  aiMessagesEl?.addEventListener("contextmenu", (event) => {
-    const target = event.target.closest(".ai-message");
-    if (!target) return;
-    event.preventDefault();
-    openAiMessageMenu(event.clientX, event.clientY, target.textContent || "");
-  });
-  aiMessagesEl?.addEventListener("click", (event) => {
-    const toggle = event.target.closest(".ai-edit-toggle");
-    if (!toggle) return;
-    const message = toggle.closest(".ai-message");
-    const details = message?.querySelector(".ai-edit-details");
-    if (!details) return;
-    details.hidden = !details.hidden;
-    toggle.textContent = details.hidden ? "Show edit" : "Hide edit";
-  });
-  aiInputEl?.addEventListener("keydown", (event) => {
-    if (event.ctrlKey && !event.shiftKey && !event.altKey && event.key === "ArrowUp") {
-      if (!aiInputHistory.length) return;
-      event.preventDefault();
-      if (aiInputHistoryIndex < 0) {
-        aiInputDraft = aiInputEl.value;
-        aiInputHistoryIndex = aiInputHistory.length;
-      }
-      aiInputHistoryIndex = Math.max(0, aiInputHistoryIndex - 1);
-      aiInputEl.value = aiInputHistory[aiInputHistoryIndex] || "";
-      aiInputEl.setSelectionRange(aiInputEl.value.length, aiInputEl.value.length);
-      return;
-    }
-    if (event.ctrlKey && !event.shiftKey && !event.altKey && event.key === "ArrowDown") {
-      if (aiInputHistoryIndex < 0) return;
-      event.preventDefault();
-      aiInputHistoryIndex = Math.min(aiInputHistory.length, aiInputHistoryIndex + 1);
-      if (aiInputHistoryIndex >= aiInputHistory.length) {
-        aiInputEl.value = aiInputDraft;
-        aiInputHistoryIndex = -1;
-      } else {
-        aiInputEl.value = aiInputHistory[aiInputHistoryIndex] || "";
-      }
-      aiInputEl.setSelectionRange(aiInputEl.value.length, aiInputEl.value.length);
-      return;
-    }
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      sendAiMessage();
-    }
-  });
-  aiEndpointSaveBtn?.addEventListener("click", upsertEndpoint);
-  aiEndpointDeleteBtn?.addEventListener("click", deleteCurrentEndpoint);
-  aiEndpointTestBtn?.addEventListener("click", testCurrentEndpoint);
-  aiEndpointNewBtn?.addEventListener("click", () => {
-    aiEndpointEditId = "";
-    fillEndpointEditor("");
-    renderEndpointList();
-  });
   aiApplyConfirmBtn?.addEventListener("click", applyAiEdit);
   aiPaneSplitEl?.addEventListener("pointerdown", (event) => {
     if (!aiInputEl || !aiPaneEl) return;
@@ -4857,21 +4579,6 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
     hideDiagramContextMenu();
   });
-  aiMessageMenuEl?.addEventListener("click", async (event) => {
-    const action = event.target?.dataset?.action;
-    if (action === "copy") {
-      const text = aiMessageMenuEl?.dataset?.text || "";
-      if (text && navigator.clipboard?.writeText) {
-        try {
-          await navigator.clipboard.writeText(text);
-          setAiStatus("Copied message.");
-        } catch {
-          setAiStatus("Copy failed.");
-        }
-      }
-    }
-    hideAiMessageMenu();
-  });
   window.addEventListener("resize", () => {
     if (state.openFiles.length) {
       renderEditorTabs();
@@ -4881,12 +4588,6 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (!diagramContextMenuEl || diagramContextMenuEl.hidden) return;
     if (!event.target.closest("#diagram-context-menu")) {
       hideDiagramContextMenu();
-    }
-  });
-  document.addEventListener("click", (event) => {
-    if (!aiMessageMenuEl || aiMessageMenuEl.hidden) return;
-    if (!event.target.closest("#ai-message-menu")) {
-      hideAiMessageMenu();
     }
   });
   compileButton?.addEventListener("click", compileWorkspace);
@@ -4926,6 +4627,10 @@ window.addEventListener("DOMContentLoaded", async () => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") {
       event.preventDefault();
       await showNewProjectDialog();
+    }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "l") {
+      event.preventDefault();
+      await showLogDialog();
     }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "b") {
       event.preventDefault();

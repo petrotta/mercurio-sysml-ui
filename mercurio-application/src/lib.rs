@@ -8,8 +8,8 @@ use std::fs::File;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::env;
-use std::time::{Instant, SystemTime};
-use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::collections::HashSet;
 use syster::base::constants::STDLIB_DIR;
 use syster::base::FileId;
@@ -209,6 +209,90 @@ fn extract_zip_to_dir(zip_path: &Path, target_dir: &Path) -> Result<(), String> 
     Ok(())
 }
 
+fn dir_has_extension(dir: &Path, extensions: &[&str]) -> Result<bool, String> {
+    if !dir.exists() {
+        return Ok(false);
+    }
+    let entries = fs::read_dir(dir).map_err(|e| e.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.is_dir() {
+            if dir_has_extension(&path, extensions)? {
+                return Ok(true);
+            }
+            continue;
+        }
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if extensions.iter().any(|value| ext.eq_ignore_ascii_case(value)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn dir_has_named_file(dir: &Path, names: &[&str]) -> Result<bool, String> {
+    if !dir.exists() {
+        return Ok(false);
+    }
+    let entries = fs::read_dir(dir).map_err(|e| e.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.is_dir() {
+            if dir_has_named_file(&path, names)? {
+                return Ok(true);
+            }
+            continue;
+        }
+        let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if names.iter().any(|value| value.eq_ignore_ascii_case(file_name)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn dir_has_any_file(dir: &Path) -> Result<bool, String> {
+    if !dir.exists() {
+        return Ok(false);
+    }
+    let entries = fs::read_dir(dir).map_err(|e| e.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.is_dir() {
+            if dir_has_any_file(&path)? {
+                return Ok(true);
+            }
+        } else {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn expand_nested_zips(target_dir: &Path) -> Result<bool, String> {
+    if !target_dir.exists() {
+        return Ok(false);
+    }
+    let mut expanded = false;
+    let entries = fs::read_dir(target_dir).map_err(|e| e.to_string())?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.is_file() {
+            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if ext.eq_ignore_ascii_case("zip") {
+                extract_zip_to_dir(&path, target_dir)?;
+                let _ = fs::remove_file(&path);
+                expanded = true;
+            }
+        }
+    }
+    Ok(expanded)
+}
+
 fn read_packaged_stdlib_manifest(app: &tauri::AppHandle) -> Result<PackagedStdlibManifest, String> {
     let manifest_path = app
         .path()
@@ -243,14 +327,40 @@ fn ensure_packaged_stdlibs(
     let manifest = read_packaged_stdlib_manifest(app)?;
     for entry in &manifest.stdlibs {
         let target_dir = stdlib_root.join(&entry.id);
-        if target_dir.exists() {
+        let has_models = dir_has_extension(&target_dir, &["sysml", "kerml"])?;
+        let has_projects = dir_has_named_file(&target_dir, &[".project", ".project.json", "project.json"])?;
+        let has_zip = dir_has_extension(&target_dir, &["zip"])?;
+        let has_any = dir_has_any_file(&target_dir)?;
+        if has_models || has_projects {
+            continue;
+        }
+        if has_any && !has_zip {
             continue;
         }
         let zip_path = app
             .path()
             .resolve(&entry.zip, BaseDirectory::Resource)
             .map_err(|e| e.to_string())?;
+        log_event(
+            "INFO",
+            "stdlib",
+            format!(
+                "extract packaged stdlib id={} zip={}",
+                entry.id,
+                zip_path.to_string_lossy()
+            ),
+        );
+        if !target_dir.exists() {
+            fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
+        }
         extract_zip_to_dir(&zip_path, &target_dir)?;
+        if expand_nested_zips(&target_dir)? {
+            log_event(
+                "INFO",
+                "stdlib",
+                format!("expanded nested stdlib zip for id={}", entry.id),
+            );
+        }
     }
     let installed = list_stdlib_versions_from_root(stdlib_root)?;
     let default_missing = settings
@@ -489,6 +599,27 @@ fn read_file(path: String) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| e.to_string())
 }
 
+static LOG_BUFFER: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+fn log_store() -> &'static Mutex<Vec<String>> {
+    LOG_BUFFER.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn log_event(level: &str, kind: &str, message: String) {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| format!("{}.{:03}", d.as_secs(), d.subsec_millis()))
+        .unwrap_or_else(|_| "0.000".to_string());
+    let line = format!("[{}] [{}] [{}] {}", timestamp, level, kind, message);
+    if let Ok(mut buffer) = log_store().lock() {
+        buffer.push(line);
+        if buffer.len() > 2000 {
+            let drain = buffer.len() - 2000;
+            buffer.drain(0..drain);
+        }
+    }
+}
+
 #[tauri::command]
 fn read_llm_instructions(app: tauri::AppHandle) -> Result<String, String> {
     app.path()
@@ -505,10 +636,89 @@ fn read_llm_hints(app: tauri::AppHandle) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     if let Ok(content) = fs::read_to_string(&resource_path) {
         return Ok(content);
+    } else {
+        log_event(
+            "WARN",
+            "hint",
+            format!(
+                "resource missing: {}",
+                resource_path.to_string_lossy()
+            ),
+        );
     }
     let dev_root = std::env::current_dir().map_err(|e| e.to_string())?;
     let dev_path = dev_root.join("mercurio-application").join("llm").join("hints.json");
-    fs::read_to_string(dev_path).map_err(|e| e.to_string())
+    fs::read_to_string(&dev_path).map_err(|e| {
+        log_event(
+            "ERROR",
+            "hint",
+            format!("dev hints missing: {} err={}", dev_path.to_string_lossy(), e),
+        );
+        e.to_string()
+    })
+}
+
+#[derive(Serialize)]
+struct LlmHintsMeta {
+    path: String,
+    modified_ms: u128,
+}
+
+#[tauri::command]
+fn get_llm_hints_meta(app: tauri::AppHandle) -> Result<LlmHintsMeta, String> {
+    let resource_path = app
+        .path()
+        .resolve("llm/hints.json", tauri::path::BaseDirectory::Resource)
+        .map_err(|e| e.to_string())?;
+    let (path, metadata) = if let Ok(meta) = fs::metadata(&resource_path) {
+        (resource_path, meta)
+    } else {
+        let dev_root = std::env::current_dir().map_err(|e| e.to_string())?;
+        let dev_path = dev_root.join("mercurio-application").join("llm").join("hints.json");
+        let meta = fs::metadata(&dev_path).map_err(|e| e.to_string())?;
+        (dev_path, meta)
+    };
+    let modified = metadata
+        .modified()
+        .map_err(|e| e.to_string())?
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_millis();
+    Ok(LlmHintsMeta {
+        path: path.to_string_lossy().to_string(),
+        modified_ms: modified,
+    })
+}
+
+#[tauri::command]
+fn get_logs() -> Result<Vec<String>, String> {
+    let buffer = log_store()
+        .lock()
+        .map_err(|_| "Log buffer lock poisoned".to_string())?;
+    Ok(buffer.clone())
+}
+
+#[derive(Deserialize)]
+struct FrontendLogPayload {
+    level: String,
+    kind: String,
+    message: String,
+}
+
+#[tauri::command]
+fn log_frontend(payload: FrontendLogPayload) -> Result<(), String> {
+    let level = if payload.level.trim().is_empty() {
+        "INFO"
+    } else {
+        payload.level.trim()
+    };
+    let kind = if payload.kind.trim().is_empty() {
+        "frontend"
+    } else {
+        payload.kind.trim()
+    };
+    log_event(level, kind, payload.message);
+    Ok(())
 }
 
 #[tauri::command]
@@ -806,12 +1016,24 @@ fn load_stdlib_cached(
         .map_err(|_| "Stdlib cache lock poisoned".to_string())?;
     if let Some(cache) = guard.as_ref() {
         if cache.path == stdlib_path {
-            println!("stdlib: cache hit");
+            log_event(
+                "INFO",
+                "stdlib",
+                format!(
+                    "cache hit path={} files={}",
+                    stdlib_path.to_string_lossy(),
+                    cache.files.len()
+                ),
+            );
             return Ok(cache.files.clone());
         }
     }
 
-    println!("stdlib: cache miss (parsing stdlib)");
+    log_event(
+        "INFO",
+        "stdlib",
+        format!("cache miss path={} (parsing stdlib)", stdlib_path.to_string_lossy()),
+    );
     let mut host = AnalysisHost::new();
     let loader = StdLibLoader::with_path(stdlib_path.to_path_buf());
     loader.load_into_host(&mut host)?;
@@ -824,6 +1046,11 @@ fn load_stdlib_cached(
         path: stdlib_path.to_path_buf(),
         files: files.clone(),
     });
+    log_event(
+        "INFO",
+        "stdlib",
+        format!("cache stored path={} files={}", stdlib_path.to_string_lossy(), files.len()),
+    );
     Ok(files)
 }
 
@@ -871,7 +1098,15 @@ async fn compile_workspace(
         compile_workspace_sync(app, state, root, run_id, allow_parse_errors, unsaved)
     })
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| {
+            let message = e.to_string();
+            log_event("ERROR", "compile", format!("panic run_id={} err={}", run_id, message));
+            message
+        })?
+        .map_err(|e| {
+            log_event("ERROR", "compile", format!("failed run_id={} err={}", run_id, e));
+            e
+        })
 }
 
 fn compile_workspace_sync(
@@ -885,7 +1120,9 @@ fn compile_workspace_sync(
     let compile_start = Instant::now();
     let root_path = PathBuf::from(root);
     if !root_path.exists() {
-        return Err("Root path does not exist".to_string());
+        let message = "Root path does not exist".to_string();
+        log_event("ERROR", "compile", message.clone());
+        return Err(message);
     }
     let default_stdlib = state
         .settings
@@ -897,6 +1134,18 @@ fn compile_workspace_sync(
         canceled: state.canceled_compiles.clone(),
         run_id,
     };
+
+    log_event(
+        "INFO",
+        "compile",
+        format!(
+            "start root={} run_id={} allow_parse_errors={} unsaved={}",
+            root_path.to_string_lossy(),
+            run_id,
+            allow_parse_errors,
+            unsaved.len()
+        ),
+    );
 
     let is_canceled = || {
         state
@@ -1014,10 +1263,31 @@ fn compile_workspace_sync(
             (StdLibLoader::new(), source, Some(discovered))
         }
     };
+    log_event(
+        "INFO",
+        "stdlib",
+        format!(
+            "resolve source={} path={}",
+            stdlib_source,
+            stdlib_path_for_log
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "none".to_string())
+        ),
+    );
     let project_set: HashSet<PathBuf> = files.iter().cloned().collect();
-    let needs_reset = workspace.root.as_ref() != Some(&root_path)
-        || workspace.stdlib_path.as_ref() != stdlib_path_for_log.as_ref()
-        || workspace.import_files != import_set;
+    let root_changed = workspace.root.as_ref() != Some(&root_path);
+    let stdlib_changed = workspace.stdlib_path.as_ref() != stdlib_path_for_log.as_ref();
+    let imports_changed = workspace.import_files != import_set;
+    let needs_reset = root_changed || stdlib_changed || imports_changed;
+    log_event(
+        "INFO",
+        "stdlib",
+        format!(
+            "workspace reset={} root_changed={} stdlib_changed={} imports_changed={}",
+            needs_reset, root_changed, stdlib_changed, imports_changed
+        ),
+    );
 
     if needs_reset {
         *analysis_host = AnalysisHost::new();
@@ -1033,18 +1303,27 @@ fn compile_workspace_sync(
         }
 
         if let Ok(cwd) = std::env::current_dir() {
-            println!("stdlib: cwd={}", cwd.to_string_lossy());
+            log_event(
+                "INFO",
+                "stdlib",
+                format!("cwd={}", cwd.to_string_lossy()),
+            );
         }
         let stdlib_path_exists = stdlib_path_for_log
             .as_ref()
             .map(|path| path.exists() && path.is_dir())
             .unwrap_or(false);
-        println!(
-            "stdlib: loading ({}) exists={}",
-            stdlib_source, stdlib_path_exists
+        log_event(
+            "INFO",
+            "stdlib",
+            format!("loading ({}) exists={}", stdlib_source, stdlib_path_exists),
         );
         if !stdlib_path_exists {
-            println!("stdlib: path missing; no stdlib files will load");
+            log_event(
+                "WARN",
+                "stdlib",
+                "path missing; no stdlib files will load".to_string(),
+            );
         }
         let stdlib_files_before = analysis_host.file_count();
         let stdlib_start = Instant::now();
@@ -1060,15 +1339,29 @@ fn compile_workspace_sync(
         }
         let stdlib_files_after = analysis_host.file_count();
         let stdlib_file_delta = stdlib_files_after.saturating_sub(stdlib_files_before);
-        println!(
-            "stdlib: loaded files={} duration_ms={}",
-            stdlib_file_delta,
-            stdlib_start.elapsed().as_millis()
+        log_event(
+            "INFO",
+            "stdlib",
+            format!(
+                "loaded files={} duration_ms={}",
+                stdlib_file_delta,
+                stdlib_start.elapsed().as_millis()
+            ),
         );
-        println!("stdlib: symbols=skipped (counting stdlib symbols can overflow the stack)");
+        log_event(
+            "INFO",
+            "stdlib",
+            "symbols=skipped (counting stdlib symbols can overflow the stack)".to_string(),
+        );
+    } else {
+        log_event("INFO", "stdlib", "reuse cached stdlib workspace; no reload".to_string());
     }
 
-    println!("compile: parsing project files count={}", files.len());
+    log_event(
+        "INFO",
+        "compile",
+        format!("parsing project files count={}", files.len()),
+    );
     let parse_start = Instant::now();
     let mut has_parse_errors = false;
     emit_progress("parsing", None, None, Some(files.len()));
@@ -1164,16 +1457,24 @@ fn compile_workspace_sync(
         .filter_map(|path| workspace.file_cache.get(path).cloned())
         .collect();
     file_results.sort_by(|a, b| a.path.cmp(&b.path));
-    println!(
-        "compile: parsing done host_files={} duration_ms={}",
-        analysis_host.file_count(),
-        parse_start.elapsed().as_millis()
+    log_event(
+        "INFO",
+        "compile",
+        format!(
+            "parsing done host_files={} duration_ms={}",
+            analysis_host.file_count(),
+            parse_start.elapsed().as_millis()
+        ),
     );
     if has_parse_errors && !allow_parse_errors {
-        println!(
-            "compile: parse failed duration_ms={} total_duration_ms={}",
-            parse_start.elapsed().as_millis(),
-            compile_start.elapsed().as_millis()
+        log_event(
+            "WARN",
+            "compile",
+            format!(
+                "parse failed duration_ms={} total_duration_ms={}",
+                parse_start.elapsed().as_millis(),
+                compile_start.elapsed().as_millis()
+            ),
         );
         return Ok(CompileResponse {
             ok: false,
@@ -1192,11 +1493,12 @@ fn compile_workspace_sync(
             check_cancel()?;
             emit_progress("analysis", None, None, None);
             let analysis_start = Instant::now();
-            println!("analysis: start");
+            log_event("INFO", "compile", "analysis: start".to_string());
             let _ = analysis_host.analysis();
-            println!(
-                "analysis: done duration_ms={}",
-                analysis_start.elapsed().as_millis()
+            log_event(
+                "INFO",
+                "compile",
+                format!("analysis: done duration_ms={}", analysis_start.elapsed().as_millis()),
             );
             check_cancel()?;
 
@@ -1205,13 +1507,13 @@ fn compile_workspace_sync(
                 .filter_map(|path| analysis_host.get_file_id_for_path(path))
                 .collect::<Vec<_>>();
             if project_file_ids.is_empty() {
-                println!("semantic: skipped (no project files)");
+                log_event("INFO", "compile", "semantic: skipped (no project files)".to_string());
             } else {
                 check_cancel()?;
                 let semantic_total = project_file_ids.len();
                 emit_progress("semantic", None, Some(0), Some(semantic_total));
                 let semantic_start = Instant::now();
-                println!("semantic: start");
+                log_event("INFO", "compile", "semantic: start".to_string());
                 let symbol_index = analysis_host.symbol_index().clone();
                 let canceled_compiles = state.canceled_compiles.clone();
                 let run_id = run_id;
@@ -1248,9 +1550,10 @@ fn compile_workspace_sync(
                     .join()
                     .map_err(|_| "Semantic checker thread panicked".to_string())?;
                 let semantic_result = semantic_result?;
-                println!(
-                    "semantic: done duration_ms={}",
-                    semantic_start.elapsed().as_millis()
+                log_event(
+                    "INFO",
+                    "compile",
+                    format!("semantic: done duration_ms={}", semantic_start.elapsed().as_millis()),
                 );
                 unresolved = semantic_result
                     .into_iter()
@@ -1268,7 +1571,7 @@ fn compile_workspace_sync(
                     .collect();
             }
 
-            println!("symbols: start");
+            log_event("INFO", "compile", "symbols: start".to_string());
             check_cancel()?;
             let analysis_snapshot = analysis_host.analysis();
             let mut all_symbols: Vec<_> = analysis_snapshot
@@ -1294,7 +1597,11 @@ fn compile_workspace_sync(
                     symbol_to_view(symbol, Path::new(file_path))
                 })
                 .collect();
-            println!("symbols: done count={}", symbols.len());
+            log_event(
+                "INFO",
+                "compile",
+                format!("symbols: done count={}", symbols.len()),
+            );
             Ok::<(), String>(())
         }));
 
@@ -1307,10 +1614,18 @@ fn compile_workspace_sync(
         }
     }
 
-    println!(
-        "compile: done total_duration_ms={}",
-        compile_start.elapsed().as_millis()
+    log_event(
+        "INFO",
+        "compile",
+        format!("done total_duration_ms={}", compile_start.elapsed().as_millis()),
     );
+    if !unresolved.is_empty() {
+        log_event(
+            "WARN",
+            "compile",
+            format!("unresolved_references={}", unresolved.len()),
+        );
+    }
     Ok(CompileResponse {
         ok: file_results.iter().all(|f| f.ok),
         files: file_results,
@@ -1330,6 +1645,7 @@ fn cancel_compile(state: tauri::State<'_, AppState>, run_id: u64) -> Result<(), 
         .lock()
         .map_err(|_| "Cancel lock poisoned".to_string())?;
     set.insert(run_id);
+    log_event("INFO", "compile", format!("cancel requested run_id={}", run_id));
     Ok(())
 }
 
@@ -2154,6 +2470,7 @@ pub fn run() {
             settings: Arc::new(Mutex::new(settings)),
         })
         .setup(|app| {
+            log_event("INFO", "startup", "app setup".to_string());
             let state = app.state::<AppState>();
             if let Ok(mut settings) = state.settings.lock() {
                 let handle = app.handle();
@@ -2163,7 +2480,7 @@ pub fn run() {
                     &state.settings_path,
                     &mut settings,
                 ) {
-                    eprintln!("mercurio: stdlib extraction failed: {}", err);
+                    log_event("ERROR", "startup", format!("stdlib extraction failed: {}", err));
                 }
             }
             Ok(())
@@ -2251,7 +2568,10 @@ pub fn run() {
             cancel_compile,
             export_compiled_model,
             read_llm_instructions,
-            read_llm_hints
+            read_llm_hints,
+            get_llm_hints_meta,
+            get_logs,
+            log_frontend
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
