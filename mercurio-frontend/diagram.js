@@ -470,6 +470,10 @@ function setDiagramSelection(nodeId) {
       `g[data-node-id="${CSS.escape(diagramState.selectedId)}"] rect.diagram-node`
     );
     if (prev) prev.classList.remove("selected");
+    const prevHandle = diagramState.svgEl.querySelector(
+      `g[data-node-id="${CSS.escape(diagramState.selectedId)}"] .diagram-resize-handle`
+    );
+    if (prevHandle) prevHandle.classList.add("hidden");
   }
   diagramState.selectedId = nodeId || null;
   if (diagramState.selectedId && diagramState.svgEl) {
@@ -477,6 +481,10 @@ function setDiagramSelection(nodeId) {
       `g[data-node-id="${CSS.escape(diagramState.selectedId)}"] rect.diagram-node`
     );
     if (next) next.classList.add("selected");
+    const nextHandle = diagramState.svgEl.querySelector(
+      `g[data-node-id="${CSS.escape(diagramState.selectedId)}"] .diagram-resize-handle`
+    );
+    if (nextHandle) nextHandle.classList.remove("hidden");
   }
 }
 
@@ -736,6 +744,69 @@ function isRequirementKind(kind) {
   return /requirement/i.test(kind || "");
 }
 
+function isRequirementRefKind(kind) {
+  const text = (kind || "").toLowerCase();
+  return text.includes("ref");
+}
+
+function isRequirementRefSymbol(symbol, parentSymbol) {
+  if (!symbol || !parentSymbol) return false;
+  if (!isRequirementKind(parentSymbol.kind)) return false;
+  return isRequirementRefKind(symbol.kind);
+}
+
+function isCompartmentItemSymbol(symbol, parentSymbol) {
+  if (!symbol) return false;
+  if (isAttributeKind(symbol.kind)) return true;
+  return isRequirementRefSymbol(symbol, parentSymbol);
+}
+
+function buildCompartmentSections(data) {
+  if (!data) return [];
+  const sections = [];
+  if (Array.isArray(data.attrs) && data.attrs.length) {
+    sections.push({
+      title: "Attributes",
+      lines: data.attrs.map((item) => item.line || item),
+    });
+  }
+  if (Array.isArray(data.refs) && data.refs.length) {
+    sections.push({
+      title: "Refs",
+      lines: data.refs.map((item) => item.line || item),
+    });
+  }
+  return sections;
+}
+
+function measureCompartmentHeight(sections) {
+  if (!sections.length) return 0;
+  let height = 24;
+  sections.forEach((section, index) => {
+    const lines = section.lines || [];
+    if (!lines.length) return;
+    if (index > 0) {
+      height += 8;
+    }
+    height += 30 + Math.max(0, lines.length - 1) * 14;
+  });
+  height += 8;
+  return height;
+}
+
+function measureCompartmentWidth(sections) {
+  let maxWidth = 0;
+  sections.forEach((section) => {
+    (section.lines || []).forEach((line) => {
+      const size = measureDiagramAttr(line);
+      if (size.width > maxWidth) {
+        maxWidth = size.width;
+      }
+    });
+  });
+  return maxWidth;
+}
+
 function appendTypeIcon(group, kindText) {
   const ns = "http://www.w3.org/2000/svg";
   const iconGroup = document.createElementNS(ns, "g");
@@ -865,31 +936,42 @@ async function renderDiagramForCurrentFile(options = {}) {
     }
   });
 
-  const attrLinesByParentId = new Map();
+  const compartmentLinesByParentId = new Map();
+  const ensureCompartment = (parentId) => {
+    if (!compartmentLinesByParentId.has(parentId)) {
+      compartmentLinesByParentId.set(parentId, { attrs: [], refs: [] });
+    }
+    return compartmentLinesByParentId.get(parentId);
+  };
   rawNodes.forEach((node) => {
     const symbol = symbolById.get(node.id);
-    if (!symbol || !isAttributeKind(symbol.kind)) return;
     const parentId = parentMap.get(node.id);
-    if (!parentId) return;
+    if (!symbol || !parentId) return;
+    const parentSymbol = symbolById.get(parentId);
+    if (!parentSymbol) return;
+    if (!isCompartmentItemSymbol(symbol, parentSymbol)) return;
     const line = formatAttributeLine(symbol);
-    if (!attrLinesByParentId.has(parentId)) {
-      attrLinesByParentId.set(parentId, []);
-    }
-    attrLinesByParentId.get(parentId).push(line);
+    const entry = ensureCompartment(parentId);
+    const target = isRequirementRefSymbol(symbol, parentSymbol) ? entry.refs : entry.attrs;
+    target.push({
+      line,
+      start: typeof symbol.start_line === "number" ? symbol.start_line : 0,
+    });
   });
-  attrLinesByParentId.forEach((lines, parentId) => {
+  compartmentLinesByParentId.forEach((entry, parentId) => {
     const parent = nodeMap.get(parentId);
     if (!parent) return;
-    const attrCount = lines.length;
-    const minHeight = 24 + 30 + Math.max(0, attrCount - 1) * 14 + 8;
+    if (entry.attrs?.length) {
+      entry.attrs.sort((a, b) => a.start - b.start);
+    }
+    if (entry.refs?.length) {
+      entry.refs.sort((a, b) => a.start - b.start);
+    }
+    const sections = buildCompartmentSections(entry);
+    if (!sections.length) return;
+    const minHeight = measureCompartmentHeight(sections);
     parent.height = Math.max(parent.height || 0, minHeight);
-    let maxWidth = parent.width || 0;
-    lines.forEach((line) => {
-      const size = measureDiagramAttr(line);
-      if (size.width > maxWidth) {
-        maxWidth = size.width;
-      }
-    });
+    const maxWidth = Math.max(parent.width || 0, measureCompartmentWidth(sections));
     parent.width = Math.max(parent.width || 0, maxWidth, 120);
   });
 
@@ -940,14 +1022,18 @@ async function renderDiagramForCurrentFile(options = {}) {
   };
   nodes.forEach((symbol, index) => {
     const sourceId = symbol.qualified_name || `${symbol.name || "symbol"}:${symbol.start_line}:${index}`;
-    if (isAttributeKind(symbol.kind)) return;
+    const parentSymbol = symbol ? symbolById.get(parentMap.get(sourceId)) : null;
+    if (isCompartmentItemSymbol(symbol, parentSymbol)) return;
     const relationships = Array.isArray(symbol.relationships) ? symbol.relationships : [];
     relationships.forEach((rel, relIndex) => {
       const target = rel.resolved_target || rel.target;
       const targetId = resolveTargetId(target);
       if (!targetId) return;
       const targetSymbol = symbolById.get(targetId);
-      if (targetSymbol && isAttributeKind(targetSymbol.kind)) return;
+      if (targetSymbol) {
+        const targetParent = symbolById.get(parentMap.get(targetId));
+        if (isCompartmentItemSymbol(targetSymbol, targetParent)) return;
+      }
       addEdge(sourceId, targetId, rel.kind || "", relIndex, rel.kind || "");
     });
     const supertypes = Array.isArray(symbol.supertypes) ? symbol.supertypes : [];
@@ -1042,8 +1128,9 @@ function drawDiagram(layout) {
     const node = diagramState.nodePositions.get(nodeId);
     if (!node) return;
     const symbol = diagramState.symbolById.get(node.id);
-    const isAttribute = symbol && isAttributeKind(symbol.kind) && node.parentId;
-    if (isAttribute) {
+    const parentSymbol = node.parentId ? diagramState.symbolById.get(node.parentId) : null;
+    const isCompartmentItem = symbol && node.parentId && isCompartmentItemSymbol(symbol, parentSymbol);
+    if (isCompartmentItem) {
       return;
     }
     const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
@@ -1071,20 +1158,22 @@ function drawDiagram(layout) {
     }
     group.appendChild(rect);
 
-    const attributeLines = attributeLinesByParent.get(node.id) || [];
-    const headerHeight = attributeLines.length ? 24 : node.height;
+    const compartments = node.compartmentSections || [];
+    const hasCompartments = compartments.some((section) => (section.lines || []).length);
+    const headerHeight = hasCompartments ? 24 : node.height;
 
     const isPackage = kindText.includes("package");
     const isPartDef = kindText.includes("part def");
+    const isRequirement = isRequirementKind(kindText);
     const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
-    if (isPackage || isPartDef) {
-      label.setAttribute("x", isPackage || isPartDef ? "28" : "10");
+    if (isPackage || isPartDef || isRequirement) {
+      label.setAttribute("x", "28");
       label.setAttribute("y", "18");
       label.setAttribute("text-anchor", "start");
       label.setAttribute("class", "diagram-node-label diagram-node-label-package");
     } else {
       label.setAttribute("x", node.width / 2);
-      label.setAttribute("y", attributeLines.length ? 16 : node.height / 2 + 4);
+      label.setAttribute("y", hasCompartments ? 16 : node.height / 2 + 4);
       label.setAttribute("text-anchor", "middle");
       label.setAttribute(
         "class",
@@ -1137,30 +1226,8 @@ function drawDiagram(layout) {
       group.appendChild(collapseGroup);
     }
 
-    if (attributeLines.length) {
-      const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
-      line.setAttribute("x1", "6");
-      line.setAttribute("x2", `${node.width - 6}`);
-      line.setAttribute("y1", `${headerHeight}`);
-      line.setAttribute("y2", `${headerHeight}`);
-      line.setAttribute("class", "diagram-compartment");
-      group.appendChild(line);
-
-      const title = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      title.setAttribute("x", "10");
-      title.setAttribute("y", `${headerHeight + 14}`);
-      title.setAttribute("class", "diagram-attr-title");
-      title.textContent = "Attributes";
-      group.appendChild(title);
-
-      attributeLines.forEach((lineText, index) => {
-        const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
-        text.setAttribute("x", "10");
-        text.setAttribute("y", `${headerHeight + 30 + index * 14}`);
-        text.setAttribute("class", "diagram-attr-text");
-        text.textContent = lineText;
-        group.appendChild(text);
-      });
+    if (hasCompartments) {
+      renderCompartments(group, node, compartments, headerHeight);
     }
 
     if (!isMiniChild) {
@@ -1170,36 +1237,45 @@ function drawDiagram(layout) {
       handle.setAttribute("width", "10");
       handle.setAttribute("height", "10");
       handle.setAttribute("rx", "2");
-      handle.setAttribute("class", "diagram-resize-handle");
+      handle.setAttribute("class", "diagram-resize-handle hidden");
       group.appendChild(handle);
     }
 
     nodeGroup.appendChild(group);
   };
 
-  const attributeLinesByParent = new Map();
+  const compartmentLinesByParent = new Map();
+  const ensureCompartment = (parentId) => {
+    if (!compartmentLinesByParent.has(parentId)) {
+      compartmentLinesByParent.set(parentId, { attrs: [], refs: [] });
+    }
+    return compartmentLinesByParent.get(parentId);
+  };
   diagramState.nodePositions.forEach((node) => {
     const symbol = diagramState.symbolById.get(node.id);
     if (!symbol || !node.parentId) return;
-    if (!isAttributeKind(symbol.kind)) return;
+    const parentSymbol = diagramState.symbolById.get(node.parentId);
+    if (!parentSymbol) return;
+    if (!isCompartmentItemSymbol(symbol, parentSymbol)) return;
     const line = formatAttributeLine(symbol);
-    if (!attributeLinesByParent.has(node.parentId)) {
-      attributeLinesByParent.set(node.parentId, []);
-    }
-    attributeLinesByParent.get(node.parentId).push({
+    const entry = ensureCompartment(node.parentId);
+    const target = isRequirementRefSymbol(symbol, parentSymbol) ? entry.refs : entry.attrs;
+    target.push({
       line,
       start: typeof symbol.start_line === "number" ? symbol.start_line : 0,
     });
   });
-  attributeLinesByParent.forEach((list, parentId) => {
-    list.sort((a, b) => a.start - b.start);
-    attributeLinesByParent.set(
-      parentId,
-      list.map((item) => item.line)
-    );
+  compartmentLinesByParent.forEach((entry, parentId) => {
+    if (entry.attrs?.length) {
+      entry.attrs.sort((a, b) => a.start - b.start);
+    }
+    if (entry.refs?.length) {
+      entry.refs.sort((a, b) => a.start - b.start);
+    }
+    compartmentLinesByParent.set(parentId, entry);
   });
   diagramState.nodePositions.forEach((node) => {
-    node.attrLines = attributeLinesByParent.get(node.id) || [];
+    node.compartmentSections = buildCompartmentSections(compartmentLinesByParent.get(node.id));
   });
 
   diagramState.nodePositions.forEach((_node, nodeId) => renderNode(nodeId));
@@ -1297,6 +1373,45 @@ function drawDiagram(layout) {
   fitDiagramToView();
 }
 
+function renderCompartments(group, node, sections, headerHeight = 24) {
+  const ns = "http://www.w3.org/2000/svg";
+  let currentY = headerHeight;
+  let first = true;
+  sections.forEach((section) => {
+    const lines = section.lines || [];
+    if (!lines.length) return;
+    if (!first) {
+      currentY += 8;
+    }
+    const divider = document.createElementNS(ns, "line");
+    divider.setAttribute("x1", "6");
+    divider.setAttribute("x2", `${node.width - 6}`);
+    divider.setAttribute("y1", `${currentY}`);
+    divider.setAttribute("y2", `${currentY}`);
+    divider.setAttribute("class", "diagram-compartment");
+    group.appendChild(divider);
+
+    const title = document.createElementNS(ns, "text");
+    title.setAttribute("x", "10");
+    title.setAttribute("y", `${currentY + 14}`);
+    title.setAttribute("class", "diagram-attr-title");
+    title.textContent = section.title;
+    group.appendChild(title);
+
+    lines.forEach((lineText, index) => {
+      const text = document.createElementNS(ns, "text");
+      text.setAttribute("x", "10");
+      text.setAttribute("y", `${currentY + 30 + index * 14}`);
+      text.setAttribute("class", "diagram-attr-text");
+      text.textContent = lineText;
+      group.appendChild(text);
+    });
+
+    currentY += 30 + Math.max(0, lines.length - 1) * 14;
+    first = false;
+  });
+}
+
 function updateEdgePaths(onlyNodeId) {
   diagramState.edges.forEach((edge) => {
     if (onlyNodeId) {
@@ -1347,9 +1462,9 @@ function clampNodeSize(node, width, height) {
   const parentId = node.parentId;
   const parent = parentId ? diagramState.nodePositions.get(parentId) : null;
   const padding = 12;
-  const attrCount = Array.isArray(node.attrLines) ? node.attrLines.length : 0;
+  const sections = Array.isArray(node.compartmentSections) ? node.compartmentSections : [];
   const minWidth = 80;
-  const minHeight = attrCount ? 24 + 30 + Math.max(0, attrCount - 1) * 14 + 8 : 32;
+  const minHeight = sections.length ? measureCompartmentHeight(sections) : 32;
   const dragBounds = getDragBounds();
   const maxWidth = parent
     ? parent.x + parent.width - node.x - padding
@@ -1375,33 +1490,26 @@ function updateNodeSize(nodeId) {
     rect.setAttribute("height", node.height);
   }
   const label = group.querySelector("text.diagram-node-label");
-  const attrLines = Array.isArray(node.attrLines) ? node.attrLines : [];
-  const headerHeight = attrLines.length ? 24 : node.height;
+  const sections = Array.isArray(node.compartmentSections) ? node.compartmentSections : [];
+  const headerHeight = sections.length ? 24 : node.height;
   if (label) {
     if (label.classList.contains("diagram-node-label-package")) {
-      const isPackage = (node._kind || "").toLowerCase().includes("package");
-      label.setAttribute("x", isPackage ? "28" : "10");
+      const kindText = (node._kind || "").toLowerCase();
+      const useHeaderX = kindText.includes("package")
+        || kindText.includes("part def")
+        || isRequirementKind(kindText);
+      label.setAttribute("x", useHeaderX ? "28" : "10");
       label.setAttribute("y", "18");
     } else {
       label.setAttribute("x", node.width / 2);
-      label.setAttribute("y", attrLines.length ? 16 : node.height / 2 + 4);
+      label.setAttribute("y", sections.length ? 16 : node.height / 2 + 4);
     }
   }
-  const line = group.querySelector("line.diagram-compartment");
-  if (line) {
-    line.setAttribute("x2", `${node.width - 6}`);
-    line.setAttribute("y1", `${headerHeight}`);
-    line.setAttribute("y2", `${headerHeight}`);
-  }
-  const title = group.querySelector("text.diagram-attr-title");
-  if (title) {
-    title.setAttribute("y", `${headerHeight + 14}`);
-  }
-  const attrTexts = group.querySelectorAll("text.diagram-attr-text");
-  if (attrTexts.length) {
-    attrTexts.forEach((text, index) => {
-      text.setAttribute("y", `${headerHeight + 30 + index * 14}`);
-    });
+  group
+    .querySelectorAll(".diagram-compartment, .diagram-attr-title, .diagram-attr-text")
+    .forEach((el) => el.remove());
+  if (sections.length) {
+    renderCompartments(group, node, sections, headerHeight);
   }
   const handle = group.querySelector(".diagram-resize-handle");
   if (handle) {
@@ -1481,7 +1589,9 @@ async function applySavedLayout() {
     const target = diagramState.nodePositions.get(id);
     if (!target) return;
     const symbol = diagramState.symbolById.get(id);
-    if (symbol && isAttributeKind(symbol.kind)) return;
+    const parentId = diagramState.nodePositions.get(id)?.parentId || "";
+    const parentSymbol = parentId ? diagramState.symbolById.get(parentId) : null;
+    if (symbol && isCompartmentItemSymbol(symbol, parentSymbol)) return;
     const x = Number(node.x);
     const y = Number(node.y);
     if (!Number.isFinite(x) || !Number.isFinite(y)) return;
@@ -1499,8 +1609,8 @@ async function applySavedLayout() {
       target.height = size.height;
       updateNodeSize(id);
     }
-    const parentId = target.parentId;
-    const parent = parentId ? diagramState.nodePositions.get(parentId) : null;
+    const clampParentId = target.parentId;
+    const parent = clampParentId ? diagramState.nodePositions.get(clampParentId) : null;
     const padding = 12;
     const minX = parent ? parent.x + padding : 20;
     const minY = parent ? parent.y + padding + 18 : 20;

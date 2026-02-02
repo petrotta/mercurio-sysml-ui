@@ -774,6 +774,10 @@ button:hover {
   cursor: se-resize;
 }
 
+.diagram-resize-handle.hidden {
+  display: none;
+}
+
 .diagram-resize-handle:hover {
   fill: #4b5057;
   stroke: #b7bcc2;
