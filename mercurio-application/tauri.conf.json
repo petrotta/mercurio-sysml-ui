@@ -27,7 +27,9 @@
     "targets": "all",
     "resources": [
       "stdlib-packaged/manifest.json",
-      "stdlib-packaged/system-release-122025.zip"
+      "stdlib-packaged/system-release-122025.zip",
+      "llm/instructions.md",
+      "llm/hints.json"
     ],
     "icon": [
       "icons/32x32.png",

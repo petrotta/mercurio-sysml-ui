@@ -1,4 +1,10 @@
 import { initDiagram, updateDiagramData, setDiagramMode } from "./diagram.js";
+import {
+  resolveActiveEndpoint,
+  sendChatMessage,
+} from "./ai.js";
+import { initAiChat } from "./ai-chat.js";
+import { initAiEndpoints } from "./ai-endpoints.js";
 
 const { invoke } = window.__TAURI__.core;
 const dialog = window.__TAURI__.dialog;
@@ -56,8 +62,13 @@ let modelExpandAllBtn;
 let modelCollapseAllBtn;
 let modelGroupToggleBtn;
 let appMenuEl;
-let menuToggleBtn;
+let menuFileBtn;
+let menuEditBtn;
+let menuViewBtn;
+let menuCompileBtn;
+let menuHelpBtn;
 let diagramContextMenuEl;
+let aiMessageMenuEl;
 let newProjectDialogEl;
 let newProjectLocationEl;
 let newProjectLocationPickEl;
@@ -69,6 +80,10 @@ let newProjectCreateBtn;
 let logDialogEl;
 let logOutputEl;
 let logRefreshBtn;
+let logLevelFilterEl;
+let logTypeFilterEl;
+let logSortEl;
+let logSortKey = "time";
 let exportDialogEl;
 let exportFormatEl;
 let exportIncludeStdlibEl;
@@ -302,6 +317,31 @@ let modelPropertiesEl;
 let modelPropertiesBodyEl;
 let modelPropertiesCloseBtn;
 let showPropertiesPane = true;
+let rightPaneToggleEl;
+let rightPaneTitleEl;
+let aiPaneEl;
+let aiMessagesEl;
+let aiInputEl;
+let aiSendBtn;
+let aiStatusEl;
+let aiSettingsOpenBtn;
+let aiSettingsDialogEl;
+let aiPaneSplitEl;
+let aiEndpointListEl;
+let aiEndpointNameEl;
+let aiEndpointTypeEl;
+let aiEndpointBaseEl;
+let aiEndpointModelEl;
+let aiEndpointTokenEl;
+let aiEndpointSaveBtn;
+let aiEndpointDeleteBtn;
+let aiEndpointTestBtn;
+let aiEndpointNewBtn;
+let aiApplyDialogEl;
+let aiApplyPathEl;
+let aiApplyCurrentEl;
+let aiApplyProposedEl;
+let aiApplyConfirmBtn;
 const modelRowSymbolMap = new WeakMap();
 let modelPropertiesSplitEl;
 let propertiesRenderId = 0;
@@ -311,6 +351,16 @@ let trackSymbolTimer = null;
 let trackSymbolIdleHandle = null;
 let symbolIndexByFile = new Map();
 let lastTrackedAnchor = null;
+let rightPaneMode = "model";
+let aiApplyPending = null;
+let aiChat = null;
+let aiEndpoints = null;
+let logEntries = [];
+let logRefreshTimer = null;
+
+function logFrontend(level, kind, message) {
+  invoke?.("log_frontend", { level, kind, message }).catch(() => {});
+}
 
 const state = {
   rootPath: "",
@@ -335,6 +385,7 @@ const MODEL_PROPERTIES_KEY = "mercurio.modelShowProperties";
 const MODEL_SECTIONS_KEY = "mercurio.modelSectionState";
 const FILE_TREE_FILTER_KEY = "mercurio.fileTreeHideArtifacts";
 const TRACK_SYMBOL_KEY = "mercurio.trackSymbol";
+const RIGHT_PANE_KEY = "mercurio.rightPane";
 const lastCompile = { symbols: [], files: [], unresolved: [], durationMs: null, libraryPath: "" };
 
 const MIN_LEFT = 200;
@@ -460,6 +511,7 @@ function registerSysmlLanguage() {
       ],
     },
   });
+  registerSysmlCompletions();
 
   window.monaco.languages.register({ id: "kerml" });
   window.monaco.languages.setMonarchTokensProvider("kerml", {
@@ -901,6 +953,203 @@ function applyTheme(themeId) {
   if (window.monaco?.editor?.setTheme) {
     window.monaco.editor.setTheme(theme);
   }
+}
+
+function loadRightPaneMode() {
+  const stored = window.localStorage?.getItem(RIGHT_PANE_KEY);
+  rightPaneMode = stored === "ai" ? "ai" : "model";
+}
+
+function setRightPaneMode(next) {
+  rightPaneMode = next === "ai" ? "ai" : "model";
+  window.localStorage?.setItem(RIGHT_PANE_KEY, rightPaneMode);
+  if (rightPaneTitleEl) {
+    rightPaneTitleEl.textContent = rightPaneMode === "ai" ? "AI" : "Model";
+  }
+  if (appEl) {
+    appEl.classList.toggle("ai-mode", rightPaneMode === "ai");
+  }
+}
+
+function formatParseErrors(path, errors) {
+  if (!errors || !errors.length) {
+    return `No parse errors in ${path}.`;
+  }
+  const maxItems = 20;
+  const lines = errors.slice(0, maxItems).map((err) => {
+    const line = (err.line ?? 0) + 1;
+    const col = (err.column ?? 0) + 1;
+    const kind = err.kind ? ` · ${err.kind}` : "";
+    return `Line ${line}, Col ${col}${kind}: ${err.message}`;
+  });
+  const extra = errors.length > maxItems ? `\n...and ${errors.length - maxItems} more.` : "";
+  return `Parse errors in ${path}:\n${lines.join("\n")}${extra}`;
+}
+
+function setAiStatus(text) {
+  if (!aiStatusEl) return;
+  aiStatusEl.textContent = text || "";
+}
+
+function normalizeAiFileContent(text) {
+  if (!text) return "";
+  const trimmed = text.trim();
+  if (trimmed.startsWith("```")) {
+    const lines = trimmed.split("\n");
+    if (lines.length >= 2) {
+      lines.shift();
+      if (lines[lines.length - 1].startsWith("```")) {
+        lines.pop();
+      }
+      return lines.join("\n").trim();
+    }
+  }
+  return text;
+}
+
+function showAiApplyDialog(payload) {
+  if (!aiApplyDialogEl || !aiApplyPathEl || !aiApplyCurrentEl || !aiApplyProposedEl) return;
+  aiApplyPending = payload;
+  aiApplyPathEl.textContent = payload.path;
+  aiApplyCurrentEl.value = payload.current || "";
+  aiApplyProposedEl.value = payload.proposed || "";
+  aiApplyDialogEl.hidden = false;
+}
+
+function hideAiApplyDialog() {
+  if (!aiApplyDialogEl) return;
+  aiApplyDialogEl.hidden = true;
+  aiApplyPending = null;
+}
+
+async function getContentForEdit(path) {
+  if (path === state.currentFile && editor) {
+    return editor.getValue();
+  }
+  if (state.bufferedContent.has(path)) {
+    return state.bufferedContent.get(path) ?? "";
+  }
+  return invoke("read_file", { path });
+}
+
+async function requestAiEditForPath(path, instruction, options = {}) {
+  const endpoint = resolveActiveEndpoint("chat");
+  if (!endpoint) {
+    setAiStatus("No chat endpoint configured.");
+    return false;
+  }
+  const current = await getContentForEdit(path);
+  setAiStatus("Preparing edit...");
+  try {
+    const messages = [
+      {
+        role: "system",
+        content:
+          "You are editing a text file for Mercurio. Return the full updated file content only. Do not include markdown fences, explanations, or commentary.",
+      },
+      {
+        role: "user",
+        content: `File: ${path}\n\nInstruction:\n${instruction}\n\nCurrent content:\n${current}`,
+      },
+    ];
+    const reply = await sendChatMessage(endpoint, messages);
+    const proposed = normalizeAiFileContent(reply || "");
+    if (options.applyImmediately) {
+      return await applyAiEditImmediate(path, proposed, options);
+    }
+    showAiApplyDialog({ path, current, proposed });
+    setAiStatus("");
+    return true;
+  } catch (error) {
+    setAiStatus(`AI error: ${error}`);
+    return false;
+  }
+}
+
+async function applyAiEdit() {
+  if (!aiApplyPending || !aiApplyProposedEl) return;
+  const path = aiApplyPending.path;
+  const content = aiApplyProposedEl.value;
+  try {
+    await invoke("write_file", { path, content });
+    state.lastSavedContent.set(path, content);
+    state.bufferedContent.delete(path);
+    setDirty(path, false);
+    lastEditContentByPath.set(path, content);
+    if (path === state.currentFile && editor) {
+      isSettingEditorValue = true;
+      editor.setValue(content);
+      isSettingEditorValue = false;
+    }
+    handleProgrammaticEdit(path);
+    hideAiApplyDialog();
+    setAiStatus("Applied edit.");
+  } catch (error) {
+    setAiStatus(`Apply failed: ${error}`);
+  }
+}
+
+async function applyAiEditImmediate(path, content, options = {}) {
+  try {
+    await invoke("write_file", { path, content });
+    state.lastSavedContent.set(path, content);
+    state.bufferedContent.delete(path);
+    setDirty(path, false);
+    lastEditContentByPath.set(path, content);
+    if (path === state.currentFile && editor) {
+      isSettingEditorValue = true;
+      editor.setValue(content);
+      isSettingEditorValue = false;
+    }
+    handleProgrammaticEdit(path);
+    if (options.announce) {
+      renderAiMessage("assistant", options.announce);
+    }
+    setAiStatus("Applied edit.");
+    return true;
+  } catch (error) {
+    setAiStatus(`Apply failed: ${error}`);
+    return false;
+  }
+}
+
+async function applyAiNewFile(relPath, content, announceText) {
+  if (!state.rootPath) {
+    setAiStatus("Select a project root first.");
+    return false;
+  }
+  if (!relPath) return false;
+  const fullPath = joinPath(state.rootPath, relPath);
+  const rootNorm = normalizePathForCompare(state.rootPath);
+  const fileNorm = normalizePathForCompare(fullPath);
+  if (!fileNorm.startsWith(rootNorm)) {
+    setAiStatus("New files must be inside the current project.");
+    return false;
+  }
+  try {
+    await invoke("write_file", { path: fullPath, content: content || "" });
+    if (state.rootPath) {
+      invoke("list_dir", { path: state.rootPath })
+        .then((entries) => renderFileTree(entries))
+        .catch(() => {});
+    }
+    handleProgrammaticEdit(fullPath);
+    if (announceText) {
+      renderAiMessage("assistant", announceText);
+    }
+    return true;
+  } catch (error) {
+    setAiStatus(`Create failed: ${error}`);
+    return false;
+  }
+}
+
+function handleProgrammaticEdit(path) {
+  if (!path) return;
+  scheduleParseRefresh(path);
+  if (!state.rootPath) return;
+  if (compileManager.active) return;
+  compileWorkspace({ silent: true, allowParseErrors: true, saveBefore: false, auto: true });
 }
 
 function setCompileFloat(state, message, detail) {
@@ -1520,17 +1769,163 @@ async function createNewProject() {
   }
 }
 
+function parseLogLine(line) {
+  const match = line.match(/^\[(.+?)\]\s+\[(.+?)\]\s+\[(.+?)\]\s+(.*)$/);
+  if (!match) {
+    return { raw: line, timestamp: "", level: "INFO", kind: "general", message: line };
+  }
+  return {
+    raw: line,
+    timestamp: match[1],
+    level: match[2],
+    kind: match[3],
+    message: match[4],
+  };
+}
+
+function formatRelativeTime(ts) {
+  const seconds = Number(ts);
+  if (!Number.isFinite(seconds)) return "";
+  const diff = Math.max(0, Date.now() - seconds * 1000);
+  if (diff < 60_000) {
+    return `${Math.max(1, Math.round(diff / 1000))}s ago`;
+  }
+  if (diff < 3_600_000) {
+    return `${Math.round(diff / 60_000)}m ago`;
+  }
+  return `${Math.round(diff / 3_600_000)}h ago`;
+}
+
+function renderLogOutput() {
+  if (!logOutputEl) return;
+  const previousTop = logOutputEl.scrollTop;
+  const previousHeight = logOutputEl.scrollHeight || 1;
+  const previousRatio = previousTop / previousHeight;
+  const level = logLevelFilterEl?.value || "all";
+  const kind = logTypeFilterEl?.value || "all";
+  const sort = logSortEl?.value || "desc";
+  const sortKey = logSortKey || "time";
+  const filtered = logEntries.filter((entry) => {
+    const levelMatch = level === "all" || entry.level === level;
+    const kindMatch = kind === "all" || entry.kind === kind;
+    return levelMatch && kindMatch;
+  });
+  filtered.sort((a, b) => {
+    const dir = sort === "asc" ? 1 : -1;
+    if (sortKey === "level") {
+      const order = { ERROR: 3, WARN: 2, INFO: 1 };
+      const aLevel = order[a.level] || 0;
+      const bLevel = order[b.level] || 0;
+      if (aLevel !== bLevel) return (aLevel - bLevel) * dir;
+    } else if (sortKey === "type") {
+      const diff = (a.kind || "").localeCompare(b.kind || "");
+      if (diff !== 0) return diff * dir;
+    } else if (sortKey === "message") {
+      const diff = (a.message || "").localeCompare(b.message || "");
+      if (diff !== 0) return diff * dir;
+    }
+    const aTime = Number(a.timestamp) || 0;
+    const bTime = Number(b.timestamp) || 0;
+    return (aTime - bTime) * dir;
+  });
+  logOutputEl.innerHTML = "";
+  const header = document.createElement("div");
+  header.className = "log-row log-row-header";
+  const buildHeaderCell = (label, key) => {
+    const cell = document.createElement("div");
+    cell.className = "log-cell log-sortable";
+    cell.dataset.sortKey = key;
+    cell.textContent = label;
+    if (sortKey === key) {
+      cell.classList.add("log-sort-active");
+      cell.classList.add(sort === "asc" ? "log-sort-asc" : "log-sort-desc");
+    }
+    cell.addEventListener("click", () => {
+      if (logSortKey === key) {
+        if (logSortEl) {
+          logSortEl.value = logSortEl.value === "asc" ? "desc" : "asc";
+        }
+      } else {
+        logSortKey = key;
+      }
+      renderLogOutput();
+    });
+    return cell;
+  };
+  header.appendChild(buildHeaderCell("Time", "time"));
+  header.appendChild(buildHeaderCell("Level", "level"));
+  header.appendChild(buildHeaderCell("Type", "type"));
+  header.appendChild(buildHeaderCell("Message", "message"));
+  logOutputEl.appendChild(header);
+  filtered.forEach((entry) => {
+    const row = document.createElement("div");
+    row.className = "log-row";
+    const time = document.createElement("div");
+    time.className = "log-cell";
+    time.textContent = formatRelativeTime(entry.timestamp);
+    const levelCell = document.createElement("div");
+    levelCell.className = `log-cell log-level ${entry.level}`;
+    levelCell.textContent = entry.level;
+    const typeCell = document.createElement("div");
+    typeCell.className = "log-cell";
+    typeCell.textContent = entry.kind;
+    const message = document.createElement("div");
+    message.className = "log-cell";
+    message.textContent = entry.message;
+    row.appendChild(time);
+    row.appendChild(levelCell);
+    row.appendChild(typeCell);
+    row.appendChild(message);
+    logOutputEl.appendChild(row);
+  });
+  logOutputEl.scrollTop = logOutputEl.scrollHeight * previousRatio;
+}
+
+function updateLogTypeOptions() {
+  if (!logTypeFilterEl) return;
+  const kinds = Array.from(new Set(logEntries.map((entry) => entry.kind))).sort();
+  const current = logTypeFilterEl.value || "all";
+  logTypeFilterEl.innerHTML = "";
+  const allOption = document.createElement("option");
+  allOption.value = "all";
+  allOption.textContent = "All";
+  logTypeFilterEl.appendChild(allOption);
+  kinds.forEach((value) => {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    logTypeFilterEl.appendChild(option);
+  });
+  logTypeFilterEl.value = kinds.includes(current) ? current : "all";
+}
+
 async function showLogDialog() {
   if (!logDialogEl || !logOutputEl) return;
   const lines = await invoke("get_logs");
-  logOutputEl.textContent = Array.isArray(lines) ? lines.join("\n") : "";
-  logOutputEl.scrollTop = logOutputEl.scrollHeight;
+  logEntries = Array.isArray(lines) ? lines.map(parseLogLine) : [];
+  updateLogTypeOptions();
+  renderLogOutput();
   logDialogEl.hidden = false;
+  if (!logRefreshTimer) {
+    logRefreshTimer = setInterval(async () => {
+      if (!logDialogEl || logDialogEl.hidden) return;
+      try {
+        const next = await invoke("get_logs");
+        logEntries = Array.isArray(next) ? next.map(parseLogLine) : [];
+        updateLogTypeOptions();
+        renderLogOutput();
+      } catch {}
+    }, 1500);
+  }
 }
 
 function hideLogDialog() {
   if (!logDialogEl) return;
   logDialogEl.hidden = true;
+  if (logRefreshTimer) {
+    clearInterval(logRefreshTimer);
+    logRefreshTimer = null;
+  }
 }
 
 function showAboutDialog() {
@@ -1573,6 +1968,17 @@ function showSettingsDialog() {
 function hideSettingsDialog() {
   if (!settingsDialogEl) return;
   settingsDialogEl.hidden = true;
+}
+
+function showAiSettingsDialog() {
+  if (!aiSettingsDialogEl) return;
+  aiEndpoints?.refresh();
+  aiSettingsDialogEl.hidden = false;
+}
+
+function hideAiSettingsDialog() {
+  if (!aiSettingsDialogEl) return;
+  aiSettingsDialogEl.hidden = true;
 }
 
 async function refreshSettingsStdlib() {
@@ -2099,6 +2505,9 @@ async function loadRoot(path, options = {}) {
   setCompileStatus("Loading files...");
   const previousRoot = state.rootPath;
   if (previousRoot && previousRoot !== path) {
+    if (state.openFiles.length) {
+      await closeTabs([...state.openFiles]);
+    }
     clearModelTreeForRootChange();
   }
   try {
@@ -2462,6 +2871,26 @@ function renderModelTree(symbols, files, unresolved, libraryPath) {
       projectSymbols.push(symbol);
     }
   });
+
+  if (libraryRoot) {
+    logFrontend(
+      "INFO",
+      "model",
+      `Model tree: library root=${libraryRoot} project=${projectSymbols.length} library=${librarySymbols.length} import=${importSymbols.length}`
+    );
+    if (!librarySymbols.length) {
+      const sample = filteredSymbols.find((symbol) => symbol?.file_path)?.file_path || "";
+      if (sample) {
+        logFrontend("WARN", "model", `Model tree: no library symbols found; sample path=${sample}`);
+      }
+    }
+  } else {
+    logFrontend(
+      "WARN",
+      "model",
+      `Model tree: library root missing (project=${projectSymbols.length} library=${librarySymbols.length} import=${importSymbols.length})`
+    );
+  }
 
   if (!projectSymbols.length && !librarySymbols.length && !unresolvedRefs.length) {
     const empty = document.createElement("p");
@@ -3216,34 +3645,164 @@ function setupEditorTabsMenu() {
 }
 
 function showAppMenu(x, y) {
-  if (!appMenuEl || !menuToggleBtn) return;
+  if (!appMenuEl) return;
   appMenuEl.hidden = false;
   const rect = appMenuEl.getBoundingClientRect();
   const left = Math.min(x, window.innerWidth - rect.width - 8);
   const top = Math.min(y, window.innerHeight - rect.height - 8);
   appMenuEl.style.left = `${Math.max(8, left)}px`;
   appMenuEl.style.top = `${Math.max(8, top)}px`;
-  menuToggleBtn.setAttribute("aria-expanded", "true");
 }
 
 function hideAppMenu() {
   if (!appMenuEl) return;
   appMenuEl.hidden = true;
-  menuToggleBtn?.setAttribute("aria-expanded", "false");
+  menuFileBtn?.setAttribute("aria-expanded", "false");
+  menuEditBtn?.setAttribute("aria-expanded", "false");
+  menuViewBtn?.setAttribute("aria-expanded", "false");
+  menuCompileBtn?.setAttribute("aria-expanded", "false");
+  menuHelpBtn?.setAttribute("aria-expanded", "false");
+}
+
+function buildAppMenu(items) {
+  if (!appMenuEl) return;
+  appMenuEl.innerHTML = "";
+  items.forEach((item) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = item.label;
+    if (item.disabled) {
+      button.classList.add("disabled");
+      button.disabled = true;
+    } else if (item.action) {
+      button.dataset.action = item.action;
+    }
+    appMenuEl.appendChild(button);
+  });
+}
+
+function registerSysmlCompletions() {
+  if (!window.monaco || registerSysmlCompletions.done) return;
+  registerSysmlCompletions.done = true;
+  window.monaco.languages.registerCompletionItemProvider("sysml", {
+    triggerCharacters: ["p", "r", "s", "a", "i", "c"],
+    provideCompletionItems(model, position) {
+      const word = model.getWordUntilPosition(position);
+      const range = {
+        startLineNumber: position.lineNumber,
+        endLineNumber: position.lineNumber,
+        startColumn: word.startColumn,
+        endColumn: word.endColumn,
+      };
+      const suggestions = [
+        {
+          label: "package",
+          kind: window.monaco.languages.CompletionItemKind.Snippet,
+          insertText: "package ${1:Name} {  $0 }",
+          insertTextRules: window.monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          range,
+        },
+        {
+          label: "part def",
+          kind: window.monaco.languages.CompletionItemKind.Snippet,
+          insertText: "part def ${1:Name} {\\n  $0\\n}",
+          insertTextRules: window.monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          range,
+        },
+        {
+          label: "part",
+          kind: window.monaco.languages.CompletionItemKind.Snippet,
+          insertText: "part ${1:name} : ${2:Type};",
+          insertTextRules: window.monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          range,
+        },
+        {
+          label: "requirement",
+          kind: window.monaco.languages.CompletionItemKind.Snippet,
+          insertText: "requirement ${1:Req} {\\n  id = \\\"${2:REQ-001}\\\";\\n  text = \\\"${3:Description}\\\";\\n}",
+          insertTextRules: window.monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          range,
+        },
+        {
+          label: "state machine",
+          kind: window.monaco.languages.CompletionItemKind.Snippet,
+          insertText: "state machine ${1:Name} {\\n  $0\\n}",
+          insertTextRules: window.monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          range,
+        },
+        {
+          label: "import",
+          kind: window.monaco.languages.CompletionItemKind.Snippet,
+          insertText: "import ${1:Library};",
+          insertTextRules: window.monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+          range,
+        },
+      ];
+      return { suggestions };
+    },
+  });
+}
+
+function openTopMenu(button, items) {
+  if (!button || !appMenuEl) return;
+  if (!appMenuEl.hidden && button.getAttribute("aria-expanded") === "true") {
+    hideAppMenu();
+    return;
+  }
+  buildAppMenu(items);
+  const rect = button.getBoundingClientRect();
+  showAppMenu(rect.left, rect.bottom + 4);
+  button.setAttribute("aria-expanded", "true");
 }
 
 function setupAppMenu() {
-  if (!appMenuEl || !menuToggleBtn) return;
+  if (!appMenuEl) return;
   hideAppMenu();
 
-  menuToggleBtn.addEventListener("click", (event) => {
+  const fileItems = [
+    { label: "New Project…", action: "new-project" },
+    { label: "Open Project…", action: "open-folder" },
+  ];
+  const editItems = [
+    { label: "Undo", disabled: true },
+    { label: "Redo", disabled: true },
+    { label: "Cut", disabled: true },
+    { label: "Copy", disabled: true },
+    { label: "Paste", disabled: true },
+  ];
+  const viewItems = [
+    { label: "View Log…", action: "view-log" },
+    { label: "Settings…", action: "settings" },
+    { label: "Toggle Project Panel", action: "toggle-project" },
+    { label: "Toggle Model Tree", action: "toggle-model-tree" },
+  ];
+  const compileItems = [
+    { label: "Compile Workspace", action: "compile-workspace" },
+    { label: "Export Model…", action: "export-model" },
+  ];
+  const helpItems = [
+    { label: "About", action: "about" },
+  ];
+
+  menuFileBtn?.addEventListener("click", (event) => {
     event.stopPropagation();
-    if (!appMenuEl.hidden) {
-      hideAppMenu();
-      return;
-    }
-    const rect = menuToggleBtn.getBoundingClientRect();
-    showAppMenu(rect.left, rect.bottom + 4);
+    openTopMenu(menuFileBtn, fileItems);
+  });
+  menuEditBtn?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openTopMenu(menuEditBtn, editItems);
+  });
+  menuViewBtn?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openTopMenu(menuViewBtn, viewItems);
+  });
+  menuCompileBtn?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openTopMenu(menuCompileBtn, compileItems);
+  });
+  menuHelpBtn?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openTopMenu(menuHelpBtn, helpItems);
   });
 
   appMenuEl.addEventListener("click", async (event) => {
@@ -3254,7 +3813,7 @@ function setupAppMenu() {
   });
 
   document.addEventListener("click", (event) => {
-    if (!appMenuEl.contains(event.target) && event.target !== menuToggleBtn) {
+    if (!appMenuEl.contains(event.target)) {
       hideAppMenu();
     }
   });
@@ -3271,6 +3830,16 @@ function setupAppMenu() {
 async function handleMenuAction(action) {
   if (action === "open-folder") {
     await chooseRoot();
+  }
+  if (action === "toggle-project") {
+    appEl.classList.toggle("hide-project");
+    syncPanelToggles();
+    return;
+  }
+  if (action === "toggle-model-tree") {
+    appEl.classList.toggle("hide-model-tree");
+    syncPanelToggles();
+    return;
   }
   if (action === "open-file") {
     if (!dialog?.open) {
@@ -3508,6 +4077,32 @@ function updateCursorStatus() {
 }
 
 window.addEventListener("DOMContentLoaded", async () => {
+  const startupStart = performance.now();
+  const startupMarks = [];
+  const markStartup = (label) => {
+    startupMarks.push({ label, ms: performance.now() - startupStart });
+  };
+  const clearBootScrim = () => {
+    document.body?.classList.remove("booting");
+  };
+  const logStartup = () => {
+    const summary = startupMarks
+      .map((item) => `${item.label}=${Math.round(item.ms)}ms`)
+      .join(", ");
+    invoke?.("log_frontend", {
+      level: "INFO",
+      kind: "startup",
+      message: summary || "startup markers unavailable",
+    }).catch(() => {});
+  };
+  const scheduleIdle = (fn) => {
+    if (typeof window.requestIdleCallback === "function") {
+      window.requestIdleCallback(() => fn());
+    } else {
+      setTimeout(fn, 0);
+    }
+  };
+
   rootApplyButton = document.querySelector("#root-apply");
   newFileButton = document.querySelector("#new-file");
   recentProjectsEl = document.querySelector("#recent-projects");
@@ -3536,6 +4131,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   logDialogEl = document.querySelector("#log-dialog");
   logOutputEl = document.querySelector("#log-output");
   logRefreshBtn = document.querySelector("#log-refresh");
+  logLevelFilterEl = document.querySelector("#log-level-filter");
+  logTypeFilterEl = document.querySelector("#log-type-filter");
+  logSortEl = document.querySelector("#log-sort");
   exportDialogEl = document.querySelector("#export-dialog");
   exportFormatEl = document.querySelector("#export-format");
   exportIncludeStdlibEl = document.querySelector("#export-include-stdlib");
@@ -3544,6 +4142,23 @@ window.addEventListener("DOMContentLoaded", async () => {
   settingsDialogEl = document.querySelector("#settings-dialog");
   settingsThemeEl = document.querySelector("#settings-theme");
   settingsStdlibEl = document.querySelector("#settings-stdlib");
+  aiSettingsDialogEl = document.querySelector("#ai-settings-dialog");
+  aiSettingsOpenBtn = document.querySelector("#ai-settings-open");
+  aiEndpointListEl = document.querySelector("#ai-endpoint-list");
+  aiEndpointNameEl = document.querySelector("#ai-endpoint-name");
+  aiEndpointTypeEl = document.querySelector("#ai-endpoint-type");
+  aiEndpointBaseEl = document.querySelector("#ai-endpoint-base");
+  aiEndpointModelEl = document.querySelector("#ai-endpoint-model");
+  aiEndpointTokenEl = document.querySelector("#ai-endpoint-token");
+  aiEndpointSaveBtn = document.querySelector("#ai-endpoint-save");
+  aiEndpointDeleteBtn = document.querySelector("#ai-endpoint-delete");
+  aiEndpointTestBtn = document.querySelector("#ai-endpoint-test");
+  aiEndpointNewBtn = document.querySelector("#ai-endpoint-new");
+  aiApplyDialogEl = document.querySelector("#ai-apply-dialog");
+  aiApplyPathEl = document.querySelector("#ai-apply-path");
+  aiApplyCurrentEl = document.querySelector("#ai-apply-current-content");
+  aiApplyProposedEl = document.querySelector("#ai-apply-proposed");
+  aiApplyConfirmBtn = document.querySelector("#ai-apply-confirm");
   rootPathEl = document.querySelector("#root-path");
   currentFileEl = document.querySelector("#current-file");
   fileTreeEl = document.querySelector("#file-tree");
@@ -3564,6 +4179,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   statusAutoCompileEl = document.querySelector("#status-autocompile");
   setAutoCompileStatus("idle", "Auto-compile idle");
   diagramContextMenuEl = document.querySelector("#diagram-context-menu");
+  aiMessageMenuEl = document.querySelector("#ai-message-menu");
   compileFloatEl = document.querySelector("#compile-float");
   compileFloatMessageEl = document.querySelector("#compile-float-message");
   compileFloatDetailEl = document.querySelector("#compile-float-detail");
@@ -3575,6 +4191,14 @@ window.addEventListener("DOMContentLoaded", async () => {
   parseToggleEl = document.querySelector("#parse-toggle");
   toggleArtifactsBtn = document.querySelector("#toggle-artifacts");
   trackSymbolToggleBtn = document.querySelector("#track-symbol-toggle");
+  rightPaneToggleEl = document.querySelector("#right-pane-toggle");
+  rightPaneTitleEl = document.querySelector("#right-pane-title");
+  aiPaneEl = document.querySelector("#ai-pane");
+  aiMessagesEl = document.querySelector("#ai-messages");
+  aiPaneSplitEl = document.querySelector("#ai-pane-split");
+  aiInputEl = document.querySelector("#ai-input");
+  aiSendBtn = document.querySelector("#ai-send");
+  aiStatusEl = document.querySelector("#ai-status");
   editorTabsEl = document.querySelector("#editor-tabs");
   editorTabsMenuEl = document.querySelector("#editor-tabs-menu");
   editorTabsOverflowMenuEl = document.querySelector("#editor-tabs-overflow-menu");
@@ -3589,12 +4213,17 @@ window.addEventListener("DOMContentLoaded", async () => {
   modelPropertiesCloseBtn = document.querySelector("#model-properties-close");
   modelPropertiesSplitEl = document.querySelector("#model-properties-split");
   appMenuEl = document.querySelector("#app-menu");
-  menuToggleBtn = document.querySelector("#menu-toggle");
+  menuFileBtn = document.querySelector("#menu-file");
+  menuEditBtn = document.querySelector("#menu-edit");
+  menuViewBtn = document.querySelector("#menu-view");
+  menuCompileBtn = document.querySelector("#menu-compile");
+  menuHelpBtn = document.querySelector("#menu-help");
   toggleProjectBtn = document.querySelector("#toggle-project");
   toggleModelTreeBtn = document.querySelector("#toggle-model-tree");
   restoreProjectBtn = document.querySelector("#restore-project");
   restoreModelTreeBtn = document.querySelector("#restore-model-tree");
   updateEditorEmptyState();
+  markStartup("dom_ready");
   initDiagram({
     toggleEl: document.querySelector("#diagram-toggle"),
     paneEl: document.querySelector("#diagram-pane"),
@@ -3603,7 +4232,11 @@ window.addEventListener("DOMContentLoaded", async () => {
     zoomInEl: document.querySelector("#diagram-zoom-in"),
     zoomOutEl: document.querySelector("#diagram-zoom-out"),
     zoomResetEl: document.querySelector("#diagram-zoom-reset"),
+    autoLayoutEl: document.querySelector("#diagram-autolayout"),
     copyEl: document.querySelector("#diagram-copy"),
+    canvasEl: document.querySelector("#diagram-canvas"),
+    minimapEl: document.querySelector("#diagram-minimap"),
+    minimapSvgEl: document.querySelector("#diagram-minimap-svg"),
     editorPanelEl,
     normalizePath: normalizePathForCompare,
     readFile: async (path) => invoke("read_file", { path }),
@@ -3611,10 +4244,18 @@ window.addEventListener("DOMContentLoaded", async () => {
     onSelectInTree: (payload, pos) => {
       openDiagramContextMenu(pos.x, pos.y, payload);
     },
+    onSelectSymbol: (payload) => {
+      if (!trackSymbolInTree) return;
+      selectInModelTree(payload);
+    },
+    log: (level, kind, message) => {
+      invoke?.("log_frontend", { level, kind, message }).catch(() => {});
+    },
   });
   updateArtifactToggle();
   updateRecentProjectsMenu(loadRecentProjects());
   loadModelPrefs();
+  loadRightPaneMode();
   syncPanelToggles();
   updateModelGroupToggle();
   updateModelLibraryToggle();
@@ -3623,6 +4264,85 @@ window.addEventListener("DOMContentLoaded", async () => {
   updateTrackSymbolToggle();
   currentTheme = loadStoredTheme();
   applyTheme(currentTheme);
+  setRightPaneMode(rightPaneMode);
+  aiEndpoints = initAiEndpoints({
+    elements: {
+      listEl: aiEndpointListEl,
+      nameEl: aiEndpointNameEl,
+      typeEl: aiEndpointTypeEl,
+      baseEl: aiEndpointBaseEl,
+      modelEl: aiEndpointModelEl,
+      tokenEl: aiEndpointTokenEl,
+      saveBtn: aiEndpointSaveBtn,
+      deleteBtn: aiEndpointDeleteBtn,
+      testBtn: aiEndpointTestBtn,
+      newBtn: aiEndpointNewBtn,
+    },
+    setStatus: setAiStatus,
+  });
+  scheduleIdle(() => aiEndpoints.refresh());
+  aiEndpoints.bind();
+  aiChat = initAiChat({
+    invoke,
+    elements: {
+      messagesEl: aiMessagesEl,
+      inputEl: aiInputEl,
+      statusEl: aiStatusEl,
+      messageMenuEl: aiMessageMenuEl,
+    },
+    getState: () => state,
+    getProjectFiles: () => lastCompile.files,
+    getEditor: () => editor,
+    onEdit: async (instruction) => {
+      if (!state.currentFile) {
+        setAiStatus("Open a file to apply edits.");
+        return false;
+      }
+      return requestAiEditForPath(state.currentFile, instruction, { applyImmediately: true });
+    },
+    onNew: async (relPath, content) => applyAiNewFile(relPath, content),
+    onParse: async (relPath) => {
+      if (!state.rootPath && !state.currentFile) {
+        setAiStatus("Select a project root first.");
+        return "";
+      }
+      let targetPath = "";
+      if (!relPath) {
+        if (!state.currentFile) {
+          setAiStatus("Open a file or provide a relative path.");
+          return "";
+        }
+        targetPath = state.currentFile;
+      } else {
+        const clean = relPath.replace(/^["']|["']$/g, "");
+        if (/^[A-Za-z]:[\\/]|^\\\\|^\//.test(clean)) {
+          setAiStatus("Use a relative path inside the current project.");
+          return "";
+        }
+        targetPath = joinPath(state.rootPath, clean);
+      }
+      try {
+        let payload;
+        if (targetPath === state.currentFile && editor) {
+          const fileContent = editor.getValue();
+          payload = await invoke("get_parse_errors_for_content", { path: targetPath, content: fileContent });
+        } else {
+          payload = await invoke("get_parse_errors", { path: targetPath });
+        }
+        const errors = payload?.errors || [];
+        return formatParseErrors(targetPath, errors);
+      } catch (error) {
+        setAiStatus(`Parse failed: ${error}`);
+        return "";
+      }
+    },
+    setStatus: setAiStatus,
+  });
+  aiChat.bind();
+  scheduleIdle(() => {
+    aiChat.loadInstructions().catch(() => {});
+  });
+  markStartup("ui_init");
   modelTreeEl?.addEventListener("contextmenu", (event) => {
     if (!event.target.closest(".model-row")) {
       event.preventDefault();
@@ -3684,6 +4404,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   logRefreshBtn?.addEventListener("click", async () => {
     await showLogDialog();
   });
+  logLevelFilterEl?.addEventListener("change", renderLogOutput);
+  logTypeFilterEl?.addEventListener("change", renderLogOutput);
+  logSortEl?.addEventListener("change", renderLogOutput);
   exportRunBtn?.addEventListener("click", async () => {
     await runExportFromDialog();
   });
@@ -3699,6 +4422,32 @@ window.addEventListener("DOMContentLoaded", async () => {
       hideLogDialog();
     }
   });
+  logDialogEl?.querySelector(".floating-log-header")?.addEventListener("pointerdown", (event) => {
+    if (!logDialogEl) return;
+    if (event.target.closest("button")) return;
+    const rect = logDialogEl.getBoundingClientRect();
+    const offsetX = event.clientX - rect.left;
+    const offsetY = event.clientY - rect.top;
+    logDialogEl.classList.add("dragging");
+    logDialogEl.setPointerCapture(event.pointerId);
+
+    const onMove = (moveEvent) => {
+      const left = Math.max(8, moveEvent.clientX - offsetX);
+      const top = Math.max(8, moveEvent.clientY - offsetY);
+      logDialogEl.style.left = `${left}px`;
+      logDialogEl.style.top = `${top}px`;
+      logDialogEl.style.right = "auto";
+    };
+
+    const onUp = () => {
+      logDialogEl.classList.remove("dragging");
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  });
   exportDialogEl?.addEventListener("click", (event) => {
     const action = event.target?.dataset?.action;
     if (action === "close") {
@@ -3709,6 +4458,12 @@ window.addEventListener("DOMContentLoaded", async () => {
     const action = event.target?.dataset?.action;
     if (action === "close") {
       hideSettingsDialog();
+    }
+  });
+  aiSettingsDialogEl?.addEventListener("click", (event) => {
+    const action = event.target?.dataset?.action;
+    if (action === "close") {
+      hideAiSettingsDialog();
     }
   });
   newProjectDialogEl?.addEventListener("click", (event) => {
@@ -3766,6 +4521,22 @@ window.addEventListener("DOMContentLoaded", async () => {
   settingsDialogEl?.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       hideSettingsDialog();
+    }
+  });
+  aiSettingsDialogEl?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      hideAiSettingsDialog();
+    }
+  });
+  aiApplyDialogEl?.addEventListener("click", (event) => {
+    const action = event.target?.dataset?.action;
+    if (action === "close") {
+      hideAiApplyDialog();
+    }
+  });
+  aiApplyDialogEl?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      hideAiApplyDialog();
     }
   });
   newProjectLocationPickEl?.addEventListener("click", async () => {
@@ -3858,6 +4629,39 @@ window.addEventListener("DOMContentLoaded", async () => {
         .then((entries) => renderFileTree(entries))
         .catch((error) => setCompileStatus(`Refresh failed: ${error}`));
     }
+  });
+  rightPaneToggleEl?.addEventListener("click", () => {
+    setRightPaneMode(rightPaneMode === "ai" ? "model" : "ai");
+  });
+  aiSettingsOpenBtn?.addEventListener("click", () => {
+    showAiSettingsDialog();
+  });
+  aiApplyConfirmBtn?.addEventListener("click", applyAiEdit);
+  aiPaneSplitEl?.addEventListener("pointerdown", (event) => {
+    if (!aiInputEl || !aiPaneEl) return;
+    const startY = event.clientY;
+    const startHeight = aiInputEl.getBoundingClientRect().height;
+    const paneHeight = aiPaneEl.getBoundingClientRect().height;
+    const minHeight = 120;
+    const maxHeight = Math.max(minHeight, paneHeight - 140);
+    appEl?.classList.add("dragging");
+    aiPaneSplitEl.setPointerCapture(event.pointerId);
+
+    const onMove = (moveEvent) => {
+      const delta = startY - moveEvent.clientY;
+      const next = Math.min(maxHeight, Math.max(minHeight, startHeight + delta));
+      aiInputEl.style.flex = "0 0 auto";
+      aiInputEl.style.height = `${next}px`;
+    };
+
+    const onUp = () => {
+      appEl?.classList.remove("dragging");
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
   });
   trackSymbolToggleBtn?.addEventListener("click", () => {
     trackSymbolInTree = !trackSymbolInTree;
@@ -3952,6 +4756,10 @@ window.addEventListener("DOMContentLoaded", async () => {
       event.preventDefault();
       await showNewProjectDialog();
     }
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "l") {
+      event.preventDefault();
+      await showLogDialog();
+    }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "b") {
       event.preventDefault();
       await compileWorkspace();
@@ -3959,6 +4767,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   });
 
   await loadMonaco();
+  markStartup("monaco_loaded");
   registerSysmlLanguage();
   editor = window.monaco.editor.create(document.querySelector("#editor"), {
     value: "",
@@ -3969,10 +4778,20 @@ window.addEventListener("DOMContentLoaded", async () => {
     selectionHighlight: false,
     occurrencesHighlight: "off",
     matchBrackets: "always",
+    quickSuggestions: true,
+    suggestOnTriggerCharacters: true,
     fontFamily: "IBM Plex Mono, Consolas, 'Courier New', monospace",
     fontSize: 14,
     lineNumbers: "on",
     renderLineHighlight: "line",
+  });
+  editor.addAction({
+    id: "mercurio.toggleLineComment",
+    label: "Toggle Line Comment",
+    keybindings: [window.monaco.KeyMod.CtrlCmd | window.monaco.KeyCode.US_SLASH],
+    run: () => {
+      return editor.getAction("editor.action.commentLine")?.run();
+    },
   });
   editor.onDidChangeCursorPosition(() => {
     updateCursorStatus();
@@ -4001,6 +4820,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   lastCursorLine = editor.getPosition()?.lineNumber ?? null;
   updateCursorStatus();
   editorReadyResolve?.();
+  markStartup("editor_ready");
 
   if (pendingOpen) {
     const pending = pendingOpen;
@@ -4026,6 +4846,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   setupMenuEvents();
   setupAppMenu();
   await setupWindowControls();
+  markStartup("window_controls");
+  clearBootScrim();
 
   try {
     let startup = null;
@@ -4048,20 +4870,27 @@ window.addEventListener("DOMContentLoaded", async () => {
         }
         await openFile(startup.path);
       }
-      await runInitialCompile();
+      scheduleIdle(() => void runInitialCompile());
+      markStartup("startup_root");
+      logStartup();
       return;
     }
     const savedRoot = window.localStorage?.getItem(ROOT_STORAGE_KEY);
     if (savedRoot) {
       await loadRoot(savedRoot, { autoCompile: false });
-      await runInitialCompile();
+      scheduleIdle(() => void runInitialCompile());
+      markStartup("saved_root");
+      logStartup();
     } else {
       const defaultRoot = await invoke("get_default_root");
       await loadRoot(defaultRoot, { autoCompile: false });
-      await runInitialCompile();
+      scheduleIdle(() => void runInitialCompile());
+      markStartup("default_root");
+      logStartup();
     }
   } catch (error) {
     setCompileStatus(`Failed to initialize: ${error}`);
+    clearBootScrim();
   }
 });
 
