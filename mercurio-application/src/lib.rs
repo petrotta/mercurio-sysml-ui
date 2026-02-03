@@ -20,7 +20,6 @@ use syster::syntax::SyntaxFile;
 use syster::syntax::parser::parse_with_result;
 use syster::interchange::{
     detect_format, JsonLd, Kpar, ModelFormat, Xmi, model_from_symbols, restore_ids_from_symbols,
-    symbols_from_model,
 };
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::path::BaseDirectory;
@@ -834,7 +833,7 @@ fn get_parse_errors(path: String) -> Result<ParseErrorsPayload, String> {
             message: err.message.clone(),
             line: err.position.line,
             column: err.position.column,
-            kind: format!("{:?}", err.kind),
+            kind: "parse".to_string(),
         })
         .collect::<Vec<_>>();
     Ok(ParseErrorsPayload {
@@ -860,7 +859,7 @@ fn get_parse_errors_for_content(path: String, content: String) -> Result<ParseEr
             message: err.message.clone(),
             line: err.position.line,
             column: err.position.column,
-            kind: format!("{:?}", err.kind),
+            kind: "parse".to_string(),
         })
         .collect::<Vec<_>>();
     Ok(ParseErrorsPayload {
@@ -2008,8 +2007,8 @@ fn import_model_into_host(host: &mut AnalysisHost, path: &Path) -> Result<(), St
             }
         }
     };
-    let symbols = symbols_from_model(&model);
-    host.add_symbols_from_model(symbols);
+    let virtual_path = path.to_string_lossy();
+    let _ = host.add_model(&model, &virtual_path);
     Ok(())
 }
 
