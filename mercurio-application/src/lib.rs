@@ -42,19 +42,49 @@ struct CompileFileResult {
   symbol_count: usize,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(untagged)]
 enum LibraryConfig {
     Default(String),
     Path { path: String },
 }
 
-#[derive(Deserialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 struct ProjectConfig {
     library: Option<LibraryConfig>,
     src: Option<Vec<String>>,
     #[serde(rename = "import")]
     import_entries: Option<Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct ProjectDescriptor {
+    name: Option<String>,
+    author: Option<String>,
+    description: Option<String>,
+    organization: Option<String>,
+    #[serde(flatten)]
+    config: ProjectConfig,
+}
+
+#[derive(Serialize, Clone)]
+struct ProjectDescriptorView {
+    name: Option<String>,
+    author: Option<String>,
+    description: Option<String>,
+    organization: Option<String>,
+    default_library: bool,
+    raw_json: String,
+}
+
+#[derive(Deserialize)]
+struct CreateProjectDescriptorPayload {
+    root: String,
+    name: String,
+    author: Option<String>,
+    description: Option<String>,
+    organization: Option<String>,
+    use_default_library: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -288,6 +318,12 @@ struct CompileResponse {
     unresolved: Vec<UnresolvedRefView>,
     library_path: Option<String>,
     parse_failed: bool,
+    stdlib_cache_hit: bool,
+    parsed_files: Vec<String>,
+    parse_duration_ms: u128,
+    analysis_duration_ms: u128,
+    stdlib_duration_ms: u128,
+    total_duration_ms: u128,
 }
 
 #[derive(Serialize, Clone)]
@@ -635,6 +671,102 @@ fn open_in_explorer(path: String) -> Result<(), String> {
     }
 }
 
+#[derive(Deserialize)]
+struct AiEndpointPayload {
+    url: String,
+    r#type: String,
+    model: Option<String>,
+    token: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct AiMessagePayload {
+    role: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct AiChatPayload {
+    url: String,
+    model: Option<String>,
+    token: Option<String>,
+    messages: Vec<AiMessagePayload>,
+    max_tokens: Option<u32>,
+}
+
+fn normalize_ai_url(base: &str, suffix: &str) -> String {
+    if base.contains(suffix) {
+        return base.to_string();
+    }
+    let trimmed = base.trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        format!("{}{}", trimmed, suffix)
+    } else {
+        format!("{}/v1{}", trimmed, suffix)
+    }
+}
+
+#[tauri::command]
+async fn ai_test_endpoint(payload: AiEndpointPayload) -> Result<serde_json::Value, String> {
+    let endpoint_type = payload.r#type.to_lowercase();
+    let url = if endpoint_type == "embeddings" {
+        normalize_ai_url(&payload.url, "/embeddings")
+    } else {
+        normalize_ai_url(&payload.url, "/chat/completions")
+    };
+    let body = if endpoint_type == "embeddings" {
+        serde_json::json!({
+            "model": payload.model.unwrap_or_else(|| "text-embedding-3-small".to_string()),
+            "input": "ping",
+        })
+    } else {
+        serde_json::json!({
+            "model": payload.model.unwrap_or_else(|| "gpt-4o-mini".to_string()),
+            "messages": [{ "role": "user", "content": "ping" }],
+            "max_tokens": 1,
+        })
+    };
+    let client = reqwest::Client::new();
+    let mut request = client.post(url).header("Content-Type", "application/json");
+    if let Some(token) = payload.token {
+        if !token.trim().is_empty() {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+    }
+    let response = request.json(&body).send().await.map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let detail = response.text().await.unwrap_or_else(|_| "".to_string());
+        return Ok(serde_json::json!({ "ok": false, "status": status, "detail": detail }));
+    }
+    Ok(serde_json::json!({ "ok": true }))
+}
+
+#[tauri::command]
+async fn ai_chat_completion(payload: AiChatPayload) -> Result<serde_json::Value, String> {
+    let url = normalize_ai_url(&payload.url, "/chat/completions");
+    let body = serde_json::json!({
+        "model": payload.model.unwrap_or_else(|| "gpt-4o-mini".to_string()),
+        "messages": payload.messages,
+        "max_tokens": payload.max_tokens.unwrap_or(512),
+    });
+    let client = reqwest::Client::new();
+    let mut request = client.post(url).header("Content-Type", "application/json");
+    if let Some(token) = payload.token {
+        if !token.trim().is_empty() {
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+    }
+    let response = request.json(&body).send().await.map_err(|e| e.to_string())?;
+    let status = response.status();
+    let text = response.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!("{} {}", status.as_u16(), text));
+    }
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    Ok(value)
+}
+
 #[tauri::command]
 fn set_watch_root(app: tauri::AppHandle, state: tauri::State<AppState>, root: String) -> Result<(), String> {
     let root_path = PathBuf::from(&root);
@@ -894,6 +1026,10 @@ fn compile_workspace_sync(
     unsaved: Vec<UnsavedFile>,
 ) -> Result<CompileResponse, String> {
     let compile_start = Instant::now();
+    let mut stdlib_cache_hit = false;
+    let mut parsed_files: Vec<String> = Vec::new();
+    let mut analysis_duration_ms: u128 = 0;
+    let mut stdlib_duration_ms: u128 = 0;
     let root_path = PathBuf::from(root);
     if !root_path.exists() {
         return Err("Root path does not exist".to_string());
@@ -1065,16 +1201,18 @@ fn compile_workspace_sync(
                 for (path, file) in cached_files {
                     analysis_host.set_file(path, file);
                 }
+                stdlib_cache_hit = true;
             }
         } else {
             stdlib_loader.load_into_host(&mut analysis_host)?;
         }
         let stdlib_files_after = analysis_host.file_count();
         let stdlib_file_delta = stdlib_files_after.saturating_sub(stdlib_files_before);
+        stdlib_duration_ms = stdlib_start.elapsed().as_millis();
         println!(
             "stdlib: loaded files={} duration_ms={}",
             stdlib_file_delta,
-            stdlib_start.elapsed().as_millis()
+            stdlib_duration_ms
         );
         println!("stdlib: symbols=skipped (counting stdlib symbols can overflow the stack)");
     }
@@ -1130,6 +1268,7 @@ fn compile_workspace_sync(
         }
 
         if should_parse || !workspace.file_cache.contains_key(path) {
+            parsed_files.push(path.to_string_lossy().to_string());
             let content = match content_override {
                 Some(value) => value.to_string(),
                 None => fs::read_to_string(path).map_err(|e| e.to_string())?,
@@ -1195,6 +1334,12 @@ fn compile_workspace_sync(
                 .as_ref()
                 .map(|path| path.to_string_lossy().to_string()),
             parse_failed: true,
+            stdlib_cache_hit,
+            parsed_files,
+            parse_duration_ms: parse_start.elapsed().as_millis(),
+            analysis_duration_ms,
+            stdlib_duration_ms,
+            total_duration_ms: compile_start.elapsed().as_millis(),
         });
     }
 
@@ -1209,6 +1354,7 @@ fn compile_workspace_sync(
                 "analysis: done duration_ms={}",
                 analysis_start.elapsed().as_millis()
             );
+            analysis_duration_ms = analysis_start.elapsed().as_millis();
             check_cancel()?;
 
             let project_file_ids = files
@@ -1331,6 +1477,12 @@ fn compile_workspace_sync(
             .as_ref()
             .map(|path| path.to_string_lossy().to_string()),
         parse_failed: false,
+        stdlib_cache_hit,
+        parsed_files,
+        parse_duration_ms: parse_start.elapsed().as_millis(),
+        analysis_duration_ms,
+        stdlib_duration_ms,
+        total_duration_ms: compile_start.elapsed().as_millis(),
     })
 }
 
@@ -1376,14 +1528,79 @@ async fn export_compiled_model(
     .map_err(|e| e.to_string())?
 }
 
-fn load_project_config(root: &Path) -> Result<Option<ProjectConfig>, String> {
+fn load_project_descriptor(root: &Path) -> Result<Option<ProjectDescriptor>, String> {
     let config_path = root.join(".project.json");
     if !config_path.exists() {
         return Ok(None);
     }
     let content = fs::read_to_string(config_path).map_err(|e| e.to_string())?;
-    let parsed: ProjectConfig = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+    let parsed: ProjectDescriptor = serde_json::from_str(&content).map_err(|e| e.to_string())?;
     Ok(Some(parsed))
+}
+
+fn load_project_config(root: &Path) -> Result<Option<ProjectConfig>, String> {
+    Ok(load_project_descriptor(root)?.map(|descriptor| descriptor.config))
+}
+
+#[tauri::command]
+fn get_project_descriptor(root: String) -> Result<Option<ProjectDescriptorView>, String> {
+    let root_path = PathBuf::from(root);
+    let descriptor = match load_project_descriptor(&root_path)? {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let default_library = matches!(
+        descriptor.config.library,
+        Some(LibraryConfig::Default(ref value)) if value == "default"
+    );
+    let raw_json = serde_json::to_string_pretty(&descriptor).map_err(|e| e.to_string())?;
+    Ok(Some(ProjectDescriptorView {
+        name: descriptor.name,
+        author: descriptor.author,
+        description: descriptor.description,
+        organization: descriptor.organization,
+        default_library,
+        raw_json,
+    }))
+}
+
+#[tauri::command]
+fn create_project_descriptor(payload: CreateProjectDescriptorPayload) -> Result<ProjectDescriptorView, String> {
+    let root_path = PathBuf::from(payload.root);
+    if root_path.exists() {
+        return Err("Project folder already exists".to_string());
+    }
+    fs::create_dir_all(&root_path).map_err(|e| e.to_string())?;
+    let config = ProjectConfig {
+        library: if payload.use_default_library {
+            Some(LibraryConfig::Default("default".to_string()))
+        } else {
+            None
+        },
+        src: Some(vec!["**/*.sysml".to_string(), "**/*.kerml".to_string()]),
+        import_entries: Some(vec!["**/*.sysmlx".to_string(), "**/*.kermlx".to_string()]),
+    };
+    let descriptor = ProjectDescriptor {
+        name: Some(payload.name),
+        author: payload.author,
+        description: payload.description,
+        organization: payload.organization,
+        config,
+    };
+    let content = serde_json::to_string_pretty(&descriptor).map_err(|e| e.to_string())?;
+    let config_path = root_path.join(".project.json");
+    fs::write(config_path, &content).map_err(|e| e.to_string())?;
+    Ok(ProjectDescriptorView {
+        name: descriptor.name,
+        author: descriptor.author,
+        description: descriptor.description,
+        organization: descriptor.organization,
+        default_library: matches!(
+            descriptor.config.library,
+            Some(LibraryConfig::Default(ref value)) if value == "default"
+        ),
+        raw_json: content,
+    })
 }
 
 fn export_model_to_path(
@@ -1740,7 +1957,17 @@ fn resolve_under_root(root: &Path, target: &Path) -> Result<PathBuf, String> {
     };
     let normalized = normalize_path(&joined);
     if !normalized.starts_with(&root) {
-        return Err("Path is outside the project root".to_string());
+        let root_str = root.to_string_lossy();
+        let path_str = normalized.to_string_lossy();
+        let strip = |value: &str| {
+            let value = value.replace('/', "\\").to_lowercase();
+            value.strip_prefix(r"\\?\").unwrap_or(&value).to_string()
+        };
+        let root_cmp = strip(&root_str);
+        let path_cmp = strip(&path_str);
+        if !path_cmp.starts_with(&root_cmp) {
+            return Err("Path is outside the project root".to_string());
+        }
     }
     Ok(normalized)
 }
@@ -2256,12 +2483,16 @@ pub fn run() {
             open_in_explorer,
             get_parse_errors,
             get_parse_errors_for_content,
+            get_project_descriptor,
+            create_project_descriptor,
             window_minimize,
             window_toggle_maximize,
             window_close,
             compile_workspace,
             cancel_compile,
-            export_compiled_model
+            export_compiled_model,
+            ai_test_endpoint,
+            ai_chat_completion
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

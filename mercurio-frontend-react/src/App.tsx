@@ -23,6 +23,8 @@ const AI_ENDPOINTS_KEY = "mercurio.ai.endpoints";
 const AI_CHAT_KEY = "mercurio.ai.chatEndpoint";
 const AI_EMBEDDINGS_KEY = "mercurio.ai.embeddingsEndpoint";
 const PROJECT_LOCATION_KEY = "mercurio.projectLocation";
+const THEME_KEY = "mercurio.theme";
+const PROJECT_DESCRIPTOR_TAB = "__project_descriptor__";
 
 function loadRecents(): string[] {
   try {
@@ -39,10 +41,18 @@ function saveRecents(list: string[]) {
 }
 
 export function App() {
-  const appWindow = getCurrentWindow();
+  void getCurrentWindow();
   const [openMenu, setOpenMenu] = useState<string | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [appTheme, setAppTheme] = useState<"dark" | "light">(
+    (window.localStorage?.getItem(THEME_KEY) as "dark" | "light") || "dark",
+  );
   const [leftWidth, setLeftWidth] = useState(240);
   const [rightWidth, setRightWidth] = useState(320);
+  const [leftCollapsed, setLeftCollapsed] = useState(false);
+  const [rightCollapsed, setRightCollapsed] = useState(false);
+  const leftStoredWidthRef = useRef(240);
+  const rightStoredWidthRef = useRef(320);
   const draggingRef = useRef<null | "left" | "right" | "model">(null);
   const startRef = useRef({ x: 0, y: 0, left: 240, right: 320, model: 260 });
   const [rootPath, setRootPath] = useState<string>(() => window.localStorage?.getItem(ROOT_STORAGE_KEY) || "");
@@ -55,11 +65,20 @@ export function App() {
   const [openTabs, setOpenTabs] = useState<Array<{ path: string; name: string; dirty: boolean }>>([]);
   const [activeTabPath, setActiveTabPath] = useState<string | null>(null);
   const [editorViewMode, setEditorViewMode] = useState<"text" | "diagram">("text");
+  const [descriptorViewMode, setDescriptorViewMode] = useState<"view" | "json">("view");
   const [tabContent, setTabContent] = useState<Record<string, string>>({});
   const suppressDirtyRef = useRef(false);
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; entry: FileEntry } | null>(null);
-  const [projectInfo, setProjectInfo] = useState<string>("");
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; entry: FileEntry; scope: "root" | "node" } | null>(null);
   const [showProjectInfo, setShowProjectInfo] = useState(false);
+  const [hasProjectDescriptor, setHasProjectDescriptor] = useState(false);
+  const [projectDescriptor, setProjectDescriptor] = useState<{
+    name?: string | null;
+    author?: string | null;
+    description?: string | null;
+    organization?: string | null;
+    default_library: boolean;
+    raw_json?: string;
+  } | null>(null);
   const [showNewFile, setShowNewFile] = useState(false);
   const [newFileName, setNewFileName] = useState("");
   const [newFileParent, setNewFileParent] = useState<string>("");
@@ -70,16 +89,23 @@ export function App() {
   const [exportPath, setExportPath] = useState("");
   const [exportBusy, setExportBusy] = useState(false);
   const [showNewProject, setShowNewProject] = useState(false);
+  const [showOpenProject, setShowOpenProject] = useState(false);
+  const [openProjectPath, setOpenProjectPath] = useState("");
   const [newProjectLocation, setNewProjectLocation] = useState("");
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectFolder, setNewProjectFolder] = useState("");
+  const [newProjectAuthor, setNewProjectAuthor] = useState("");
+  const [newProjectDescription, setNewProjectDescription] = useState("");
+  const [newProjectOrganization, setNewProjectOrganization] = useState("");
   const [newProjectFolderStatus, setNewProjectFolderStatus] = useState("");
   const [newProjectFolderAvailable, setNewProjectFolderAvailable] = useState(false);
   const [newProjectDefaultLib, setNewProjectDefaultLib] = useState(true);
   const [newProjectBusy, setNewProjectBusy] = useState(false);
+  const [newProjectError, setNewProjectError] = useState("");
   const [rightPaneMode, setRightPaneMode] = useState<"model" | "ai">("model");
+  const [cursorPos, setCursorPos] = useState<{ line: number; col: number } | null>(null);
   const [aiInput, setAiInput] = useState("");
-  const [aiMessages, setAiMessages] = useState<{ role: "user" | "assistant"; text: string }[]>([]);
+  const [aiMessages, setAiMessages] = useState<Array<{ role: "user" | "assistant"; text: string; pendingId?: number }>>([]);
   const [showAiSettings, setShowAiSettings] = useState(false);
   const [aiEndpoints, setAiEndpoints] = useState<Array<{
     id: string;
@@ -112,10 +138,29 @@ export function App() {
     token: string;
   }>({ name: "", url: "", type: "chat", model: "", token: "" });
   const [endpointTestStatus, setEndpointTestStatus] = useState<Record<string, string>>({});
-  const [compileStatus, setCompileStatus] = useState("Background compile: idle");
+  const aiRequestRef = useRef(0);
+  const [, setCompileStatus] = useState("Background compile: idle");
   const [compileRunId, setCompileRunId] = useState<number | null>(null);
+  const [compileToast, setCompileToast] = useState<{
+    open: boolean;
+    ok: boolean | null;
+    lines: string[];
+    parseErrors: Array<{ path: string; errors: string[] }>;
+    details: string[];
+    parsedFiles: string[];
+  }>({
+    open: false,
+    ok: null,
+    lines: [],
+    parseErrors: [],
+    details: [],
+    parsedFiles: [],
+  });
+  const compileToastTimerRef = useRef<number | null>(null);
   const backgroundCompileRef = useRef<number | null>(null);
+  const backgroundCompileTokenRef = useRef(0);
   const [backgroundCompileEnabled, setBackgroundCompileEnabled] = useState(true);
+  const [projectSymbolsLoaded, setProjectSymbolsLoaded] = useState(false);
   const [symbols, setSymbols] = useState<Array<{
     name: string;
     kind: string;
@@ -154,16 +199,19 @@ export function App() {
   } | null>(null);
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
+  const cursorListenerRef = useRef<null | { dispose: () => void }>(null);
   const parseReqRef = useRef(0);
   const pendingEditorContentRef = useRef<string | null>(null);
   const pendingEditorPathRef = useRef<string | null>(null);
-  const editorOptions: Parameters<typeof MonacoEditor>[0]["options"] = {
-    minimap: { enabled: false },
-    fontSize: 14,
-    fontFamily: "IBM Plex Mono, Consolas, 'Courier New', monospace",
-    wordWrap: "on" as const,
-    automaticLayout: true,
-  };
+    const editorOptions: Parameters<typeof MonacoEditor>[0]["options"] = {
+      minimap: { enabled: false },
+      fontSize: 14,
+      fontFamily: "IBM Plex Mono, Consolas, 'Courier New', monospace",
+      wordWrap: "on" as const,
+      selectionHighlight: false,
+      occurrencesHighlight: "off",
+      automaticLayout: true,
+    };
   const [diagramScale, setDiagramScale] = useState(1);
   const [diagramOffset, setDiagramOffset] = useState({ x: 0, y: 0 });
   const diagramPanRef = useRef<null | { x: number; y: number; startX: number; startY: number }>(null);
@@ -177,6 +225,7 @@ export function App() {
   });
   const [diagramNodeOffsets, setDiagramNodeOffsets] = useState<Record<string, { x: number; y: number }>>({});
   const [diagramNodeSizes, setDiagramNodeSizes] = useState<Record<string, { width: number; height: number }>>({});
+  const [syncDiagramSelection, setSyncDiagramSelection] = useState(false);
   const diagramDragRef = useRef<null | {
     node: string;
     startX: number;
@@ -202,6 +251,15 @@ export function App() {
   const [diagramManualNodes, setDiagramManualNodes] = useState<Array<{ id: string; type: string; name: string; x: number; y: number; width: number; height: number; pending: boolean }>>([]);
   const paletteCreateRef = useRef<null | { type: string; name: string; startX: number; startY: number }>(null);
   const [paletteGhost, setPaletteGhost] = useState<null | { x: number; y: number; type: string }>(null);
+  const fsChangeTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    document.body.classList.toggle("theme-light", appTheme === "light");
+    window.localStorage?.setItem(THEME_KEY, appTheme);
+    if (monacoRef.current) {
+      monacoRef.current.editor.setTheme(appTheme === "light" ? "vs" : "vs-dark");
+    }
+  }, [appTheme]);
 
   useEffect(() => {
     const onDocClick = (event: MouseEvent) => {
@@ -211,9 +269,6 @@ export function App() {
       }
       if (!target || !target.closest(".context-menu")) {
         setContextMenu(null);
-      }
-      if (!target || !target.closest(".tab-menu")) {
-        setTabMenu(null);
       }
     };
     document.addEventListener("click", onDocClick);
@@ -249,6 +304,10 @@ export function App() {
     };
   }, []);
 
+  useEffect(() => {
+    setProjectSymbolsLoaded(false);
+  }, [rootPath]);
+
   const rememberProjectLocation = (path: string) => {
     if (!path) return;
     window.localStorage?.setItem(PROJECT_LOCATION_KEY, path);
@@ -273,23 +332,16 @@ export function App() {
       .replace(/(^-|-$)/g, "");
   };
 
-  const buildProjectConfigText = (useDefaultLibrary: boolean) => {
-    const base: { src: string[]; import: string[]; library?: string } = {
-      src: ["**/*.sysml", "**/*.kerml"],
-      import: ["**/*.sysmlx", "**/*.kermlx"],
-    };
-    if (useDefaultLibrary) {
-      base.library = "default";
-    }
-    return JSON.stringify(base, null, 2);
-  };
-
   const openNewProjectDialog = async () => {
     setNewProjectName("");
     setNewProjectFolder("");
+    setNewProjectAuthor("");
+    setNewProjectDescription("");
+    setNewProjectOrganization("");
     setNewProjectFolderStatus("");
     setNewProjectFolderAvailable(false);
     setNewProjectDefaultLib(true);
+    setNewProjectError("");
     setNewProjectLocation(await getDefaultProjectLocation());
     setShowNewProject(true);
     setTimeout(() => {
@@ -346,36 +398,58 @@ export function App() {
     const name = newProjectName.trim();
     const folder = newProjectFolder.trim();
     if (!location || !name || !folder) {
-      setCompileStatus("Enter location, project name, and folder name");
+      setNewProjectError("Enter location, project name, and folder name.");
       return;
     }
     const projectPath = `${location}\\${folder}`.replace(/[\\/]+/g, "\\");
-    const projectFile = `${projectPath}\\.project.json`.replace(/[\\/]+/g, "\\");
-    const config = buildProjectConfigText(newProjectDefaultLib);
     try {
       setNewProjectBusy(true);
+      setNewProjectError("");
       const exists = await invoke<boolean>("path_exists", { path: projectPath });
       if (exists) {
-        setCompileStatus("Project folder already exists");
+        setNewProjectError("Project folder already exists.");
         setNewProjectFolderStatus("Folder already exists");
         setNewProjectFolderAvailable(false);
         setNewProjectBusy(false);
         return;
       }
-      await invoke("write_file", { path: projectFile, content: config });
+      const descriptor = await invoke<{
+        name?: string | null;
+        author?: string | null;
+        description?: string | null;
+        organization?: string | null;
+        default_library: boolean;
+        raw_json?: string;
+      }>("create_project_descriptor", {
+        payload: {
+          root: projectPath,
+          name,
+          author: newProjectAuthor.trim() || null,
+          description: newProjectDescription.trim() || null,
+          organization: newProjectOrganization.trim() || null,
+          use_default_library: newProjectDefaultLib,
+        },
+      });
+      setProjectDescriptor(descriptor || null);
+      setHasProjectDescriptor(!!descriptor);
       rememberProjectLocation(location);
       setShowNewProject(false);
       setNewProjectBusy(false);
-      await openProject(projectPath);
+      try {
+        await openProject(projectPath);
+      } catch (error) {
+        setNewProjectError(`Open project failed: ${String(error)}`);
+      }
+      openProjectDescriptorTab(descriptor || null);
       setCompileStatus("Project created");
     } catch (error) {
       setNewProjectBusy(false);
-      setCompileStatus(`Create project failed: ${error}`);
+      setNewProjectError(`Create project failed: ${String(error)}`);
     }
   };
 
-  useEffect(() => {
-    const onMove = (event: PointerEvent) => {
+    useEffect(() => {
+      const onMove = (event: PointerEvent) => {
       if (!draggingRef.current) return;
       const delta = event.clientX - startRef.current.x;
       if (draggingRef.current === "left") {
@@ -398,7 +472,36 @@ export function App() {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
     };
-  }, []);
+    }, []);
+
+  useEffect(() => {
+    if (!rootPath) {
+      setProjectDescriptor(null);
+      setHasProjectDescriptor(false);
+      return;
+    }
+      invoke<{
+        name?: string | null;
+        author?: string | null;
+        description?: string | null;
+        organization?: string | null;
+        default_library: boolean;
+        raw_json?: string;
+      } | null>("get_project_descriptor", { root: rootPath })
+        .then((descriptor) => {
+          setProjectDescriptor(descriptor || null);
+          setHasProjectDescriptor(!!descriptor);
+        })
+        .catch(() => {
+          setProjectDescriptor(null);
+          setHasProjectDescriptor(false);
+        });
+    }, [rootPath]);
+
+  useEffect(() => {
+    if (!rootPath) return;
+    void runBackgroundCompile(rootPath);
+  }, [rootPath, backgroundCompileEnabled]);
 
   useEffect(() => {
     if (rightPaneMode !== "model") return;
@@ -539,6 +642,14 @@ export function App() {
     if (event.currentTarget && "setPointerCapture" in event.currentTarget) {
       (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
     }
+    if (side === "left" && leftCollapsed) {
+      setLeftCollapsed(false);
+      setLeftWidth(leftStoredWidthRef.current || 240);
+    }
+    if (side === "right" && rightCollapsed) {
+      setRightCollapsed(false);
+      setRightWidth(rightStoredWidthRef.current || 320);
+    }
     draggingRef.current = side;
     startRef.current = { x: event.clientX, y: event.clientY, left: leftWidth, right: rightWidth, model: modelTreeHeight };
     document.body.classList.add("dragging");
@@ -552,20 +663,46 @@ export function App() {
 
   const openProject = async (path: string) => {
     if (!path) return;
+    if (compileRunId) {
+      void invoke("cancel_compile", { run_id: compileRunId }).catch(() => {});
+      setCompileRunId(null);
+    }
+    if (backgroundCompileRef.current) {
+      void invoke("cancel_compile", { run_id: backgroundCompileRef.current }).catch(() => {});
+      backgroundCompileRef.current = null;
+    }
+    backgroundCompileTokenRef.current += 1;
+    closeAllTabs();
+    setSelectedSymbol(null);
+    setEditorViewMode("text");
+    setDescriptorViewMode("view");
+    setProjectDescriptor(null);
+    setHasProjectDescriptor(false);
     setRootPath(path);
     window.localStorage?.setItem(ROOT_STORAGE_KEY, path);
     const next = [path, ...recentProjects.filter((p) => p !== path)].slice(0, 8);
     setRecentProjects(next);
     saveRecents(next);
     await refreshRoot(path);
-    void runBackgroundCompile(path);
   };
 
-  const chooseProject = async () => {
+  const chooseProject = () => {
+    setOpenProjectPath("");
+    setShowOpenProject(true);
+  };
+
+  const browseOpenProject = async () => {
     const selected = await open({ directory: true, multiple: false });
     if (typeof selected === "string" && selected) {
-      await openProject(selected);
+      setOpenProjectPath(selected);
     }
+  };
+
+  const confirmOpenProject = async () => {
+    const path = openProjectPath.trim();
+    if (!path) return;
+    await openProject(path);
+    setShowOpenProject(false);
   };
 
   const toggleExpand = async (entry: FileEntry) => {
@@ -606,14 +743,14 @@ export function App() {
     if (currentFilePath !== target.path) {
       const content = await invoke<string>("read_file", { path: target.path });
       if (reqId !== navReqRef.current) return;
-      suppressDirtyRef.current = true;
-      editorValueRef.current = content || "";
-      if (editorRef.current) {
-        editorRef.current.setValue(editorValueRef.current);
-      } else {
-        pendingEditorContentRef.current = editorValueRef.current;
-        pendingEditorPathRef.current = target.path;
-      }
+        suppressDirtyRef.current = true;
+        editorValueRef.current = content || "";
+        if (editorRef.current && editorViewMode === "text" && activeTabPath !== PROJECT_DESCRIPTOR_TAB) {
+          editorRef.current.setValue(editorValueRef.current);
+        } else {
+          pendingEditorContentRef.current = editorValueRef.current;
+          pendingEditorPathRef.current = target.path;
+        }
       setCurrentFilePath(target.path);
       setActiveTabPath(target.path);
       setOpenTabs((prev) => {
@@ -641,7 +778,20 @@ export function App() {
 
   const showContext = (event: React.MouseEvent, entry: FileEntry) => {
     event.preventDefault();
-    setContextMenu({ x: event.clientX, y: event.clientY, entry });
+    event.stopPropagation();
+    setContextMenu({ x: event.clientX, y: event.clientY, entry, scope: "node" });
+  };
+
+  const showRootContext = (event: React.MouseEvent) => {
+    if (!rootPath) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu({
+      x: event.clientX,
+      y: event.clientY,
+      scope: "root",
+      entry: { name: rootPath.split(/[\\/]/).pop() || rootPath, path: rootPath, is_dir: true },
+    });
   };
 
   const handleContextAction = async (action: string) => {
@@ -649,6 +799,8 @@ export function App() {
     if (!entry || !rootPath) return;
     if (action === "new-file") {
       openNewFileDialog(entry.is_dir ? entry.path : rootPath);
+    } else if (action === "show-in-explorer") {
+      await invoke("open_in_explorer", { path: entry.path });
     } else if (action === "open-project") {
       if (entry.is_dir) {
         await openProject(entry.path);
@@ -664,11 +816,6 @@ export function App() {
       if (!name) return;
       await invoke("rename_path", { root: rootPath, path: entry.path, new_name: name });
       await refreshRoot(rootPath);
-    } else if (action === "delete") {
-      const ok = window.confirm(`Delete ${entry.name}?`);
-      if (!ok) return;
-      await invoke("delete_path", { root: rootPath, path: entry.path });
-      await refreshRoot(rootPath);
     }
     setContextMenu(null);
   };
@@ -676,27 +823,33 @@ export function App() {
   const loadProjectInfo = async () => {
     if (!rootPath) return;
     try {
-      const path = `${rootPath}\\.project.json`.replace(/[\\/]+/g, "\\");
-      const raw = await invoke<string>("read_file", { path });
-      setProjectInfo(raw || "");
+      const descriptor = await invoke<{
+        name?: string | null;
+        author?: string | null;
+        description?: string | null;
+        organization?: string | null;
+        default_library: boolean;
+        raw_json?: string;
+      } | null>("get_project_descriptor", { root: rootPath });
+      setProjectDescriptor(descriptor || null);
+      setHasProjectDescriptor(!!descriptor);
     } catch {
-      setProjectInfo("");
+      setProjectDescriptor(null);
+      setHasProjectDescriptor(false);
     }
-    setShowProjectInfo(true);
+    openProjectDescriptorTab();
   };
 
   const createNewFile = async () => {
     if (!rootPath || !newFileName) return;
-    const parent = newFileParent || rootPath;
     const normRoot = rootPath.replace(/[\\/]+/g, "\\").toLowerCase();
-    const normParent = parent.replace(/[\\/]+/g, "\\").toLowerCase();
-    if (!normParent.startsWith(normRoot)) {
-      setCompileStatus("New file path must be inside the project root");
-      return;
-    }
+    const parentCandidate = newFileParent || rootPath;
+    const normParentCandidate = parentCandidate.replace(/[\\/]+/g, "\\").toLowerCase();
+    const parent = normParentCandidate.startsWith(normRoot) ? parentCandidate : rootPath;
     const trimmed = newFileName.trim();
+    const baseName = trimmed.split(/[\\/]/).pop() || trimmed;
     const extension = newFileType === "kerml" ? ".kerml" : ".sysml";
-    const finalName = trimmed.toLowerCase().endsWith(extension) ? trimmed : `${trimmed}${extension}`;
+    const finalName = baseName.toLowerCase().endsWith(extension) ? baseName : `${baseName}${extension}`;
     await invoke("create_file", { root: rootPath, parent, name: finalName });
     setShowNewFile(false);
     setNewFileName("");
@@ -742,6 +895,31 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (!rootPath) return;
+    void invoke("set_watch_root", { root: rootPath }).catch(() => {});
+  }, [rootPath]);
+
+  useEffect(() => {
+    const unlistenPromise = listen("fs-changed", () => {
+      if (!rootPath) return;
+      if (fsChangeTimerRef.current) {
+        window.clearTimeout(fsChangeTimerRef.current);
+      }
+      fsChangeTimerRef.current = window.setTimeout(() => {
+        fsChangeTimerRef.current = null;
+        void refreshRoot(rootPath);
+      }, 200);
+    });
+    return () => {
+      if (fsChangeTimerRef.current) {
+        window.clearTimeout(fsChangeTimerRef.current);
+        fsChangeTimerRef.current = null;
+      }
+      unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
+    };
+  }, [rootPath]);
+
+  useEffect(() => {
     const unlistenPromise = listen<{
       run_id: number;
       stage: string;
@@ -758,6 +936,9 @@ export function App() {
       const detail = payload.file ? `${stage}: ${payload.file}` : stage;
       const prefix = compileRunId ? "Compile" : "Background compile";
       setCompileStatus(`${prefix}: ${detail}`);
+      if (compileRunId && payload.run_id === compileRunId) {
+        setCompileToast((prev) => ({ ...prev, open: true, lines: [...prev.lines, detail].slice(-8) }));
+      }
     });
     return () => {
       unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
@@ -766,12 +947,24 @@ export function App() {
 
   const runCompile = async () => {
     if (!rootPath) return;
+    if (backgroundCompileRef.current) {
+      void invoke("cancel_compile", { run_id: backgroundCompileRef.current }).catch(() => {});
+      backgroundCompileRef.current = null;
+    }
     const runId = Date.now();
     setCompileRunId(runId);
+    setCompileToast({ open: true, ok: null, lines: ["starting..."], parseErrors: [], details: [], parsedFiles: [] });
     setCompileStatus("Compile: starting...");
     try {
       const response = await invoke<{
         ok: boolean;
+        files?: Array<{ path: string; ok: boolean; errors: string[]; symbol_count: number }>;
+        parsed_files?: string[];
+        parse_duration_ms?: number;
+        analysis_duration_ms?: number;
+        stdlib_duration_ms?: number;
+        total_duration_ms?: number;
+        stdlib_cache_hit?: boolean;
         symbols: Array<{
           name: string;
           kind: string;
@@ -804,9 +997,58 @@ export function App() {
       setSymbols(response?.symbols || []);
       setUnresolved(response?.unresolved || []);
       setLibraryPath(response?.library_path ?? null);
-      setCompileStatus(response?.ok ? "Compile: complete" : "Compile: finished with errors");
+      setProjectSymbolsLoaded(true);
+      setProjectSymbolsLoaded(true);
+      setProjectSymbolsLoaded(true);
+      const ok = !!response?.ok;
+      const parseErrors = (response?.files || [])
+        .filter((file) => !file.ok && file.errors && file.errors.length)
+        .map((file) => ({ path: file.path, errors: file.errors }));
+      const details: string[] = [];
+      if (typeof response?.stdlib_cache_hit === "boolean") {
+        details.push(`Stdlib: ${response.stdlib_cache_hit ? "cache hit" : "reloaded"}`);
+      }
+      if (typeof response?.stdlib_duration_ms === "number") {
+        details.push(`Stdlib load: ${response.stdlib_duration_ms} ms`);
+      }
+      if (typeof response?.parse_duration_ms === "number") {
+        details.push(`Parse: ${response.parse_duration_ms} ms`);
+      }
+      if (typeof response?.analysis_duration_ms === "number") {
+        details.push(`Analysis: ${response.analysis_duration_ms} ms`);
+      }
+      if (typeof response?.total_duration_ms === "number") {
+        details.push(`Total: ${response.total_duration_ms} ms`);
+      }
+      const parsedFiles = response?.parsed_files || [];
+      if (parsedFiles.length) {
+        details.push(`Files parsed: ${parsedFiles.length}`);
+      }
+      if (response?.symbols?.length != null) {
+        details.push(`Symbols: ${response.symbols.length}`);
+      }
+      if (response?.unresolved?.length != null) {
+        details.push(`Unresolved: ${response.unresolved.length}`);
+      }
+      setCompileStatus(ok ? "Compile: complete" : "Compile: finished with errors");
+      setCompileToast((prev) => ({ ...prev, ok, open: true, parseErrors, details, parsedFiles }));
+      if (ok) {
+        if (compileToastTimerRef.current) {
+          window.clearTimeout(compileToastTimerRef.current);
+        }
+        compileToastTimerRef.current = window.setTimeout(() => {
+          setCompileToast((prev) => ({ ...prev, open: false }));
+          compileToastTimerRef.current = null;
+        }, 2000);
+      }
     } catch (error) {
       setCompileStatus(`Compile: failed: ${error}`);
+      setCompileToast((prev) => ({
+        ...prev,
+        ok: false,
+        open: true,
+        lines: [...prev.lines, `failed: ${String(error)}`].slice(-8),
+      }));
     } finally {
       setCompileRunId(null);
     }
@@ -821,6 +1063,7 @@ export function App() {
   const runBackgroundCompile = async (path: string) => {
     if (!backgroundCompileEnabled || !path || compileRunId || backgroundCompileRef.current) return;
     const runId = Date.now();
+    const token = backgroundCompileTokenRef.current;
     backgroundCompileRef.current = runId;
     setCompileStatus("Background compile: starting...");
     try {
@@ -855,20 +1098,28 @@ export function App() {
           unsaved: [],
         },
       });
+      if (token !== backgroundCompileTokenRef.current || path !== rootPath) {
+        return;
+      }
       setSymbols(response?.symbols || []);
       setUnresolved(response?.unresolved || []);
       setLibraryPath(response?.library_path ?? null);
       setCompileStatus(response?.ok ? "Background compile: complete" : "Background compile: finished with errors");
     } catch (error) {
-      setCompileStatus(`Background compile: failed: ${error}`);
+      if (token === backgroundCompileTokenRef.current) {
+        setCompileStatus(`Background compile: failed: ${error}`);
+      }
     } finally {
-      backgroundCompileRef.current = null;
+      if (token === backgroundCompileTokenRef.current) {
+        backgroundCompileRef.current = null;
+      }
     }
   };
 
   const runBackgroundCompileWithUnsaved = async (path: string, filePath: string, content: string) => {
     if (!backgroundCompileEnabled || !path || compileRunId || backgroundCompileRef.current) return;
     const runId = Date.now();
+    const token = backgroundCompileTokenRef.current;
     backgroundCompileRef.current = runId;
     setCompileStatus("Background compile: starting...");
     try {
@@ -903,20 +1154,38 @@ export function App() {
           unsaved: [{ path: filePath, content }],
         },
       });
+      if (token !== backgroundCompileTokenRef.current || path !== rootPath) {
+        return;
+      }
       setSymbols(response?.symbols || []);
       setUnresolved(response?.unresolved || []);
       setLibraryPath(response?.library_path ?? null);
       setCompileStatus(response?.ok ? "Background compile: complete" : "Background compile: finished with errors");
     } catch (error) {
-      setCompileStatus(`Background compile: failed: ${error}`);
+      if (token === backgroundCompileTokenRef.current) {
+        setCompileStatus(`Background compile: failed: ${error}`);
+      }
     } finally {
-      backgroundCompileRef.current = null;
+      if (token === backgroundCompileTokenRef.current) {
+        backgroundCompileRef.current = null;
+      }
     }
   };
 
   const handleEditorMount: OnMount = (editorInstance, monaco) => {
     editorRef.current = editorInstance;
     monacoRef.current = monaco;
+    if (cursorListenerRef.current) {
+      cursorListenerRef.current.dispose();
+      cursorListenerRef.current = null;
+    }
+    cursorListenerRef.current = editorInstance.onDidChangeCursorPosition((event) => {
+      setCursorPos({ line: event.position.lineNumber, col: event.position.column });
+    });
+    const initialPos = editorInstance.getPosition();
+    if (initialPos) {
+      setCursorPos({ line: initialPos.lineNumber, col: initialPos.column });
+    }
     if (pendingEditorContentRef.current && (!pendingEditorPathRef.current || pendingEditorPathRef.current === currentFilePath)) {
       editorInstance.setValue(pendingEditorContentRef.current);
       pendingEditorContentRef.current = null;
@@ -1005,12 +1274,12 @@ export function App() {
         ],
       },
     });
-    monaco.editor.setTheme("vs-dark");
+    monaco.editor.setTheme(appTheme === "light" ? "vs" : "vs-dark");
     editorInstance.focus();
   };
 
   useEffect(() => {
-    if (!activeTabPath) return;
+    if (!activeTabPath || activeTabPath === PROJECT_DESCRIPTOR_TAB) return;
     const monaco = monacoRef.current;
     const editor = editorRef.current;
     if (!monaco || !editor) return;
@@ -1043,7 +1312,7 @@ export function App() {
   }, [editorChangeTick, activeTabPath]);
 
   useEffect(() => {
-    if (!rootPath || !activeTabPath) return;
+    if (!rootPath || !activeTabPath || activeTabPath === PROJECT_DESCRIPTOR_TAB) return;
     const timer = window.setTimeout(() => {
       void runBackgroundCompileWithUnsaved(rootPath, activeTabPath, editorValueRef.current);
     }, 800);
@@ -1054,20 +1323,52 @@ export function App() {
     if (!symbol) return;
     if (symbol.name?.startsWith("<anon")) return;
     if (!symbol.file_path) return;
+    const startLine = (symbol.start_line ?? 0) + 1;
+    const startCol = (symbol.start_col ?? 0) + 1;
+    const endLine = (symbol.end_line ?? symbol.start_line ?? 0) + 1;
+    const endCol = (symbol.end_col ?? symbol.start_col ?? 0) + 1;
     await navigateTo({
       path: symbol.file_path,
       name: symbol.file_path.split(/[\\/]/).pop() || "Untitled",
       selection: {
-        startLine: symbol.start_line || 1,
-        startCol: symbol.start_col || 1,
-        endLine: symbol.end_line || symbol.start_line || 1,
-        endCol: symbol.end_col || symbol.start_col || 1,
+        startLine,
+        startCol,
+        endLine,
+        endCol,
       },
     });
   };
 
+  const openProjectDescriptorTab = (descriptor?: {
+    name?: string | null;
+    author?: string | null;
+    description?: string | null;
+    organization?: string | null;
+    default_library: boolean;
+    raw_json?: string;
+  } | null) => {
+    if (descriptor) {
+      setProjectDescriptor(descriptor);
+      setHasProjectDescriptor(true);
+    }
+    setEditorViewMode("text");
+    setShowProjectInfo(true);
+    setDescriptorViewMode("view");
+    setOpenTabs((prev) => {
+      if (prev.some((tab) => tab.path === PROJECT_DESCRIPTOR_TAB)) return prev;
+      return [...prev, { path: PROJECT_DESCRIPTOR_TAB, name: "Project Descriptor", dirty: false }];
+    });
+    setActiveTabPath(PROJECT_DESCRIPTOR_TAB);
+  };
+
   const selectTab = async (path: string) => {
     if (path === activeTabPath) return;
+    if (path === PROJECT_DESCRIPTOR_TAB) {
+      setEditorViewMode("text");
+      setDescriptorViewMode("view");
+      setActiveTabPath(path);
+      return;
+    }
     await navigateTo({ path });
   };
 
@@ -1080,10 +1381,26 @@ export function App() {
     editorRef.current.focus();
   }, [currentFilePath]);
 
+  useEffect(() => {
+    if (!activeTabPath || activeTabPath === PROJECT_DESCRIPTOR_TAB) {
+      setCursorPos(null);
+      return;
+    }
+    const editor = editorRef.current;
+    if (!editor) return;
+    const pos = editor.getPosition();
+    if (pos) {
+      setCursorPos({ line: pos.lineNumber, col: pos.column });
+    }
+  }, [activeTabPath, editorViewMode]);
+
   const closeTab = (path: string) => {
     navReqRef.current += 1;
     pendingNavRef.current = null;
     setOpenTabs((prev) => prev.filter((tab) => tab.path !== path));
+    if (path === PROJECT_DESCRIPTOR_TAB) {
+      setShowProjectInfo(false);
+    }
     if (activeTabPath === path) {
       const remaining = openTabs.filter((tab) => tab.path !== path);
       const next = remaining[remaining.length - 1];
@@ -1115,22 +1432,8 @@ export function App() {
     setCurrentFilePath(null);
   };
 
-  const closeOtherTabs = (path: string) => {
-    navReqRef.current += 1;
-    pendingNavRef.current = null;
-    setOpenTabs((prev) => prev.filter((tab) => tab.path === path));
-    setActiveTabPath(path);
-  };
-
-  const [tabMenu, setTabMenu] = useState<{ x: number; y: number; path: string } | null>(null);
-
-  const showTabMenu = (event: React.MouseEvent, path: string) => {
-    event.preventDefault();
-    setTabMenu({ x: event.clientX, y: event.clientY, path });
-  };
-
   const saveActiveTab = async () => {
-    if (!activeTabPath) return;
+    if (!activeTabPath || activeTabPath === PROJECT_DESCRIPTOR_TAB) return;
     await invoke("write_file", { path: activeTabPath, content: editorValueRef.current });
     setOpenTabs((prev) => prev.map((tab) => (tab.path === activeTabPath ? { ...tab, dirty: false } : tab)));
     setTabContent((prev) => ({ ...prev, [activeTabPath]: editorValueRef.current }));
@@ -1159,7 +1462,52 @@ export function App() {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const key = event.key.toLowerCase();
+      const isBuild = (event.ctrlKey || event.metaKey) && key === "b";
       const isSave = (event.ctrlKey || event.metaKey) && key === "s";
+      if (event.key === "Escape") {
+        if (openMenu) {
+          setOpenMenu(null);
+          return;
+        }
+        if (contextMenu) {
+          setContextMenu(null);
+          return;
+        }
+        if (showProjectInfo && activeTabPath === PROJECT_DESCRIPTOR_TAB) {
+          closeTab(PROJECT_DESCRIPTOR_TAB);
+          return;
+        }
+        if (showAiSettings) {
+          setShowAiSettings(false);
+          return;
+        }
+        if (showSettings) {
+          setShowSettings(false);
+          return;
+        }
+        if (showExport) {
+          setShowExport(false);
+          return;
+        }
+        if (showNewFile) {
+          setShowNewFile(false);
+          return;
+        }
+        if (showOpenProject) {
+          setShowOpenProject(false);
+          return;
+        }
+        if (showNewProject) {
+          setShowNewProject(false);
+          return;
+        }
+        return;
+      }
+      if (isBuild) {
+        event.preventDefault();
+        runCompile();
+        return;
+      }
       if (isSave) {
         event.preventDefault();
         void saveActiveTab();
@@ -1167,12 +1515,20 @@ export function App() {
       }
       if (event.key === "F10") {
         event.preventDefault();
+        if (activeTabPath === PROJECT_DESCRIPTOR_TAB) {
+          setDescriptorViewMode((prev) => (prev === "view" ? "json" : "view"));
+          return;
+        }
+        if (editorRef.current && activeTabPath) {
+          pendingEditorContentRef.current = editorValueRef.current;
+          pendingEditorPathRef.current = activeTabPath;
+        }
         setEditorViewMode((prev) => (prev === "text" ? "diagram" : "text"));
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeTabPath]);
+  }, [activeTabPath, contextMenu, openMenu, showAiSettings, showExport, showNewFile, showNewProject, showOpenProject, showSettings]);
 
   const resetEndpointDraft = () => {
     setEndpointDraft({ name: "", url: "", type: "chat", model: "", token: "" });
@@ -1216,50 +1572,83 @@ export function App() {
     if (selectedEmbeddingsEndpoint === endpointId) setSelectedEmbeddingsEndpoint(null);
   };
 
-  const normalizeEndpointUrl = (base: string, suffix: string) => {
-    const trimmed = base.replace(/\/+$/, "");
-    if (trimmed.endsWith("/v1")) {
-      return `${trimmed}${suffix}`;
-    }
-    return `${trimmed}/v1${suffix}`;
-  };
-
   const testEndpoint = async (endpointId: string) => {
     const endpoint = aiEndpoints.find((item) => item.id === endpointId);
     if (!endpoint) return;
+    if (!endpoint.url || !endpoint.url.trim()) {
+      setEndpointTestStatus((prev) => ({ ...prev, [endpointId]: "fail: missing url" }));
+      return;
+    }
     setEndpointTestStatus((prev) => ({ ...prev, [endpointId]: "testing..." }));
     try {
-      const url =
-        endpoint.type === "chat"
-          ? normalizeEndpointUrl(endpoint.url, "/chat/completions")
-          : normalizeEndpointUrl(endpoint.url, "/embeddings");
-      const payload =
-        endpoint.type === "chat"
-          ? {
-              model: endpoint.model || "gpt-4o-mini",
-              messages: [{ role: "user", content: "ping" }],
-              max_tokens: 1,
-            }
-          : {
-              model: endpoint.model || "text-embedding-3-small",
-              input: "ping",
-            };
-      const response = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(endpoint.token ? { Authorization: `Bearer ${endpoint.token}` } : {}),
+      const response = await invoke<{ ok: boolean; status?: number; detail?: string }>("ai_test_endpoint", {
+        payload: {
+          url: endpoint.url || "",
+          type: endpoint.type,
+          model: endpoint.model || null,
+          token: endpoint.token || null,
         },
-        body: JSON.stringify(payload),
       });
-      if (!response.ok) {
-        const detail = await response.text();
-        setEndpointTestStatus((prev) => ({ ...prev, [endpointId]: `fail: ${response.status} ${detail}` }));
+      if (!response?.ok) {
+        const status = response?.status ? ` ${response.status}` : "";
+        const detail = response?.detail ? ` ${response.detail}` : "";
+        setEndpointTestStatus((prev) => ({ ...prev, [endpointId]: `fail:${status}${detail}`.trim() }));
         return;
       }
       setEndpointTestStatus((prev) => ({ ...prev, [endpointId]: "pass" }));
     } catch (error) {
       setEndpointTestStatus((prev) => ({ ...prev, [endpointId]: `fail: ${String(error)}` }));
+    }
+  };
+
+  const sendAiMessage = async (text: string) => {
+    const endpoint = selectedChatEndpoint ? aiEndpoints.find((item) => item.id === selectedChatEndpoint) : null;
+    const requestId = ++aiRequestRef.current;
+    setAiMessages((prev) => [...prev, { role: "user", text }, { role: "assistant", text: "...", pendingId: requestId }]);
+    setAiInput("");
+    if (!endpoint) {
+      setAiMessages((prev) =>
+        prev.map((msg) =>
+          msg.pendingId === requestId ? { ...msg, text: "No chat endpoint selected.", pendingId: undefined } : msg,
+        ),
+      );
+      return;
+    }
+    if (!endpoint.url || !endpoint.url.trim()) {
+      setAiMessages((prev) =>
+        prev.map((msg) =>
+          msg.pendingId === requestId ? { ...msg, text: "Chat endpoint is missing a URL.", pendingId: undefined } : msg,
+        ),
+      );
+      return;
+    }
+    const history = aiMessages.filter((msg) => msg.text !== "...");
+    const messages = [...history, { role: "user" as const, text }];
+    try {
+      const response = await invoke<any>("ai_chat_completion", {
+        payload: {
+          url: endpoint.url,
+          model: endpoint.model || null,
+          token: endpoint.token || null,
+          max_tokens: 512,
+          messages: messages.map((msg) => ({ role: msg.role, content: msg.text })),
+        },
+      });
+      const content =
+        response?.choices?.[0]?.message?.content ??
+        response?.choices?.[0]?.text ??
+        response?.message ??
+        "";
+      const nextText = content || "No response.";
+      setAiMessages((prev) =>
+        prev.map((msg) => (msg.pendingId === requestId ? { ...msg, text: nextText, pendingId: undefined } : msg)),
+      );
+    } catch (error) {
+      setAiMessages((prev) =>
+        prev.map((msg) =>
+          msg.pendingId === requestId ? { ...msg, text: `Error: ${String(error)}`, pendingId: undefined } : msg,
+        ),
+      );
     }
   };
 
@@ -1637,7 +2026,7 @@ export function App() {
           pushSymbolGroups(projectGroups, "project");
         }
       },
-      "No project symbols.",
+      projectSymbolsLoaded ? "No project symbols." : "Loading project symbols...",
     );
     addSection(
       "library",
@@ -1679,9 +2068,13 @@ export function App() {
     libraryCounts.symbolCount,
     errorCounts.fileCount,
     errorCounts.symbolCount,
+    projectSymbolsLoaded,
   ]);
 
   const modelListRef = useRef<ListImperativeAPI | null>(null);
+  const pendingScrollSymbolRef = useRef<string | null>(null);
+  const [modelCursorIndex, setModelCursorIndex] = useState<number | null>(null);
+  const modelSectionIndent = 12;
   const getModelRowHeight = (row: ModelRow) => {
     if (row.type === "section") return 28;
     if (row.type === "error") return 64;
@@ -1691,18 +2084,163 @@ export function App() {
 
   const modelListHeight = Math.max(120, (modelTreeViewportHeight || modelTreeHeight) - 16);
 
+  const findSelectedSymbolIndex = () => {
+    if (!selectedSymbol) return -1;
+    return modelRows.findIndex((row) => {
+      if (row.type !== "symbol") return false;
+      if (selectedSymbol.qualified_name) {
+        return row.node.symbols.some((sym) => sym.qualified_name === selectedSymbol.qualified_name);
+      }
+      return row.node.symbols.some((sym) => sym.file_path === selectedSymbol.file_path && sym.name === selectedSymbol.name);
+    });
+  };
+
+  const activateModelRow = (row: ModelRow, index: number) => {
+    if (row.type === "section") {
+      setModelSectionOpen((prev) => ({ ...prev, [row.section]: !prev[row.section] }));
+      return;
+    }
+    if (row.type === "symbol") {
+      const symbol = row.node.symbols[0];
+      if (symbol) {
+        setSelectedSymbol(symbol);
+        void selectSymbolInEditor(symbol);
+      }
+      return;
+    }
+    if (row.type === "error") {
+      const issue = row.issue;
+      const path = issue.file_path;
+      if (!path) return;
+      void navigateTo({
+        path,
+        name: path.split(/[\\/]/).pop() || "Untitled",
+        selection: {
+          startLine: issue.line || 1,
+          startCol: issue.column || 1,
+          endLine: issue.line || 1,
+          endCol: (issue.column || 1) + 1,
+        },
+      });
+      return;
+    }
+    if (row.type === "empty") {
+      setModelCursorIndex(index);
+    }
+  };
+
+  const handleModelTreeKeyDown = (event: React.KeyboardEvent<HTMLDivElement>, indexOverride?: number) => {
+    if (!modelRows.length) return;
+    const key = event.key;
+    if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Enter"].includes(key)) return;
+    event.preventDefault();
+    event.stopPropagation();
+
+    const currentIndex = modelCursorIndex ?? indexOverride ?? 0;
+    if (modelCursorIndex == null) {
+      setModelCursorIndex(currentIndex);
+    }
+    if (key === "ArrowUp") {
+      setModelCursorIndex(Math.max(0, currentIndex - 1));
+      return;
+    }
+    if (key === "ArrowDown") {
+      setModelCursorIndex(Math.min(modelRows.length - 1, currentIndex + 1));
+      return;
+    }
+
+    const row = modelRows[currentIndex];
+    if (!row) return;
+    if (key === "Enter") {
+      activateModelRow(row, currentIndex);
+      return;
+    }
+    if (key === "ArrowRight") {
+      if (row.type === "section") {
+        setModelSectionOpen((prev) => ({ ...prev, [row.section]: true }));
+      } else if (row.type === "symbol" && row.hasChildren && !row.expanded) {
+        setModelExpanded((prev) => ({ ...prev, [row.key]: true }));
+      }
+      return;
+    }
+    if (key === "ArrowLeft") {
+      if (row.type === "section") {
+        setModelSectionOpen((prev) => ({ ...prev, [row.section]: false }));
+      } else if (row.type === "symbol" && row.hasChildren && row.expanded) {
+        setModelExpanded((prev) => ({ ...prev, [row.key]: false }));
+      }
+    }
+  };
+
+  const syncModelTreeToSymbol = (symbol: typeof symbols[number]) => {
+    if (!symbol?.file_path) return;
+    const qualified = symbol.qualified_name || symbol.name;
+    const projectGroup = projectGroups.find((group) => group.path === symbol.file_path);
+    const libraryGroup = projectGroup ? null : libraryGroups.find((group) => group.path === symbol.file_path);
+    const section = projectGroup ? "project" : libraryGroup ? "library" : null;
+    if (!section) return;
+    const group = projectGroup || libraryGroup;
+    if (!group) return;
+    const rootKey = `${section}::${group.path}`;
+    const nextExpanded: Record<string, boolean> = {};
+    nextExpanded[`${rootKey}::${rootKey}`] = true;
+    if (qualified) {
+      const segments = qualified.split("::").filter(Boolean);
+      let prefix = "";
+      segments.forEach((segment) => {
+        prefix = prefix ? `${prefix}::${segment}` : segment;
+        nextExpanded[`${rootKey}::${prefix}`] = true;
+      });
+    }
+    setModelSectionOpen((prev) => ({ ...prev, [section]: true }));
+    setModelExpanded((prev) => ({ ...prev, ...nextExpanded }));
+    pendingScrollSymbolRef.current = qualified;
+  };
+
+  useEffect(() => {
+    if (!pendingScrollSymbolRef.current) return;
+    const target = pendingScrollSymbolRef.current;
+    const index = modelRows.findIndex((row) => {
+      if (row.type !== "symbol") return false;
+      if (row.node.fullName === target) return true;
+      return row.node.symbols.some((sym) => (sym.qualified_name || sym.name) === target);
+    });
+    if (index >= 0) {
+      modelListRef.current?.scrollToRow({ index, align: "center" });
+      pendingScrollSymbolRef.current = null;
+    }
+  }, [modelRows]);
+
+  useEffect(() => {
+    if (modelCursorIndex == null) return;
+    if (modelCursorIndex < 0 || modelCursorIndex >= modelRows.length) {
+      setModelCursorIndex(modelRows.length ? 0 : null);
+      return;
+    }
+    modelListRef.current?.scrollToRow({ index: modelCursorIndex, align: "smart" });
+  }, [modelCursorIndex, modelRows.length]);
+
   const renderModelRow = ({ index, style, rows }: RowComponentProps<{ rows: ModelRow[] }>) => {
     const row = rows[index];
     if (!row) return null;
+    const isFocused = modelCursorIndex === index;
     if (row.type === "section") {
       const isOpen = modelSectionOpen[row.section];
       return (
         <div
           style={style}
-          className="model-section-row"
+          className={`model-section-row ${isFocused ? "model-row-focused" : ""}`}
           role="button"
-          tabIndex={0}
-          onClick={() => setModelSectionOpen((prev) => ({ ...prev, [row.section]: !isOpen }))}
+          tabIndex={-1}
+          onKeyDown={(event) => handleModelTreeKeyDown(event, index)}
+          onMouseDown={(event) => {
+            event.preventDefault();
+            modelTreeRef.current?.focus();
+          }}
+          onClick={() => {
+            setModelCursorIndex(index);
+            setModelSectionOpen((prev) => ({ ...prev, [row.section]: !isOpen }));
+          }}
         >
           <span className="model-section-toggle">{isOpen ? "-" : "+"}</span>
           <span className="model-section-label">{row.label}</span>
@@ -1712,7 +2250,18 @@ export function App() {
     }
     if (row.type === "empty") {
       return (
-        <div style={style} className="model-empty-row">
+        <div
+          style={{ ...style, paddingLeft: `${modelSectionIndent}px` }}
+          className={`model-empty-row ${isFocused ? "model-row-focused" : ""}`}
+          onClick={() => setModelCursorIndex(index)}
+          role="button"
+          tabIndex={-1}
+          onKeyDown={(event) => handleModelTreeKeyDown(event, index)}
+          onMouseDown={(event) => {
+            event.preventDefault();
+            modelTreeRef.current?.focus();
+          }}
+        >
           {row.text}
         </div>
       );
@@ -1721,14 +2270,19 @@ export function App() {
       const issue = row.issue;
       return (
         <div
-          style={style}
-          className="error-row"
+          style={{ ...style, paddingLeft: `${modelSectionIndent}px` }}
+          className={`error-row ${isFocused ? "model-row-focused" : ""}`}
           role="button"
-          tabIndex={0}
+          tabIndex={-1}
+          onKeyDown={(event) => handleModelTreeKeyDown(event, index)}
+          onMouseDown={(event) => {
+            event.preventDefault();
+            modelTreeRef.current?.focus();
+          }}
           onClick={() => {
+            setModelCursorIndex(index);
             const path = issue.file_path;
             if (!path) return;
-            const entry = { path, name: path.split(/[\\/]/).pop() || path, is_dir: false };
             void navigateTo({
               path,
               name: path.split(/[\\/]/).pop() || "Untitled",
@@ -1740,22 +2294,6 @@ export function App() {
               },
             });
           }}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") {
-              const path = issue.file_path;
-              if (!path) return;
-              void navigateTo({
-                path,
-                name: path.split(/[\\/]/).pop() || "Untitled",
-                selection: {
-                  startLine: issue.line || 1,
-                  startCol: issue.column || 1,
-                  endLine: issue.line || 1,
-                  endCol: (issue.column || 1) + 1,
-                },
-              });
-            }
-          }}
         >
           <div className="error-title">{issue.file_path}:{issue.line}:{issue.column}</div>
           <div className="error-message">{issue.message}</div>
@@ -1763,14 +2301,25 @@ export function App() {
       );
     }
     const symbol = row.node.symbols[0];
+    const isSelected =
+      !!symbol &&
+      (selectedSymbol?.qualified_name
+        ? selectedSymbol.qualified_name === symbol.qualified_name
+        : selectedSymbol?.file_path === symbol.file_path && selectedSymbol?.name === symbol.name);
     return (
       <div
-        style={{ ...style, paddingLeft: `${8 + row.depth * 14}px` }}
-        className="model-virtual-row"
+        style={{ ...style, paddingLeft: `${modelSectionIndent + 8 + row.depth * 14}px` }}
+        className={`model-virtual-row ${isSelected ? "selected" : ""} ${isFocused ? "model-row-focused" : ""}`}
         role="button"
-        tabIndex={0}
+        tabIndex={-1}
+        onKeyDown={(event) => handleModelTreeKeyDown(event, index)}
+        onMouseDown={(event) => {
+          event.preventDefault();
+          modelTreeRef.current?.focus();
+        }}
         onClick={(event) => {
           event.stopPropagation();
+          setModelCursorIndex(index);
           if (symbol) {
             setSelectedSymbol(symbol);
             void selectSymbolInEditor(symbol);
@@ -1892,10 +2441,14 @@ export function App() {
           };
           (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
         }}
-        onClick={() => {
+        onClick={(event) => {
+          event.stopPropagation();
           if (symbol) {
             setSelectedSymbol(symbol);
             void selectSymbolInEditor(symbol);
+            if (syncDiagramSelection) {
+              syncModelTreeToSymbol(symbol);
+            }
           }
         }}
         onKeyDown={(event) => {
@@ -2036,28 +2589,30 @@ export function App() {
     diagramBoundsRef.current = diagramBounds;
   }, [diagramBounds]);
 
-  return (
-    <div
-      className="app-shell"
-      style={{
-        ["--left-width" as string]: `${leftWidth}px`,
-        ["--right-width" as string]: `${rightWidth}px`,
-      }}
-    >
+    return (
+      <div
+        className="app-shell"
+        style={{
+          ["--left-width" as string]: `${leftCollapsed ? 0 : leftWidth}px`,
+          ["--right-width" as string]: `${rightCollapsed ? 0 : rightWidth}px`,
+          ["--split-left-width" as string]: `${leftCollapsed ? 16 : 6}px`,
+          ["--split-right-width" as string]: `${rightCollapsed ? 16 : 6}px`,
+        }}
+      >
       <header className="titlebar" data-tauri-drag-region>
         <div className="titlebar-left">
           <span className="app-mark" aria-hidden="true" />
           <nav className="menu-row" aria-label="App menu">
             <div className="menu-item">
               <button type="button" className="menu-button" onClick={() => setOpenMenu(openMenu === "File" ? null : "File")}>File</button>
-              {openMenu === "File" ? (
-                <div className="menu-dropdown" data-tauri-drag-region="false">
-                  <button type="button" onClick={openNewProjectDialog}>New Project</button>
-                  <button type="button" onClick={chooseProject}>Open Project</button>
-                  <div className="menu-divider" />
-                  <button type="button" onClick={() => appWindow.close()}>Exit</button>
-                </div>
-              ) : null}
+                {openMenu === "File" ? (
+                  <div className="menu-dropdown" data-tauri-drag-region="false">
+                    <button type="button" onClick={openNewProjectDialog}>New Project</button>
+                    <button type="button" onClick={chooseProject}>Open Project</button>
+                    <div className="menu-divider" />
+                    <button type="button" onClick={() => { void invoke("window_close"); }}>Exit</button>
+                  </div>
+                ) : null}
             </div>
             <div className="menu-item">
               <button type="button" className="menu-button" onClick={() => setOpenMenu(openMenu === "Edit" ? null : "Edit")}>Edit</button>
@@ -2077,16 +2632,17 @@ export function App() {
               <button type="button">Project Panel</button>
               <button type="button">Model Panel</button>
               <div className="menu-divider" />
+              <button type="button" onClick={() => { setShowSettings(true); setOpenMenu(null); }}>Settings…</button>
               <button type="button">Logs</button>
             </div>
               ) : null}
             </div>
             <div className="menu-item">
-              <button type="button" className="menu-button" onClick={() => setOpenMenu(openMenu === "Compile" ? null : "Compile")}>Compile</button>
-              {openMenu === "Compile" ? (
+              <button type="button" className="menu-button" onClick={() => setOpenMenu(openMenu === "Build" ? null : "Build")}>Build</button>
+              {openMenu === "Build" ? (
             <div className="menu-dropdown" data-tauri-drag-region="false">
-              <button type="button" onClick={runCompile}>Compile Workspace</button>
-              <button type="button" onClick={openExportDialog}>Export Model</button>
+              <button type="button" onClick={() => { setOpenMenu(null); runCompile(); }}>Build Workspace</button>
+              <button type="button" onClick={() => { setOpenMenu(null); openExportDialog(); }}>Export Model</button>
             </div>
               ) : null}
             </div>
@@ -2102,50 +2658,68 @@ export function App() {
         </div>
         <div className="titlebar-center" />
         <div className="titlebar-right" data-tauri-drag-region="false">
-          <button
-            type="button"
-            className="titlebar-btn"
-            data-tauri-drag-region="false"
-            aria-label="Minimize"
-            onClick={() => { void invoke("window_minimize"); }}
-          >
-            -
-          </button>
-          <button
-            type="button"
-            className="titlebar-btn"
-            data-tauri-drag-region="false"
-            aria-label="Maximize"
-            onClick={() => { void invoke("window_toggle_maximize"); }}
-          >
-            [ ]
-          </button>
-          <button
-            type="button"
-            className="titlebar-btn close"
-            data-tauri-drag-region="false"
-            aria-label="Close"
-            onClick={() => { void invoke("window_close"); }}
-          >
-            x
-          </button>
+            <button
+              type="button"
+              className="titlebar-btn minimize"
+              data-tauri-drag-region="false"
+              aria-label="Minimize"
+              onClick={() => { void invoke("window_minimize"); }}
+            >
+              <span className="titlebar-icon" aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              className="titlebar-btn maximize"
+              data-tauri-drag-region="false"
+              aria-label="Maximize"
+              onClick={() => { void invoke("window_toggle_maximize"); }}
+            >
+              <span className="titlebar-icon" aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              className="titlebar-btn close"
+              data-tauri-drag-region="false"
+              aria-label="Close"
+              onClick={() => { void invoke("window_close"); }}
+            >
+              <span className="titlebar-icon" aria-hidden="true" />
+            </button>
         </div>
       </header>
       <main className="content">
-        <section className="panel sidebar">
-          <div className="panel-header">
-            <span>Project</span>
-          </div>
-          <div className="project-actions inline">
-            <button type="button" className="ghost" onClick={loadProjectInfo}>Info</button>
-            <button type="button" className="icon-button" onClick={chooseProject} aria-label="Open Project" title="Open Project" />
-            <select value="" onChange={(e) => openProject(e.target.value)}>
-              <option value="">Recent</option>
-              {recentProjects.map((path) => (
-                <option key={path} value={path}>{path}</option>
-              ))}
-            </select>
-          </div>
+          {leftCollapsed ? <div className="panel-spacer" /> : (
+            <section className="panel sidebar">
+              <div className="panel-header">
+                <span>Project</span>
+                <button
+                  type="button"
+                  className="ghost collapse-btn"
+                  onClick={() => {
+                    leftStoredWidthRef.current = leftWidth;
+                    setLeftCollapsed(true);
+                  }}
+                  title="Collapse project"
+                >
+                  «
+                </button>
+              </div>
+            <div className="project-actions inline">
+                <button
+                  type="button"
+                  className={`ghost icon-info ${hasProjectDescriptor ? "active" : ""}`}
+                  onClick={loadProjectInfo}
+                  aria-label="Project info"
+                  title="Project info"
+                />
+                <button type="button" className="icon-button" onClick={chooseProject} aria-label="Open Project" title="Open Project" />
+                <select className="recent-select" value="" onChange={(e) => openProject(e.target.value)} aria-label="Open recent" title="Open recent">
+                  <option value="">Recent</option>
+                  {recentProjects.map((path) => (
+                    <option key={path} value={path}>{path}</option>
+                  ))}
+                </select>
+            </div>
           <div className="project-root">
             {rootPath ? (
               <>
@@ -2156,21 +2730,49 @@ export function App() {
               "No project selected"
             )}
           </div>
-          <div className="file-tree">{tree}</div>
-        </section>
-        <div className="splitter" onPointerDown={(event) => startDrag("left", event)} />
-        <section className="panel editor">
-          <div className="panel-header editor-tabs">
-            <div className="tabs">
-              {openTabs.length ? (
+            <div className="file-tree" onContextMenu={showRootContext}>{tree}</div>
+            </section>
+          )}
+          <div
+            className={`splitter ${leftCollapsed ? "collapsed" : ""}`}
+            onPointerDown={leftCollapsed ? undefined : (event) => startDrag("left", event)}
+          >
+            {leftCollapsed ? (
+              <button
+                type="button"
+                className="splitter-toggle"
+                onClick={() => {
+                  setLeftCollapsed(false);
+                  setLeftWidth(leftStoredWidthRef.current || 240);
+                }}
+                title="Restore project"
+              >
+                »
+              </button>
+            ) : null}
+          </div>
+          <section className="panel editor">
+            <div className="panel-header editor-tabs">
+              <div className="tabs">
+                {openTabs.length ? (
                 openTabs.map((tab) => (
                   <button
                     key={tab.path}
                     type="button"
                     className={`tab ${tab.path === activeTabPath ? "active" : ""}`}
                     onClick={() => selectTab(tab.path)}
-                    onContextMenu={(event) => showTabMenu(event, tab.path)}
-                  >
+                      onContextMenu={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        setActiveTabPath(tab.path);
+                        if (tab.path === PROJECT_DESCRIPTOR_TAB) {
+                          setEditorViewMode("text");
+                          setDescriptorViewMode((prev) => (prev === "view" ? "json" : "view"));
+                          return;
+                        }
+                        setEditorViewMode((prev) => (prev === "text" ? "diagram" : "text"));
+                      }}
+                    >
                     <span className="tab-label">{tab.name}</span>
                     {tab.dirty ? <span className="tab-dirty" aria-hidden="true">•</span> : null}
                     <span className="tab-close" onClick={(event) => { event.stopPropagation(); closeTab(tab.path); }}>x</span>
@@ -2180,39 +2782,101 @@ export function App() {
                 <div className="muted">No files open.</div>
               )}
             </div>
-            {openTabs.length > 6 ? (
-              <select className="tab-dropdown" value={activeTabPath || ""} onChange={(event) => selectTab(event.target.value)}>
-                {openTabs.map((tab) => (
-                  <option key={tab.path} value={tab.path}>{tab.name}</option>
-                ))}
-              </select>
-            ) : null}
-          </div>
-          <div className="editor-host" id="monaco-root">
-            {!activeTabPath ? (
-              <div className="editor-placeholder">Open a file to start editing.</div>
-            ) : editorViewMode === "text" ? (
-              <MonacoEditor
-                defaultValue=""
-                onChange={(value) => {
-                  editorValueRef.current = value ?? "";
-                  if (editorChangeRafRef.current == null) {
-                    editorChangeRafRef.current = window.requestAnimationFrame(() => {
-                      setEditorChangeTick((tick) => tick + 1);
-                      editorChangeRafRef.current = null;
-                    });
-                  }
-                }}
-                language="sysml"
-                theme="vs-dark"
-                onMount={handleEditorMount}
-                options={editorOptions}
-              />
-            ) : (
-              <div className="diagram-surface">
-                <div className="diagram-header">
+              {openTabs.length > 6 ? (
+                <select className="tab-dropdown" value={activeTabPath || ""} onChange={(event) => selectTab(event.target.value)}>
+                  {openTabs.map((tab) => (
+                    <option key={tab.path} value={tab.path}>{tab.name}</option>
+                  ))}
+                </select>
+              ) : null}
+            </div>
+            <div className="editor-host" id="monaco-root">
+              {!activeTabPath ? (
+                <div className="editor-placeholder">
+                  <div className="welcome-screen">
+                      <div className="welcome-title">Welcome to Mercurio</div>
+                      <div className="welcome-subtitle">Open a project or create a new one to get started.</div>
+                      <div className="welcome-actions">
+                        <button type="button" className="ghost" onClick={openNewProjectDialog}>New Project</button>
+                        <button type="button" className="ghost" onClick={chooseProject}>Open Project</button>
+                      </div>
+                      <div className="welcome-hint">Tip: Press F10 to toggle diagram view.</div>
+                    </div>
+                  </div>
+              ) : activeTabPath === PROJECT_DESCRIPTOR_TAB ? (
+                <div className="descriptor-view">
+                  <div className="descriptor-header">Project Descriptor</div>
+                  {descriptorViewMode === "view" ? (
+                    projectDescriptor ? (
+                      <div className="descriptor-grid">
+                        <div className="descriptor-row">
+                          <div className="descriptor-label">Name</div>
+                          <div className="descriptor-value">{projectDescriptor.name || "—"}</div>
+                        </div>
+                        <div className="descriptor-row">
+                          <div className="descriptor-label">Author</div>
+                          <div className="descriptor-value">{projectDescriptor.author || "—"}</div>
+                        </div>
+                        <div className="descriptor-row">
+                          <div className="descriptor-label">Organization</div>
+                          <div className="descriptor-value">{projectDescriptor.organization || "—"}</div>
+                        </div>
+                        <div className="descriptor-row">
+                          <div className="descriptor-label">Description</div>
+                          <div className="descriptor-value">{projectDescriptor.description || "—"}</div>
+                        </div>
+                        <div className="descriptor-row">
+                          <div className="descriptor-label">Default library</div>
+                          <div className="descriptor-value">{projectDescriptor.default_library ? "Yes" : "No"}</div>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="muted">No project descriptor found.</div>
+                    )
+                  ) : (
+                    <pre className="descriptor-json">
+                      {projectDescriptor?.raw_json || "{}"}
+                    </pre>
+                  )}
+                </div>
+              ) : editorViewMode === "text" ? (
+                <MonacoEditor
+                  defaultValue=""
+                  onChange={(value) => {
+                    editorValueRef.current = value ?? "";
+                    if (editorChangeRafRef.current == null) {
+                      editorChangeRafRef.current = window.requestAnimationFrame(() => {
+                        setEditorChangeTick((tick) => tick + 1);
+                        editorChangeRafRef.current = null;
+                      });
+                    }
+                  }}
+                  language="sysml"
+                  theme={appTheme === "light" ? "vs" : "vs-dark"}
+                  onMount={handleEditorMount}
+                  options={editorOptions}
+                />
+              ) : (
+                <div className="diagram-surface">
+                  <div className="diagram-header">
                   <span>Diagram view (F10 to toggle)</span>
                   <div className="diagram-controls">
+                    <button
+                      type="button"
+                      className="ghost toggle-btn"
+                      onClick={() => setEditorViewMode("text")}
+                      title="Switch to text (F10)"
+                    >
+                      Text
+                    </button>
+                    <button
+                      type="button"
+                      className={`ghost ${syncDiagramSelection ? "active" : ""}`}
+                      onClick={() => setSyncDiagramSelection((prev) => !prev)}
+                      title="Sync diagram selection to model tree"
+                    >
+                      Sync
+                    </button>
                     <button
                       type="button"
                       className="ghost"
@@ -2389,34 +3053,65 @@ export function App() {
             )}
           </div>
         </section>
-        <div className="splitter" onPointerDown={(event) => startDrag("right", event)} />
-        <section className="panel sidebar">
-          <div className="panel-header">
-            <button
-              type="button"
-              className="ghost toggle-btn"
-              onClick={() => setRightPaneMode(rightPaneMode === "ai" ? "model" : "ai")}
-            >
-              {rightPaneMode === "ai" ? "AI" : "Model"}
-            </button>
+          <div
+            className={`splitter ${rightCollapsed ? "collapsed" : ""}`}
+            onPointerDown={rightCollapsed ? undefined : (event) => startDrag("right", event)}
+          >
+            {rightCollapsed ? (
+              <button
+                type="button"
+                className="splitter-toggle"
+                onClick={() => {
+                  setRightCollapsed(false);
+                  setRightWidth(rightStoredWidthRef.current || 320);
+                }}
+                title="Restore model pane"
+              >
+                «
+              </button>
+            ) : null}
+          </div>
+          {rightCollapsed ? null : (
+            <section className="panel sidebar">
+              <div className="panel-header">
+              <select
+                className="ghost pane-select"
+                value={rightPaneMode}
+                onChange={(event) => setRightPaneMode(event.target.value as "model" | "ai")}
+                aria-label="Right pane mode"
+              >
+                <option value="model">Model</option>
+                <option value="ai">AI</option>
+              </select>
             {rightPaneMode === "model" ? (
               <button type="button" className="ghost" onClick={() => setCollapseAllModel((prev) => !prev)}>
                 {collapseAllModel ? "Expand all" : "Collapse all"}
               </button>
             ) : null}
-            {rightPaneMode === "model" ? (
+              {rightPaneMode === "model" ? (
+                <button
+                  type="button"
+                  className={`ghost icon-properties ${showPropertiesPane ? "active" : ""}`}
+                  onClick={() => setShowPropertiesPane((prev) => !prev)}
+                  aria-label="Toggle properties"
+                  title={showPropertiesPane ? "Hide properties" : "Show properties"}
+                />
+              ) : null}
               <button
                 type="button"
-                className={`ghost icon-properties ${showPropertiesPane ? "active" : ""}`}
-                onClick={() => setShowPropertiesPane((prev) => !prev)}
-                aria-label="Toggle properties"
-                title={showPropertiesPane ? "Hide properties" : "Show properties"}
-              />
-            ) : null}
-            {rightPaneMode === "ai" ? (
-              <button type="button" className="ghost icon-gear" onClick={() => setShowAiSettings(true)} aria-label="AI settings" title="AI settings" />
-            ) : null}
-          </div>
+                className="ghost collapse-btn"
+                onClick={() => {
+                  rightStoredWidthRef.current = rightWidth;
+                  setRightCollapsed(true);
+                }}
+                title="Collapse model pane"
+              >
+                »
+              </button>
+              {rightPaneMode === "ai" ? (
+                <button type="button" className="ghost icon-gear" onClick={() => setShowAiSettings(true)} aria-label="AI settings" title="AI settings" />
+              ) : null}
+            </div>
           {rightPaneMode === "model" ? (
             <div
               className={`model-pane ${showPropertiesPane ? "" : "no-properties"}`}
@@ -2425,6 +3120,18 @@ export function App() {
               <div
                 className="model-tree"
                 ref={modelTreeRef}
+                tabIndex={0}
+                onKeyDown={handleModelTreeKeyDown}
+                onMouseDown={() => {
+                  if (document.activeElement !== modelTreeRef.current) {
+                    modelTreeRef.current?.focus();
+                  }
+                }}
+                onFocus={() => {
+                  if (modelCursorIndex != null || !modelRows.length) return;
+                  const selectedIndex = findSelectedSymbolIndex();
+                  setModelCursorIndex(selectedIndex >= 0 ? selectedIndex : 0);
+                }}
               >
                 <List
                   listRef={modelListRef}
@@ -2474,12 +3181,18 @@ export function App() {
                             selectedSymbol.end_line == null &&
                             selectedSymbol.end_col == null ? (
                               <div className="muted">No parse data available.</div>
-                            ) : (
-                              <>
-                                <div className="properties-row">
-                                  <div className="properties-key">File path</div>
-                                  <div className="properties-value">{selectedSymbol.file_path ?? "—"}</div>
-                                </div>
+                              ) : (
+                                <>
+                                  <div className="properties-row">
+                                    <div className="properties-key">File id</div>
+                                    <div className="properties-value">
+                                      {selectedSymbol.file == null ? "—" : String(selectedSymbol.file)}
+                                    </div>
+                                  </div>
+                                  <div className="properties-row">
+                                    <div className="properties-key">File path</div>
+                                    <div className="properties-value">{selectedSymbol.file_path ?? "—"}</div>
+                                  </div>
                                 <div className="properties-row">
                                   <div className="properties-key">Start line</div>
                                   <div className="properties-value">{selectedSymbol.start_line ?? "—"}</div>
@@ -2525,57 +3238,44 @@ export function App() {
                   onChange={(e) => setAiInput(e.target.value)}
                   placeholder="Type a prompt..."
                 />
-                <button
-                  type="button"
-                  onClick={() => {
-                    const text = aiInput.trim();
-                    if (!text) return;
-                    setAiMessages((prev) => [...prev, { role: "user", text }, { role: "assistant", text: "..." }]);
-                    setAiInput("");
-                  }}
-                >
-                  Send
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const text = aiInput.trim();
+                      if (!text) return;
+                      void sendAiMessage(text);
+                    }}
+                  >
+                    Send
+                  </button>
               </div>
             </div>
           )}
-        </section>
+            </section>
+          )}
       </main>
-      {contextMenu ? (
-        <div className="context-menu" style={{ left: contextMenu.x, top: contextMenu.y }}>
-          {contextMenu.entry.is_dir ? (
-            <button type="button" onClick={() => handleContextAction("open-project")}>Open As Project</button>
-          ) : null}
-          <button type="button" onClick={() => handleContextAction("new-file")}>New file</button>
-          <button type="button" onClick={() => handleContextAction("new-folder")}>New folder</button>
-          <button type="button" onClick={() => handleContextAction("rename")}>Rename</button>
-          <button type="button" onClick={() => handleContextAction("delete")}>Delete</button>
-        </div>
-      ) : null}
-      {tabMenu ? (
-        <div className="context-menu tab-menu" style={{ left: tabMenu.x, top: tabMenu.y }}>
-          <button type="button" onClick={() => { closeTab(tabMenu.path); setTabMenu(null); }}>Close</button>
-          <button type="button" onClick={() => { closeOtherTabs(tabMenu.path); setTabMenu(null); }}>Close others</button>
-          <button type="button" onClick={() => { closeAllTabs(); setTabMenu(null); }}>Close all</button>
-        </div>
-      ) : null}
-      {showProjectInfo ? (
-        <div className="modal">
-          <div className="modal-card">
-            <div className="modal-header">
-              <span>Project Info</span>
-              <button type="button" onClick={() => setShowProjectInfo(false)}>Close</button>
-            </div>
-            <div className="modal-body">
-              {projectInfo ? (
-                <pre className="file-preview">{projectInfo}</pre>
-              ) : (
-                <div className="muted">No .project.json found.</div>
-              )}
-            </div>
+        {contextMenu ? (
+          <div className="context-menu" style={{ left: contextMenu.x, top: contextMenu.y }}>
+            {contextMenu.scope === "root" ? (
+              <>
+                <button type="button" onClick={() => handleContextAction("new-file")}>New file</button>
+                <button type="button" onClick={() => handleContextAction("new-folder")}>New folder</button>
+              </>
+            ) : (
+              <>
+                {contextMenu.entry.is_dir ? (
+                  <>
+                    <button type="button" onClick={() => handleContextAction("new-file")}>New file</button>
+                    <button type="button" onClick={() => handleContextAction("new-folder")}>New folder</button>
+                    <button type="button" onClick={() => handleContextAction("open-project")}>Open As Project</button>
+                  </>
+                ) : null}
+                <button type="button" onClick={() => handleContextAction("show-in-explorer")}>Show in Explorer</button>
+                <button type="button" onClick={() => handleContextAction("rename")}>Rename</button>
+              </>
+            )}
           </div>
-        </div>
-      ) : null}
+        ) : null}
           {showNewFile ? (
             <div className="modal">
               <div className="modal-card">
@@ -2584,18 +3284,22 @@ export function App() {
                   <button type="button" onClick={() => setShowNewFile(false)}>Close</button>
                 </div>
                 <div className="modal-body">
-                  <label className="field">
-                    <span>Name</span>
-                    <input value={newFileName} onChange={(e) => setNewFileName(e.target.value)} />
-                  </label>
-                  <label className="field">
-                    <span>Type</span>
-                    <select value={newFileType} onChange={(e) => setNewFileType(e.target.value)}>
-                      <option value="sysml">.sysml</option>
-                      <option value="kerml">.kerml</option>
-                    </select>
-                  </label>
+                <label className="field">
+                  <span>Name</span>
+                  <input value={newFileName} onChange={(e) => setNewFileName(e.target.value)} />
+                </label>
+                <label className="field">
+                  <span>Type</span>
+                  <select value={newFileType} onChange={(e) => setNewFileType(e.target.value)}>
+                    <option value="sysml">.sysml</option>
+                    <option value="kerml">.kerml</option>
+                  </select>
+                </label>
+                <div className="field">
+                  <span>Parent</span>
+                  <div className="field-value">{newFileParent || rootPath || "—"}</div>
                 </div>
+              </div>
                 <div className="modal-actions">
                   <button type="button" className="ghost" onClick={() => setShowNewFile(false)}>Cancel</button>
                   <button type="button" onClick={createNewFile}>Create</button>
@@ -2603,13 +3307,13 @@ export function App() {
               </div>
             </div>
           ) : null}
-      {showNewProject ? (
-        <div className="modal">
-          <div className="modal-card">
-            <div className="modal-header">
-              <span>New Project</span>
-            </div>
-            <div className="modal-body">
+        {showNewProject ? (
+          <div className="modal">
+            <div className="modal-card">
+              <div className="modal-header">
+                <span>New Project</span>
+              </div>
+              <div className="modal-body">
               <label className="field">
                 <span>Location</span>
                 <div className="field-inline">
@@ -2635,43 +3339,111 @@ export function App() {
                   </button>
                 </div>
               </label>
-              <label className="field">
-                <span>Project Name</span>
-                <input
-                  id="new-project-name"
-                  value={newProjectName}
-                  onChange={(event) => {
-                    const value = event.target.value;
-                    setNewProjectName(value);
-                    const slug = slugifyProjectName(value);
-                    setNewProjectFolder(slug);
-                    void updateNewProjectFolderStatus();
-                  }}
-                  placeholder="My SysML Project"
-                />
-              </label>
-              <label className="field">
-                <span>Folder Name</span>
-                <div className="field-value">{newProjectFolder}</div>
-                <span className={`field-hint ${newProjectFolderStatus.includes("exists") ? "error" : ""}`}>{newProjectFolderStatus}</span>
-              </label>
-              <label className="field checkbox">
-                <input
-                  type="checkbox"
-                  checked={newProjectDefaultLib}
-                  onChange={(event) => setNewProjectDefaultLib(event.target.checked)}
-                />
-                <span>Use default library</span>
-              </label>
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="ghost" onClick={() => setShowNewProject(false)}>Cancel</button>
-              <button type="button" onClick={createNewProject} disabled={newProjectBusy || !newProjectFolderAvailable}>Create Project</button>
+                <label className="field">
+                  <span>Project Name</span>
+                  <input
+                    id="new-project-name"
+                    value={newProjectName}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      setNewProjectName(value);
+                      const slug = slugifyProjectName(value);
+                      setNewProjectFolder(slug);
+                      void updateNewProjectFolderStatus();
+                    }}
+                    placeholder="My SysML Project"
+                  />
+                </label>
+                <label className="field">
+                  <span>Author</span>
+                  <input
+                    value={newProjectAuthor}
+                    onChange={(event) => setNewProjectAuthor(event.target.value)}
+                    placeholder="Your name"
+                  />
+                </label>
+                <label className="field">
+                  <span>Organization</span>
+                  <input
+                    value={newProjectOrganization}
+                    onChange={(event) => setNewProjectOrganization(event.target.value)}
+                    placeholder="Company or team"
+                  />
+                </label>
+                <label className="field">
+                  <span>Description</span>
+                  <input
+                    value={newProjectDescription}
+                    onChange={(event) => setNewProjectDescription(event.target.value)}
+                    placeholder="Short project summary"
+                  />
+                </label>
+                <label className="field">
+                  <span>Folder Name</span>
+                  <div className="field-value">{newProjectFolder}</div>
+                  <span className={`field-hint ${newProjectFolderStatus.includes("exists") ? "error" : ""}`}>{newProjectFolderStatus}</span>
+                </label>
+                <label className="field checkbox">
+                  <input
+                    type="checkbox"
+                    checked={newProjectDefaultLib}
+                    onChange={(event) => setNewProjectDefaultLib(event.target.checked)}
+                  />
+                  <span>Use default library</span>
+                </label>
+                {newProjectError ? <div className="field-hint error">{newProjectError}</div> : null}
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="ghost" onClick={() => setShowNewProject(false)}>Cancel</button>
+                <button type="button" onClick={createNewProject} disabled={newProjectBusy || !newProjectFolderAvailable}>Create Project</button>
+              </div>
             </div>
           </div>
-        </div>
-      ) : null}
-      {showExport ? (
+        ) : null}
+        {showOpenProject ? (
+          <div className="modal">
+            <div className="modal-card">
+              <div className="modal-header">
+                <span>Open Project</span>
+              </div>
+              <div className="modal-body">
+                <label className="field">
+                  <span>Project folder</span>
+                  <div className="field-inline">
+                    <input
+                      value={openProjectPath}
+                      onChange={(event) => setOpenProjectPath(event.target.value)}
+                      placeholder="Select a project directory"
+                    />
+                    <button type="button" className="ghost" onClick={browseOpenProject}>Browse</button>
+                  </div>
+                </label>
+                <label className="field">
+                  <span>Recent</span>
+                  <select
+                    value=""
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      if (value) {
+                        setOpenProjectPath(value);
+                      }
+                    }}
+                  >
+                    <option value="">Select recent</option>
+                    {recentProjects.map((path) => (
+                      <option key={path} value={path}>{path}</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="ghost" onClick={() => setShowOpenProject(false)}>Cancel</button>
+                <button type="button" onClick={confirmOpenProject} disabled={!openProjectPath.trim()}>Open</button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+        {showExport ? (
         <div className="modal">
           <div className="modal-card">
             <div className="modal-header">
@@ -2845,27 +3617,109 @@ export function App() {
           </div>
         </div>
       ) : null}
-      <footer className="statusbar">
-        <div className="status-left">{compileStatus}</div>
-        <div className="status-right">
-          <span
-            className={`status-compile-indicator ${backgroundCompileRef.current ? "active" : ""} ${backgroundCompileEnabled ? "" : "disabled"}`}
-            title={backgroundCompileEnabled ? "Background compile enabled (right-click to disable)" : "Background compile disabled (right-click to enable)"}
-            onContextMenu={(event) => {
-              event.preventDefault();
-              setBackgroundCompileEnabled((prev) => !prev);
-            }}
-          >
-            BG
-          </span>
-          {errorCounts.symbolCount ? (
-            <span className="status-error-badge">{errorCounts.symbolCount}</span>
-          ) : null}
-          {compileRunId ? (
-            <button type="button" className="ghost" onClick={cancelCompile}>Cancel compile</button>
-          ) : null}
+      {showSettings ? (
+        <div className="modal">
+          <div className="modal-backdrop" onClick={() => setShowSettings(false)} />
+          <div className="modal-card legacy-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+            <div className="modal-header">
+              <h3 id="settings-title">Settings</h3>
+            </div>
+            <div className="modal-body">
+              <div className="field">
+                <span className="field-label">Theme</span>
+                <div className="theme-toggle">
+                  <button
+                    type="button"
+                    className={`theme-option ${appTheme === "dark" ? "active" : ""}`}
+                    onClick={() => setAppTheme("dark")}
+                  >
+                    Dark
+                  </button>
+                  <button
+                    type="button"
+                    className={`theme-option ${appTheme === "light" ? "active" : ""}`}
+                    onClick={() => setAppTheme("light")}
+                  >
+                    Light
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="ghost" onClick={() => setShowSettings(false)}>Close</button>
+            </div>
+          </div>
         </div>
+      ) : null}
+        <footer className="statusbar">
+          <div className="status-left" />
+          <div className="status-right">
+            {errorCounts.symbolCount ? (
+              <span className="status-error-badge">{errorCounts.symbolCount}</span>
+            ) : null}
+            {cursorPos && activeTabPath && activeTabPath !== PROJECT_DESCRIPTOR_TAB ? (
+              <span className="status-cursor">Ln {cursorPos.line}, Col {cursorPos.col}</span>
+            ) : null}
+            <span
+              className={`status-compile-indicator ${backgroundCompileRef.current ? "active" : ""} ${backgroundCompileEnabled ? "" : "disabled"}`}
+              title={backgroundCompileEnabled ? "Background compile enabled (right-click to disable)" : "Background compile disabled (right-click to enable)"}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                setBackgroundCompileEnabled((prev) => !prev);
+              }}
+            >
+              BG
+            </span>
+            {compileRunId ? (
+              <button type="button" className="ghost" onClick={cancelCompile}>Cancel compile</button>
+            ) : null}
+          </div>
       </footer>
+      {compileToast.open ? (
+        <div className={`compile-toast ${compileToast.ok === false ? "error" : compileToast.ok ? "ok" : ""}`}>
+          <div className="compile-toast-header">
+            <span className={`compile-toast-title ${compileToast.ok === null ? "running" : ""}`}>
+              <span className="compile-spinner" aria-hidden="true" />
+              Compile
+            </span>
+            <button type="button" onClick={() => setCompileToast((prev) => ({ ...prev, open: false }))}>x</button>
+          </div>
+          <div className="compile-toast-body">
+            {compileToast.lines.map((line, index) => (
+              <div key={`${line}-${index}`}>{line}</div>
+            ))}
+            {compileToast.details.length ? (
+              <div className="compile-toast-details">
+                {compileToast.details.map((line, index) => (
+                  <div key={`${line}-${index}`}>{line}</div>
+                ))}
+              </div>
+            ) : null}
+            {compileToast.parsedFiles.length ? (
+              <div className="compile-toast-files">
+                <div className="compile-toast-files-title">Reparsed files</div>
+                {compileToast.parsedFiles.slice(0, 8).map((path) => (
+                  <div key={path} className="compile-toast-file-path">{path}</div>
+                ))}
+                {compileToast.parsedFiles.length > 8 ? (
+                  <div className="compile-toast-file-more">+{compileToast.parsedFiles.length - 8} more</div>
+                ) : null}
+              </div>
+            ) : null}
+            {compileToast.parseErrors.length ? (
+              <div className="compile-toast-errors">
+                <div className="compile-toast-errors-title">Parse errors</div>
+                {compileToast.parseErrors.map((file) => (
+                  <div key={file.path} className="compile-toast-error-item">
+                    <div className="compile-toast-error-path">{file.path}</div>
+                    <div className="compile-toast-error-count">{file.errors.length} issues</div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
