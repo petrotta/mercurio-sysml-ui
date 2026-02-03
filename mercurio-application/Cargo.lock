@@ -4387,9 +4387,9 @@ dependencies = [
 
 [[package]]
 name = "syster-base"
-version = "0.2.3-alpha"
+version = "0.3.0-alpha"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44712263747f8ba432787f4f2aa9dd65f7eddb9dc3ee114fb88efdaff1b4e68d"
+checksum = "e7d447d9021d364af09b0ab4e2ef1a8b5276693596a2e58f56f75dd7d81d092e"
 dependencies = [
  "from-pest",
  "indexmap 2.13.0",
