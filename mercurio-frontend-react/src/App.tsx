@@ -6,42 +6,24 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import MonacoEditor, { loader, type OnMount } from "@monaco-editor/react";
 import { listen } from "@tauri-apps/api/event";
 import { List, type ListImperativeAPI, type RowComponentProps } from "react-window";
+import {
+  AI_CHAT_KEY,
+  AI_EMBEDDINGS_KEY,
+  AI_ENDPOINTS_KEY,
+  AI_VIEW_TAB,
+  DATA_VIEW_TAB,
+  PROJECT_DESCRIPTOR_TAB,
+  PROJECT_LOCATION_KEY,
+  ROOT_STORAGE_KEY,
+  THEME_KEY,
+} from "./app/constants";
+import { loadRecents, saveRecents } from "./app/storage";
+import { makeDiagramTabId, makeDiagramTabName } from "./app/tabs";
+import { AiView } from "./app/components/AiView";
+import { TabBar } from "./app/components/TabBar";
+import type { FileEntry, OpenTab } from "./app/types";
 
 loader.config({ paths: { vs: "/monaco/vs" } });
-
-type FileEntry = {
-  path: string;
-  name: string;
-  is_dir: boolean;
-  is_parent?: boolean;
-  is_action?: boolean;
-};
-
-const ROOT_STORAGE_KEY = "mercurio.rootPath";
-const RECENTS_KEY = "mercurio.recentProjects";
-const AI_ENDPOINTS_KEY = "mercurio.ai.endpoints";
-const AI_CHAT_KEY = "mercurio.ai.chatEndpoint";
-const AI_EMBEDDINGS_KEY = "mercurio.ai.embeddingsEndpoint";
-const PROJECT_LOCATION_KEY = "mercurio.projectLocation";
-const THEME_KEY = "mercurio.theme";
-const PROJECT_DESCRIPTOR_TAB = "__project_descriptor__";
-const AI_VIEW_TAB = "__view_ai__";
-const DATA_VIEW_TAB = "__view_data__";
-const DIAGRAM_TAB_PREFIX = "__diagram__::";
-
-function loadRecents(): string[] {
-  try {
-    const raw = window.localStorage?.getItem(RECENTS_KEY);
-    const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveRecents(list: string[]) {
-  window.localStorage?.setItem(RECENTS_KEY, JSON.stringify(list));
-}
 
 export function App() {
   void getCurrentWindow();
@@ -65,14 +47,9 @@ export function App() {
   const editorValueRef = useRef("");
   const editorChangeRafRef = useRef<number | null>(null);
   const [editorChangeTick, setEditorChangeTick] = useState(0);
-  const [openTabs, setOpenTabs] = useState<Array<{
-    path: string;
-    name: string;
-    dirty: boolean;
-    kind?: "file" | "descriptor" | "diagram" | "ai" | "data";
-    sourcePath?: string;
-  }>>([]);
+  const [openTabs, setOpenTabs] = useState<OpenTab[]>([]);
   const [activeTabPath, setActiveTabPath] = useState<string | null>(null);
+  const activeTabPathRef = useRef<string | null>(null);
   const [descriptorViewMode, setDescriptorViewMode] = useState<"view" | "json">("view");
   const [tabContent, setTabContent] = useState<Record<string, string>>({});
   const suppressDirtyRef = useRef(false);
@@ -115,20 +92,30 @@ export function App() {
   const [centerView, setCenterView] = useState<"file" | "diagram" | "ai" | "data">("file");
   const [cursorPos, setCursorPos] = useState<{ line: number; col: number } | null>(null);
   const [aiInput, setAiInput] = useState("");
-  const [aiMessages, setAiMessages] = useState<Array<{ role: "user" | "assistant"; text: string; pendingId?: number }>>([]);
+  const [aiMessages, setAiMessages] = useState<Array<{
+    role: "user" | "assistant";
+    text: string;
+    pendingId?: number;
+    steps?: Array<{ kind: string; detail: string }>;
+  }>>([]);
   const [showAiSettings, setShowAiSettings] = useState(false);
   const [aiEndpoints, setAiEndpoints] = useState<Array<{
     id: string;
     name: string;
     url: string;
     type: "chat" | "embeddings";
+    provider: "openai" | "anthropic";
     model: string;
     token: string;
   }>>(() => {
     try {
       const raw = window.localStorage?.getItem(AI_ENDPOINTS_KEY);
       const parsed = raw ? JSON.parse(raw) : [];
-      return Array.isArray(parsed) ? parsed : [];
+      if (!Array.isArray(parsed)) return [];
+      return parsed.map((item: any) => ({
+        ...item,
+        provider: item?.provider === "anthropic" ? "anthropic" : "openai",
+      }));
     } catch {
       return [];
     }
@@ -144,9 +131,10 @@ export function App() {
     name: string;
     url: string;
     type: "chat" | "embeddings";
+    provider: "openai" | "anthropic";
     model: string;
     token: string;
-  }>({ name: "", url: "", type: "chat", model: "", token: "" });
+  }>({ name: "", url: "", type: "chat", provider: "openai", model: "", token: "" });
   const [endpointTestStatus, setEndpointTestStatus] = useState<Record<string, string>>({});
   const aiRequestRef = useRef(0);
   const [, setCompileStatus] = useState("Background compile: idle");
@@ -195,6 +183,7 @@ export function App() {
   const [libraryPath, setLibraryPath] = useState<string | null>(null);
   const [selectedSymbol, setSelectedSymbol] = useState<typeof symbols[number] | null>(null);
   const [currentFilePath, setCurrentFilePath] = useState<string | null>(null);
+  const currentFilePathRef = useRef<string | null>(null);
   const [modelTreeHeight, setModelTreeHeight] = useState(260);
   const [modelTreeViewportHeight, setModelTreeViewportHeight] = useState(0);
   const [collapseAllModel, setCollapseAllModel] = useState(false);
@@ -263,7 +252,6 @@ export function App() {
   const paletteCreateRef = useRef<null | { type: string; name: string; startX: number; startY: number }>(null);
   const [paletteGhost, setPaletteGhost] = useState<null | { x: number; y: number; type: string }>(null);
   const fsChangeTimerRef = useRef<number | null>(null);
-  const draggedTabPathRef = useRef<string | null>(null);
   const activeTabMeta = useMemo(
     () => openTabs.find((tab) => tab.path === activeTabPath) || null,
     [openTabs, activeTabPath],
@@ -286,6 +274,14 @@ export function App() {
       monacoRef.current.editor.setTheme(appTheme === "light" ? "vs" : "vs-dark");
     }
   }, [appTheme]);
+
+  useEffect(() => {
+    activeTabPathRef.current = activeTabPath;
+  }, [activeTabPath]);
+
+  useEffect(() => {
+    currentFilePathRef.current = currentFilePath;
+  }, [currentFilePath]);
 
   useEffect(() => {
     const onDocClick = (event: MouseEvent) => {
@@ -772,25 +768,52 @@ export function App() {
     setCenterView("file");
     const reqId = ++navReqRef.current;
     pendingNavRef.current = target;
-    if (currentFilePath !== target.path) {
+    const currentPath = currentFilePathRef.current;
+    if (currentPath !== target.path) {
       const content = await invoke<string>("read_file", { path: target.path });
       if (reqId !== navReqRef.current) return;
         suppressDirtyRef.current = true;
         editorValueRef.current = content || "";
-        if (editorRef.current && centerView === "file" && activeTabPath !== PROJECT_DESCRIPTOR_TAB) {
+        // Always queue content for the next editor mount in case the current ref is stale.
+        pendingEditorContentRef.current = editorValueRef.current;
+        pendingEditorPathRef.current = target.path;
+        if (editorRef.current && centerView === "file" && activeTabPathRef.current !== PROJECT_DESCRIPTOR_TAB) {
           editorRef.current.setValue(editorValueRef.current);
-        } else {
-          pendingEditorContentRef.current = editorValueRef.current;
-          pendingEditorPathRef.current = target.path;
         }
       setCurrentFilePath(target.path);
+      currentFilePathRef.current = target.path;
       setActiveTabPath(target.path);
+      activeTabPathRef.current = target.path;
       setOpenTabs((prev) => {
         if (prev.some((tab) => tab.path === target.path)) return prev;
         const name = target.name || target.path.split(/[\\/]/).pop() || "Untitled";
         return [...prev, { path: target.path, name, dirty: false, kind: "file" }];
       });
       setTabContent((prev) => ({ ...prev, [target.path]: content || "" }));
+    } else {
+      const cached = tabContent[target.path];
+      if (cached != null && cached !== "") {
+        suppressDirtyRef.current = true;
+        editorValueRef.current = cached;
+        pendingEditorContentRef.current = cached;
+        pendingEditorPathRef.current = target.path;
+        if (editorRef.current && centerView === "file" && activeTabPathRef.current !== PROJECT_DESCRIPTOR_TAB) {
+          editorRef.current.setValue(cached);
+        }
+      } else {
+        const content = await invoke<string>("read_file", { path: target.path });
+        if (reqId !== navReqRef.current) return;
+        suppressDirtyRef.current = true;
+        editorValueRef.current = content || "";
+        pendingEditorContentRef.current = editorValueRef.current;
+        pendingEditorPathRef.current = target.path;
+        if (editorRef.current && centerView === "file" && activeTabPathRef.current !== PROJECT_DESCRIPTOR_TAB) {
+          editorRef.current.setValue(editorValueRef.current);
+        }
+        setTabContent((prev) => ({ ...prev, [target.path]: content || "" }));
+      }
+      setActiveTabPath(target.path);
+      activeTabPathRef.current = target.path;
     }
     if (reqId !== navReqRef.current) return;
     if (editorRef.current) {
@@ -1386,6 +1409,8 @@ export function App() {
     setCenterView("file");
     setShowProjectInfo(true);
     setDescriptorViewMode("view");
+    setCurrentFilePath(null);
+    currentFilePathRef.current = null;
     setOpenTabs((prev) => {
       if (prev.some((tab) => tab.path === PROJECT_DESCRIPTOR_TAB)) return prev;
       return [...prev, { path: PROJECT_DESCRIPTOR_TAB, name: "Project Descriptor", dirty: false, kind: "descriptor" }];
@@ -1399,21 +1424,29 @@ export function App() {
     if (path === PROJECT_DESCRIPTOR_TAB || tab?.kind === "descriptor") {
       setCenterView("file");
       setDescriptorViewMode("view");
+      setCurrentFilePath(null);
+      currentFilePathRef.current = null;
       setActiveTabPath(PROJECT_DESCRIPTOR_TAB);
       return;
     }
     if (tab?.kind === "ai") {
       setCenterView("ai");
+      setCurrentFilePath(null);
+      currentFilePathRef.current = null;
       setActiveTabPath(tab.path);
       return;
     }
     if (tab?.kind === "data") {
       setCenterView("data");
+      setCurrentFilePath(null);
+      currentFilePathRef.current = null;
       setActiveTabPath(tab.path);
       return;
     }
     if (tab?.kind === "diagram") {
       setCenterView("diagram");
+      setCurrentFilePath(null);
+      currentFilePathRef.current = null;
       setActiveTabPath(tab.path);
       return;
     }
@@ -1427,6 +1460,8 @@ export function App() {
       return [...prev, { path: AI_VIEW_TAB, name: "AI", dirty: false, kind: "ai" }];
     });
     setActiveTabPath(AI_VIEW_TAB);
+    setCurrentFilePath(null);
+    currentFilePathRef.current = null;
     setCenterView("ai");
   };
 
@@ -1436,42 +1471,23 @@ export function App() {
       return [...prev, { path: DATA_VIEW_TAB, name: "Data", dirty: false, kind: "data" }];
     });
     setActiveTabPath(DATA_VIEW_TAB);
+    setCurrentFilePath(null);
+    currentFilePathRef.current = null;
     setCenterView("data");
   };
 
   const openDiagramViewTab = (filePath: string) => {
     if (!filePath || filePath === PROJECT_DESCRIPTOR_TAB) return;
-    const id = `${DIAGRAM_TAB_PREFIX}${filePath}`;
-    const name = `Diagram: ${filePath.split(/[\\/]/).pop() || "file"}`;
+    const id = makeDiagramTabId(filePath);
+    const name = makeDiagramTabName(filePath);
     setOpenTabs((prev) => {
       if (prev.some((tab) => tab.path === id)) return prev;
       return [...prev, { path: id, name, dirty: false, kind: "diagram", sourcePath: filePath }];
     });
     setActiveTabPath(id);
+    setCurrentFilePath(null);
+    currentFilePathRef.current = null;
     setCenterView("diagram");
-  };
-
-  const tabIcon = (tab: (typeof openTabs)[number]) => {
-    if (tab.kind === "ai") return "AI";
-    if (tab.kind === "data") return "DT";
-    if (tab.kind === "diagram") return "DG";
-    if (tab.kind === "descriptor") return "PD";
-    const ext = tab.path.split(".").pop()?.toLowerCase() || "";
-    if (ext === "sysml") return "S";
-    if (ext === "kerml") return "K";
-    if (ext === "json" || ext === "jsonld") return "{}";
-    return "F";
-  };
-
-  const tabKindClass = (tab: (typeof openTabs)[number]) => {
-    if (tab.kind === "ai" || tab.kind === "data" || tab.kind === "diagram" || tab.kind === "descriptor") {
-      return tab.kind;
-    }
-    const ext = tab.path.split(".").pop()?.toLowerCase() || "";
-    if (ext === "sysml") return "sysml";
-    if (ext === "kerml") return "kerml";
-    if (ext === "json" || ext === "jsonld") return "json";
-    return "file";
   };
 
   const reorderTabs = (fromPath: string, toPath: string) => {
@@ -1523,12 +1539,16 @@ export function App() {
         void selectTab(next.path);
       } else {
         setActiveTabPath(null);
+        activeTabPathRef.current = null;
         setCenterView("file");
         editorValueRef.current = "";
         if (editorRef.current) {
           editorRef.current.setValue("");
         }
+        pendingEditorContentRef.current = null;
+        pendingEditorPathRef.current = null;
         setCurrentFilePath(null);
+        currentFilePathRef.current = null;
       }
     }
     if (selectedSymbol && selectedSymbol.file_path === path) {
@@ -1541,12 +1561,16 @@ export function App() {
     pendingNavRef.current = null;
     setOpenTabs([]);
     setActiveTabPath(null);
+    activeTabPathRef.current = null;
     setCenterView("file");
     editorValueRef.current = "";
     if (editorRef.current) {
       editorRef.current.setValue("");
     }
+    pendingEditorContentRef.current = null;
+    pendingEditorPathRef.current = null;
     setCurrentFilePath(null);
+    currentFilePathRef.current = null;
   };
 
   const closeOtherTabs = (path: string) => {
@@ -1560,18 +1584,26 @@ export function App() {
       setShowProjectInfo(true);
       setCenterView("file");
       setDescriptorViewMode("view");
+      setCurrentFilePath(null);
+      currentFilePathRef.current = null;
       return;
     }
     if (kept.kind === "ai") {
       setCenterView("ai");
+      setCurrentFilePath(null);
+      currentFilePathRef.current = null;
       return;
     }
     if (kept.kind === "data") {
       setCenterView("data");
+      setCurrentFilePath(null);
+      currentFilePathRef.current = null;
       return;
     }
     if (kept.kind === "diagram") {
       setCenterView("diagram");
+      setCurrentFilePath(null);
+      currentFilePathRef.current = null;
       return;
     }
     setCenterView("file");
@@ -1687,7 +1719,7 @@ export function App() {
   }, [activeTabPath, activeTabMeta, activeEditorPath, contextMenu, openMenu, showAiSettings, showExport, showNewFile, showNewProject, showOpenProject, showSettings, tabMenu]);
 
   const resetEndpointDraft = () => {
-    setEndpointDraft({ name: "", url: "", type: "chat", model: "", token: "" });
+    setEndpointDraft({ name: "", url: "", type: "chat", provider: "openai", model: "", token: "" });
   };
 
   const saveEndpointDraft = () => {
@@ -1698,14 +1730,30 @@ export function App() {
       if (endpointDraft.id) {
         return prev.map((endpoint) =>
           endpoint.id === endpointDraft.id
-            ? { ...endpoint, name, url, type: endpointDraft.type, model: endpointDraft.model.trim(), token: endpointDraft.token }
+            ? {
+                ...endpoint,
+                name,
+                url,
+                type: endpointDraft.type,
+                provider: endpointDraft.provider,
+                model: endpointDraft.model.trim(),
+                token: endpointDraft.token,
+              }
             : endpoint,
         );
       }
       const id = crypto.randomUUID();
       return [
         ...prev,
-        { id, name, url, type: endpointDraft.type, model: endpointDraft.model.trim(), token: endpointDraft.token },
+        {
+          id,
+          name,
+          url,
+          type: endpointDraft.type,
+          provider: endpointDraft.provider,
+          model: endpointDraft.model.trim(),
+          token: endpointDraft.token,
+        },
       ];
     });
     resetEndpointDraft();
@@ -1741,6 +1789,7 @@ export function App() {
         payload: {
           url: endpoint.url || "",
           type: endpoint.type,
+          provider: endpoint.provider,
           model: endpoint.model || null,
           token: endpoint.token || null,
         },
@@ -1778,26 +1827,79 @@ export function App() {
       );
       return;
     }
+    const buildModelContext = () => {
+      const activePath = activeEditorPath || currentFilePath || "";
+      const projectSymbols = symbols.filter((symbol) => !(libraryPath && symbol.file_path.startsWith(libraryPath)));
+      const activeSymbols = activePath
+        ? projectSymbols.filter((symbol) => symbol.file_path === activePath).slice(0, 40)
+        : [];
+      const unresolvedTop = unresolved.slice(0, 20);
+      const snippet =
+        activePath && currentFilePath === activePath
+          ? editorValueRef.current.slice(0, 8000)
+          : "";
+      const symbolLines = activeSymbols.map(
+        (symbol) =>
+          `- ${symbol.kind} ${symbol.qualified_name} @ ${symbol.file_path}:${(symbol.start_line ?? 0) + 1}`,
+      );
+      const unresolvedLines = unresolvedTop.map(
+        (item) => `- ${item.file_path}:${(item.line ?? 0) + 1}:${(item.column ?? 0) + 1} ${item.message}`,
+      );
+      return [
+        `root: ${rootPath || "unknown"}`,
+        `active_file: ${activePath || "none"}`,
+        `symbol_count: ${projectSymbols.length}`,
+        "",
+        "active_file_symbols:",
+        ...(symbolLines.length ? symbolLines : ["- none"]),
+        "",
+        "unresolved_top:",
+        ...(unresolvedLines.length ? unresolvedLines : ["- none"]),
+        "",
+        "active_file_content:",
+        snippet || "(not loaded)",
+      ].join("\n");
+    };
+
     const history = aiMessages.filter((msg) => msg.text !== "...");
-    const messages = [...history, { role: "user" as const, text }];
+    const contextText = buildModelContext();
+    const messages = [
+      {
+        role: "user" as const,
+        text:
+          "Model context (read-only). Use it as ground truth when answering about this workspace:\n\n" +
+          contextText,
+      },
+      ...history,
+      { role: "user" as const, text },
+    ];
     try {
-      const response = await invoke<any>("ai_chat_completion", {
+      const response = await invoke<any>("ai_agent_run", {
         payload: {
           url: endpoint.url,
+          provider: endpoint.provider,
           model: endpoint.model || null,
           token: endpoint.token || null,
           max_tokens: 512,
+          root: rootPath || null,
+          enable_tools: true,
           messages: messages.map((msg) => ({ role: msg.role, content: msg.text })),
         },
       });
       const content =
+        response?.message ??
         response?.choices?.[0]?.message?.content ??
         response?.choices?.[0]?.text ??
+        response?.content?.find?.((part: any) => part?.type === "text")?.text ??
         response?.message ??
         "";
       const nextText = content || "No response.";
       setAiMessages((prev) =>
-        prev.map((msg) => (msg.pendingId === requestId ? { ...msg, text: nextText, pendingId: undefined } : msg)),
+        prev.map((msg) =>
+          msg.pendingId === requestId
+            ? { ...msg, text: nextText, pendingId: undefined, steps: Array.isArray(response?.steps) ? response.steps : [] }
+            : msg,
+        ),
       );
     } catch (error) {
       setAiMessages((prev) =>
@@ -2938,115 +3040,34 @@ export function App() {
             ) : null}
           </div>
           <section className="panel editor">
-            <div className="panel-header editor-tabs">
-              <div className="tabs">
-                {openTabs.length ? (
-                openTabs.map((tab) => (
-                  <button
-                    key={tab.path}
-                    type="button"
-                    className={`tab tab-kind-${tabKindClass(tab)} ${tab.path === activeTabPath ? "active" : ""}`}
-                    draggable
-                    onClick={() => selectTab(tab.path)}
-                    onDragStart={() => {
-                      draggedTabPathRef.current = tab.path;
-                    }}
-                    onDragOver={(event) => {
-                      event.preventDefault();
-                    }}
-                    onDrop={(event) => {
-                      event.preventDefault();
-                      const fromPath = draggedTabPathRef.current;
-                      if (fromPath) {
-                        reorderTabs(fromPath, tab.path);
-                      }
-                    }}
-                    onDragEnd={() => {
-                      draggedTabPathRef.current = null;
-                    }}
-                      onContextMenu={(event) => {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        setActiveTabPath(tab.path);
-                        setTabMenu({ x: event.clientX, y: event.clientY, path: tab.path });
-                      }}
-                    >
-                    <span className="tab-icon" aria-hidden="true">{tabIcon(tab)}</span>
-                    <span className="tab-label">{tab.name}</span>
-                    {tab.dirty ? <span className="tab-dirty" aria-hidden="true">•</span> : null}
-                    <span className="tab-close" onClick={(event) => { event.stopPropagation(); closeTab(tab.path); }}>x</span>
-                  </button>
-                ))
-              ) : (
-                <div className="muted">No files open.</div>
-              )}
-            </div>
-              {openTabs.length ? (
-                <div className="tab-overflow">
-                  <button
-                    type="button"
-                    className="tab-overflow-btn"
-                    title="Tab overflow"
-                    onClick={() => setTabOverflowOpen((prev) => !prev)}
-                  >
-                    v
-                  </button>
-                  {tabOverflowOpen ? (
-                    <div className="tab-overflow-menu">
-                      {openTabs.map((tab) => (
-                        <button
-                          key={tab.path}
-                          type="button"
-                          className={tab.path === activeTabPath ? "active" : ""}
-                          onClick={() => {
-                            setTabOverflowOpen(false);
-                            void selectTab(tab.path);
-                          }}
-                        >
-                          {tabIcon(tab)} {tab.name}
-                        </button>
-                      ))}
-                    </div>
-                  ) : null}
-                </div>
-              ) : null}
-            </div>
+            <TabBar
+              openTabs={openTabs}
+              activeTabPath={activeTabPath}
+              tabOverflowOpen={tabOverflowOpen}
+              onSetTabOverflowOpen={setTabOverflowOpen}
+              onSelectTab={(path) => {
+                void selectTab(path);
+              }}
+              onCloseTab={closeTab}
+              onReorderTabs={reorderTabs}
+              onTabContextMenu={(path, x, y) => {
+                setActiveTabPath(path);
+                setTabMenu({ x, y, path });
+              }}
+            />
             <div className="editor-host" id="monaco-root">
               {activeTabMeta?.kind === "ai" ? (
-                <div className="ai-view">
-                  <div className="view-header">
-                    <div className="view-title">AI</div>
-                    <button type="button" className="ghost" onClick={() => setShowAiSettings(true)}>Settings</button>
-                  </div>
-                  <div className="ai-pane">
-                    <div className="ai-messages">
-                      {aiMessages.length ? (
-                        aiMessages.map((msg, idx) => (
-                          <div key={idx} className={`ai-message ${msg.role}`}>{msg.text}</div>
-                        ))
-                      ) : (
-                        <div className="muted">Ask about your model.</div>
-                      )}
-                    </div>
-                    <div className="ai-input">
-                      <textarea
-                        value={aiInput}
-                        onChange={(e) => setAiInput(e.target.value)}
-                        placeholder="Type a prompt..."
-                      />
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const text = aiInput.trim();
-                          if (!text) return;
-                          void sendAiMessage(text);
-                        }}
-                      >
-                        Send
-                      </button>
-                    </div>
-                  </div>
-                </div>
+                <AiView
+                  aiMessages={aiMessages}
+                  aiInput={aiInput}
+                  onInputChange={setAiInput}
+                  onOpenSettings={() => setShowAiSettings(true)}
+                  onSend={() => {
+                    const text = aiInput.trim();
+                    if (!text) return;
+                    void sendAiMessage(text);
+                  }}
+                />
               ) : activeTabMeta?.kind === "data" ? (
                 <div className="data-view">
                   <div className="view-header">
@@ -3801,7 +3822,7 @@ export function App() {
                     <div key={endpoint.id} className="endpoint-row">
                       <div className="endpoint-main">
                         <div className="endpoint-title">{endpoint.name}</div>
-                        <div className="endpoint-meta">{endpoint.type.toUpperCase()} • {endpoint.url}</div>
+                        <div className="endpoint-meta">{endpoint.provider.toUpperCase()} / {endpoint.type.toUpperCase()} / {endpoint.url}</div>
                         {endpoint.model ? <div className="endpoint-meta">Model: {endpoint.model}</div> : null}
                         {endpointTestStatus[endpoint.id] ? (
                           <div className={`endpoint-status ${endpointTestStatus[endpoint.id].startsWith("pass") ? "ok" : endpointTestStatus[endpoint.id].startsWith("fail") ? "fail" : ""}`}>
@@ -3873,13 +3894,24 @@ export function App() {
                 </label>
                 <label className="field">
                   <span className="field-label">URL</span>
-                  <input value={endpointDraft.url} onChange={(e) => setEndpointDraft({ ...endpointDraft, url: e.target.value })} placeholder="https://api.openai.com" />
+                  <input
+                    value={endpointDraft.url}
+                    onChange={(e) => setEndpointDraft({ ...endpointDraft, url: e.target.value })}
+                    placeholder={endpointDraft.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com"}
+                  />
                 </label>
                 <label className="field">
                   <span className="field-label">Type</span>
                   <select value={endpointDraft.type} onChange={(e) => setEndpointDraft({ ...endpointDraft, type: e.target.value as "chat" | "embeddings" })}>
                     <option value="chat">Chat</option>
                     <option value="embeddings">Embeddings</option>
+                  </select>
+                </label>
+                <label className="field">
+                  <span className="field-label">Provider</span>
+                  <select value={endpointDraft.provider} onChange={(e) => setEndpointDraft({ ...endpointDraft, provider: e.target.value as "openai" | "anthropic" })}>
+                    <option value="openai">OpenAI-compatible</option>
+                    <option value="anthropic">Anthropic</option>
                   </select>
                 </label>
                 <label className="field">

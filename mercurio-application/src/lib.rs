@@ -26,8 +26,18 @@ use tauri::path::BaseDirectory;
 use tauri::{Emitter, EventTarget, Manager};
 use zip::ZipArchive;
 
+mod commands;
+
+// Re-exported Tauri commands from focused modules.
+use commands::{
+    ai_agent_run, ai_chat_completion, ai_test_endpoint, create_dir, create_file, create_package, delete_path,
+    get_default_root, get_default_stdlib, get_startup_path, list_dir, list_stdlib_versions,
+    open_in_explorer, path_exists, read_file, rename_path, set_default_stdlib, window_close,
+    window_minimize, window_toggle_maximize, write_file,
+};
+
 #[derive(Serialize)]
-struct DirEntry {
+pub(crate) struct DirEntry {
     name: String,
     path: String,
     is_dir: bool,
@@ -101,7 +111,7 @@ struct ParseErrorsPayload {
 }
 
 #[derive(Serialize)]
-struct StartupOpen {
+pub(crate) struct StartupOpen {
     path: String,
     kind: String,
 }
@@ -113,15 +123,15 @@ struct FsEventPayload {
 }
 
 #[derive(Clone)]
-struct AppState {
-    watcher: Arc<Mutex<Option<RecommendedWatcher>>>,
-    stdlib_cache: Arc<Mutex<Option<StdlibCache>>>,
-    canceled_compiles: Arc<Mutex<HashSet<u64>>>,
-    analysis_host: Arc<Mutex<AnalysisHost>>,
-    workspace: Arc<Mutex<WorkspaceState>>,
-    stdlib_root: PathBuf,
-    settings_path: PathBuf,
-    settings: Arc<Mutex<AppSettings>>,
+pub(crate) struct AppState {
+    pub(crate) watcher: Arc<Mutex<Option<RecommendedWatcher>>>,
+    pub(crate) stdlib_cache: Arc<Mutex<Option<StdlibCache>>>,
+    pub(crate) canceled_compiles: Arc<Mutex<HashSet<u64>>>,
+    pub(crate) analysis_host: Arc<Mutex<AnalysisHost>>,
+    pub(crate) workspace: Arc<Mutex<WorkspaceState>>,
+    pub(crate) stdlib_root: PathBuf,
+    pub(crate) settings_path: PathBuf,
+    pub(crate) settings: Arc<Mutex<AppSettings>>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -197,7 +207,7 @@ fn load_app_settings(path: &Path) -> AppSettings {
     }
 }
 
-fn save_app_settings(path: &Path, settings: &AppSettings) -> Result<(), String> {
+pub(crate) fn save_app_settings(path: &Path, settings: &AppSettings) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -247,7 +257,7 @@ fn read_packaged_stdlib_manifest(app: &tauri::AppHandle) -> Result<PackagedStdli
     serde_json::from_str(&content).map_err(|e| e.to_string())
 }
 
-fn list_stdlib_versions_from_root(stdlib_root: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn list_stdlib_versions_from_root(stdlib_root: &Path) -> Result<Vec<String>, String> {
     let mut versions = Vec::new();
     let entries = fs::read_dir(stdlib_root).map_err(|e| e.to_string())?;
     for entry in entries {
@@ -422,349 +432,6 @@ enum TypeRefView {
     Chain { parts: Vec<TypeRefPartView> },
 }
 
-#[tauri::command]
-fn get_default_root() -> Result<String, String> {
-    std::env::current_dir()
-        .map_err(|e| e.to_string())
-        .and_then(|path| {
-            path.to_str()
-                .map(|s| s.to_string())
-                .ok_or_else(|| "Failed to resolve current directory".to_string())
-        })
-}
-
-#[tauri::command]
-fn list_stdlib_versions(state: tauri::State<'_, AppState>) -> Result<Vec<String>, String> {
-    list_stdlib_versions_from_root(&state.stdlib_root)
-}
-
-#[tauri::command]
-fn get_default_stdlib(state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
-    let settings = state
-        .settings
-        .lock()
-        .map_err(|_| "Settings lock poisoned".to_string())?;
-    Ok(settings.default_stdlib.clone())
-}
-
-#[tauri::command]
-fn set_default_stdlib(state: tauri::State<'_, AppState>, version: String) -> Result<(), String> {
-    let trimmed = version.trim().to_string();
-    if !trimmed.is_empty() {
-        let candidate = state.stdlib_root.join(&trimmed);
-        if !candidate.exists() || !candidate.is_dir() {
-            return Err("Stdlib version not found".to_string());
-        }
-    }
-    let mut settings = state
-        .settings
-        .lock()
-        .map_err(|_| "Settings lock poisoned".to_string())?;
-    settings.default_stdlib = if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    };
-    save_app_settings(&state.settings_path, &settings)?;
-    Ok(())
-}
-
-#[tauri::command]
-fn get_startup_path() -> Result<Option<StartupOpen>, String> {
-    let arg = match std::env::args_os().nth(1) {
-        Some(arg) => arg,
-        None => return Ok(None),
-    };
-    let mut path = PathBuf::from(arg);
-    if !path.is_absolute() {
-        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-        path = cwd.join(path);
-    }
-    let meta = fs::metadata(&path).map_err(|e| e.to_string())?;
-    let kind = if meta.is_dir() { "dir" } else { "file" };
-    Ok(Some(StartupOpen {
-        path: path.to_string_lossy().to_string(),
-        kind: kind.to_string(),
-    }))
-}
-
-#[tauri::command]
-fn list_dir(path: String) -> Result<Vec<DirEntry>, String> {
-    let mut entries = Vec::new();
-    let read_dir = fs::read_dir(&path).map_err(|e| e.to_string())?;
-
-    for entry in read_dir {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let entry_path = entry.path();
-        let name = entry
-            .file_name()
-            .to_string_lossy()
-            .to_string();
-        let is_dir = entry_path.is_dir();
-        entries.push(DirEntry {
-            name,
-            path: entry_path.to_string_lossy().to_string(),
-            is_dir,
-        });
-    }
-
-    entries.sort_by(|a, b| {
-        match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        }
-    });
-
-    Ok(entries)
-}
-
-#[tauri::command]
-fn read_file(path: String) -> Result<String, String> {
-    fs::read_to_string(path).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn path_exists(path: String) -> Result<bool, String> {
-    Ok(PathBuf::from(path).exists())
-}
-
-#[tauri::command]
-fn write_file(path: String, content: String) -> Result<(), String> {
-    let target = PathBuf::from(path);
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    fs::write(target, content).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-fn create_file(root: String, parent: String, name: String) -> Result<String, String> {
-    if name.trim().is_empty() {
-        return Err("File name is required".to_string());
-    }
-    let root_path = PathBuf::from(root);
-    let parent_path = resolve_under_root(&root_path, Path::new(&parent))?;
-    let new_path = resolve_under_root(&root_path, &parent_path.join(name))?;
-    if let Some(parent_dir) = new_path.parent() {
-        fs::create_dir_all(parent_dir).map_err(|e| e.to_string())?;
-    }
-    fs::write(&new_path, "").map_err(|e| e.to_string())?;
-    Ok(new_path.to_string_lossy().to_string())
-}
-
-#[tauri::command]
-fn create_dir(root: String, parent: String, name: String) -> Result<String, String> {
-    if name.trim().is_empty() {
-        return Err("Folder name is required".to_string());
-    }
-    let root_path = PathBuf::from(root);
-    let parent_path = resolve_under_root(&root_path, Path::new(&parent))?;
-    let new_path = resolve_under_root(&root_path, &parent_path.join(name))?;
-    fs::create_dir_all(&new_path).map_err(|e| e.to_string())?;
-    Ok(new_path.to_string_lossy().to_string())
-}
-
-#[tauri::command]
-fn create_package(payload: serde_json::Value) -> Result<(), String> {
-    let root = payload
-        .get("root")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "Missing required 'root' argument".to_string())?
-        .to_string();
-    let file = payload
-        .get("file")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "Missing required 'file' argument".to_string())?
-        .to_string();
-    let name = payload
-        .get("name")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "Missing required 'name' argument".to_string())?
-        .trim()
-        .to_string();
-    if name.is_empty() {
-        return Err("Package name is required".to_string());
-    }
-    let root_path = PathBuf::from(root);
-    let target_path = resolve_under_root(&root_path, Path::new(&file))?;
-    let mut content = fs::read_to_string(&target_path).unwrap_or_default();
-    if !content.ends_with('\n') && !content.is_empty() {
-        content.push('\n');
-    }
-    content.push('\n');
-    content.push_str(&format!("package {} {{\n}}\n", name));
-    fs::write(&target_path, content).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[tauri::command]
-fn rename_path(root: String, path: String, new_name: String) -> Result<String, String> {
-    if new_name.trim().is_empty() {
-        return Err("New name is required".to_string());
-    }
-    let root_path = PathBuf::from(root);
-    let target_path = resolve_under_root(&root_path, Path::new(&path))?;
-    let parent = target_path
-        .parent()
-        .ok_or_else(|| "Cannot rename root".to_string())?;
-    let new_path = resolve_under_root(&root_path, &parent.join(new_name))?;
-    fs::rename(&target_path, &new_path).map_err(|e| e.to_string())?;
-    Ok(new_path.to_string_lossy().to_string())
-}
-
-#[tauri::command]
-fn delete_path(root: String, path: String) -> Result<(), String> {
-    let root_path = PathBuf::from(root);
-    let target_path = resolve_under_root(&root_path, Path::new(&path))?;
-    if target_path.is_dir() {
-        fs::remove_dir_all(&target_path).map_err(|e| e.to_string())?;
-    } else {
-        fs::remove_file(&target_path).map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn open_in_explorer(path: String) -> Result<(), String> {
-    let target = PathBuf::from(&path);
-    if !target.exists() {
-        return Err("Path does not exist".to_string());
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let mut command = std::process::Command::new("explorer");
-        if target.is_file() {
-            command.arg("/select,");
-            command.arg(target);
-        } else {
-            command.arg(target);
-        }
-        command.spawn().map_err(|e| e.to_string())?;
-        return Ok(());
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let mut command = std::process::Command::new("open");
-        if target.is_file() {
-            command.arg("-R");
-        }
-        command.arg(target);
-        command.spawn().map_err(|e| e.to_string())?;
-        return Ok(());
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let mut command = std::process::Command::new("xdg-open");
-        let open_path = if target.is_file() {
-            target.parent().unwrap_or(&target)
-        } else {
-            &target
-        };
-        command.arg(open_path);
-        command.spawn().map_err(|e| e.to_string())?;
-        return Ok(());
-    }
-}
-
-#[derive(Deserialize)]
-struct AiEndpointPayload {
-    url: String,
-    r#type: String,
-    model: Option<String>,
-    token: Option<String>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct AiMessagePayload {
-    role: String,
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct AiChatPayload {
-    url: String,
-    model: Option<String>,
-    token: Option<String>,
-    messages: Vec<AiMessagePayload>,
-    max_tokens: Option<u32>,
-}
-
-fn normalize_ai_url(base: &str, suffix: &str) -> String {
-    if base.contains(suffix) {
-        return base.to_string();
-    }
-    let trimmed = base.trim_end_matches('/');
-    if trimmed.ends_with("/v1") {
-        format!("{}{}", trimmed, suffix)
-    } else {
-        format!("{}/v1{}", trimmed, suffix)
-    }
-}
-
-#[tauri::command]
-async fn ai_test_endpoint(payload: AiEndpointPayload) -> Result<serde_json::Value, String> {
-    let endpoint_type = payload.r#type.to_lowercase();
-    let url = if endpoint_type == "embeddings" {
-        normalize_ai_url(&payload.url, "/embeddings")
-    } else {
-        normalize_ai_url(&payload.url, "/chat/completions")
-    };
-    let body = if endpoint_type == "embeddings" {
-        serde_json::json!({
-            "model": payload.model.unwrap_or_else(|| "text-embedding-3-small".to_string()),
-            "input": "ping",
-        })
-    } else {
-        serde_json::json!({
-            "model": payload.model.unwrap_or_else(|| "gpt-4o-mini".to_string()),
-            "messages": [{ "role": "user", "content": "ping" }],
-            "max_completion_tokens": 1,
-        })
-    };
-    let client = reqwest::Client::new();
-    let mut request = client.post(url).header("Content-Type", "application/json");
-    if let Some(token) = payload.token {
-        if !token.trim().is_empty() {
-            request = request.header("Authorization", format!("Bearer {}", token));
-        }
-    }
-    let response = request.json(&body).send().await.map_err(|e| e.to_string())?;
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let detail = response.text().await.unwrap_or_else(|_| "".to_string());
-        return Ok(serde_json::json!({ "ok": false, "status": status, "detail": detail }));
-    }
-    Ok(serde_json::json!({ "ok": true }))
-}
-
-#[tauri::command]
-async fn ai_chat_completion(payload: AiChatPayload) -> Result<serde_json::Value, String> {
-    let url = normalize_ai_url(&payload.url, "/chat/completions");
-    let body = serde_json::json!({
-        "model": payload.model.unwrap_or_else(|| "gpt-4o-mini".to_string()),
-        "messages": payload.messages,
-        "max_completion_tokens": payload.max_tokens.unwrap_or(512),
-    });
-    let client = reqwest::Client::new();
-    let mut request = client.post(url).header("Content-Type", "application/json");
-    if let Some(token) = payload.token {
-        if !token.trim().is_empty() {
-            request = request.header("Authorization", format!("Bearer {}", token));
-        }
-    }
-    let response = request.json(&body).send().await.map_err(|e| e.to_string())?;
-    let status = response.status();
-    let text = response.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        return Err(format!("{} {}", status.as_u16(), text));
-    }
-    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    Ok(value)
-}
 
 #[tauri::command]
 fn set_watch_root(app: tauri::AppHandle, state: tauri::State<AppState>, root: String) -> Result<(), String> {
@@ -866,34 +533,6 @@ fn get_parse_errors_for_content(path: String, content: String) -> Result<ParseEr
         path: path.clone(),
         errors,
     })
-}
-
-#[tauri::command]
-fn window_minimize(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("main") {
-        window.minimize().map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn window_toggle_maximize(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("main") {
-        if window.is_maximized().map_err(|e| e.to_string())? {
-            window.unmaximize().map_err(|e| e.to_string())?;
-        } else {
-            window.maximize().map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn window_close(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("main") {
-        window.close().map_err(|e| e.to_string())?;
-    }
-    Ok(())
 }
 
 fn discover_stdlib_path() -> PathBuf {
@@ -1947,7 +1586,7 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
-fn resolve_under_root(root: &Path, target: &Path) -> Result<PathBuf, String> {
+pub(crate) fn resolve_under_root(root: &Path, target: &Path) -> Result<PathBuf, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let joined = if target.is_absolute() {
         target.to_path_buf()
@@ -2491,7 +2130,8 @@ pub fn run() {
             cancel_compile,
             export_compiled_model,
             ai_test_endpoint,
-            ai_chat_completion
+            ai_chat_completion,
+            ai_agent_run
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

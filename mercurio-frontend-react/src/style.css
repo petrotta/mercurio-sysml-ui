@@ -1481,6 +1481,24 @@ body.theme-light .ai-messages {
   justify-self: start;
 }
 
+.ai-steps {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(255, 255, 255, 0.15);
+  display: grid;
+  gap: 4px;
+}
+
+.ai-step {
+  font-family: "IBM Plex Mono", Consolas, "Courier New", monospace;
+  font-size: 0.72rem;
+  opacity: 0.92;
+}
+
+.ai-step.tool_error {
+  color: #ffb7b7;
+}
+
 .ai-input {
   display: grid;
   grid-template-columns: 1fr auto;
@@ -1512,6 +1530,10 @@ body.theme-light .ai-input button {
   border-color: #cdd3dc;
   background: #ffffff;
   color: #1e1f22;
+}
+
+body.theme-light .ai-steps {
+  border-top-color: rgba(0, 0, 0, 0.15);
 }
 
 .statusbar {
