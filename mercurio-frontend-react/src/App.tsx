@@ -25,6 +25,9 @@ const AI_EMBEDDINGS_KEY = "mercurio.ai.embeddingsEndpoint";
 const PROJECT_LOCATION_KEY = "mercurio.projectLocation";
 const THEME_KEY = "mercurio.theme";
 const PROJECT_DESCRIPTOR_TAB = "__project_descriptor__";
+const AI_VIEW_TAB = "__view_ai__";
+const DATA_VIEW_TAB = "__view_data__";
+const DIAGRAM_TAB_PREFIX = "__diagram__::";
 
 function loadRecents(): string[] {
   try {
@@ -62,13 +65,20 @@ export function App() {
   const editorValueRef = useRef("");
   const editorChangeRafRef = useRef<number | null>(null);
   const [editorChangeTick, setEditorChangeTick] = useState(0);
-  const [openTabs, setOpenTabs] = useState<Array<{ path: string; name: string; dirty: boolean }>>([]);
+  const [openTabs, setOpenTabs] = useState<Array<{
+    path: string;
+    name: string;
+    dirty: boolean;
+    kind?: "file" | "descriptor" | "diagram" | "ai" | "data";
+    sourcePath?: string;
+  }>>([]);
   const [activeTabPath, setActiveTabPath] = useState<string | null>(null);
-  const [editorViewMode, setEditorViewMode] = useState<"text" | "diagram">("text");
   const [descriptorViewMode, setDescriptorViewMode] = useState<"view" | "json">("view");
   const [tabContent, setTabContent] = useState<Record<string, string>>({});
   const suppressDirtyRef = useRef(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; entry: FileEntry; scope: "root" | "node" } | null>(null);
+  const [tabMenu, setTabMenu] = useState<{ x: number; y: number; path: string } | null>(null);
+  const [tabOverflowOpen, setTabOverflowOpen] = useState(false);
   const [showProjectInfo, setShowProjectInfo] = useState(false);
   const [hasProjectDescriptor, setHasProjectDescriptor] = useState(false);
   const [projectDescriptor, setProjectDescriptor] = useState<{
@@ -102,7 +112,7 @@ export function App() {
   const [newProjectDefaultLib, setNewProjectDefaultLib] = useState(true);
   const [newProjectBusy, setNewProjectBusy] = useState(false);
   const [newProjectError, setNewProjectError] = useState("");
-  const [rightPaneMode, setRightPaneMode] = useState<"model" | "ai">("model");
+  const [centerView, setCenterView] = useState<"file" | "diagram" | "ai" | "data">("file");
   const [cursorPos, setCursorPos] = useState<{ line: number; col: number } | null>(null);
   const [aiInput, setAiInput] = useState("");
   const [aiMessages, setAiMessages] = useState<Array<{ role: "user" | "assistant"; text: string; pendingId?: number }>>([]);
@@ -161,6 +171,7 @@ export function App() {
   const backgroundCompileTokenRef = useRef(0);
   const [backgroundCompileEnabled, setBackgroundCompileEnabled] = useState(true);
   const [projectSymbolsLoaded, setProjectSymbolsLoaded] = useState(false);
+  const [dataExcludeStdlib, setDataExcludeStdlib] = useState(true);
   const [symbols, setSymbols] = useState<Array<{
     name: string;
     kind: string;
@@ -252,6 +263,21 @@ export function App() {
   const paletteCreateRef = useRef<null | { type: string; name: string; startX: number; startY: number }>(null);
   const [paletteGhost, setPaletteGhost] = useState<null | { x: number; y: number; type: string }>(null);
   const fsChangeTimerRef = useRef<number | null>(null);
+  const draggedTabPathRef = useRef<string | null>(null);
+  const activeTabMeta = useMemo(
+    () => openTabs.find((tab) => tab.path === activeTabPath) || null,
+    [openTabs, activeTabPath],
+  );
+  const activeEditorPath = useMemo(() => {
+    if (!activeTabMeta) return null;
+    if (activeTabMeta.path === PROJECT_DESCRIPTOR_TAB) return null;
+    if (activeTabMeta.kind === "ai" || activeTabMeta.kind === "data" || activeTabMeta.kind === "diagram") return null;
+    return activeTabMeta.path;
+  }, [activeTabMeta]);
+  const activeDiagramPath = useMemo(() => {
+    if (activeTabMeta?.kind === "diagram") return activeTabMeta.sourcePath || null;
+    return activeEditorPath;
+  }, [activeTabMeta, activeEditorPath]);
 
   useEffect(() => {
     document.body.classList.toggle("theme-light", appTheme === "light");
@@ -269,6 +295,12 @@ export function App() {
       }
       if (!target || !target.closest(".context-menu")) {
         setContextMenu(null);
+      }
+      if (!target || !target.closest(".tab-menu")) {
+        setTabMenu(null);
+      }
+      if (!target || !target.closest(".tab-overflow")) {
+        setTabOverflowOpen(false);
       }
     };
     document.addEventListener("click", onDocClick);
@@ -504,7 +536,6 @@ export function App() {
   }, [rootPath, backgroundCompileEnabled]);
 
   useEffect(() => {
-    if (rightPaneMode !== "model") return;
     const container = modelTreeRef.current;
     if (!container) return;
     const updateHeight = () => {
@@ -514,7 +545,7 @@ export function App() {
     const resizeObserver = new ResizeObserver(() => updateHeight());
     resizeObserver.observe(container);
     return () => resizeObserver.disconnect();
-  }, [rightPaneMode, modelTreeHeight, showPropertiesPane]);
+  }, [modelTreeHeight, showPropertiesPane]);
 
   useEffect(() => {
     const onMove = (event: PointerEvent) => {
@@ -674,7 +705,7 @@ export function App() {
     backgroundCompileTokenRef.current += 1;
     closeAllTabs();
     setSelectedSymbol(null);
-    setEditorViewMode("text");
+    setCenterView("file");
     setDescriptorViewMode("view");
     setProjectDescriptor(null);
     setHasProjectDescriptor(false);
@@ -738,6 +769,7 @@ export function App() {
     name?: string;
     selection?: { startLine: number; startCol: number; endLine: number; endCol: number };
   }) => {
+    setCenterView("file");
     const reqId = ++navReqRef.current;
     pendingNavRef.current = target;
     if (currentFilePath !== target.path) {
@@ -745,7 +777,7 @@ export function App() {
       if (reqId !== navReqRef.current) return;
         suppressDirtyRef.current = true;
         editorValueRef.current = content || "";
-        if (editorRef.current && editorViewMode === "text" && activeTabPath !== PROJECT_DESCRIPTOR_TAB) {
+        if (editorRef.current && centerView === "file" && activeTabPath !== PROJECT_DESCRIPTOR_TAB) {
           editorRef.current.setValue(editorValueRef.current);
         } else {
           pendingEditorContentRef.current = editorValueRef.current;
@@ -756,7 +788,7 @@ export function App() {
       setOpenTabs((prev) => {
         if (prev.some((tab) => tab.path === target.path)) return prev;
         const name = target.name || target.path.split(/[\\/]/).pop() || "Untitled";
-        return [...prev, { path: target.path, name, dirty: false }];
+        return [...prev, { path: target.path, name, dirty: false, kind: "file" }];
       });
       setTabContent((prev) => ({ ...prev, [target.path]: content || "" }));
     }
@@ -1279,7 +1311,7 @@ export function App() {
   };
 
   useEffect(() => {
-    if (!activeTabPath || activeTabPath === PROJECT_DESCRIPTOR_TAB) return;
+    if (!activeEditorPath) return;
     const monaco = monacoRef.current;
     const editor = editorRef.current;
     if (!monaco || !editor) return;
@@ -1290,7 +1322,7 @@ export function App() {
       invoke<{
         path: string;
         errors: Array<{ message: string; line: number; column: number; kind: string }>;
-      }>("get_parse_errors_for_content", { path: activeTabPath, content: editorValueRef.current })
+      }>("get_parse_errors_for_content", { path: activeEditorPath, content: editorValueRef.current })
         .then((payload) => {
           if (reqId !== parseReqRef.current) return;
           const markers = (payload?.errors || []).map((err) => ({
@@ -1309,15 +1341,15 @@ export function App() {
         });
     }, 450);
     return () => window.clearTimeout(timer);
-  }, [editorChangeTick, activeTabPath]);
+  }, [editorChangeTick, activeEditorPath]);
 
   useEffect(() => {
-    if (!rootPath || !activeTabPath || activeTabPath === PROJECT_DESCRIPTOR_TAB) return;
+    if (!rootPath || !activeEditorPath) return;
     const timer = window.setTimeout(() => {
-      void runBackgroundCompileWithUnsaved(rootPath, activeTabPath, editorValueRef.current);
+      void runBackgroundCompileWithUnsaved(rootPath, activeEditorPath, editorValueRef.current);
     }, 800);
     return () => window.clearTimeout(timer);
-  }, [editorChangeTick, activeTabPath, rootPath]);
+  }, [editorChangeTick, activeEditorPath, rootPath]);
 
   const selectSymbolInEditor = async (symbol: typeof symbols[number]) => {
     if (!symbol) return;
@@ -1351,25 +1383,108 @@ export function App() {
       setProjectDescriptor(descriptor);
       setHasProjectDescriptor(true);
     }
-    setEditorViewMode("text");
+    setCenterView("file");
     setShowProjectInfo(true);
     setDescriptorViewMode("view");
     setOpenTabs((prev) => {
       if (prev.some((tab) => tab.path === PROJECT_DESCRIPTOR_TAB)) return prev;
-      return [...prev, { path: PROJECT_DESCRIPTOR_TAB, name: "Project Descriptor", dirty: false }];
+      return [...prev, { path: PROJECT_DESCRIPTOR_TAB, name: "Project Descriptor", dirty: false, kind: "descriptor" }];
     });
     setActiveTabPath(PROJECT_DESCRIPTOR_TAB);
   };
 
   const selectTab = async (path: string) => {
     if (path === activeTabPath) return;
-    if (path === PROJECT_DESCRIPTOR_TAB) {
-      setEditorViewMode("text");
+    const tab = openTabs.find((entry) => entry.path === path);
+    if (path === PROJECT_DESCRIPTOR_TAB || tab?.kind === "descriptor") {
+      setCenterView("file");
       setDescriptorViewMode("view");
-      setActiveTabPath(path);
+      setActiveTabPath(PROJECT_DESCRIPTOR_TAB);
       return;
     }
+    if (tab?.kind === "ai") {
+      setCenterView("ai");
+      setActiveTabPath(tab.path);
+      return;
+    }
+    if (tab?.kind === "data") {
+      setCenterView("data");
+      setActiveTabPath(tab.path);
+      return;
+    }
+    if (tab?.kind === "diagram") {
+      setCenterView("diagram");
+      setActiveTabPath(tab.path);
+      return;
+    }
+    setCenterView("file");
     await navigateTo({ path });
+  };
+
+  const openAiViewTab = () => {
+    setOpenTabs((prev) => {
+      if (prev.some((tab) => tab.path === AI_VIEW_TAB)) return prev;
+      return [...prev, { path: AI_VIEW_TAB, name: "AI", dirty: false, kind: "ai" }];
+    });
+    setActiveTabPath(AI_VIEW_TAB);
+    setCenterView("ai");
+  };
+
+  const openDataViewTab = () => {
+    setOpenTabs((prev) => {
+      if (prev.some((tab) => tab.path === DATA_VIEW_TAB)) return prev;
+      return [...prev, { path: DATA_VIEW_TAB, name: "Data", dirty: false, kind: "data" }];
+    });
+    setActiveTabPath(DATA_VIEW_TAB);
+    setCenterView("data");
+  };
+
+  const openDiagramViewTab = (filePath: string) => {
+    if (!filePath || filePath === PROJECT_DESCRIPTOR_TAB) return;
+    const id = `${DIAGRAM_TAB_PREFIX}${filePath}`;
+    const name = `Diagram: ${filePath.split(/[\\/]/).pop() || "file"}`;
+    setOpenTabs((prev) => {
+      if (prev.some((tab) => tab.path === id)) return prev;
+      return [...prev, { path: id, name, dirty: false, kind: "diagram", sourcePath: filePath }];
+    });
+    setActiveTabPath(id);
+    setCenterView("diagram");
+  };
+
+  const tabIcon = (tab: (typeof openTabs)[number]) => {
+    if (tab.kind === "ai") return "AI";
+    if (tab.kind === "data") return "DT";
+    if (tab.kind === "diagram") return "DG";
+    if (tab.kind === "descriptor") return "PD";
+    const ext = tab.path.split(".").pop()?.toLowerCase() || "";
+    if (ext === "sysml") return "S";
+    if (ext === "kerml") return "K";
+    if (ext === "json" || ext === "jsonld") return "{}";
+    return "F";
+  };
+
+  const tabKindClass = (tab: (typeof openTabs)[number]) => {
+    if (tab.kind === "ai" || tab.kind === "data" || tab.kind === "diagram" || tab.kind === "descriptor") {
+      return tab.kind;
+    }
+    const ext = tab.path.split(".").pop()?.toLowerCase() || "";
+    if (ext === "sysml") return "sysml";
+    if (ext === "kerml") return "kerml";
+    if (ext === "json" || ext === "jsonld") return "json";
+    return "file";
+  };
+
+  const reorderTabs = (fromPath: string, toPath: string) => {
+    if (!fromPath || !toPath || fromPath === toPath) return;
+    setOpenTabs((prev) => {
+      const fromIndex = prev.findIndex((tab) => tab.path === fromPath);
+      const toIndex = prev.findIndex((tab) => tab.path === toPath);
+      if (fromIndex < 0 || toIndex < 0) return prev;
+      const next = [...prev];
+      const [moved] = next.splice(fromIndex, 1);
+      next.splice(toIndex, 0, moved);
+      return next;
+    });
   };
 
   useEffect(() => {
@@ -1382,7 +1497,7 @@ export function App() {
   }, [currentFilePath]);
 
   useEffect(() => {
-    if (!activeTabPath || activeTabPath === PROJECT_DESCRIPTOR_TAB) {
+    if (centerView !== "file" || !activeEditorPath) {
       setCursorPos(null);
       return;
     }
@@ -1392,7 +1507,7 @@ export function App() {
     if (pos) {
       setCursorPos({ line: pos.lineNumber, col: pos.column });
     }
-  }, [activeTabPath, editorViewMode]);
+  }, [activeEditorPath, centerView]);
 
   const closeTab = (path: string) => {
     navReqRef.current += 1;
@@ -1408,6 +1523,7 @@ export function App() {
         void selectTab(next.path);
       } else {
         setActiveTabPath(null);
+        setCenterView("file");
         editorValueRef.current = "";
         if (editorRef.current) {
           editorRef.current.setValue("");
@@ -1425,6 +1541,7 @@ export function App() {
     pendingNavRef.current = null;
     setOpenTabs([]);
     setActiveTabPath(null);
+    setCenterView("file");
     editorValueRef.current = "";
     if (editorRef.current) {
       editorRef.current.setValue("");
@@ -1432,32 +1549,60 @@ export function App() {
     setCurrentFilePath(null);
   };
 
+  const closeOtherTabs = (path: string) => {
+    navReqRef.current += 1;
+    pendingNavRef.current = null;
+    const kept = openTabs.find((tab) => tab.path === path);
+    if (!kept) return;
+    setOpenTabs([kept]);
+    setActiveTabPath(path);
+    if (path === PROJECT_DESCRIPTOR_TAB) {
+      setShowProjectInfo(true);
+      setCenterView("file");
+      setDescriptorViewMode("view");
+      return;
+    }
+    if (kept.kind === "ai") {
+      setCenterView("ai");
+      return;
+    }
+    if (kept.kind === "data") {
+      setCenterView("data");
+      return;
+    }
+    if (kept.kind === "diagram") {
+      setCenterView("diagram");
+      return;
+    }
+    setCenterView("file");
+  };
+
   const saveActiveTab = async () => {
-    if (!activeTabPath || activeTabPath === PROJECT_DESCRIPTOR_TAB) return;
-    await invoke("write_file", { path: activeTabPath, content: editorValueRef.current });
-    setOpenTabs((prev) => prev.map((tab) => (tab.path === activeTabPath ? { ...tab, dirty: false } : tab)));
-    setTabContent((prev) => ({ ...prev, [activeTabPath]: editorValueRef.current }));
+    if (!activeEditorPath) return;
+    await invoke("write_file", { path: activeEditorPath, content: editorValueRef.current });
+    setOpenTabs((prev) => prev.map((tab) => (tab.path === activeEditorPath ? { ...tab, dirty: false } : tab)));
+    setTabContent((prev) => ({ ...prev, [activeEditorPath]: editorValueRef.current }));
   };
 
   useEffect(() => {
-    if (!activeTabPath) return;
+    if (!activeEditorPath) return;
     if (suppressDirtyRef.current) {
       suppressDirtyRef.current = false;
       setOpenTabs((prev) =>
         prev.map((tab) =>
-          tab.path === activeTabPath ? { ...tab, dirty: false } : tab,
+          tab.path === activeEditorPath ? { ...tab, dirty: false } : tab,
         ),
       );
       return;
     }
-    const baseline = tabContent[activeTabPath] ?? "";
+    const baseline = tabContent[activeEditorPath] ?? "";
     const isDirty = editorValueRef.current !== baseline;
     setOpenTabs((prev) =>
       prev.map((tab) =>
-        tab.path === activeTabPath ? { ...tab, dirty: isDirty } : tab,
+        tab.path === activeEditorPath ? { ...tab, dirty: isDirty } : tab,
       ),
     );
-  }, [editorChangeTick]);
+  }, [editorChangeTick, activeEditorPath, tabContent]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1471,6 +1616,10 @@ export function App() {
         }
         if (contextMenu) {
           setContextMenu(null);
+          return;
+        }
+        if (tabMenu) {
+          setTabMenu(null);
           return;
         }
         if (showProjectInfo && activeTabPath === PROJECT_DESCRIPTOR_TAB) {
@@ -1519,16 +1668,23 @@ export function App() {
           setDescriptorViewMode((prev) => (prev === "view" ? "json" : "view"));
           return;
         }
-        if (editorRef.current && activeTabPath) {
-          pendingEditorContentRef.current = editorValueRef.current;
-          pendingEditorPathRef.current = activeTabPath;
+        if (activeTabMeta?.kind === "diagram") {
+          if (activeTabMeta.sourcePath) {
+            void selectTab(activeTabMeta.sourcePath);
+          }
+          return;
         }
-        setEditorViewMode((prev) => (prev === "text" ? "diagram" : "text"));
+        if (!activeEditorPath) return;
+        if (editorRef.current && activeEditorPath) {
+          pendingEditorContentRef.current = editorValueRef.current;
+          pendingEditorPathRef.current = activeEditorPath;
+        }
+        openDiagramViewTab(activeEditorPath);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeTabPath, contextMenu, openMenu, showAiSettings, showExport, showNewFile, showNewProject, showOpenProject, showSettings]);
+  }, [activeTabPath, activeTabMeta, activeEditorPath, contextMenu, openMenu, showAiSettings, showExport, showNewFile, showNewProject, showOpenProject, showSettings, tabMenu]);
 
   const resetEndpointDraft = () => {
     setEndpointDraft({ name: "", url: "", type: "chat", model: "", token: "" });
@@ -1743,6 +1899,20 @@ export function App() {
     const symbolCount = deferredUnresolved.length;
     return { fileCount, symbolCount };
   }, [deferredUnresolved]);
+
+  const dataViewSymbols = useMemo(() => {
+    if (!dataExcludeStdlib || !libraryPath) return deferredSymbols;
+    const libPrefix = libraryPath.toLowerCase();
+    return deferredSymbols.filter((symbol) => !(symbol.file_path || "").toLowerCase().startsWith(libPrefix));
+  }, [deferredSymbols, dataExcludeStdlib, libraryPath]);
+  const dataViewSymbolKindCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    dataViewSymbols.forEach((symbol) => {
+      const key = symbol.kind || "Unknown";
+      counts.set(key, (counts.get(key) || 0) + 1);
+    });
+    return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
+  }, [dataViewSymbols]);
 
   type SymbolNode = {
     name: string;
@@ -2270,7 +2440,7 @@ export function App() {
       const issue = row.issue;
       return (
         <div
-          style={{ ...style, paddingLeft: `${modelSectionIndent}px` }}
+          style={{ ...style, paddingLeft: `${modelSectionIndent + 8}px` }}
           className={`error-row ${isFocused ? "model-row-focused" : ""}`}
           role="button"
           tabIndex={-1}
@@ -2295,8 +2465,11 @@ export function App() {
             });
           }}
         >
-          <div className="error-title">{issue.file_path}:{issue.line}:{issue.column}</div>
-          <div className="error-message">{issue.message}</div>
+          <span className="error-icon" aria-hidden="true" />
+          <div className="error-text">
+            <div className="error-message">{issue.message}</div>
+            <div className="error-title">{issue.file_path}:{issue.line}:{issue.column}</div>
+          </div>
         </div>
       );
     }
@@ -2351,9 +2524,9 @@ export function App() {
   };
 
   const fileSymbols = useMemo(() => {
-    if (!activeTabPath) return [];
-    return deferredSymbols.filter((symbol) => symbol.file_path === activeTabPath);
-  }, [deferredSymbols, activeTabPath]);
+    if (!activeDiagramPath) return [];
+    return deferredSymbols.filter((symbol) => symbol.file_path === activeDiagramPath);
+  }, [deferredSymbols, activeDiagramPath]);
 
   const symbolByQualified = useMemo(() => {
     const map = new Map<string, typeof symbols[number]>();
@@ -2632,7 +2805,20 @@ export function App() {
               <button type="button">Project Panel</button>
               <button type="button">Model Panel</button>
               <div className="menu-divider" />
-              <button type="button" onClick={() => { setShowSettings(true); setOpenMenu(null); }}>Settings…</button>
+              <button type="button" onClick={() => { setOpenMenu(null); openAiViewTab(); }}>AI View</button>
+              <button type="button" onClick={() => { setOpenMenu(null); openDataViewTab(); }}>Data Analysis View</button>
+              <button
+                type="button"
+                onClick={() => {
+                  setOpenMenu(null);
+                  if (activeEditorPath) openDiagramViewTab(activeEditorPath);
+                }}
+                disabled={!activeEditorPath}
+              >
+                Diagram View
+              </button>
+              <div className="menu-divider" />
+              <button type="button" onClick={() => { setShowSettings(true); setOpenMenu(null); }}>Settings?</button>
               <button type="button">Logs</button>
             </div>
               ) : null}
@@ -2759,20 +2945,33 @@ export function App() {
                   <button
                     key={tab.path}
                     type="button"
-                    className={`tab ${tab.path === activeTabPath ? "active" : ""}`}
+                    className={`tab tab-kind-${tabKindClass(tab)} ${tab.path === activeTabPath ? "active" : ""}`}
+                    draggable
                     onClick={() => selectTab(tab.path)}
+                    onDragStart={() => {
+                      draggedTabPathRef.current = tab.path;
+                    }}
+                    onDragOver={(event) => {
+                      event.preventDefault();
+                    }}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      const fromPath = draggedTabPathRef.current;
+                      if (fromPath) {
+                        reorderTabs(fromPath, tab.path);
+                      }
+                    }}
+                    onDragEnd={() => {
+                      draggedTabPathRef.current = null;
+                    }}
                       onContextMenu={(event) => {
                         event.preventDefault();
                         event.stopPropagation();
                         setActiveTabPath(tab.path);
-                        if (tab.path === PROJECT_DESCRIPTOR_TAB) {
-                          setEditorViewMode("text");
-                          setDescriptorViewMode((prev) => (prev === "view" ? "json" : "view"));
-                          return;
-                        }
-                        setEditorViewMode((prev) => (prev === "text" ? "diagram" : "text"));
+                        setTabMenu({ x: event.clientX, y: event.clientY, path: tab.path });
                       }}
                     >
+                    <span className="tab-icon" aria-hidden="true">{tabIcon(tab)}</span>
                     <span className="tab-label">{tab.name}</span>
                     {tab.dirty ? <span className="tab-dirty" aria-hidden="true">•</span> : null}
                     <span className="tab-close" onClick={(event) => { event.stopPropagation(); closeTab(tab.path); }}>x</span>
@@ -2782,16 +2981,116 @@ export function App() {
                 <div className="muted">No files open.</div>
               )}
             </div>
-              {openTabs.length > 6 ? (
-                <select className="tab-dropdown" value={activeTabPath || ""} onChange={(event) => selectTab(event.target.value)}>
-                  {openTabs.map((tab) => (
-                    <option key={tab.path} value={tab.path}>{tab.name}</option>
-                  ))}
-                </select>
+              {openTabs.length ? (
+                <div className="tab-overflow">
+                  <button
+                    type="button"
+                    className="tab-overflow-btn"
+                    title="Tab overflow"
+                    onClick={() => setTabOverflowOpen((prev) => !prev)}
+                  >
+                    v
+                  </button>
+                  {tabOverflowOpen ? (
+                    <div className="tab-overflow-menu">
+                      {openTabs.map((tab) => (
+                        <button
+                          key={tab.path}
+                          type="button"
+                          className={tab.path === activeTabPath ? "active" : ""}
+                          onClick={() => {
+                            setTabOverflowOpen(false);
+                            void selectTab(tab.path);
+                          }}
+                        >
+                          {tabIcon(tab)} {tab.name}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
               ) : null}
             </div>
             <div className="editor-host" id="monaco-root">
-              {!activeTabPath ? (
+              {activeTabMeta?.kind === "ai" ? (
+                <div className="ai-view">
+                  <div className="view-header">
+                    <div className="view-title">AI</div>
+                    <button type="button" className="ghost" onClick={() => setShowAiSettings(true)}>Settings</button>
+                  </div>
+                  <div className="ai-pane">
+                    <div className="ai-messages">
+                      {aiMessages.length ? (
+                        aiMessages.map((msg, idx) => (
+                          <div key={idx} className={`ai-message ${msg.role}`}>{msg.text}</div>
+                        ))
+                      ) : (
+                        <div className="muted">Ask about your model.</div>
+                      )}
+                    </div>
+                    <div className="ai-input">
+                      <textarea
+                        value={aiInput}
+                        onChange={(e) => setAiInput(e.target.value)}
+                        placeholder="Type a prompt..."
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const text = aiInput.trim();
+                          if (!text) return;
+                          void sendAiMessage(text);
+                        }}
+                      >
+                        Send
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ) : activeTabMeta?.kind === "data" ? (
+                <div className="data-view">
+                  <div className="view-header">
+                    <div className="view-title">Data Analysis</div>
+                    <label className="view-toggle">
+                      <input
+                        type="checkbox"
+                        checked={dataExcludeStdlib}
+                        onChange={(event) => setDataExcludeStdlib(event.target.checked)}
+                      />
+                      <span>Exclude stdlib</span>
+                    </label>
+                  </div>
+                  <div className="data-grid">
+                    <div className="data-card">
+                      <div className="data-card-label">Project</div>
+                      <div className="data-card-value">{projectCounts.fileCount} files / {projectCounts.symbolCount} symbols</div>
+                    </div>
+                    <div className="data-card">
+                      <div className="data-card-label">Library</div>
+                      <div className="data-card-value">{libraryCounts.fileCount} files / {libraryCounts.symbolCount} symbols</div>
+                    </div>
+                    <div className="data-card">
+                      <div className="data-card-label">Errors</div>
+                      <div className="data-card-value">{errorCounts.fileCount} files / {errorCounts.symbolCount} issues</div>
+                    </div>
+                  </div>
+                  <div className="data-section">
+                    <div className="data-section-title">Top symbol kinds</div>
+                    {dataViewSymbolKindCounts.length ? (
+                      <div className="data-list">
+                        {dataViewSymbolKindCounts.slice(0, 12).map(([kind, count]) => (
+                          <div key={kind} className="data-row">
+                            <span className="data-row-label">{kind}</span>
+                            <span className="data-row-value">{count}</span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="muted">No symbols yet.</div>
+                    )}
+                  </div>
+                </div>
+              ) : !activeTabPath ? (
                 <div className="editor-placeholder">
                   <div className="welcome-screen">
                       <div className="welcome-title">Welcome to Mercurio</div>
@@ -2800,7 +3099,7 @@ export function App() {
                         <button type="button" className="ghost" onClick={openNewProjectDialog}>New Project</button>
                         <button type="button" className="ghost" onClick={chooseProject}>Open Project</button>
                       </div>
-                      <div className="welcome-hint">Tip: Press F10 to toggle diagram view.</div>
+                      <div className="welcome-hint">Tip: Press F10 to open the diagram view.</div>
                     </div>
                   </div>
               ) : activeTabPath === PROJECT_DESCRIPTOR_TAB ? (
@@ -2839,7 +3138,7 @@ export function App() {
                     </pre>
                   )}
                 </div>
-              ) : editorViewMode === "text" ? (
+              ) : activeTabMeta?.kind !== "diagram" ? (
                 <MonacoEditor
                   defaultValue=""
                   onChange={(value) => {
@@ -2859,13 +3158,13 @@ export function App() {
               ) : (
                 <div className="diagram-surface">
                   <div className="diagram-header">
-                  <span>Diagram view (F10 to toggle)</span>
+                  <span>Diagram view</span>
                   <div className="diagram-controls">
                     <button
                       type="button"
                       className="ghost toggle-btn"
-                      onClick={() => setEditorViewMode("text")}
-                      title="Switch to text (F10)"
+                      onClick={() => setCenterView("file")}
+                      title="Switch to text"
                     >
                       Text
                     </button>
@@ -3045,7 +3344,7 @@ export function App() {
                     </>
                   ) : (
                     <div className="diagram-placeholder">
-                      No symbols found for {activeTabPath ? activeTabPath.split(/[\\/]/).pop() : "file"}.
+                      No symbols found for {activeDiagramPath ? activeDiagramPath.split(/[\\/]/).pop() : "file"}.
                     </div>
                   )}
                 </div>
@@ -3074,29 +3373,16 @@ export function App() {
           {rightCollapsed ? null : (
             <section className="panel sidebar">
               <div className="panel-header">
-              <select
-                className="ghost pane-select"
-                value={rightPaneMode}
-                onChange={(event) => setRightPaneMode(event.target.value as "model" | "ai")}
-                aria-label="Right pane mode"
-              >
-                <option value="model">Model</option>
-                <option value="ai">AI</option>
-              </select>
-            {rightPaneMode === "model" ? (
               <button type="button" className="ghost" onClick={() => setCollapseAllModel((prev) => !prev)}>
                 {collapseAllModel ? "Expand all" : "Collapse all"}
               </button>
-            ) : null}
-              {rightPaneMode === "model" ? (
-                <button
-                  type="button"
-                  className={`ghost icon-properties ${showPropertiesPane ? "active" : ""}`}
-                  onClick={() => setShowPropertiesPane((prev) => !prev)}
-                  aria-label="Toggle properties"
-                  title={showPropertiesPane ? "Hide properties" : "Show properties"}
-                />
-              ) : null}
+              <button
+                type="button"
+                className={`ghost icon-properties ${showPropertiesPane ? "active" : ""}`}
+                onClick={() => setShowPropertiesPane((prev) => !prev)}
+                aria-label="Toggle properties"
+                title={showPropertiesPane ? "Hide properties" : "Show properties"}
+              />
               <button
                 type="button"
                 className="ghost collapse-btn"
@@ -3108,11 +3394,7 @@ export function App() {
               >
                 »
               </button>
-              {rightPaneMode === "ai" ? (
-                <button type="button" className="ghost icon-gear" onClick={() => setShowAiSettings(true)} aria-label="AI settings" title="AI settings" />
-              ) : null}
             </div>
-          {rightPaneMode === "model" ? (
             <div
               className={`model-pane ${showPropertiesPane ? "" : "no-properties"}`}
               style={{ ["--model-tree-height" as string]: `${modelTreeHeight}px` }}
@@ -3221,39 +3503,42 @@ export function App() {
                 </>
               ) : null}
             </div>
-          ) : (
-            <div className="ai-pane">
-              <div className="ai-messages">
-                {aiMessages.length ? (
-                  aiMessages.map((msg, idx) => (
-                    <div key={idx} className={`ai-message ${msg.role}`}>{msg.text}</div>
-                  ))
-                ) : (
-                  <div className="muted">Ask about your model.</div>
-                )}
-              </div>
-              <div className="ai-input">
-                <textarea
-                  value={aiInput}
-                  onChange={(e) => setAiInput(e.target.value)}
-                  placeholder="Type a prompt..."
-                />
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const text = aiInput.trim();
-                      if (!text) return;
-                      void sendAiMessage(text);
-                    }}
-                  >
-                    Send
-                  </button>
-              </div>
-            </div>
-          )}
             </section>
           )}
       </main>
+        {tabMenu ? (
+          <div className="context-menu tab-menu" style={{ left: tabMenu.x, top: tabMenu.y }}>
+            <button
+              type="button"
+              onClick={() => {
+                closeTab(tabMenu.path);
+                setTabMenu(null);
+              }}
+            >
+              Close
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                closeOtherTabs(tabMenu.path);
+                setTabMenu(null);
+              }}
+              disabled={openTabs.length <= 1}
+            >
+              Close Others
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                closeAllTabs();
+                setTabMenu(null);
+              }}
+              disabled={!openTabs.length}
+            >
+              Close All
+            </button>
+          </div>
+        ) : null}
         {contextMenu ? (
           <div className="context-menu" style={{ left: contextMenu.x, top: contextMenu.y }}>
             {contextMenu.scope === "root" ? (
@@ -3657,7 +3942,7 @@ export function App() {
             {errorCounts.symbolCount ? (
               <span className="status-error-badge">{errorCounts.symbolCount}</span>
             ) : null}
-            {cursorPos && activeTabPath && activeTabPath !== PROJECT_DESCRIPTOR_TAB ? (
+            {cursorPos && activeEditorPath ? (
               <span className="status-cursor">Ln {cursorPos.line}, Col {cursorPos.col}</span>
             ) : null}
             <span

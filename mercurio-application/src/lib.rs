@@ -722,7 +722,7 @@ async fn ai_test_endpoint(payload: AiEndpointPayload) -> Result<serde_json::Valu
         serde_json::json!({
             "model": payload.model.unwrap_or_else(|| "gpt-4o-mini".to_string()),
             "messages": [{ "role": "user", "content": "ping" }],
-            "max_tokens": 1,
+            "max_completion_tokens": 1,
         })
     };
     let client = reqwest::Client::new();
@@ -747,7 +747,7 @@ async fn ai_chat_completion(payload: AiChatPayload) -> Result<serde_json::Value,
     let body = serde_json::json!({
         "model": payload.model.unwrap_or_else(|| "gpt-4o-mini".to_string()),
         "messages": payload.messages,
-        "max_tokens": payload.max_tokens.unwrap_or(512),
+        "max_completion_tokens": payload.max_tokens.unwrap_or(512),
     });
     let client = reqwest::Client::new();
     let mut request = client.post(url).header("Content-Type", "application/json");
