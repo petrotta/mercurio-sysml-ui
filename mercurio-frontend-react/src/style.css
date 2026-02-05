@@ -485,6 +485,65 @@ body.theme-light .ghost.active {
   color: #7fb1ff;
 }
 
+.icon-track {
+  width: 28px;
+  height: 28px;
+  position: relative;
+}
+
+.icon-track::before {
+  content: "";
+  position: absolute;
+  inset: 6px;
+  border-radius: 50%;
+  border: 2px solid #9aa0a6;
+}
+
+.icon-track::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  transform: translate(-50%, -50%);
+  background:
+    linear-gradient(#9aa0a6, #9aa0a6) 50% 0 / 2px 12px no-repeat,
+    linear-gradient(#9aa0a6, #9aa0a6) 0 50% / 12px 2px no-repeat;
+}
+
+body.theme-light .icon-track::before {
+  border-color: #7a8aa0;
+}
+
+body.theme-light .icon-track::after {
+  background:
+    linear-gradient(#7a8aa0, #7a8aa0) 50% 0 / 2px 12px no-repeat,
+    linear-gradient(#7a8aa0, #7a8aa0) 0 50% / 12px 2px no-repeat;
+}
+
+.icon-track.active::before {
+  border-color: #7fb1ff;
+  box-shadow: 0 0 0 2px rgba(127, 177, 255, 0.3);
+}
+
+.icon-track.active::after {
+  background:
+    linear-gradient(#7fb1ff, #7fb1ff) 50% 0 / 2px 12px no-repeat,
+    linear-gradient(#7fb1ff, #7fb1ff) 0 50% / 12px 2px no-repeat;
+}
+
+body.theme-light .icon-track.active::before {
+  border-color: #4a7ac8;
+  box-shadow: 0 0 0 2px rgba(74, 122, 200, 0.25);
+}
+
+body.theme-light .icon-track.active::after {
+  background:
+    linear-gradient(#4a7ac8, #4a7ac8) 50% 0 / 2px 12px no-repeat,
+    linear-gradient(#4a7ac8, #4a7ac8) 0 50% / 12px 2px no-repeat;
+}
+
 body.theme-light .icon-info::before {
   border-color: #7a8aa0;
 }

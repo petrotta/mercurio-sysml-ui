@@ -5,23 +5,36 @@ import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import MonacoEditor, { loader, type OnMount } from "@monaco-editor/react";
 import { listen } from "@tauri-apps/api/event";
-import { List, type ListImperativeAPI, type RowComponentProps } from "react-window";
 import {
   AI_CHAT_KEY,
   AI_EMBEDDINGS_KEY,
   AI_ENDPOINTS_KEY,
-  AI_VIEW_TAB,
-  DATA_VIEW_TAB,
   PROJECT_DESCRIPTOR_TAB,
   PROJECT_LOCATION_KEY,
   ROOT_STORAGE_KEY,
   THEME_KEY,
 } from "./app/constants";
 import { loadRecents, saveRecents } from "./app/storage";
-import { makeDiagramTabId, makeDiagramTabName } from "./app/tabs";
+import { useEditorState } from "./app/editorState";
 import { AiView } from "./app/components/AiView";
-import { TabBar } from "./app/components/TabBar";
-import type { FileEntry, OpenTab } from "./app/types";
+import { ModelPane } from "./app/components/ModelPane";
+import { ModelHeader } from "./app/components/ModelHeader";
+import { EditorPane } from "./app/components/EditorPane";
+import { ProjectTree } from "./app/components/ProjectTree";
+import { DataView } from "./app/components/DataView";
+import { DescriptorView } from "./app/components/DescriptorView";
+import { DiagramView } from "./app/components/DiagramView";
+import { getKindKey, renderTypeIcon } from "./app/diagramIcons";
+import { useModelTracking } from "./app/useModelTracking";
+import { useDiagramView } from "./app/useDiagramView";
+import { useModelTree } from "./app/useModelTree";
+import { useModelTreeSelection } from "./app/useModelTreeSelection";
+import { createModelRowRenderer } from "./app/modelRowRenderer";
+import { useModelGroups } from "./app/useModelGroups";
+import { useTabs } from "./app/useTabs";
+import { useEditorNavigation } from "./app/useEditorNavigation";
+import { useCompileRunner } from "./app/useCompileRunner";
+import type { FileEntry, OpenTab, SymbolView } from "./app/types";
 
 loader.config({ paths: { vs: "/monaco/vs" } });
 
@@ -44,14 +57,25 @@ export function App() {
   const [recentProjects, setRecentProjects] = useState<string[]>(() => loadRecents());
   const [treeEntries, setTreeEntries] = useState<FileEntry[]>([]);
   const [expanded, setExpanded] = useState<Record<string, FileEntry[]>>({});
-  const editorValueRef = useRef("");
-  const editorChangeRafRef = useRef<number | null>(null);
-  const [editorChangeTick, setEditorChangeTick] = useState(0);
+  const {
+    editorValueRef,
+    editorChangeTick,
+    cursorPos,
+    updateCursorPos,
+    onEditorChange,
+    activeDoc,
+    setActiveEditorDoc,
+    queuePendingEditorContent,
+    clearPendingEditorContent,
+    consumePendingEditorContent,
+    markSaved,
+    getDoc,
+    currentFilePathRef,
+  } = useEditorState();
   const [openTabs, setOpenTabs] = useState<OpenTab[]>([]);
   const [activeTabPath, setActiveTabPath] = useState<string | null>(null);
   const activeTabPathRef = useRef<string | null>(null);
   const [descriptorViewMode, setDescriptorViewMode] = useState<"view" | "json">("view");
-  const [tabContent, setTabContent] = useState<Record<string, string>>({});
   const suppressDirtyRef = useRef(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; entry: FileEntry; scope: "root" | "node" } | null>(null);
   const [tabMenu, setTabMenu] = useState<{ x: number; y: number; path: string } | null>(null);
@@ -90,7 +114,7 @@ export function App() {
   const [newProjectBusy, setNewProjectBusy] = useState(false);
   const [newProjectError, setNewProjectError] = useState("");
   const [centerView, setCenterView] = useState<"file" | "diagram" | "ai" | "data">("file");
-  const [cursorPos, setCursorPos] = useState<{ line: number; col: number } | null>(null);
+  // cursorPos is managed by useEditorState
   const [aiInput, setAiInput] = useState("");
   const [aiMessages, setAiMessages] = useState<Array<{
     role: "user" | "assistant";
@@ -137,57 +161,30 @@ export function App() {
   }>({ name: "", url: "", type: "chat", provider: "openai", model: "", token: "" });
   const [endpointTestStatus, setEndpointTestStatus] = useState<Record<string, string>>({});
   const aiRequestRef = useRef(0);
-  const [, setCompileStatus] = useState("Background compile: idle");
-  const [compileRunId, setCompileRunId] = useState<number | null>(null);
-  const [compileToast, setCompileToast] = useState<{
-    open: boolean;
-    ok: boolean | null;
-    lines: string[];
-    parseErrors: Array<{ path: string; errors: string[] }>;
-    details: string[];
-    parsedFiles: string[];
-  }>({
-    open: false,
-    ok: null,
-    lines: [],
-    parseErrors: [],
-    details: [],
-    parsedFiles: [],
-  });
-  const compileToastTimerRef = useRef<number | null>(null);
-  const backgroundCompileRef = useRef<number | null>(null);
-  const backgroundCompileTokenRef = useRef(0);
-  const [backgroundCompileEnabled, setBackgroundCompileEnabled] = useState(true);
-  const [projectSymbolsLoaded, setProjectSymbolsLoaded] = useState(false);
+  const {
+    setCompileStatus,
+    compileRunId,
+    compileToast,
+    setCompileToast,
+    runCompile,
+    cancelCompile,
+    runBackgroundCompile,
+    runBackgroundCompileWithUnsaved,
+    cancelBackgroundCompile,
+    backgroundCompileEnabled,
+    setBackgroundCompileEnabled,
+    backgroundCompileActive,
+    symbols,
+    unresolved,
+    libraryPath,
+    projectSymbolsLoaded,
+  } = useCompileRunner({ rootPath });
   const [dataExcludeStdlib, setDataExcludeStdlib] = useState(true);
-  const [symbols, setSymbols] = useState<Array<{
-    name: string;
-    kind: string;
-    file_path: string;
-    qualified_name: string;
-    file: number;
-    start_line: number;
-    start_col: number;
-    end_line: number;
-    end_col: number;
-    doc?: string | null;
-    properties: Array<{
-      name: string;
-      label: string;
-      value: { type: "text"; value: string } | { type: "list"; items: string[] } | { type: "bool"; value: boolean } | { type: "number"; value: number };
-      hint?: string | null;
-      group?: string | null;
-    }>;
-  }>>([]);
-  const [unresolved, setUnresolved] = useState<Array<{ file_path: string; message: string; line: number; column: number }>>([]);
-  const [libraryPath, setLibraryPath] = useState<string | null>(null);
-  const [selectedSymbol, setSelectedSymbol] = useState<typeof symbols[number] | null>(null);
-  const [currentFilePath, setCurrentFilePath] = useState<string | null>(null);
-  const currentFilePathRef = useRef<string | null>(null);
+  const [selectedSymbol, setSelectedSymbol] = useState<SymbolView | null>(null);
   const [modelTreeHeight, setModelTreeHeight] = useState(260);
-  const [modelTreeViewportHeight, setModelTreeViewportHeight] = useState(0);
   const [collapseAllModel, setCollapseAllModel] = useState(false);
   const [showPropertiesPane, setShowPropertiesPane] = useState(true);
+  const [trackText, setTrackText] = useState(false);
   const [modelExpanded, setModelExpanded] = useState<Record<string, boolean>>({});
   const [modelSectionOpen, setModelSectionOpen] = useState({ project: true, library: true, errors: true });
   const modelTreeRef = useRef<HTMLDivElement | null>(null);
@@ -197,12 +194,11 @@ export function App() {
     name?: string;
     selection?: { startLine: number; startCol: number; endLine: number; endCol: number };
   } | null>(null);
+  const lastCompiledContentRef = useRef<Record<string, string>>({});
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
   const cursorListenerRef = useRef<null | { dispose: () => void }>(null);
   const parseReqRef = useRef(0);
-  const pendingEditorContentRef = useRef<string | null>(null);
-  const pendingEditorPathRef = useRef<string | null>(null);
     const editorOptions: Parameters<typeof MonacoEditor>[0]["options"] = {
       minimap: { enabled: false },
       fontSize: 14,
@@ -212,45 +208,7 @@ export function App() {
       occurrencesHighlight: "off",
       automaticLayout: true,
     };
-  const [diagramScale, setDiagramScale] = useState(1);
-  const [diagramOffset, setDiagramOffset] = useState({ x: 0, y: 0 });
-  const diagramPanRef = useRef<null | { x: number; y: number; startX: number; startY: number }>(null);
-  const diagramBodyRef = useRef<HTMLDivElement | null>(null);
-  const diagramViewportRef = useRef<null | { startX: number; startY: number; baseX: number; baseY: number }>(null);
-  const [diagramViewport, setDiagramViewport] = useState<{ x: number; y: number; width: number; height: number }>({
-    x: 0,
-    y: 0,
-    width: 80,
-    height: 60,
-  });
-  const [diagramNodeOffsets, setDiagramNodeOffsets] = useState<Record<string, { x: number; y: number }>>({});
-  const [diagramNodeSizes, setDiagramNodeSizes] = useState<Record<string, { width: number; height: number }>>({});
   const [syncDiagramSelection, setSyncDiagramSelection] = useState(false);
-  const diagramDragRef = useRef<null | {
-    node: string;
-    startX: number;
-    startY: number;
-    base: { x: number; y: number };
-  }>(null);
-  const diagramResizeRef = useRef<null | {
-    node: string;
-    startX: number;
-    startY: number;
-    base: { width: number; height: number };
-  }>(null);
-  const diagramBoundsRef = useRef<Record<string, { minX: number; maxX: number; minY: number; maxY: number }>>({});
-  const diagramWorkerRef = useRef<Worker | null>(null);
-  const diagramLayoutReqRef = useRef(0);
-  const diagramRafRef = useRef<number | null>(null);
-  const diagramPendingRef = useRef<{ offsets?: Record<string, { x: number; y: number }>; sizes?: Record<string, { width: number; height: number }> }>({});
-  const diagramPanRafRef = useRef<number | null>(null);
-  const diagramPanPendingRef = useRef<{ x: number; y: number } | null>(null);
-  const [diagramLayout, setDiagramLayout] = useState<DiagramLayout | null>(null);
-  const [palettePos, setPalettePos] = useState({ x: 16, y: 16 });
-  const paletteDragRef = useRef<null | { startX: number; startY: number; baseX: number; baseY: number }>(null);
-  const [diagramManualNodes, setDiagramManualNodes] = useState<Array<{ id: string; type: string; name: string; x: number; y: number; width: number; height: number; pending: boolean }>>([]);
-  const paletteCreateRef = useRef<null | { type: string; name: string; startX: number; startY: number }>(null);
-  const [paletteGhost, setPaletteGhost] = useState<null | { x: number; y: number; type: string }>(null);
   const fsChangeTimerRef = useRef<number | null>(null);
   const activeTabMeta = useMemo(
     () => openTabs.find((tab) => tab.path === activeTabPath) || null,
@@ -280,8 +238,8 @@ export function App() {
   }, [activeTabPath]);
 
   useEffect(() => {
-    currentFilePathRef.current = currentFilePath;
-  }, [currentFilePath]);
+    currentFilePathRef.current = activeDoc.path;
+  }, [activeDoc, currentFilePathRef]);
 
   useEffect(() => {
     const onDocClick = (event: MouseEvent) => {
@@ -322,19 +280,6 @@ export function App() {
       window.localStorage?.removeItem(AI_EMBEDDINGS_KEY);
     }
   }, [selectedEmbeddingsEndpoint]);
-
-  useEffect(() => {
-    const worker = new Worker(new URL("./diagramWorker.ts", import.meta.url), { type: "module" });
-    diagramWorkerRef.current = worker;
-    return () => {
-      worker.terminate();
-      diagramWorkerRef.current = null;
-    };
-  }, []);
-
-  useEffect(() => {
-    setProjectSymbolsLoaded(false);
-  }, [rootPath]);
 
   const rememberProjectLocation = (path: string) => {
     if (!path) return;
@@ -531,139 +476,6 @@ export function App() {
     void runBackgroundCompile(rootPath);
   }, [rootPath, backgroundCompileEnabled]);
 
-  useEffect(() => {
-    const container = modelTreeRef.current;
-    if (!container) return;
-    const updateHeight = () => {
-      setModelTreeViewportHeight(container.clientHeight);
-    };
-    updateHeight();
-    const resizeObserver = new ResizeObserver(() => updateHeight());
-    resizeObserver.observe(container);
-    return () => resizeObserver.disconnect();
-  }, [modelTreeHeight, showPropertiesPane]);
-
-  useEffect(() => {
-    const onMove = (event: PointerEvent) => {
-      if (diagramDragRef.current) {
-        const { node, startX, startY, base } = diagramDragRef.current;
-        const deltaX = event.clientX - startX;
-        const deltaY = event.clientY - startY;
-        const bounds = diagramBoundsRef.current[node];
-        const nextX = base.x + deltaX;
-        const nextY = base.y + deltaY;
-        const clampedX = bounds ? Math.min(bounds.maxX, Math.max(bounds.minX, nextX)) : nextX;
-        const clampedY = bounds ? Math.min(bounds.maxY, Math.max(bounds.minY, nextY)) : nextY;
-        diagramPendingRef.current.offsets = {
-          ...(diagramPendingRef.current.offsets || {}),
-          [node]: { x: clampedX, y: clampedY },
-        };
-      }
-      if (diagramResizeRef.current) {
-        const { node, startX, startY, base } = diagramResizeRef.current;
-        const deltaX = event.clientX - startX;
-        const deltaY = event.clientY - startY;
-        diagramPendingRef.current.sizes = {
-          ...(diagramPendingRef.current.sizes || {}),
-          [node]: {
-            width: Math.max(120, base.width + deltaX),
-            height: Math.max(60, base.height + deltaY),
-          },
-        };
-      }
-      if (diagramDragRef.current || diagramResizeRef.current) {
-        if (diagramRafRef.current == null) {
-          diagramRafRef.current = window.requestAnimationFrame(() => {
-            const pending = diagramPendingRef.current;
-            if (pending.offsets) {
-              setDiagramNodeOffsets((prev) => ({ ...prev, ...pending.offsets }));
-            }
-            if (pending.sizes) {
-              setDiagramNodeSizes((prev) => ({ ...prev, ...pending.sizes }));
-            }
-            diagramPendingRef.current = {};
-            diagramRafRef.current = null;
-          });
-        }
-      }
-      if (paletteDragRef.current) {
-        const deltaX = event.clientX - paletteDragRef.current.startX;
-        const deltaY = event.clientY - paletteDragRef.current.startY;
-        setPalettePos({
-          x: paletteDragRef.current.baseX + deltaX,
-          y: paletteDragRef.current.baseY + deltaY,
-        });
-      }
-      if (paletteCreateRef.current) {
-        setPaletteGhost({ x: event.clientX, y: event.clientY, type: paletteCreateRef.current.type });
-      }
-    };
-    const onUp = () => {
-      diagramDragRef.current = null;
-      diagramResizeRef.current = null;
-      diagramViewportRef.current = null;
-      paletteDragRef.current = null;
-      if (paletteCreateRef.current && diagramBodyRef.current) {
-        const body = diagramBodyRef.current.getBoundingClientRect();
-        const within =
-          paletteGhost &&
-          paletteGhost.x >= body.left &&
-          paletteGhost.x <= body.right &&
-          paletteGhost.y >= body.top &&
-          paletteGhost.y <= body.bottom;
-        if (within) {
-          const x = (paletteGhost!.x - body.left - diagramOffset.x) / diagramScale;
-          const y = (paletteGhost!.y - body.top - diagramOffset.y) / diagramScale;
-          const tempId = crypto.randomUUID();
-          const tempName = `temp-${paletteCreateRef.current!.name.toLowerCase()}`;
-          setDiagramManualNodes((prev) => [
-            ...prev,
-            {
-              id: tempId,
-              type: paletteCreateRef.current!.type,
-              name: tempName,
-              x,
-              y,
-              width: 180,
-              height: 120,
-              pending: true,
-            },
-          ]);
-          if (!rootPath || !activeTabPath) {
-            setCompileStatus("Select a file before creating a package");
-            setDiagramManualNodes((prev) => prev.filter((node) => node.id !== tempId));
-          } else {
-            invoke("create_package", {
-              payload: {
-                root: rootPath,
-                file: activeTabPath,
-                name: `Package_${Date.now()}`,
-              },
-            })
-              .then(() => {
-                setDiagramManualNodes((prev) => prev.filter((node) => node.id !== tempId));
-                void runBackgroundCompile(rootPath);
-              })
-              .catch((error) => {
-                setCompileStatus(`Create package failed: ${error}`);
-                setDiagramManualNodes((prev) =>
-                  prev.map((node) => (node.id === tempId ? { ...node, pending: false } : node)),
-                );
-              });
-          }
-        }
-      }
-      paletteCreateRef.current = null;
-      setPaletteGhost(null);
-    };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-    return () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-    };
-  }, []);
-
   const startDrag = (side: "left" | "right" | "model", event: React.PointerEvent) => {
     event.preventDefault();
     if (event.currentTarget && "setPointerCapture" in event.currentTarget) {
@@ -691,14 +503,9 @@ export function App() {
   const openProject = async (path: string) => {
     if (!path) return;
     if (compileRunId) {
-      void invoke("cancel_compile", { run_id: compileRunId }).catch(() => {});
-      setCompileRunId(null);
+      await cancelCompile();
     }
-    if (backgroundCompileRef.current) {
-      void invoke("cancel_compile", { run_id: backgroundCompileRef.current }).catch(() => {});
-      backgroundCompileRef.current = null;
-    }
-    backgroundCompileTokenRef.current += 1;
+    await cancelBackgroundCompile();
     closeAllTabs();
     setSelectedSymbol(null);
     setCenterView("file");
@@ -745,83 +552,53 @@ export function App() {
     const children = await invoke<FileEntry[]>("list_dir", { path: entry.path });
     setExpanded((prev) => ({ ...prev, [entry.path]: children || [] }));
   };
-
-  const applyEditorSelection = (
-    editor: Parameters<OnMount>[0],
-    selection?: { startLine: number; startCol: number; endLine: number; endCol: number },
-  ) => {
-    if (!selection) return;
-    editor.setSelection({
-      startLineNumber: selection.startLine || 1,
-      startColumn: selection.startCol || 1,
-      endLineNumber: selection.endLine || selection.startLine || 1,
-      endColumn: selection.endCol || selection.startCol || 1,
-    });
-    editor.revealLineInCenter(selection.startLine || 1);
-  };
-
-  const navigateTo = async (target: {
-    path: string;
-    name?: string;
-    selection?: { startLine: number; startCol: number; endLine: number; endCol: number };
-  }) => {
-    setCenterView("file");
-    const reqId = ++navReqRef.current;
-    pendingNavRef.current = target;
-    const currentPath = currentFilePathRef.current;
-    if (currentPath !== target.path) {
-      const content = await invoke<string>("read_file", { path: target.path });
-      if (reqId !== navReqRef.current) return;
-        suppressDirtyRef.current = true;
-        editorValueRef.current = content || "";
-        // Always queue content for the next editor mount in case the current ref is stale.
-        pendingEditorContentRef.current = editorValueRef.current;
-        pendingEditorPathRef.current = target.path;
-        if (editorRef.current && centerView === "file" && activeTabPathRef.current !== PROJECT_DESCRIPTOR_TAB) {
-          editorRef.current.setValue(editorValueRef.current);
-        }
-      setCurrentFilePath(target.path);
-      currentFilePathRef.current = target.path;
-      setActiveTabPath(target.path);
-      activeTabPathRef.current = target.path;
-      setOpenTabs((prev) => {
-        if (prev.some((tab) => tab.path === target.path)) return prev;
-        const name = target.name || target.path.split(/[\\/]/).pop() || "Untitled";
-        return [...prev, { path: target.path, name, dirty: false, kind: "file" }];
-      });
-      setTabContent((prev) => ({ ...prev, [target.path]: content || "" }));
-    } else {
-      const cached = tabContent[target.path];
-      if (cached != null && cached !== "") {
-        suppressDirtyRef.current = true;
-        editorValueRef.current = cached;
-        pendingEditorContentRef.current = cached;
-        pendingEditorPathRef.current = target.path;
-        if (editorRef.current && centerView === "file" && activeTabPathRef.current !== PROJECT_DESCRIPTOR_TAB) {
-          editorRef.current.setValue(cached);
-        }
-      } else {
-        const content = await invoke<string>("read_file", { path: target.path });
-        if (reqId !== navReqRef.current) return;
-        suppressDirtyRef.current = true;
-        editorValueRef.current = content || "";
-        pendingEditorContentRef.current = editorValueRef.current;
-        pendingEditorPathRef.current = target.path;
-        if (editorRef.current && centerView === "file" && activeTabPathRef.current !== PROJECT_DESCRIPTOR_TAB) {
-          editorRef.current.setValue(editorValueRef.current);
-        }
-        setTabContent((prev) => ({ ...prev, [target.path]: content || "" }));
-      }
-      setActiveTabPath(target.path);
-      activeTabPathRef.current = target.path;
-    }
-    if (reqId !== navReqRef.current) return;
-    if (editorRef.current) {
-      applyEditorSelection(editorRef.current, target.selection);
-      editorRef.current.focus();
-      pendingNavRef.current = null;
-    }
-  };
+  const { navigateTo, applyEditorSelection } = useEditorNavigation({
+    centerView,
+    setCenterView,
+    activeDocPath: activeDoc.path,
+    getDoc,
+    setActiveEditorDoc,
+    queuePendingEditorContent,
+    editorValueRef,
+    suppressDirtyRef,
+    editorRef,
+    currentFilePathRef,
+    activeTabPathRef,
+    navReqRef,
+    pendingNavRef,
+    setActiveTabPath,
+    setOpenTabs,
+  });
+  const {
+    openProjectDescriptorTab,
+    selectTab,
+    openAiViewTab,
+    openDataViewTab,
+    openDiagramViewTab,
+    reorderTabs,
+    closeTab,
+    closeAllTabs,
+    closeOtherTabs,
+  } = useTabs({
+    openTabs,
+    setOpenTabs,
+    activeTabPath,
+    setActiveTabPath,
+    activeTabPathRef,
+    setCenterView,
+    setActiveEditorDoc,
+    setDescriptorViewMode,
+    setShowProjectInfo,
+    setProjectDescriptor,
+    setHasProjectDescriptor,
+    clearPendingEditorContent,
+    editorRef,
+    navReqRef,
+    pendingNavRef,
+    selectedSymbol,
+    setSelectedSymbol,
+    navigateTo,
+  });
 
   const openFile = async (entry: FileEntry) => {
     if (entry.is_dir) {
@@ -975,257 +752,11 @@ export function App() {
   }, [rootPath]);
 
   useEffect(() => {
-    const unlistenPromise = listen<{
-      run_id: number;
-      stage: string;
-      file?: string;
-      index?: number;
-      total?: number;
-    }>("compile-progress", (event) => {
-      const payload = event.payload;
-      if (!payload) return;
-      const stage = payload.stage || "running";
-      if (payload.run_id && compileRunId && payload.run_id !== compileRunId) {
-        return;
-      }
-      const detail = payload.file ? `${stage}: ${payload.file}` : stage;
-      const prefix = compileRunId ? "Compile" : "Background compile";
-      setCompileStatus(`${prefix}: ${detail}`);
-      if (compileRunId && payload.run_id === compileRunId) {
-        setCompileToast((prev) => ({ ...prev, open: true, lines: [...prev.lines, detail].slice(-8) }));
-      }
-    });
-    return () => {
-      unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
-    };
   }, [compileRunId]);
 
-  const runCompile = async () => {
-    if (!rootPath) return;
-    if (backgroundCompileRef.current) {
-      void invoke("cancel_compile", { run_id: backgroundCompileRef.current }).catch(() => {});
-      backgroundCompileRef.current = null;
-    }
-    const runId = Date.now();
-    setCompileRunId(runId);
-    setCompileToast({ open: true, ok: null, lines: ["starting..."], parseErrors: [], details: [], parsedFiles: [] });
-    setCompileStatus("Compile: starting...");
-    try {
-      const response = await invoke<{
-        ok: boolean;
-        files?: Array<{ path: string; ok: boolean; errors: string[]; symbol_count: number }>;
-        parsed_files?: string[];
-        parse_duration_ms?: number;
-        analysis_duration_ms?: number;
-        stdlib_duration_ms?: number;
-        total_duration_ms?: number;
-        stdlib_cache_hit?: boolean;
-        symbols: Array<{
-          name: string;
-          kind: string;
-          file_path: string;
-          qualified_name: string;
-          file: number;
-          start_line: number;
-          start_col: number;
-          end_line: number;
-          end_col: number;
-          doc?: string | null;
-          properties: Array<{
-            name: string;
-            label: string;
-            value: { type: "text"; value: string } | { type: "list"; items: string[] } | { type: "bool"; value: boolean } | { type: "number"; value: number };
-            hint?: string | null;
-            group?: string | null;
-          }>;
-        }>;
-        unresolved: Array<{ file_path: string; message: string; line: number; column: number }>;
-        library_path?: string | null;
-      }>("compile_workspace", {
-        payload: {
-          root: rootPath,
-          run_id: runId,
-          allow_parse_errors: true,
-          unsaved: [],
-        },
-      });
-      setSymbols(response?.symbols || []);
-      setUnresolved(response?.unresolved || []);
-      setLibraryPath(response?.library_path ?? null);
-      setProjectSymbolsLoaded(true);
-      setProjectSymbolsLoaded(true);
-      setProjectSymbolsLoaded(true);
-      const ok = !!response?.ok;
-      const parseErrors = (response?.files || [])
-        .filter((file) => !file.ok && file.errors && file.errors.length)
-        .map((file) => ({ path: file.path, errors: file.errors }));
-      const details: string[] = [];
-      if (typeof response?.stdlib_cache_hit === "boolean") {
-        details.push(`Stdlib: ${response.stdlib_cache_hit ? "cache hit" : "reloaded"}`);
-      }
-      if (typeof response?.stdlib_duration_ms === "number") {
-        details.push(`Stdlib load: ${response.stdlib_duration_ms} ms`);
-      }
-      if (typeof response?.parse_duration_ms === "number") {
-        details.push(`Parse: ${response.parse_duration_ms} ms`);
-      }
-      if (typeof response?.analysis_duration_ms === "number") {
-        details.push(`Analysis: ${response.analysis_duration_ms} ms`);
-      }
-      if (typeof response?.total_duration_ms === "number") {
-        details.push(`Total: ${response.total_duration_ms} ms`);
-      }
-      const parsedFiles = response?.parsed_files || [];
-      if (parsedFiles.length) {
-        details.push(`Files parsed: ${parsedFiles.length}`);
-      }
-      if (response?.symbols?.length != null) {
-        details.push(`Symbols: ${response.symbols.length}`);
-      }
-      if (response?.unresolved?.length != null) {
-        details.push(`Unresolved: ${response.unresolved.length}`);
-      }
-      setCompileStatus(ok ? "Compile: complete" : "Compile: finished with errors");
-      setCompileToast((prev) => ({ ...prev, ok, open: true, parseErrors, details, parsedFiles }));
-      if (ok) {
-        if (compileToastTimerRef.current) {
-          window.clearTimeout(compileToastTimerRef.current);
-        }
-        compileToastTimerRef.current = window.setTimeout(() => {
-          setCompileToast((prev) => ({ ...prev, open: false }));
-          compileToastTimerRef.current = null;
-        }, 2000);
-      }
-    } catch (error) {
-      setCompileStatus(`Compile: failed: ${error}`);
-      setCompileToast((prev) => ({
-        ...prev,
-        ok: false,
-        open: true,
-        lines: [...prev.lines, `failed: ${String(error)}`].slice(-8),
-      }));
-    } finally {
-      setCompileRunId(null);
-    }
-  };
 
-  const cancelCompile = async () => {
-    if (!compileRunId) return;
-    await invoke("cancel_compile", { run_id: compileRunId });
-    setCompileStatus("Compile: canceling...");
-  };
 
-  const runBackgroundCompile = async (path: string) => {
-    if (!backgroundCompileEnabled || !path || compileRunId || backgroundCompileRef.current) return;
-    const runId = Date.now();
-    const token = backgroundCompileTokenRef.current;
-    backgroundCompileRef.current = runId;
-    setCompileStatus("Background compile: starting...");
-    try {
-      const response = await invoke<{
-        ok: boolean;
-        symbols: Array<{
-          name: string;
-          kind: string;
-          file_path: string;
-          qualified_name: string;
-          file: number;
-          start_line: number;
-          start_col: number;
-          end_line: number;
-          end_col: number;
-          doc?: string | null;
-          properties: Array<{
-            name: string;
-            label: string;
-            value: { type: "text"; value: string } | { type: "list"; items: string[] } | { type: "bool"; value: boolean } | { type: "number"; value: number };
-            hint?: string | null;
-            group?: string | null;
-          }>;
-        }>;
-        unresolved: Array<{ file_path: string; message: string; line: number; column: number }>;
-        library_path?: string | null;
-      }>("compile_workspace", {
-        payload: {
-          root: path,
-          run_id: runId,
-          allow_parse_errors: true,
-          unsaved: [],
-        },
-      });
-      if (token !== backgroundCompileTokenRef.current || path !== rootPath) {
-        return;
-      }
-      setSymbols(response?.symbols || []);
-      setUnresolved(response?.unresolved || []);
-      setLibraryPath(response?.library_path ?? null);
-      setCompileStatus(response?.ok ? "Background compile: complete" : "Background compile: finished with errors");
-    } catch (error) {
-      if (token === backgroundCompileTokenRef.current) {
-        setCompileStatus(`Background compile: failed: ${error}`);
-      }
-    } finally {
-      if (token === backgroundCompileTokenRef.current) {
-        backgroundCompileRef.current = null;
-      }
-    }
-  };
 
-  const runBackgroundCompileWithUnsaved = async (path: string, filePath: string, content: string) => {
-    if (!backgroundCompileEnabled || !path || compileRunId || backgroundCompileRef.current) return;
-    const runId = Date.now();
-    const token = backgroundCompileTokenRef.current;
-    backgroundCompileRef.current = runId;
-    setCompileStatus("Background compile: starting...");
-    try {
-      const response = await invoke<{
-        ok: boolean;
-        symbols: Array<{
-          name: string;
-          kind: string;
-          file_path: string;
-          qualified_name: string;
-          file: number;
-          start_line: number;
-          start_col: number;
-          end_line: number;
-          end_col: number;
-          doc?: string | null;
-          properties: Array<{
-            name: string;
-            label: string;
-            value: { type: "text"; value: string } | { type: "list"; items: string[] } | { type: "bool"; value: boolean } | { type: "number"; value: number };
-            hint?: string | null;
-            group?: string | null;
-          }>;
-        }>;
-        unresolved: Array<{ file_path: string; message: string; line: number; column: number }>;
-        library_path?: string | null;
-      }>("compile_workspace", {
-        payload: {
-          root: path,
-          run_id: runId,
-          allow_parse_errors: true,
-          unsaved: [{ path: filePath, content }],
-        },
-      });
-      if (token !== backgroundCompileTokenRef.current || path !== rootPath) {
-        return;
-      }
-      setSymbols(response?.symbols || []);
-      setUnresolved(response?.unresolved || []);
-      setLibraryPath(response?.library_path ?? null);
-      setCompileStatus(response?.ok ? "Background compile: complete" : "Background compile: finished with errors");
-    } catch (error) {
-      if (token === backgroundCompileTokenRef.current) {
-        setCompileStatus(`Background compile: failed: ${error}`);
-      }
-    } finally {
-      if (token === backgroundCompileTokenRef.current) {
-        backgroundCompileRef.current = null;
-      }
-    }
-  };
 
   const handleEditorMount: OnMount = (editorInstance, monaco) => {
     editorRef.current = editorInstance;
@@ -1235,19 +766,18 @@ export function App() {
       cursorListenerRef.current = null;
     }
     cursorListenerRef.current = editorInstance.onDidChangeCursorPosition((event) => {
-      setCursorPos({ line: event.position.lineNumber, col: event.position.column });
+      updateCursorPos(event.position.lineNumber, event.position.column);
     });
     const initialPos = editorInstance.getPosition();
     if (initialPos) {
-      setCursorPos({ line: initialPos.lineNumber, col: initialPos.column });
+      updateCursorPos(initialPos.lineNumber, initialPos.column);
     }
-    if (pendingEditorContentRef.current && (!pendingEditorPathRef.current || pendingEditorPathRef.current === currentFilePath)) {
-      editorInstance.setValue(pendingEditorContentRef.current);
-      pendingEditorContentRef.current = null;
-      pendingEditorPathRef.current = null;
+    const pendingEditorContent = consumePendingEditorContent(currentFilePathRef.current);
+    if (pendingEditorContent != null) {
+      editorInstance.setValue(pendingEditorContent);
     }
-    if (pendingNavRef.current && pendingNavRef.current.path === currentFilePath) {
-      applyEditorSelection(editorInstance, pendingNavRef.current.selection);
+    if (pendingNavRef.current && pendingNavRef.current.path === currentFilePathRef.current) {
+      applyEditorSelection(pendingNavRef.current.selection);
       editorInstance.focus();
       pendingNavRef.current = null;
     }
@@ -1368,13 +898,17 @@ export function App() {
 
   useEffect(() => {
     if (!rootPath || !activeEditorPath) return;
+    if (!activeDoc.dirty) return;
+    const content = editorValueRef.current;
+    if (lastCompiledContentRef.current[activeEditorPath] === content) return;
     const timer = window.setTimeout(() => {
-      void runBackgroundCompileWithUnsaved(rootPath, activeEditorPath, editorValueRef.current);
+      lastCompiledContentRef.current[activeEditorPath] = content;
+      void runBackgroundCompileWithUnsaved(rootPath, activeEditorPath, content);
     }, 800);
     return () => window.clearTimeout(timer);
-  }, [editorChangeTick, activeEditorPath, rootPath]);
+  }, [editorChangeTick, activeEditorPath, rootPath, activeDoc.dirty]);
 
-  const selectSymbolInEditor = async (symbol: typeof symbols[number]) => {
+  const selectSymbolInEditor = async (symbol: SymbolView) => {
     if (!symbol) return;
     if (symbol.name?.startsWith("<anon")) return;
     if (!symbol.file_path) return;
@@ -1394,226 +928,12 @@ export function App() {
     });
   };
 
-  const openProjectDescriptorTab = (descriptor?: {
-    name?: string | null;
-    author?: string | null;
-    description?: string | null;
-    organization?: string | null;
-    default_library: boolean;
-    raw_json?: string;
-  } | null) => {
-    if (descriptor) {
-      setProjectDescriptor(descriptor);
-      setHasProjectDescriptor(true);
-    }
-    setCenterView("file");
-    setShowProjectInfo(true);
-    setDescriptorViewMode("view");
-    setCurrentFilePath(null);
-    currentFilePathRef.current = null;
-    setOpenTabs((prev) => {
-      if (prev.some((tab) => tab.path === PROJECT_DESCRIPTOR_TAB)) return prev;
-      return [...prev, { path: PROJECT_DESCRIPTOR_TAB, name: "Project Descriptor", dirty: false, kind: "descriptor" }];
-    });
-    setActiveTabPath(PROJECT_DESCRIPTOR_TAB);
-  };
-
-  const selectTab = async (path: string) => {
-    if (path === activeTabPath) return;
-    const tab = openTabs.find((entry) => entry.path === path);
-    if (path === PROJECT_DESCRIPTOR_TAB || tab?.kind === "descriptor") {
-      setCenterView("file");
-      setDescriptorViewMode("view");
-      setCurrentFilePath(null);
-      currentFilePathRef.current = null;
-      setActiveTabPath(PROJECT_DESCRIPTOR_TAB);
-      return;
-    }
-    if (tab?.kind === "ai") {
-      setCenterView("ai");
-      setCurrentFilePath(null);
-      currentFilePathRef.current = null;
-      setActiveTabPath(tab.path);
-      return;
-    }
-    if (tab?.kind === "data") {
-      setCenterView("data");
-      setCurrentFilePath(null);
-      currentFilePathRef.current = null;
-      setActiveTabPath(tab.path);
-      return;
-    }
-    if (tab?.kind === "diagram") {
-      setCenterView("diagram");
-      setCurrentFilePath(null);
-      currentFilePathRef.current = null;
-      setActiveTabPath(tab.path);
-      return;
-    }
-    setCenterView("file");
-    await navigateTo({ path });
-  };
-
-  const openAiViewTab = () => {
-    setOpenTabs((prev) => {
-      if (prev.some((tab) => tab.path === AI_VIEW_TAB)) return prev;
-      return [...prev, { path: AI_VIEW_TAB, name: "AI", dirty: false, kind: "ai" }];
-    });
-    setActiveTabPath(AI_VIEW_TAB);
-    setCurrentFilePath(null);
-    currentFilePathRef.current = null;
-    setCenterView("ai");
-  };
-
-  const openDataViewTab = () => {
-    setOpenTabs((prev) => {
-      if (prev.some((tab) => tab.path === DATA_VIEW_TAB)) return prev;
-      return [...prev, { path: DATA_VIEW_TAB, name: "Data", dirty: false, kind: "data" }];
-    });
-    setActiveTabPath(DATA_VIEW_TAB);
-    setCurrentFilePath(null);
-    currentFilePathRef.current = null;
-    setCenterView("data");
-  };
-
-  const openDiagramViewTab = (filePath: string) => {
-    if (!filePath || filePath === PROJECT_DESCRIPTOR_TAB) return;
-    const id = makeDiagramTabId(filePath);
-    const name = makeDiagramTabName(filePath);
-    setOpenTabs((prev) => {
-      if (prev.some((tab) => tab.path === id)) return prev;
-      return [...prev, { path: id, name, dirty: false, kind: "diagram", sourcePath: filePath }];
-    });
-    setActiveTabPath(id);
-    setCurrentFilePath(null);
-    currentFilePathRef.current = null;
-    setCenterView("diagram");
-  };
-
-  const reorderTabs = (fromPath: string, toPath: string) => {
-    if (!fromPath || !toPath || fromPath === toPath) return;
-    setOpenTabs((prev) => {
-      const fromIndex = prev.findIndex((tab) => tab.path === fromPath);
-      const toIndex = prev.findIndex((tab) => tab.path === toPath);
-      if (fromIndex < 0 || toIndex < 0) return prev;
-      const next = [...prev];
-      const [moved] = next.splice(fromIndex, 1);
-      next.splice(toIndex, 0, moved);
-      return next;
-    });
-  };
-
-  useEffect(() => {
-    if (!currentFilePath || !editorRef.current) return;
-    const pending = pendingNavRef.current;
-    if (!pending || pending.path !== currentFilePath) return;
-    pendingNavRef.current = null;
-    applyEditorSelection(editorRef.current, pending.selection);
-    editorRef.current.focus();
-  }, [currentFilePath]);
-
-  useEffect(() => {
-    if (centerView !== "file" || !activeEditorPath) {
-      setCursorPos(null);
-      return;
-    }
-    const editor = editorRef.current;
-    if (!editor) return;
-    const pos = editor.getPosition();
-    if (pos) {
-      setCursorPos({ line: pos.lineNumber, col: pos.column });
-    }
-  }, [activeEditorPath, centerView]);
-
-  const closeTab = (path: string) => {
-    navReqRef.current += 1;
-    pendingNavRef.current = null;
-    setOpenTabs((prev) => prev.filter((tab) => tab.path !== path));
-    if (path === PROJECT_DESCRIPTOR_TAB) {
-      setShowProjectInfo(false);
-    }
-    if (activeTabPath === path) {
-      const remaining = openTabs.filter((tab) => tab.path !== path);
-      const next = remaining[remaining.length - 1];
-      if (next) {
-        void selectTab(next.path);
-      } else {
-        setActiveTabPath(null);
-        activeTabPathRef.current = null;
-        setCenterView("file");
-        editorValueRef.current = "";
-        if (editorRef.current) {
-          editorRef.current.setValue("");
-        }
-        pendingEditorContentRef.current = null;
-        pendingEditorPathRef.current = null;
-        setCurrentFilePath(null);
-        currentFilePathRef.current = null;
-      }
-    }
-    if (selectedSymbol && selectedSymbol.file_path === path) {
-      setSelectedSymbol(null);
-    }
-  };
-
-  const closeAllTabs = () => {
-    navReqRef.current += 1;
-    pendingNavRef.current = null;
-    setOpenTabs([]);
-    setActiveTabPath(null);
-    activeTabPathRef.current = null;
-    setCenterView("file");
-    editorValueRef.current = "";
-    if (editorRef.current) {
-      editorRef.current.setValue("");
-    }
-    pendingEditorContentRef.current = null;
-    pendingEditorPathRef.current = null;
-    setCurrentFilePath(null);
-    currentFilePathRef.current = null;
-  };
-
-  const closeOtherTabs = (path: string) => {
-    navReqRef.current += 1;
-    pendingNavRef.current = null;
-    const kept = openTabs.find((tab) => tab.path === path);
-    if (!kept) return;
-    setOpenTabs([kept]);
-    setActiveTabPath(path);
-    if (path === PROJECT_DESCRIPTOR_TAB) {
-      setShowProjectInfo(true);
-      setCenterView("file");
-      setDescriptorViewMode("view");
-      setCurrentFilePath(null);
-      currentFilePathRef.current = null;
-      return;
-    }
-    if (kept.kind === "ai") {
-      setCenterView("ai");
-      setCurrentFilePath(null);
-      currentFilePathRef.current = null;
-      return;
-    }
-    if (kept.kind === "data") {
-      setCenterView("data");
-      setCurrentFilePath(null);
-      currentFilePathRef.current = null;
-      return;
-    }
-    if (kept.kind === "diagram") {
-      setCenterView("diagram");
-      setCurrentFilePath(null);
-      currentFilePathRef.current = null;
-      return;
-    }
-    setCenterView("file");
-  };
 
   const saveActiveTab = async () => {
     if (!activeEditorPath) return;
     await invoke("write_file", { path: activeEditorPath, content: editorValueRef.current });
     setOpenTabs((prev) => prev.map((tab) => (tab.path === activeEditorPath ? { ...tab, dirty: false } : tab)));
-    setTabContent((prev) => ({ ...prev, [activeEditorPath]: editorValueRef.current }));
+    markSaved();
   };
 
   useEffect(() => {
@@ -1627,14 +947,13 @@ export function App() {
       );
       return;
     }
-    const baseline = tabContent[activeEditorPath] ?? "";
-    const isDirty = editorValueRef.current !== baseline;
+    const isDirty = activeDoc.path === activeEditorPath ? activeDoc.dirty : false;
     setOpenTabs((prev) =>
       prev.map((tab) =>
         tab.path === activeEditorPath ? { ...tab, dirty: isDirty } : tab,
       ),
     );
-  }, [editorChangeTick, activeEditorPath, tabContent]);
+  }, [editorChangeTick, activeEditorPath, activeDoc]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1708,8 +1027,7 @@ export function App() {
         }
         if (!activeEditorPath) return;
         if (editorRef.current && activeEditorPath) {
-          pendingEditorContentRef.current = editorValueRef.current;
-          pendingEditorPathRef.current = activeEditorPath;
+          queuePendingEditorContent(activeEditorPath, editorValueRef.current);
         }
         openDiagramViewTab(activeEditorPath);
       }
@@ -1828,14 +1146,14 @@ export function App() {
       return;
     }
     const buildModelContext = () => {
-      const activePath = activeEditorPath || currentFilePath || "";
+      const activePath = activeEditorPath || activeDoc.path || "";
       const projectSymbols = symbols.filter((symbol) => !(libraryPath && symbol.file_path.startsWith(libraryPath)));
       const activeSymbols = activePath
         ? projectSymbols.filter((symbol) => symbol.file_path === activePath).slice(0, 40)
         : [];
       const unresolvedTop = unresolved.slice(0, 20);
       const snippet =
-        activePath && currentFilePath === activePath
+        activePath && activeDoc.path === activePath
           ? editorValueRef.current.slice(0, 8000)
           : "";
       const symbolLines = activeSymbols.map(
@@ -1910,959 +1228,141 @@ export function App() {
     }
   };
 
-  const tree = useMemo(() => {
-    const renderEntries = (entries: FileEntry[], depth = 0) => {
-      return entries.map((entry) => {
-        const isExpanded = Boolean(expanded[entry.path]);
-        const ext = entry.name.toLowerCase().split(".").pop() || "";
-        const iconLabel =
-          entry.is_dir
-            ? ""
-            : ext === "sysml"
-              ? "s"
-              : ext === "kerml"
-                ? "k"
-                : ext === "json" || ext === "jsonld"
-                  ? "{}"
-                  : "";
-        return (
-          <div key={`${entry.path}-${depth}`} className="tree-node">
-            <div
-              className={`tree-row ${entry.is_dir ? "dir" : "file"}`}
-              style={{ paddingLeft: `${10 + depth * 14}px` }}
-              onClick={() => openFile(entry)}
-              onContextMenu={(e) => showContext(e, entry)}
-            >
-              <span className="tree-caret">{entry.is_dir ? (isExpanded ? "v" : ">") : ""}</span>
-              <span className={`tree-icon ${entry.is_dir ? "folder" : "file"}`}>
-                {iconLabel ? <span className="tree-icon-label">{iconLabel}</span> : null}
-              </span>
-              <span className="tree-label">{entry.name}</span>
-            </div>
-            {entry.is_dir && isExpanded ? (
-              <div className="tree-children">
-                {renderEntries(expanded[entry.path] || [], depth + 1)}
-              </div>
-            ) : null}
-          </div>
-        );
-      });
-    };
-
-    return renderEntries(treeEntries, 0);
-  }, [treeEntries, expanded]);
-
   const deferredSymbols = useDeferredValue(symbols);
   const deferredUnresolved = useDeferredValue(unresolved);
 
-  const groupedSymbols = useMemo(() => {
-    const groups = new Map<string, typeof symbols>();
-    deferredSymbols.forEach((symbol) => {
-      const key = symbol.file_path || "unknown";
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key)?.push(symbol);
-    });
-    return Array.from(groups.entries()).map(([path, list]) => ({
-      path,
-      list: list.sort((a, b) => a.name.localeCompare(b.name)),
-    }));
-  }, [deferredSymbols]);
+  const {
+    projectGroups,
+    libraryGroups,
+    projectCounts,
+    libraryCounts,
+    errorCounts,
+    dataViewSymbolKindCounts,
+  } = useModelGroups({
+    deferredSymbols,
+    deferredUnresolved,
+    rootPath,
+    libraryPath,
+    dataExcludeStdlib,
+  });
 
-  const projectGroups = useMemo(() => {
-    const prefix = rootPath ? rootPath.toLowerCase() : "";
-    const libPrefix = libraryPath ? libraryPath.toLowerCase() : "";
-    return groupedSymbols.filter((group) => {
-      const path = group.path.toLowerCase();
-      if (libPrefix && path.startsWith(libPrefix)) return false;
-      return prefix ? path.startsWith(prefix) : true;
-    });
-  }, [groupedSymbols, rootPath, libraryPath]);
-
-  const libraryGroups = useMemo(() => {
-    const libPrefix = libraryPath ? libraryPath.toLowerCase() : "";
-    if (!libPrefix) return [];
-    return groupedSymbols.filter((group) => group.path.toLowerCase().startsWith(libPrefix));
-  }, [groupedSymbols, libraryPath]);
-
-  const projectCounts = useMemo(() => {
-    const fileCount = projectGroups.length;
-    const symbolCount = projectGroups.reduce((sum, group) => sum + group.list.length, 0);
-    return { fileCount, symbolCount };
-  }, [projectGroups]);
-
-  const libraryCounts = useMemo(() => {
-    const fileCount = libraryGroups.length;
-    const symbolCount = libraryGroups.reduce((sum, group) => sum + group.list.length, 0);
-    return { fileCount, symbolCount };
-  }, [libraryGroups]);
-
-  const errorCounts = useMemo(() => {
-    const fileCount = new Set(deferredUnresolved.map((entry) => entry.file_path)).size;
-    const symbolCount = deferredUnresolved.length;
-    return { fileCount, symbolCount };
-  }, [deferredUnresolved]);
-
-  const dataViewSymbols = useMemo(() => {
-    if (!dataExcludeStdlib || !libraryPath) return deferredSymbols;
-    const libPrefix = libraryPath.toLowerCase();
-    return deferredSymbols.filter((symbol) => !(symbol.file_path || "").toLowerCase().startsWith(libPrefix));
-  }, [deferredSymbols, dataExcludeStdlib, libraryPath]);
-  const dataViewSymbolKindCounts = useMemo(() => {
-    const counts = new Map<string, number>();
-    dataViewSymbols.forEach((symbol) => {
-      const key = symbol.kind || "Unknown";
-      counts.set(key, (counts.get(key) || 0) + 1);
-    });
-    return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
-  }, [dataViewSymbols]);
-
-  type SymbolNode = {
-    name: string;
-    fullName: string;
-    symbols: typeof symbols;
-    children: Map<string, SymbolNode>;
-  };
-
-  const buildSymbolTree = (list: typeof symbols) => {
-    const root: SymbolNode = {
-      name: "root",
-      fullName: "",
-      symbols: [],
-      children: new Map(),
-    };
-    list.forEach((symbol) => {
-      const qualified = symbol.qualified_name || symbol.name;
-      const segments = qualified.split("::").filter(Boolean);
-      let cursor = root;
-      segments.forEach((segment, index) => {
-        if (!cursor.children.has(segment)) {
-          cursor.children.set(segment, {
-            name: segment,
-            fullName: cursor.fullName ? `${cursor.fullName}::${segment}` : segment,
-            symbols: [],
-            children: new Map(),
-          });
-        }
-        cursor = cursor.children.get(segment)!;
-        if (index === segments.length - 1) {
-          cursor.symbols.push(symbol);
-        }
-      });
-    });
-    return root;
-  };
-
-  const getKindKey = (kind: string) => {
-    const value = (kind || "").toLowerCase();
-    if (value.includes("package")) return "package";
-    if (value.includes("part def")) return "part-def";
-    if (value.includes("part") && value.includes("usage")) return "part";
-    if (value.includes("part")) return "part";
-    if (value.includes("requirement")) return "requirement";
-    if (value.includes("port")) return "port";
-    if (value.includes("interface")) return "interface";
-    if (value.includes("action")) return "action";
-    if (value.includes("state")) return "state";
-    if (value.includes("item")) return "item";
-    if (value.includes("constraint")) return "constraint";
-    if (value.includes("allocation")) return "allocation";
-    if (value.includes("connection")) return "connection";
-    if (value.includes("viewpoint")) return "viewpoint";
-    if (value.includes("view")) return "view";
-    if (value.includes("concern")) return "concern";
-    if (value.includes("usecase")) return "usecase";
-    if (value.includes("enum")) return "enum";
-    if (value.includes("attribute")) return "attribute";
-    return "default";
-  };
-
-  const renderTypeIcon = (kind: string, variant: "model" | "diagram") => {
-    const key = getKindKey(kind);
-    return (
-      <span className={`type-icon type-${key} ${variant}`} aria-hidden="true">
-        <svg viewBox="0 0 16 16" focusable="false" aria-hidden="true">
-          {key === "package" ? (
-            <>
-              <rect x="2" y="5" width="12" height="8" rx="1.5" />
-              <rect x="2" y="2" width="6" height="3" rx="1" />
-            </>
-          ) : key === "part-def" ? (
-            <>
-              <rect x="2" y="2" width="12" height="12" rx="2" />
-              <path d="M5 6h6M5 9h6" />
-            </>
-          ) : key === "part" ? (
-            <>
-              <rect x="3" y="3" width="10" height="10" rx="2" />
-              <circle cx="5.5" cy="5.5" r="1" />
-            </>
-          ) : key === "requirement" ? (
-            <>
-              <rect x="2" y="2" width="12" height="12" rx="2" />
-              <path d="M5 5h6M5 8h6M5 11h4" />
-            </>
-          ) : key === "port" ? (
-            <>
-              <circle cx="8" cy="8" r="5" />
-              <path d="M8 3v10M3 8h10" />
-            </>
-          ) : key === "interface" ? (
-            <>
-              <rect x="3" y="3" width="10" height="10" rx="2" />
-              <path d="M5 8h6" />
-            </>
-          ) : key === "action" ? (
-            <>
-              <path d="M3 3h6l4 5-4 5H3z" />
-            </>
-          ) : key === "state" ? (
-            <>
-              <rect x="3" y="4" width="10" height="8" rx="4" />
-            </>
-          ) : key === "item" ? (
-            <>
-              <rect x="2.5" y="3" width="11" height="10" rx="2" />
-            </>
-          ) : key === "constraint" ? (
-            <>
-              <path d="M4 4h8v8H4z" />
-              <path d="M6 6h4M6 8h4M6 10h4" />
-            </>
-          ) : key === "allocation" ? (
-            <>
-              <path d="M3 8h10M8 3v10" />
-              <circle cx="8" cy="8" r="5" />
-            </>
-          ) : key === "connection" ? (
-            <>
-              <circle cx="4" cy="8" r="2" />
-              <circle cx="12" cy="8" r="2" />
-              <path d="M6 8h4" />
-            </>
-          ) : key === "view" ? (
-            <>
-              <rect x="2.5" y="3" width="11" height="10" rx="2" />
-              <path d="M4 5h8M4 8h8M4 11h5" />
-            </>
-          ) : key === "viewpoint" ? (
-            <>
-              <circle cx="8" cy="8" r="5" />
-              <path d="M8 4v8M4 8h8" />
-            </>
-          ) : key === "concern" ? (
-            <>
-              <path d="M8 3l5 5-5 5-5-5z" />
-            </>
-          ) : key === "usecase" ? (
-            <>
-              <ellipse cx="8" cy="8" rx="5" ry="3" />
-            </>
-          ) : key === "enum" ? (
-            <>
-              <rect x="3" y="3" width="10" height="10" rx="2" />
-              <path d="M5 6h6M5 8h6M5 10h6" />
-            </>
-          ) : key === "attribute" ? (
-            <>
-              <rect x="4" y="4" width="8" height="8" rx="1" />
-              <path d="M6 8h4" />
-            </>
-          ) : (
-            <>
-              <circle cx="8" cy="8" r="5" />
-            </>
-          )}
-        </svg>
-      </span>
-    );
-  };
-
-  const buildRowsForTree = (
-    root: SymbolNode,
-    rootLabel: string | undefined,
-    rootKey: string,
-    expanded: Record<string, boolean>,
-    collapseAll: boolean,
-  ) => {
-    const rows: Array<{
-      id: string;
-      name: string;
-      kindLabel: string;
-      kindKey: string;
-      depth: number;
-      node: SymbolNode;
-      hasChildren: boolean;
-      expanded: boolean;
-    }> = [];
-    const walk = (node: SymbolNode, depth: number, isTop: boolean, pathKey: string) => {
-      const displayName = isTop && node.name === "root" && rootLabel ? rootLabel : node.name;
-      const nodeId = `${rootKey}::${node.fullName || pathKey}`;
-      const kindLabel = node.symbols.map((symbol) => symbol.kind).filter(Boolean).join(", ");
-      const kindKey = getKindKey(node.symbols[0]?.kind || "");
-      const hasChildren = node.children.size > 0;
-      const expandedState = collapseAll ? false : expanded[nodeId] ?? false;
-      const isVirtualRoot = node.name === "root" && node.symbols.length === 0;
-      if (!isVirtualRoot) {
-        rows.push({
-          id: nodeId,
-          name: displayName,
-          kindLabel,
-          kindKey,
-          depth,
-          node,
-          hasChildren,
-          expanded: expandedState,
-        });
-      }
-      if (hasChildren && (expandedState || isVirtualRoot)) {
-        const byNameCount = new Map<string, number>();
-        Array.from(node.children.values())
-          .sort((a, b) => a.name.localeCompare(b.name))
-          .forEach((child) => {
-            const keyBase = child.name || "node";
-            const count = (byNameCount.get(keyBase) || 0) + 1;
-            byNameCount.set(keyBase, count);
-            const childKey = `${pathKey}::${keyBase}#${count}`;
-            walk(child, isVirtualRoot ? depth : depth + 1, false, childKey);
-          });
-      }
-    };
-    walk(root, 0, true, rootKey || "root");
-    return rows;
-  };
-
-  type ModelRow =
-    | { type: "section"; key: string; section: "project" | "library" | "errors"; label: string; countLabel: string }
-    | {
-        type: "symbol";
-        key: string;
-        name: string;
-        kindLabel: string;
-        kindKey: string;
-        depth: number;
-        node: SymbolNode;
-        hasChildren: boolean;
-        expanded: boolean;
-      }
-    | { type: "empty"; key: string; text: string }
-    | { type: "error"; key: string; issue: (typeof deferredUnresolved)[number] };
-
-  const modelRows = useMemo<ModelRow[]>(() => {
-    const rows: ModelRow[] = [];
-    const pushSymbolGroups = (groups: typeof projectGroups, sectionKey: string) => {
-      groups.forEach((group) => {
-        const rootLabel = group.path.split(/[\\/]/).pop() || group.path;
-        const fileRow: SymbolNode = {
-          name: rootLabel,
-          fullName: `${sectionKey}::${group.path}`,
-          symbols: [],
-          children: new Map([[rootLabel, buildSymbolTree(group.list)]]),
-        };
-        const builtRows = buildRowsForTree(fileRow, rootLabel, `${sectionKey}::${group.path}`, modelExpanded, collapseAllModel);
-        builtRows.forEach((row) => {
-          rows.push({
-            type: "symbol",
-            key: row.id,
-            name: row.name,
-            kindLabel: row.kindLabel,
-            kindKey: row.kindKey,
-            depth: row.depth,
-            node: row.node,
-            hasChildren: row.hasChildren,
-            expanded: row.expanded,
-          });
-        });
-      });
-    };
-    const addSection = (
-      section: "project" | "library" | "errors",
-      label: string,
-      countLabel: string,
-      addBody: () => void,
-      emptyLabel: string,
-    ) => {
-      rows.push({ type: "section", key: `section-${section}`, section, label, countLabel });
-      if (!modelSectionOpen[section]) return;
-      const beforeCount = rows.length;
-      addBody();
-      if (rows.length === beforeCount) {
-        rows.push({ type: "empty", key: `empty-${section}`, text: emptyLabel });
-      }
-    };
-    addSection(
-      "project",
-      "Project",
-      `${projectCounts.fileCount} files • ${projectCounts.symbolCount} symbols`,
-      () => {
-        if (projectGroups.length) {
-          pushSymbolGroups(projectGroups, "project");
-        }
-      },
-      projectSymbolsLoaded ? "No project symbols." : "Loading project symbols...",
-    );
-    addSection(
-      "library",
-      "Library",
-      `${libraryCounts.fileCount} files • ${libraryCounts.symbolCount} symbols`,
-      () => {
-        if (libraryGroups.length) {
-          pushSymbolGroups(libraryGroups, "library");
-        }
-      },
-      "No library symbols loaded.",
-    );
-    addSection(
-      "errors",
-      "Errors",
-      `${errorCounts.fileCount} files • ${errorCounts.symbolCount} issues`,
-      () => {
-        deferredUnresolved.forEach((issue, index) => {
-          rows.push({
-            type: "error",
-            key: `error-${issue.file_path}-${issue.line}-${issue.column}-${index}`,
-            issue,
-          });
-        });
-      },
-      "No semantic errors.",
-    );
-    return rows;
-  }, [
+  const { modelRows } = useModelTree({
     projectGroups,
     libraryGroups,
     deferredUnresolved,
     modelExpanded,
     collapseAllModel,
     modelSectionOpen,
-    projectCounts.fileCount,
-    projectCounts.symbolCount,
-    libraryCounts.fileCount,
-    libraryCounts.symbolCount,
-    errorCounts.fileCount,
-    errorCounts.symbolCount,
+    projectCounts,
+    libraryCounts,
+    errorCounts,
     projectSymbolsLoaded,
-  ]);
+    getKindKey,
+  });
 
-  const modelListRef = useRef<ListImperativeAPI | null>(null);
-  const pendingScrollSymbolRef = useRef<string | null>(null);
-  const [modelCursorIndex, setModelCursorIndex] = useState<number | null>(null);
-  const modelSectionIndent = 12;
-  const getModelRowHeight = (row: ModelRow) => {
-    if (row.type === "section") return 28;
-    if (row.type === "error") return 64;
-    if (row.type === "empty") return 24;
-    return 24;
-  };
+  const {
+    modelListRef,
+    modelSectionIndent,
+    modelListHeight,
+    modelCursorIndex,
+    setModelCursorIndex,
+    findSelectedSymbolIndex,
+    syncModelTreeToSymbol,
+    handleModelTreeKeyDown,
+    getModelRowHeight,
+  } = useModelTreeSelection({
+    modelRows,
+    modelTreeHeight,
+    setModelSectionOpen,
+    setModelExpanded,
+    selectedSymbol,
+    setSelectedSymbol,
+    selectSymbolInEditor,
+    navigateTo,
+    projectGroups,
+    libraryGroups,
+  });
 
-  const modelListHeight = Math.max(120, (modelTreeViewportHeight || modelTreeHeight) - 16);
+  const {
+    diagramScale,
+    setDiagramScale,
+    diagramOffset,
+    setDiagramOffset,
+    diagramPanRef,
+    diagramBodyRef,
+    diagramViewportRef,
+    diagramViewport,
+    diagramPanRafRef,
+    diagramPanPendingRef,
+    diagramLayout,
+    diagramManualNodes,
+    palettePos,
+    paletteGhost,
+    paletteDragRef,
+    paletteCreateRef,
+    renderDiagramLayout,
+    renderManualNode,
+    renderMinimapLayout,
+    requestDiagramLayout,
+    setDiagramNodeOffsets,
+    setDiagramNodeSizes,
+    setPaletteGhost,
+  } = useDiagramView({
+    activeDiagramPath,
+    activeTabPath,
+    deferredSymbols,
+    selectedSymbol,
+    setSelectedSymbol,
+    selectSymbolInEditor,
+    syncModelTreeToSymbol,
+    syncDiagramSelection,
+    getKindKey,
+    renderTypeIcon,
+    rootPath,
+    runBackgroundCompile,
+    setCompileStatus,
+  });
 
-  const findSelectedSymbolIndex = () => {
-    if (!selectedSymbol) return -1;
-    return modelRows.findIndex((row) => {
-      if (row.type !== "symbol") return false;
-      if (selectedSymbol.qualified_name) {
-        return row.node.symbols.some((sym) => sym.qualified_name === selectedSymbol.qualified_name);
-      }
-      return row.node.symbols.some((sym) => sym.file_path === selectedSymbol.file_path && sym.name === selectedSymbol.name);
-    });
-  };
+  const { trackCandidate, trackNow } = useModelTracking({
+    symbols,
+    activeEditorPath,
+    cursorPos,
+    enabled: trackText,
+    onTrack: (symbol) => {
+      setSelectedSymbol(symbol);
+      syncModelTreeToSymbol(symbol);
+    },
+  });
 
-  const activateModelRow = (row: ModelRow, index: number) => {
-    if (row.type === "section") {
-      setModelSectionOpen((prev) => ({ ...prev, [row.section]: !prev[row.section] }));
-      return;
-    }
-    if (row.type === "symbol") {
-      const symbol = row.node.symbols[0];
-      if (symbol) {
-        setSelectedSymbol(symbol);
-        void selectSymbolInEditor(symbol);
-      }
-      return;
-    }
-    if (row.type === "error") {
-      const issue = row.issue;
-      const path = issue.file_path;
-      if (!path) return;
-      void navigateTo({
-        path,
-        name: path.split(/[\\/]/).pop() || "Untitled",
-        selection: {
-          startLine: issue.line || 1,
-          startCol: issue.column || 1,
-          endLine: issue.line || 1,
-          endCol: (issue.column || 1) + 1,
-        },
-      });
-      return;
-    }
-    if (row.type === "empty") {
-      setModelCursorIndex(index);
-    }
-  };
-
-  const handleModelTreeKeyDown = (event: React.KeyboardEvent<HTMLDivElement>, indexOverride?: number) => {
-    if (!modelRows.length) return;
-    const key = event.key;
-    if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Enter"].includes(key)) return;
-    event.preventDefault();
-    event.stopPropagation();
-
-    const currentIndex = modelCursorIndex ?? indexOverride ?? 0;
-    if (modelCursorIndex == null) {
-      setModelCursorIndex(currentIndex);
-    }
-    if (key === "ArrowUp") {
-      setModelCursorIndex(Math.max(0, currentIndex - 1));
-      return;
-    }
-    if (key === "ArrowDown") {
-      setModelCursorIndex(Math.min(modelRows.length - 1, currentIndex + 1));
-      return;
-    }
-
-    const row = modelRows[currentIndex];
-    if (!row) return;
-    if (key === "Enter") {
-      activateModelRow(row, currentIndex);
-      return;
-    }
-    if (key === "ArrowRight") {
-      if (row.type === "section") {
-        setModelSectionOpen((prev) => ({ ...prev, [row.section]: true }));
-      } else if (row.type === "symbol" && row.hasChildren && !row.expanded) {
-        setModelExpanded((prev) => ({ ...prev, [row.key]: true }));
-      }
-      return;
-    }
-    if (key === "ArrowLeft") {
-      if (row.type === "section") {
-        setModelSectionOpen((prev) => ({ ...prev, [row.section]: false }));
-      } else if (row.type === "symbol" && row.hasChildren && row.expanded) {
-        setModelExpanded((prev) => ({ ...prev, [row.key]: false }));
-      }
-    }
-  };
-
-  const syncModelTreeToSymbol = (symbol: typeof symbols[number]) => {
-    if (!symbol?.file_path) return;
-    const qualified = symbol.qualified_name || symbol.name;
-    const projectGroup = projectGroups.find((group) => group.path === symbol.file_path);
-    const libraryGroup = projectGroup ? null : libraryGroups.find((group) => group.path === symbol.file_path);
-    const section = projectGroup ? "project" : libraryGroup ? "library" : null;
-    if (!section) return;
-    const group = projectGroup || libraryGroup;
-    if (!group) return;
-    const rootKey = `${section}::${group.path}`;
-    const nextExpanded: Record<string, boolean> = {};
-    nextExpanded[`${rootKey}::${rootKey}`] = true;
-    if (qualified) {
-      const segments = qualified.split("::").filter(Boolean);
-      let prefix = "";
-      segments.forEach((segment) => {
-        prefix = prefix ? `${prefix}::${segment}` : segment;
-        nextExpanded[`${rootKey}::${prefix}`] = true;
-      });
-    }
-    setModelSectionOpen((prev) => ({ ...prev, [section]: true }));
-    setModelExpanded((prev) => ({ ...prev, ...nextExpanded }));
-    pendingScrollSymbolRef.current = qualified;
-  };
-
-  useEffect(() => {
-    if (!pendingScrollSymbolRef.current) return;
-    const target = pendingScrollSymbolRef.current;
-    const index = modelRows.findIndex((row) => {
-      if (row.type !== "symbol") return false;
-      if (row.node.fullName === target) return true;
-      return row.node.symbols.some((sym) => (sym.qualified_name || sym.name) === target);
-    });
-    if (index >= 0) {
-      modelListRef.current?.scrollToRow({ index, align: "center" });
-      pendingScrollSymbolRef.current = null;
-    }
-  }, [modelRows]);
-
-  useEffect(() => {
-    if (modelCursorIndex == null) return;
-    if (modelCursorIndex < 0 || modelCursorIndex >= modelRows.length) {
-      setModelCursorIndex(modelRows.length ? 0 : null);
-      return;
-    }
-    modelListRef.current?.scrollToRow({ index: modelCursorIndex, align: "smart" });
-  }, [modelCursorIndex, modelRows.length]);
-
-  const renderModelRow = ({ index, style, rows }: RowComponentProps<{ rows: ModelRow[] }>) => {
-    const row = rows[index];
-    if (!row) return null;
-    const isFocused = modelCursorIndex === index;
-    if (row.type === "section") {
-      const isOpen = modelSectionOpen[row.section];
-      return (
-        <div
-          style={style}
-          className={`model-section-row ${isFocused ? "model-row-focused" : ""}`}
-          role="button"
-          tabIndex={-1}
-          onKeyDown={(event) => handleModelTreeKeyDown(event, index)}
-          onMouseDown={(event) => {
-            event.preventDefault();
-            modelTreeRef.current?.focus();
-          }}
-          onClick={() => {
-            setModelCursorIndex(index);
-            setModelSectionOpen((prev) => ({ ...prev, [row.section]: !isOpen }));
-          }}
-        >
-          <span className="model-section-toggle">{isOpen ? "-" : "+"}</span>
-          <span className="model-section-label">{row.label}</span>
-          <span className="model-section-count">{row.countLabel}</span>
-        </div>
-      );
-    }
-    if (row.type === "empty") {
-      return (
-        <div
-          style={{ ...style, paddingLeft: `${modelSectionIndent}px` }}
-          className={`model-empty-row ${isFocused ? "model-row-focused" : ""}`}
-          onClick={() => setModelCursorIndex(index)}
-          role="button"
-          tabIndex={-1}
-          onKeyDown={(event) => handleModelTreeKeyDown(event, index)}
-          onMouseDown={(event) => {
-            event.preventDefault();
-            modelTreeRef.current?.focus();
-          }}
-        >
-          {row.text}
-        </div>
-      );
-    }
-    if (row.type === "error") {
-      const issue = row.issue;
-      return (
-        <div
-          style={{ ...style, paddingLeft: `${modelSectionIndent + 8}px` }}
-          className={`error-row ${isFocused ? "model-row-focused" : ""}`}
-          role="button"
-          tabIndex={-1}
-          onKeyDown={(event) => handleModelTreeKeyDown(event, index)}
-          onMouseDown={(event) => {
-            event.preventDefault();
-            modelTreeRef.current?.focus();
-          }}
-          onClick={() => {
-            setModelCursorIndex(index);
-            const path = issue.file_path;
-            if (!path) return;
-            void navigateTo({
-              path,
-              name: path.split(/[\\/]/).pop() || "Untitled",
-              selection: {
-                startLine: issue.line || 1,
-                startCol: issue.column || 1,
-                endLine: issue.line || 1,
-                endCol: (issue.column || 1) + 1,
-              },
-            });
-          }}
-        >
-          <span className="error-icon" aria-hidden="true" />
-          <div className="error-text">
-            <div className="error-message">{issue.message}</div>
-            <div className="error-title">{issue.file_path}:{issue.line}:{issue.column}</div>
-          </div>
-        </div>
-      );
-    }
-    const symbol = row.node.symbols[0];
-    const isSelected =
-      !!symbol &&
-      (selectedSymbol?.qualified_name
-        ? selectedSymbol.qualified_name === symbol.qualified_name
-        : selectedSymbol?.file_path === symbol.file_path && selectedSymbol?.name === symbol.name);
-    return (
-      <div
-        style={{ ...style, paddingLeft: `${modelSectionIndent + 8 + row.depth * 14}px` }}
-        className={`model-virtual-row ${isSelected ? "selected" : ""} ${isFocused ? "model-row-focused" : ""}`}
-        role="button"
-        tabIndex={-1}
-        onKeyDown={(event) => handleModelTreeKeyDown(event, index)}
-        onMouseDown={(event) => {
-          event.preventDefault();
-          modelTreeRef.current?.focus();
-        }}
-        onClick={(event) => {
-          event.stopPropagation();
-          setModelCursorIndex(index);
-          if (symbol) {
-            setSelectedSymbol(symbol);
-            void selectSymbolInEditor(symbol);
-          }
-        }}
-        onDoubleClick={(event) => {
-          event.stopPropagation();
-          if (symbol) {
-            void selectSymbolInEditor(symbol);
-          }
-        }}
-      >
-        <span
-          className="model-caret"
-          onClick={(event) => {
-            event.stopPropagation();
-            if (row.hasChildren) {
-              setModelExpanded((prev) => ({ ...prev, [row.key]: !row.expanded }));
-            }
-          }}
-        >
-          {row.hasChildren ? (row.expanded ? "-" : "+") : ""}
-        </span>
-        {renderTypeIcon(row.kindKey, "model")}
-        <span className="model-name">{row.name}</span>
-        {row.kindLabel ? <span className="model-kind">{row.kindLabel}</span> : null}
-      </div>
-    );
-  };
-
-  const fileSymbols = useMemo(() => {
-    if (!activeDiagramPath) return [];
-    return deferredSymbols.filter((symbol) => symbol.file_path === activeDiagramPath);
-  }, [deferredSymbols, activeDiagramPath]);
-
-  const symbolByQualified = useMemo(() => {
-    const map = new Map<string, typeof symbols[number]>();
-    fileSymbols.forEach((symbol) => map.set(symbol.qualified_name, symbol));
-    return map;
-  }, [fileSymbols]);
-
-  const requestDiagramLayout = () => {
-    if (!diagramWorkerRef.current) return;
-    if (!fileSymbols.length) {
-      setDiagramLayout(null);
-      return;
-    }
-    const worker = diagramWorkerRef.current;
-    const reqId = ++diagramLayoutReqRef.current;
-    worker.postMessage({
-      type: "layout",
-      reqId,
-      nodes: fileSymbols.map((symbol) => ({
-        qualified: symbol.qualified_name,
-        name: symbol.name,
-        kind: symbol.kind,
-      })),
-    });
-    const onMessage = (event: MessageEvent) => {
-      const data = event.data as { type: string; reqId: number; layout?: DiagramLayout };
-      if (data?.type !== "layout" || data.reqId !== reqId) return;
-      setDiagramLayout(data.layout || null);
-      worker.removeEventListener("message", onMessage);
-    };
-    worker.addEventListener("message", onMessage);
-  };
-
-  useEffect(() => {
-    requestDiagramLayout();
-  }, [fileSymbols]);
-
-
-  type DiagramLayout = {
-    node: { name: string; fullName: string; kind: string };
-    width: number;
-    height: number;
-    children: Array<{ layout: DiagramLayout; x: number; y: number }>;
-  };
-
-  const renderDiagramLayout = (layout: DiagramLayout) => {
-    if (layout.node.name === "root") {
-      return (
-        <div className="diagram-content" style={{ width: `${layout.width}px`, height: `${layout.height}px` }}>
-          {layout.children.map((child) => (
-            <div
-              key={child.layout.node.fullName}
-              className="diagram-position"
-              style={{ left: `${child.x}px`, top: `${child.y}px` }}
-            >
-              {renderDiagramLayout(child.layout)}
-            </div>
-          ))}
-        </div>
-      );
-    }
-      const symbol = symbolByQualified.get(layout.node.fullName);
-      const kindLabel = symbol?.kind || layout.node.kind;
-      const kindKey = getKindKey(kindLabel || "");
-    const isSelected = selectedSymbol?.qualified_name === layout.node.fullName;
-    const offset = diagramNodeOffsets[layout.node.fullName] || { x: 0, y: 0 };
-    const sizeOverride = diagramNodeSizes[layout.node.fullName];
-    return (
-      <div
-        className={`diagram-node ${isSelected ? "selected" : ""}`}
-        style={{
-          width: `${sizeOverride?.width ?? layout.width}px`,
-          height: `${sizeOverride?.height ?? layout.height}px`,
-          transform: `translate(${offset.x}px, ${offset.y}px)`,
-        }}
-        role="button"
-        tabIndex={0}
-        onPointerDown={(event) => {
-          event.stopPropagation();
-          diagramDragRef.current = {
-            node: layout.node.fullName,
-            startX: event.clientX,
-            startY: event.clientY,
-            base: offset,
-          };
-          (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-        }}
-        onClick={(event) => {
-          event.stopPropagation();
-          if (symbol) {
-            setSelectedSymbol(symbol);
-            void selectSymbolInEditor(symbol);
-            if (syncDiagramSelection) {
-              syncModelTreeToSymbol(symbol);
-            }
-          }
-        }}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" && symbol) {
-            setSelectedSymbol(symbol);
-            void selectSymbolInEditor(symbol);
-          }
-        }}
-      >
-        <div className="diagram-node-header">
-          {renderTypeIcon(kindKey, "diagram")}
-          <span className="diagram-node-name">{layout.node.name}</span>
-          {kindLabel ? <span className="diagram-node-kind">{kindLabel}</span> : null}
-        </div>
-        {layout.children.map((child) => {
-          const childOffset = diagramNodeOffsets[child.layout.node.fullName] || { x: 0, y: 0 };
-          return (
-            <div
-              key={child.layout.node.fullName}
-              className="diagram-position"
-              style={{ left: `${child.x + childOffset.x}px`, top: `${child.y + childOffset.y}px` }}
-            >
-              {renderDiagramLayout(child.layout)}
-            </div>
-          );
-        })}
-        <div
-          className="diagram-resize-handle"
-          onPointerDown={(event) => {
-            event.stopPropagation();
-            diagramResizeRef.current = {
-              node: layout.node.fullName,
-              startX: event.clientX,
-              startY: event.clientY,
-              base: {
-                width: sizeOverride?.width ?? layout.width,
-                height: sizeOverride?.height ?? layout.height,
-              },
-            };
-            (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-          }}
-        />
-      </div>
-    );
-  };
-
-  const renderManualNode = (node: { id: string; type: string; name: string; x: number; y: number; width: number; height: number; pending: boolean }) => {
-    const kindKey = getKindKey(node.type);
-    return (
-      <div
-        key={node.id}
-        className={`diagram-node manual ${node.pending ? "pending" : ""}`}
-        style={{
-          width: `${node.width}px`,
-          height: `${node.height}px`,
-          transform: `translate(${node.x}px, ${node.y}px)`,
-        }}
-      >
-        <div className="diagram-node-header">
-          {renderTypeIcon(kindKey, "diagram")}
-          <span className="diagram-node-name">{node.name}</span>
-        </div>
-      </div>
-    );
-  };
-
-
-  const renderMinimapLayout = (layout: DiagramLayout) => {
-    if (layout.node.name === "root") {
-      return (
-        <div className="minimap-content" style={{ width: `${layout.width}px`, height: `${layout.height}px` }}>
-          {layout.children.map((child) => (
-            <div
-              key={child.layout.node.fullName}
-              className="diagram-position"
-              style={{ left: `${child.x}px`, top: `${child.y}px` }}
-            >
-              {renderMinimapLayout(child.layout)}
-            </div>
-          ))}
-        </div>
-      );
-    }
-    return (
-      <div className="minimap-node" style={{ width: `${layout.width}px`, height: `${layout.height}px` }}>
-        {layout.children.map((child) => (
-          <div
-            key={child.layout.node.fullName}
-            className="diagram-position"
-            style={{ left: `${child.x}px`, top: `${child.y}px` }}
-          >
-            {renderMinimapLayout(child.layout)}
-          </div>
-        ))}
-      </div>
-    );
-  };
-
-  useEffect(() => {
-    if (!diagramLayout || !diagramBodyRef.current) return;
-    const body = diagramBodyRef.current.getBoundingClientRect();
-    const canvasWidth = diagramLayout.width * diagramScale;
-    const canvasHeight = diagramLayout.height * diagramScale;
-    const viewWidth = Math.min(140, Math.max(60, (body.width / Math.max(canvasWidth, 1)) * 140));
-    const viewHeight = Math.min(100, Math.max(40, (body.height / Math.max(canvasHeight, 1)) * 100));
-    const miniScaleX = 140 / Math.max(canvasWidth, 1);
-    const miniScaleY = 100 / Math.max(canvasHeight, 1);
-    const viewX = Math.min(140 - viewWidth, Math.max(0, -diagramOffset.x * miniScaleX));
-    const viewY = Math.min(100 - viewHeight, Math.max(0, -diagramOffset.y * miniScaleY));
-    setDiagramViewport({ x: viewX, y: viewY, width: viewWidth, height: viewHeight });
-  }, [diagramLayout, diagramScale, diagramOffset]);
-
-  const diagramBounds = useMemo(() => {
-    if (!diagramLayout) return {};
-    const bounds: Record<string, { minX: number; maxX: number; minY: number; maxY: number }> = {};
-    const walk = (layout: DiagramLayout) => {
-      const sizeOverride = diagramNodeSizes[layout.node.fullName];
-      const width = sizeOverride?.width ?? layout.width;
-      const height = sizeOverride?.height ?? layout.height;
-      layout.children.forEach((child) => {
-        const childSizeOverride = diagramNodeSizes[child.layout.node.fullName];
-        const childWidth = childSizeOverride?.width ?? child.layout.width;
-        const childHeight = childSizeOverride?.height ?? child.layout.height;
-        bounds[child.layout.node.fullName] = {
-          minX: -child.x,
-          maxX: width - childWidth - child.x,
-          minY: -child.y,
-          maxY: height - childHeight - child.y,
-        };
-        walk(child.layout);
-      });
-    };
-    walk(diagramLayout);
-    return bounds;
-  }, [diagramLayout, diagramNodeSizes]);
-
-  useEffect(() => {
-    diagramBoundsRef.current = diagramBounds;
-  }, [diagramBounds]);
+  const renderModelRow = useMemo(
+    () =>
+      createModelRowRenderer({
+        modelCursorIndex,
+        modelSectionOpen,
+        modelSectionIndent,
+        modelTreeRef,
+        handleModelTreeKeyDown,
+        setModelCursorIndex,
+        setModelSectionOpen,
+        setModelExpanded,
+        selectedSymbol,
+        setSelectedSymbol,
+        selectSymbolInEditor,
+        navigateTo,
+        renderTypeIcon,
+      }),
+    [
+      modelCursorIndex,
+      modelSectionOpen,
+      modelSectionIndent,
+      handleModelTreeKeyDown,
+      selectedSymbol,
+      setSelectedSymbol,
+      selectSymbolInEditor,
+      navigateTo,
+      renderTypeIcon,
+    ],
+  );
 
     return (
       <div
@@ -3018,7 +1518,13 @@ export function App() {
               "No project selected"
             )}
           </div>
-            <div className="file-tree" onContextMenu={showRootContext}>{tree}</div>
+            <ProjectTree
+              treeEntries={treeEntries}
+              expanded={expanded}
+              onOpenFile={openFile}
+              onContextMenu={showContext}
+              onRootContextMenu={showRootContext}
+            />
             </section>
           )}
           <div
@@ -3039,24 +1545,22 @@ export function App() {
               </button>
             ) : null}
           </div>
-          <section className="panel editor">
-            <TabBar
-              openTabs={openTabs}
-              activeTabPath={activeTabPath}
-              tabOverflowOpen={tabOverflowOpen}
-              onSetTabOverflowOpen={setTabOverflowOpen}
-              onSelectTab={(path) => {
-                void selectTab(path);
-              }}
-              onCloseTab={closeTab}
-              onReorderTabs={reorderTabs}
-              onTabContextMenu={(path, x, y) => {
-                setActiveTabPath(path);
-                setTabMenu({ x, y, path });
-              }}
-            />
-            <div className="editor-host" id="monaco-root">
-              {activeTabMeta?.kind === "ai" ? (
+          <EditorPane
+            openTabs={openTabs}
+            activeTabPath={activeTabPath}
+            tabOverflowOpen={tabOverflowOpen}
+            onSetTabOverflowOpen={setTabOverflowOpen}
+            onSelectTab={(path) => {
+              void selectTab(path);
+            }}
+            onCloseTab={closeTab}
+            onReorderTabs={reorderTabs}
+            onTabContextMenu={(path, x, y) => {
+              setActiveTabPath(path);
+              setTabMenu({ x, y, path });
+            }}
+          >
+            {activeTabMeta?.kind === "ai" ? (
                 <AiView
                   aiMessages={aiMessages}
                   aiInput={aiInput}
@@ -3069,48 +1573,14 @@ export function App() {
                   }}
                 />
               ) : activeTabMeta?.kind === "data" ? (
-                <div className="data-view">
-                  <div className="view-header">
-                    <div className="view-title">Data Analysis</div>
-                    <label className="view-toggle">
-                      <input
-                        type="checkbox"
-                        checked={dataExcludeStdlib}
-                        onChange={(event) => setDataExcludeStdlib(event.target.checked)}
-                      />
-                      <span>Exclude stdlib</span>
-                    </label>
-                  </div>
-                  <div className="data-grid">
-                    <div className="data-card">
-                      <div className="data-card-label">Project</div>
-                      <div className="data-card-value">{projectCounts.fileCount} files / {projectCounts.symbolCount} symbols</div>
-                    </div>
-                    <div className="data-card">
-                      <div className="data-card-label">Library</div>
-                      <div className="data-card-value">{libraryCounts.fileCount} files / {libraryCounts.symbolCount} symbols</div>
-                    </div>
-                    <div className="data-card">
-                      <div className="data-card-label">Errors</div>
-                      <div className="data-card-value">{errorCounts.fileCount} files / {errorCounts.symbolCount} issues</div>
-                    </div>
-                  </div>
-                  <div className="data-section">
-                    <div className="data-section-title">Top symbol kinds</div>
-                    {dataViewSymbolKindCounts.length ? (
-                      <div className="data-list">
-                        {dataViewSymbolKindCounts.slice(0, 12).map(([kind, count]) => (
-                          <div key={kind} className="data-row">
-                            <span className="data-row-label">{kind}</span>
-                            <span className="data-row-value">{count}</span>
-                          </div>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="muted">No symbols yet.</div>
-                    )}
-                  </div>
-                </div>
+                <DataView
+                  dataExcludeStdlib={dataExcludeStdlib}
+                  onToggleExcludeStdlib={setDataExcludeStdlib}
+                  projectCounts={projectCounts}
+                  libraryCounts={libraryCounts}
+                  errorCounts={errorCounts}
+                  dataViewSymbolKindCounts={dataViewSymbolKindCounts}
+                />
               ) : !activeTabPath ? (
                 <div className="editor-placeholder">
                   <div className="welcome-screen">
@@ -3124,255 +1594,67 @@ export function App() {
                     </div>
                   </div>
               ) : activeTabPath === PROJECT_DESCRIPTOR_TAB ? (
-                <div className="descriptor-view">
-                  <div className="descriptor-header">Project Descriptor</div>
-                  {descriptorViewMode === "view" ? (
-                    projectDescriptor ? (
-                      <div className="descriptor-grid">
-                        <div className="descriptor-row">
-                          <div className="descriptor-label">Name</div>
-                          <div className="descriptor-value">{projectDescriptor.name || "—"}</div>
-                        </div>
-                        <div className="descriptor-row">
-                          <div className="descriptor-label">Author</div>
-                          <div className="descriptor-value">{projectDescriptor.author || "—"}</div>
-                        </div>
-                        <div className="descriptor-row">
-                          <div className="descriptor-label">Organization</div>
-                          <div className="descriptor-value">{projectDescriptor.organization || "—"}</div>
-                        </div>
-                        <div className="descriptor-row">
-                          <div className="descriptor-label">Description</div>
-                          <div className="descriptor-value">{projectDescriptor.description || "—"}</div>
-                        </div>
-                        <div className="descriptor-row">
-                          <div className="descriptor-label">Default library</div>
-                          <div className="descriptor-value">{projectDescriptor.default_library ? "Yes" : "No"}</div>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="muted">No project descriptor found.</div>
-                    )
-                  ) : (
-                    <pre className="descriptor-json">
-                      {projectDescriptor?.raw_json || "{}"}
-                    </pre>
-                  )}
-                </div>
+                <DescriptorView
+                  descriptorViewMode={descriptorViewMode}
+                  projectDescriptor={projectDescriptor}
+                />
               ) : activeTabMeta?.kind !== "diagram" ? (
                 <MonacoEditor
                   defaultValue=""
-                  onChange={(value) => {
-                    editorValueRef.current = value ?? "";
-                    if (editorChangeRafRef.current == null) {
-                      editorChangeRafRef.current = window.requestAnimationFrame(() => {
-                        setEditorChangeTick((tick) => tick + 1);
-                        editorChangeRafRef.current = null;
-                      });
-                    }
-                  }}
+                    onChange={(value) => {
+                      const next = value ?? "";
+                      if (suppressDirtyRef.current) {
+                        suppressDirtyRef.current = false;
+                        return;
+                      }
+                      onEditorChange(next);
+                    }}
                   language="sysml"
                   theme={appTheme === "light" ? "vs" : "vs-dark"}
                   onMount={handleEditorMount}
                   options={editorOptions}
                 />
-              ) : (
-                <div className="diagram-surface">
-                  <div className="diagram-header">
-                  <span>Diagram view</span>
-                  <div className="diagram-controls">
-                    <button
-                      type="button"
-                      className="ghost toggle-btn"
-                      onClick={() => setCenterView("file")}
-                      title="Switch to text"
-                    >
-                      Text
-                    </button>
-                    <button
-                      type="button"
-                      className={`ghost ${syncDiagramSelection ? "active" : ""}`}
-                      onClick={() => setSyncDiagramSelection((prev) => !prev)}
-                      title="Sync diagram selection to model tree"
-                    >
-                      Sync
-                    </button>
-                    <button
-                      type="button"
-                      className="ghost"
-                      onClick={() => {
-                        setDiagramNodeOffsets({});
-                        setDiagramNodeSizes({});
-                        setDiagramOffset({ x: 0, y: 0 });
-                        requestDiagramLayout();
-                      }}
-                    >
-                      Auto-layout
-                    </button>
-                    <button type="button" className="ghost" onClick={() => setDiagramScale((s) => Math.min(2.0, s + 0.1))}>+</button>
-                    <button type="button" className="ghost" onClick={() => setDiagramScale((s) => Math.max(0.4, s - 0.1))}>-</button>
-                    <button
-                      type="button"
-                      className="ghost"
-                      onClick={() => {
-                        setDiagramScale(1);
-                        setDiagramOffset({ x: 0, y: 0 });
-                      }}
-                    >
-                      Reset
-                    </button>
-                  </div>
-                </div>
-                <div
-                  className="diagram-body"
-                  ref={diagramBodyRef}
-                  onPointerDown={(event) => {
-                    const target = event.target as HTMLElement | null;
-                    if (target?.closest(".diagram-node") || target?.closest(".diagram-viewport")) return;
-                    diagramPanRef.current = {
-                      x: diagramOffset.x,
-                      y: diagramOffset.y,
-                      startX: event.clientX,
-                      startY: event.clientY,
-                    };
-                    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-                  }}
-                  onPointerMove={(event) => {
-                    if (!diagramPanRef.current) return;
-                    const deltaX = event.clientX - diagramPanRef.current.startX;
-                    const deltaY = event.clientY - diagramPanRef.current.startY;
-                    diagramPanPendingRef.current = {
-                      x: diagramPanRef.current.x + deltaX,
-                      y: diagramPanRef.current.y + deltaY,
-                    };
-                    if (diagramPanRafRef.current == null) {
-                      diagramPanRafRef.current = window.requestAnimationFrame(() => {
-                        if (diagramPanPendingRef.current) {
-                          setDiagramOffset(diagramPanPendingRef.current);
-                        }
-                        diagramPanPendingRef.current = null;
-                        diagramPanRafRef.current = null;
-                      });
-                    }
-                  }}
-                  onPointerUp={() => {
-                    diagramPanRef.current = null;
-                  }}
-                >
-                  {diagramLayout ? (
-                    <>
-                      <div
-                        className="diagram-canvas"
-                        style={{
-                          transform: `translate(${diagramOffset.x}px, ${diagramOffset.y}px) scale(${diagramScale})`,
-                        }}
-                      >
-                        {renderDiagramLayout(diagramLayout)}
-                        {diagramManualNodes.map((node) => renderManualNode(node))}
-                      </div>
-                      {paletteGhost ? (
-                        <div
-                          className="diagram-ghost"
-                          style={{ left: `${paletteGhost.x}px`, top: `${paletteGhost.y}px` }}
-                        >
-                          {renderTypeIcon(paletteGhost.type, "diagram")}
-                        </div>
-                      ) : null}
-                      <div
-                        className="diagram-palette"
-                        style={{ left: `${palettePos.x}px`, top: `${palettePos.y}px` }}
-                      >
-                        <div
-                          className="diagram-palette-header"
-                          onPointerDown={(event) => {
-                            event.stopPropagation();
-                            paletteDragRef.current = {
-                              startX: event.clientX,
-                              startY: event.clientY,
-                              baseX: palettePos.x,
-                              baseY: palettePos.y,
-                            };
-                            (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-                          }}
-                        >
-                          Palette
-                        </div>
-                        <button
-                          type="button"
-                          className="diagram-palette-item"
-                          onPointerDown={(event) => {
-                            event.stopPropagation();
-                            paletteCreateRef.current = { type: "package", name: "Package", startX: event.clientX, startY: event.clientY };
-                            setPaletteGhost({ x: event.clientX, y: event.clientY, type: "package" });
-                            (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-                          }}
-                        >
-                          {renderTypeIcon("package", "diagram")}
-                          <span>Package</span>
-                        </button>
-                      </div>
-                      <div className="diagram-minimap">
-                        {diagramLayout ? (
-                          <div className="diagram-minimap-canvas">
-                            <div
-                              className="diagram-minimap-scale"
-                              style={{
-                                transform: `scale(${140 / Math.max(diagramLayout.width * diagramScale, 1)}, ${100 / Math.max(diagramLayout.height * diagramScale, 1)})`,
-                              }}
-                            >
-                              {renderMinimapLayout(diagramLayout)}
-                            </div>
-                          </div>
-                        ) : null}
-                        <div
-                          className="diagram-viewport"
-                          style={{
-                            left: `${diagramViewport.x}px`,
-                            top: `${diagramViewport.y}px`,
-                            width: `${diagramViewport.width}px`,
-                            height: `${diagramViewport.height}px`,
-                          }}
-                          onPointerDown={(event) => {
-                            event.stopPropagation();
-                            diagramViewportRef.current = {
-                              startX: event.clientX,
-                              startY: event.clientY,
-                              baseX: diagramViewport.x,
-                              baseY: diagramViewport.y,
-                            };
-                            (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-                          }}
-                          onPointerMove={(event) => {
-                            if (!diagramViewportRef.current || !diagramLayout || !diagramBodyRef.current) return;
-                            const deltaX = event.clientX - diagramViewportRef.current.startX;
-                            const deltaY = event.clientY - diagramViewportRef.current.startY;
-                            const nextX = Math.min(140 - diagramViewport.width, Math.max(0, diagramViewportRef.current.baseX + deltaX));
-                            const nextY = Math.min(100 - diagramViewport.height, Math.max(0, diagramViewportRef.current.baseY + deltaY));
-                            const canvasWidth = diagramLayout.width * diagramScale;
-                            const canvasHeight = diagramLayout.height * diagramScale;
-                            const miniScaleX = 140 / Math.max(canvasWidth, 1);
-                            const miniScaleY = 100 / Math.max(canvasHeight, 1);
-                            setDiagramOffset({
-                              x: -nextX / miniScaleX,
-                              y: -nextY / miniScaleY,
-                            });
-                          }}
-                          onPointerUp={() => {
-                            diagramViewportRef.current = null;
-                          }}
-                        />
-                      </div>
-                    </>
-                  ) : (
-                    <div className="diagram-placeholder">
-                      No symbols found for {activeDiagramPath ? activeDiagramPath.split(/[\\/]/).pop() : "file"}.
-                    </div>
-                  )}
-                </div>
-              </div>
+            ) : (
+              <DiagramView
+                activeDiagramPath={activeDiagramPath}
+                syncDiagramSelection={syncDiagramSelection}
+                diagramLayout={diagramLayout}
+                diagramScale={diagramScale}
+                diagramOffset={diagramOffset}
+                diagramViewport={diagramViewport}
+                diagramManualNodes={diagramManualNodes}
+                paletteGhost={paletteGhost}
+                palettePos={palettePos}
+                diagramBodyRef={diagramBodyRef}
+                diagramPanRef={diagramPanRef}
+                diagramPanPendingRef={diagramPanPendingRef}
+                diagramPanRafRef={diagramPanRafRef}
+                diagramViewportRef={diagramViewportRef}
+                paletteDragRef={paletteDragRef}
+                paletteCreateRef={paletteCreateRef}
+                onSwitchToText={() => setCenterView("file")}
+                onToggleSync={() => setSyncDiagramSelection((prev) => !prev)}
+                onAutoLayout={() => {
+                  setDiagramNodeOffsets({});
+                  setDiagramNodeSizes({});
+                  setDiagramOffset({ x: 0, y: 0 });
+                  requestDiagramLayout();
+                }}
+                onZoomIn={() => setDiagramScale((s) => Math.min(2.0, s + 0.1))}
+                onZoomOut={() => setDiagramScale((s) => Math.max(0.4, s - 0.1))}
+                onReset={() => {
+                  setDiagramScale(1);
+                  setDiagramOffset({ x: 0, y: 0 });
+                }}
+                setDiagramOffset={setDiagramOffset}
+                setPaletteGhost={setPaletteGhost}
+                renderDiagramLayout={renderDiagramLayout}
+                renderManualNode={renderManualNode}
+                renderMinimapLayout={renderMinimapLayout}
+                renderTypeIcon={renderTypeIcon}
+              />
             )}
-          </div>
-        </section>
+          </EditorPane>
           <div
             className={`splitter ${rightCollapsed ? "collapsed" : ""}`}
             onPointerDown={rightCollapsed ? undefined : (event) => startDrag("right", event)}
@@ -3394,15 +1676,20 @@ export function App() {
           {rightCollapsed ? null : (
             <section className="panel sidebar">
               <div className="panel-header">
-              <button type="button" className="ghost" onClick={() => setCollapseAllModel((prev) => !prev)}>
-                {collapseAllModel ? "Expand all" : "Collapse all"}
-              </button>
-              <button
-                type="button"
-                className={`ghost icon-properties ${showPropertiesPane ? "active" : ""}`}
-                onClick={() => setShowPropertiesPane((prev) => !prev)}
-                aria-label="Toggle properties"
-                title={showPropertiesPane ? "Hide properties" : "Show properties"}
+              <ModelHeader
+                canTrack={!!trackCandidate}
+                trackText={trackText}
+                collapseAll={collapseAllModel}
+                onCollapseAll={() => setCollapseAllModel(true)}
+                onExpandAll={() => setCollapseAllModel(false)}
+                onToggleTrack={() => {
+                  setTrackText((prev) => !prev);
+                  if (!trackText) {
+                    trackNow();
+                  }
+                }}
+                onToggleProperties={() => setShowPropertiesPane((prev) => !prev)}
+                showProperties={showPropertiesPane}
               />
               <button
                 type="button"
@@ -3416,114 +1703,24 @@ export function App() {
                 »
               </button>
             </div>
-            <div
-              className={`model-pane ${showPropertiesPane ? "" : "no-properties"}`}
-              style={{ ["--model-tree-height" as string]: `${modelTreeHeight}px` }}
-            >
-              <div
-                className="model-tree"
-                ref={modelTreeRef}
-                tabIndex={0}
-                onKeyDown={handleModelTreeKeyDown}
-                onMouseDown={() => {
-                  if (document.activeElement !== modelTreeRef.current) {
-                    modelTreeRef.current?.focus();
-                  }
-                }}
-                onFocus={() => {
-                  if (modelCursorIndex != null || !modelRows.length) return;
-                  const selectedIndex = findSelectedSymbolIndex();
-                  setModelCursorIndex(selectedIndex >= 0 ? selectedIndex : 0);
-                }}
-              >
-                <List
-                  listRef={modelListRef}
-                  rowCount={modelRows.length}
-                  rowHeight={(index) => getModelRowHeight(modelRows[index])}
-                  rowComponent={renderModelRow}
-                  rowProps={{ rows: modelRows }}
-                  overscanCount={6}
-                  style={{ height: modelListHeight, width: "100%" }}
-                />
-              </div>
-              {showPropertiesPane ? (
-                <>
-                  <div className="h-splitter" onPointerDown={(event) => startDrag("model", event)} />
-                  <div className="properties-pane">
-                    <div className="properties-header" />
-                    {selectedSymbol ? (
-                      <div className="properties-body">
-                        <div className="properties-title">
-                          <span>{selectedSymbol.name}</span>
-                          <span className="model-kind">{selectedSymbol.kind}</span>
-                        </div>
-                        {selectedSymbol.doc ? <div className="properties-doc">{selectedSymbol.doc}</div> : null}
-                        <div className="properties-list">
-                          {selectedSymbol.properties.length ? (
-                            selectedSymbol.properties.map((prop, index) => (
-                              <div key={`${prop.name}-${index}`} className="properties-row">
-                                <div className="properties-key">{prop.label}</div>
-                                <div className="properties-value">
-                                  {"type" in prop.value && prop.value.type === "text" ? prop.value.value : null}
-                                  {"type" in prop.value && prop.value.type === "bool" ? (prop.value.value ? "true" : "false") : null}
-                                  {"type" in prop.value && prop.value.type === "number" ? String(prop.value.value) : null}
-                                  {"type" in prop.value && prop.value.type === "list" ? prop.value.items.join(", ") : null}
-                                </div>
-                              </div>
-                            ))
-                          ) : (
-                            <div className="muted">No properties.</div>
-                          )}
-                        </div>
-                        <details className="properties-section" key={`parse-${selectedSymbol.qualified_name}`}>
-                          <summary>Parse information</summary>
-                          <div className="properties-parse">
-                            {selectedSymbol.file == null &&
-                            selectedSymbol.start_line == null &&
-                            selectedSymbol.start_col == null &&
-                            selectedSymbol.end_line == null &&
-                            selectedSymbol.end_col == null ? (
-                              <div className="muted">No parse data available.</div>
-                              ) : (
-                                <>
-                                  <div className="properties-row">
-                                    <div className="properties-key">File id</div>
-                                    <div className="properties-value">
-                                      {selectedSymbol.file == null ? "—" : String(selectedSymbol.file)}
-                                    </div>
-                                  </div>
-                                  <div className="properties-row">
-                                    <div className="properties-key">File path</div>
-                                    <div className="properties-value">{selectedSymbol.file_path ?? "—"}</div>
-                                  </div>
-                                <div className="properties-row">
-                                  <div className="properties-key">Start line</div>
-                                  <div className="properties-value">{selectedSymbol.start_line ?? "—"}</div>
-                                </div>
-                                <div className="properties-row">
-                                  <div className="properties-key">Start column</div>
-                                  <div className="properties-value">{selectedSymbol.start_col ?? "—"}</div>
-                                </div>
-                                <div className="properties-row">
-                                  <div className="properties-key">End line</div>
-                                  <div className="properties-value">{selectedSymbol.end_line ?? "—"}</div>
-                                </div>
-                                <div className="properties-row">
-                                  <div className="properties-key">End column</div>
-                                  <div className="properties-value">{selectedSymbol.end_col ?? "—"}</div>
-                                </div>
-                              </>
-                            )}
-                          </div>
-                        </details>
-                      </div>
-                    ) : (
-                      <div className="muted">Select a model element to view its properties.</div>
-                    )}
-                  </div>
-                </>
-              ) : null}
-            </div>
+            <ModelPane
+              modelTreeHeight={modelTreeHeight}
+              showPropertiesPane={showPropertiesPane}
+              modelTreeRef={modelTreeRef}
+              modelListRef={modelListRef}
+              modelRows={modelRows}
+              modelListHeight={modelListHeight}
+              getModelRowHeight={getModelRowHeight}
+              renderModelRow={renderModelRow}
+              handleModelTreeKeyDown={handleModelTreeKeyDown}
+              onModelTreeFocus={() => {
+                if (modelCursorIndex != null || !modelRows.length) return;
+                const selectedIndex = findSelectedSymbolIndex();
+                setModelCursorIndex(selectedIndex >= 0 ? selectedIndex : 0);
+              }}
+              startDrag={startDrag}
+              selectedSymbol={selectedSymbol}
+            />
             </section>
           )}
       </main>
@@ -3978,7 +2175,7 @@ export function App() {
               <span className="status-cursor">Ln {cursorPos.line}, Col {cursorPos.col}</span>
             ) : null}
             <span
-              className={`status-compile-indicator ${backgroundCompileRef.current ? "active" : ""} ${backgroundCompileEnabled ? "" : "disabled"}`}
+              className={`status-compile-indicator ${backgroundCompileActive ? "active" : ""} ${backgroundCompileEnabled ? "" : "disabled"}`}
               title={backgroundCompileEnabled ? "Background compile enabled (right-click to disable)" : "Background compile disabled (right-click to enable)"}
               onContextMenu={(event) => {
                 event.preventDefault();

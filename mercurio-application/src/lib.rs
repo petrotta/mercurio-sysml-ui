@@ -1803,6 +1803,20 @@ const BASE_PROPERTY_DESCRIPTORS: &[PropertyDescriptor] = &[
         group: None,
         getter: prop_type_refs,
     },
+    PropertyDescriptor {
+        name: "multiplicity",
+        label: "Multiplicity",
+        hint: Some("multiplicity"),
+        group: None,
+        getter: prop_multiplicity,
+    },
+    PropertyDescriptor {
+        name: "expression_refs",
+        label: "Expression refs",
+        hint: Some("list"),
+        group: None,
+        getter: prop_expression_refs,
+    },
 ];
 
 const PARSE_PROPERTY_DESCRIPTORS: &[PropertyDescriptor] = &[
@@ -1944,6 +1958,51 @@ fn prop_type_refs(symbol: &HirSymbol, _file_path: &Path) -> PropertyValueView {
         .filter_map(type_ref_display_target)
         .collect::<Vec<_>>();
     PropertyValueView::List { items }
+}
+
+fn prop_expression_refs(symbol: &HirSymbol, _file_path: &Path) -> PropertyValueView {
+    let mut items = Vec::new();
+    for type_ref in &symbol.type_refs {
+        match type_ref {
+            TypeRefKind::Simple(part) => {
+                if matches!(part.kind, syster::hir::RefKind::Expression) {
+                    items.push(part.target.as_ref().to_string());
+                }
+            }
+            TypeRefKind::Chain(chain) => {
+                let has_expression = chain
+                    .parts
+                    .iter()
+                    .any(|part| matches!(part.kind, syster::hir::RefKind::Expression));
+                if has_expression {
+                    items.push(chain.as_dotted_string());
+                }
+            }
+        }
+    }
+    PropertyValueView::List { items }
+}
+
+fn prop_multiplicity(symbol: &HirSymbol, _file_path: &Path) -> PropertyValueView {
+    let value = match symbol.multiplicity {
+        None => String::new(),
+        Some(m) => {
+            let lower = m
+                .lower
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "*".to_string());
+            let upper = m
+                .upper
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "*".to_string());
+            if m.lower.is_some() && m.upper.is_some() && m.lower == m.upper {
+                format!("[{}]", lower)
+            } else {
+                format!("[{}..{}]", lower, upper)
+            }
+        }
+    };
+    PropertyValueView::Text { value }
 }
 
 fn prop_file_id(symbol: &HirSymbol, _file_path: &Path) -> PropertyValueView {
