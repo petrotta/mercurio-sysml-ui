@@ -208,7 +208,6 @@ export function App() {
       occurrencesHighlight: "off",
       automaticLayout: true,
     };
-  const [syncDiagramSelection, setSyncDiagramSelection] = useState(false);
   const fsChangeTimerRef = useRef<number | null>(null);
   const activeTabMeta = useMemo(
     () => openTabs.find((tab) => tab.path === activeTabPath) || null,
@@ -222,8 +221,8 @@ export function App() {
   }, [activeTabMeta]);
   const activeDiagramPath = useMemo(() => {
     if (activeTabMeta?.kind === "diagram") return activeTabMeta.sourcePath || null;
-    return activeEditorPath;
-  }, [activeTabMeta, activeEditorPath]);
+    return null;
+  }, [activeTabMeta]);
 
   useEffect(() => {
     document.body.classList.toggle("theme-light", appTheme === "light");
@@ -605,6 +604,10 @@ export function App() {
       void toggleExpand(entry);
       return;
     }
+    if (entry.path.toLowerCase().endsWith(".diagram")) {
+      openDiagramViewTab(entry.path);
+      return;
+    }
     await navigateTo({ path: entry.path, name: entry.name });
   };
 
@@ -680,9 +683,19 @@ export function App() {
     const parent = normParentCandidate.startsWith(normRoot) ? parentCandidate : rootPath;
     const trimmed = newFileName.trim();
     const baseName = trimmed.split(/[\\/]/).pop() || trimmed;
-    const extension = newFileType === "kerml" ? ".kerml" : ".sysml";
+    const extension =
+      newFileType === "diagram" ? ".diagram" : newFileType === "kerml" ? ".kerml" : ".sysml";
     const finalName = baseName.toLowerCase().endsWith(extension) ? baseName : `${baseName}${extension}`;
-    await invoke("create_file", { root: rootPath, parent, name: finalName });
+    if (newFileType === "diagram") {
+      const createdPath = await invoke<string>("create_file", { root: rootPath, parent, name: finalName });
+      await invoke("write_diagram", {
+        root: rootPath,
+        path: createdPath,
+        diagram: { version: 1, nodes: [], offsets: {}, sizes: {} },
+      });
+    } else {
+      await invoke("create_file", { root: rootPath, parent, name: finalName });
+    }
     setShowNewFile(false);
     setNewFileName("");
     await refreshRoot(rootPath);
@@ -1021,12 +1034,13 @@ export function App() {
         }
         if (activeTabMeta?.kind === "diagram") {
           if (activeTabMeta.sourcePath) {
-            void selectTab(activeTabMeta.sourcePath);
+            void navigateTo({ path: activeTabMeta.sourcePath });
           }
           return;
         }
         if (!activeEditorPath) return;
-        if (editorRef.current && activeEditorPath) {
+        if (!activeEditorPath.toLowerCase().endsWith(".diagram")) return;
+        if (editorRef.current) {
           queuePendingEditorContent(activeEditorPath, editorValueRef.current);
         }
         openDiagramViewTab(activeEditorPath);
@@ -1295,31 +1309,25 @@ export function App() {
     diagramPanRafRef,
     diagramPanPendingRef,
     diagramLayout,
-    diagramManualNodes,
+    diagramDropActive,
     palettePos,
     paletteGhost,
     paletteDragRef,
     paletteCreateRef,
     renderDiagramLayout,
-    renderManualNode,
     renderMinimapLayout,
     requestDiagramLayout,
     setDiagramNodeOffsets,
     setDiagramNodeSizes,
     setPaletteGhost,
+    handleDiagramDrop,
+    handleDiagramDragOver,
+    handleDiagramDragLeave,
   } = useDiagramView({
     activeDiagramPath,
-    activeTabPath,
-    deferredSymbols,
-    selectedSymbol,
-    setSelectedSymbol,
-    selectSymbolInEditor,
-    syncModelTreeToSymbol,
-    syncDiagramSelection,
     getKindKey,
     renderTypeIcon,
     rootPath,
-    runBackgroundCompile,
     setCompileStatus,
   });
 
@@ -1413,9 +1421,14 @@ export function App() {
                 type="button"
                 onClick={() => {
                   setOpenMenu(null);
-                  if (activeEditorPath) openDiagramViewTab(activeEditorPath);
+                  if (activeEditorPath && activeEditorPath.toLowerCase().endsWith(".diagram")) {
+                    if (editorRef.current) {
+                      queuePendingEditorContent(activeEditorPath, editorValueRef.current);
+                    }
+                    openDiagramViewTab(activeEditorPath);
+                  }
                 }}
-                disabled={!activeEditorPath}
+                disabled={!activeEditorPath || !activeEditorPath.toLowerCase().endsWith(".diagram")}
               >
                 Diagram View
               </button>
@@ -1590,7 +1603,7 @@ export function App() {
                         <button type="button" className="ghost" onClick={openNewProjectDialog}>New Project</button>
                         <button type="button" className="ghost" onClick={chooseProject}>Open Project</button>
                       </div>
-                      <div className="welcome-hint">Tip: Press F10 to open the diagram view.</div>
+                      <div className="welcome-hint">Tip: Open a .diagram file to view diagrams.</div>
                     </div>
                   </div>
               ) : activeTabPath === PROJECT_DESCRIPTOR_TAB ? (
@@ -1617,12 +1630,10 @@ export function App() {
             ) : (
               <DiagramView
                 activeDiagramPath={activeDiagramPath}
-                syncDiagramSelection={syncDiagramSelection}
                 diagramLayout={diagramLayout}
                 diagramScale={diagramScale}
                 diagramOffset={diagramOffset}
                 diagramViewport={diagramViewport}
-                diagramManualNodes={diagramManualNodes}
                 paletteGhost={paletteGhost}
                 palettePos={palettePos}
                 diagramBodyRef={diagramBodyRef}
@@ -1632,8 +1643,14 @@ export function App() {
                 diagramViewportRef={diagramViewportRef}
                 paletteDragRef={paletteDragRef}
                 paletteCreateRef={paletteCreateRef}
-                onSwitchToText={() => setCenterView("file")}
-                onToggleSync={() => setSyncDiagramSelection((prev) => !prev)}
+                diagramDropActive={diagramDropActive}
+                onSwitchToText={() => {
+                  if (activeDiagramPath) {
+                    void navigateTo({ path: activeDiagramPath });
+                  } else {
+                    setCenterView("file");
+                  }
+                }}
                 onAutoLayout={() => {
                   setDiagramNodeOffsets({});
                   setDiagramNodeSizes({});
@@ -1646,10 +1663,12 @@ export function App() {
                   setDiagramScale(1);
                   setDiagramOffset({ x: 0, y: 0 });
                 }}
+                onDiagramDrop={handleDiagramDrop}
+                onDiagramDragOver={handleDiagramDragOver}
+                onDiagramDragLeave={handleDiagramDragLeave}
                 setDiagramOffset={setDiagramOffset}
                 setPaletteGhost={setPaletteGhost}
                 renderDiagramLayout={renderDiagramLayout}
-                renderManualNode={renderManualNode}
                 renderMinimapLayout={renderMinimapLayout}
                 renderTypeIcon={renderTypeIcon}
               />
@@ -1796,6 +1815,7 @@ export function App() {
                   <select value={newFileType} onChange={(e) => setNewFileType(e.target.value)}>
                     <option value="sysml">.sysml</option>
                     <option value="kerml">.kerml</option>
+                    <option value="diagram">.diagram</option>
                   </select>
                 </label>
                 <div className="field">

@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { DiagramLayout, SymbolView } from "./types";
+import type { DiagramLayout, DiagramNode } from "./types";
 
 type UseDiagramLayoutOptions = {
   activeDiagramPath: string | null;
-  deferredSymbols: SymbolView[];
+  diagramNodes: DiagramNode[];
 };
 
-export function useDiagramLayout({ activeDiagramPath, deferredSymbols }: UseDiagramLayoutOptions) {
+export function useDiagramLayout({ activeDiagramPath, diagramNodes }: UseDiagramLayoutOptions) {
   const diagramWorkerRef = useRef<Worker | null>(null);
   const diagramLayoutReqRef = useRef(0);
   const [diagramLayout, setDiagramLayout] = useState<DiagramLayout | null>(null);
@@ -20,20 +20,20 @@ export function useDiagramLayout({ activeDiagramPath, deferredSymbols }: UseDiag
     };
   }, []);
 
-  const fileSymbols = useMemo(() => {
+  const fileNodes = useMemo(() => {
     if (!activeDiagramPath) return [];
-    return deferredSymbols.filter((symbol) => symbol.file_path === activeDiagramPath);
-  }, [deferredSymbols, activeDiagramPath]);
+    return diagramNodes;
+  }, [diagramNodes, activeDiagramPath]);
 
-  const symbolByQualified = useMemo(() => {
-    const map = new Map<string, SymbolView>();
-    fileSymbols.forEach((symbol) => map.set(symbol.qualified_name, symbol));
+  const nodeByQualified = useMemo(() => {
+    const map = new Map<string, DiagramNode>();
+    fileNodes.forEach((node) => map.set(node.qualified, node));
     return map;
-  }, [fileSymbols]);
+  }, [fileNodes]);
 
   const requestDiagramLayout = () => {
     if (!diagramWorkerRef.current) return;
-    if (!fileSymbols.length) {
+    if (!fileNodes.length) {
       setDiagramLayout(null);
       return;
     }
@@ -42,10 +42,10 @@ export function useDiagramLayout({ activeDiagramPath, deferredSymbols }: UseDiag
     worker.postMessage({
       type: "layout",
       reqId,
-      nodes: fileSymbols.map((symbol) => ({
-        qualified: symbol.qualified_name,
-        name: symbol.name,
-        kind: symbol.kind,
+      nodes: fileNodes.map((node) => ({
+        qualified: node.qualified,
+        name: node.name,
+        kind: node.kind,
       })),
     });
     const onMessage = (event: MessageEvent) => {
@@ -59,7 +59,7 @@ export function useDiagramLayout({ activeDiagramPath, deferredSymbols }: UseDiag
 
   useEffect(() => {
     requestDiagramLayout();
-  }, [fileSymbols]);
+  }, [fileNodes]);
 
-  return { diagramLayout, requestDiagramLayout, symbolByQualified };
+  return { diagramLayout, requestDiagramLayout, nodeByQualified };
 }

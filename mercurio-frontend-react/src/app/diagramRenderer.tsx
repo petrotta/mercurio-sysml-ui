@@ -1,21 +1,15 @@
 import type { MutableRefObject, ReactElement } from "react";
-import type { DiagramLayout, DiagramManualNode, SymbolView } from "./types";
-
-type DiagramNodeOffset = { x: number; y: number };
-type DiagramNodeSize = { width: number; height: number };
+import type { DiagramLayout, DiagramNode, DiagramNodeOffset, DiagramNodeSize } from "./types";
 
 type DiagramDragState = { node: string; startX: number; startY: number; base: DiagramNodeOffset };
 type DiagramResizeState = { node: string; startX: number; startY: number; base: DiagramNodeSize };
 
 type DiagramRendererOptions = {
-  symbolByQualified: Map<string, SymbolView>;
+  nodeByQualified: Map<string, DiagramNode>;
   getKindKey: (kind: string) => string;
   renderTypeIcon: (kind: string, variant: "model" | "diagram") => ReactElement;
-  selectedSymbol: SymbolView | null;
-  setSelectedSymbol: (symbol: SymbolView | null) => void;
-  selectSymbolInEditor: (symbol: SymbolView) => Promise<void> | void;
-  syncModelTreeToSymbol: (symbol: SymbolView) => void;
-  syncDiagramSelection: boolean;
+  selectedNode: DiagramNode | null;
+  setSelectedNode: (node: DiagramNode | null) => void;
   diagramNodeOffsets: Record<string, DiagramNodeOffset>;
   diagramNodeSizes: Record<string, DiagramNodeSize>;
   diagramDragRef: MutableRefObject<DiagramDragState | null>;
@@ -24,14 +18,11 @@ type DiagramRendererOptions = {
 
 export function createDiagramRenderer(options: DiagramRendererOptions) {
   const {
-    symbolByQualified,
+    nodeByQualified,
     getKindKey,
     renderTypeIcon,
-    selectedSymbol,
-    setSelectedSymbol,
-    selectSymbolInEditor,
-    syncModelTreeToSymbol,
-    syncDiagramSelection,
+    selectedNode,
+    setSelectedNode,
     diagramNodeOffsets,
     diagramNodeSizes,
     diagramDragRef,
@@ -54,10 +45,10 @@ export function createDiagramRenderer(options: DiagramRendererOptions) {
         </div>
       );
     }
-    const symbol = symbolByQualified.get(layout.node.fullName);
-    const kindLabel = symbol?.kind || layout.node.kind;
+    const node = nodeByQualified.get(layout.node.fullName);
+    const kindLabel = node?.kind || layout.node.kind;
     const kindKey = getKindKey(kindLabel || "");
-    const isSelected = selectedSymbol?.qualified_name === layout.node.fullName;
+    const isSelected = selectedNode?.qualified === layout.node.fullName;
     const offset = diagramNodeOffsets[layout.node.fullName] || { x: 0, y: 0 };
     const sizeOverride = diagramNodeSizes[layout.node.fullName];
     return (
@@ -82,18 +73,13 @@ export function createDiagramRenderer(options: DiagramRendererOptions) {
         }}
         onClick={(event) => {
           event.stopPropagation();
-          if (symbol) {
-            setSelectedSymbol(symbol);
-            void selectSymbolInEditor(symbol);
-            if (syncDiagramSelection) {
-              syncModelTreeToSymbol(symbol);
-            }
+          if (node) {
+            setSelectedNode(node);
           }
         }}
         onKeyDown={(event) => {
-          if (event.key === "Enter" && symbol) {
-            setSelectedSymbol(symbol);
-            void selectSymbolInEditor(symbol);
+          if (event.key === "Enter" && node) {
+            setSelectedNode(node);
           }
         }}
       >
@@ -134,26 +120,6 @@ export function createDiagramRenderer(options: DiagramRendererOptions) {
     );
   };
 
-  const renderManualNode = (node: DiagramManualNode) => {
-    const kindKey = getKindKey(node.type);
-    return (
-      <div
-        key={node.id}
-        className={`diagram-node manual ${node.pending ? "pending" : ""}`}
-        style={{
-          width: `${node.width}px`,
-          height: `${node.height}px`,
-          transform: `translate(${node.x}px, ${node.y}px)`,
-        }}
-      >
-        <div className="diagram-node-header">
-          {renderTypeIcon(kindKey, "diagram")}
-          <span className="diagram-node-name">{node.name}</span>
-        </div>
-      </div>
-    );
-  };
-
   const renderMinimapLayout = (layout: DiagramLayout) => {
     if (layout.node.name === "root") {
       return (
@@ -185,5 +151,5 @@ export function createDiagramRenderer(options: DiagramRendererOptions) {
     );
   };
 
-  return { renderDiagramLayout, renderManualNode, renderMinimapLayout };
+  return { renderDiagramLayout, renderMinimapLayout };
 }

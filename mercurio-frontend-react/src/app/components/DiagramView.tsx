@@ -1,14 +1,12 @@
-import type { MutableRefObject, ReactElement } from "react";
-import type { DiagramLayout, DiagramManualNode, DiagramViewport } from "../types";
+import type { DragEvent, MutableRefObject, ReactElement } from "react";
+import type { DiagramLayout, DiagramViewport } from "../types";
 
 type DiagramViewProps = {
   activeDiagramPath: string | null;
-  syncDiagramSelection: boolean;
   diagramLayout: DiagramLayout | null;
   diagramScale: number;
   diagramOffset: { x: number; y: number };
   diagramViewport: DiagramViewport;
-  diagramManualNodes: DiagramManualNode[];
   paletteGhost: null | { x: number; y: number; type: string };
   palettePos: { x: number; y: number };
   diagramBodyRef: MutableRefObject<HTMLDivElement | null>;
@@ -18,28 +16,28 @@ type DiagramViewProps = {
   diagramViewportRef: MutableRefObject<null | { startX: number; startY: number; baseX: number; baseY: number }>;
   paletteDragRef: MutableRefObject<null | { startX: number; startY: number; baseX: number; baseY: number }>;
   paletteCreateRef: MutableRefObject<null | { type: string; name: string; startX: number; startY: number }>;
+  diagramDropActive: boolean;
   onSwitchToText: () => void;
-  onToggleSync: () => void;
   onAutoLayout: () => void;
   onZoomIn: () => void;
   onZoomOut: () => void;
   onReset: () => void;
+  onDiagramDrop: (event: DragEvent<HTMLDivElement>) => void;
+  onDiagramDragOver: (event: DragEvent<HTMLDivElement>) => void;
+  onDiagramDragLeave: (event: DragEvent<HTMLDivElement>) => void;
   setDiagramOffset: (value: { x: number; y: number }) => void;
   setPaletteGhost: (value: null | { x: number; y: number; type: string }) => void;
   renderDiagramLayout: (layout: DiagramLayout) => ReactElement;
-  renderManualNode: (node: DiagramManualNode) => ReactElement;
   renderMinimapLayout: (layout: DiagramLayout) => ReactElement;
   renderTypeIcon: (kind: string, variant: "model" | "diagram") => ReactElement;
 };
 
 export function DiagramView({
   activeDiagramPath,
-  syncDiagramSelection,
   diagramLayout,
   diagramScale,
   diagramOffset,
   diagramViewport,
-  diagramManualNodes,
   paletteGhost,
   palettePos,
   diagramBodyRef,
@@ -49,21 +47,29 @@ export function DiagramView({
   diagramViewportRef,
   paletteDragRef,
   paletteCreateRef,
+  diagramDropActive,
   onSwitchToText,
-  onToggleSync,
   onAutoLayout,
   onZoomIn,
   onZoomOut,
   onReset,
+  onDiagramDrop,
+  onDiagramDragOver,
+  onDiagramDragLeave,
   setDiagramOffset,
   setPaletteGhost,
   renderDiagramLayout,
-  renderManualNode,
   renderMinimapLayout,
   renderTypeIcon,
 }: DiagramViewProps) {
   return (
-    <div className="diagram-surface">
+    <div
+      className="diagram-surface"
+      onDragOver={onDiagramDragOver}
+      onDragEnter={onDiagramDragOver}
+      onDragLeave={onDiagramDragLeave}
+      onDrop={onDiagramDrop}
+    >
       <div className="diagram-header">
         <span>Diagram view</span>
         <div className="diagram-controls">
@@ -74,14 +80,6 @@ export function DiagramView({
             title="Switch to text"
           >
             Text
-          </button>
-          <button
-            type="button"
-            className={`ghost ${syncDiagramSelection ? "active" : ""}`}
-            onClick={onToggleSync}
-            title="Sync diagram selection to model tree"
-          >
-            Sync
           </button>
           <button
             type="button"
@@ -102,8 +100,12 @@ export function DiagramView({
         </div>
       </div>
       <div
-        className="diagram-body"
+        className={`diagram-body ${diagramDropActive ? "drop-active" : ""}`}
         ref={diagramBodyRef}
+        onDragOver={onDiagramDragOver}
+        onDragEnter={onDiagramDragOver}
+        onDragLeave={onDiagramDragLeave}
+        onDrop={onDiagramDrop}
         onPointerDown={(event) => {
           const target = event.target as HTMLElement | null;
           if (target?.closest(".diagram-node") || target?.closest(".diagram-viewport")) return;
@@ -139,14 +141,18 @@ export function DiagramView({
       >
         {diagramLayout ? (
           <>
+            {diagramDropActive ? <div className="diagram-drop-indicator">Drop to add package</div> : null}
             <div
               className="diagram-canvas"
+              onDragOver={onDiagramDragOver}
+              onDragEnter={onDiagramDragOver}
+              onDragLeave={onDiagramDragLeave}
+              onDrop={onDiagramDrop}
               style={{
                 transform: `translate(${diagramOffset.x}px, ${diagramOffset.y}px) scale(${diagramScale})`,
               }}
             >
               {renderDiagramLayout(diagramLayout)}
-              {diagramManualNodes.map((node) => renderManualNode(node))}
             </div>
             {paletteGhost ? (
               <div
@@ -243,7 +249,7 @@ export function DiagramView({
           </>
         ) : (
           <div className="diagram-placeholder">
-            No symbols found for {activeDiagramPath ? activeDiagramPath.split(/[\\/]/).pop() : "file"}.
+            No diagram content for {activeDiagramPath ? activeDiagramPath.split(/[\\/]/).pop() : "file"}.
           </div>
         )}
       </div>

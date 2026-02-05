@@ -20,6 +20,7 @@ export function ProjectTree({
     return entries.map((entry) => {
       const isExpanded = Boolean(expanded[entry.path]);
       const ext = entry.name.toLowerCase().split(".").pop() || "";
+      const isDiagram = !entry.is_dir && ext === "diagram";
       const iconLabel =
         entry.is_dir
           ? ""
@@ -27,9 +28,12 @@ export function ProjectTree({
             ? "s"
             : ext === "kerml"
               ? "k"
+              : ext === "diagram"
+                ? "d"
               : ext === "json" || ext === "jsonld"
                 ? "{}"
                 : "";
+      const iconClass = entry.is_dir ? "folder" : isDiagram ? "file diagram" : "file";
       return (
         <div key={`${entry.path}-${depth}`} className="tree-node">
           <div
@@ -39,7 +43,7 @@ export function ProjectTree({
             onContextMenu={(event) => onContextMenu(event, entry)}
           >
             <span className="tree-caret">{entry.is_dir ? (isExpanded ? "v" : ">") : ""}</span>
-            <span className={`tree-icon ${entry.is_dir ? "folder" : "file"}`}>
+            <span className={`tree-icon ${iconClass}`}>
               {iconLabel ? <span className="tree-icon-label">{iconLabel}</span> : null}
             </span>
             <span className="tree-label">{entry.name}</span>

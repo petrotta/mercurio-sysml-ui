@@ -130,15 +130,30 @@ export function createModelRowRenderer(options: ModelRowRendererOptions) {
       (selectedSymbol?.qualified_name
         ? selectedSymbol.qualified_name === symbol.qualified_name
         : selectedSymbol?.file_path === symbol.file_path && selectedSymbol?.name === symbol.name);
+    const isPackage = !!symbol?.kind && symbol.kind.toLowerCase() === "package";
     return (
       <div
         style={{ ...style, paddingLeft: `${modelSectionIndent + 8 + row.depth * 14}px` }}
         className={`model-virtual-row ${isSelected ? "selected" : ""} ${isFocused ? "model-row-focused" : ""}`}
         role="button"
         tabIndex={-1}
+        draggable={isPackage}
+        onDragStart={(event) => {
+          if (!symbol || !isPackage) return;
+          const payload = {
+            qualified: symbol.qualified_name,
+            name: symbol.name,
+            kind: symbol.kind,
+          };
+          event.dataTransfer.setData("application/x-mercurio-diagram-node", JSON.stringify(payload));
+          event.dataTransfer.setData("text/plain", symbol.qualified_name || symbol.name || "package");
+          event.dataTransfer.effectAllowed = "copy";
+        }}
         onKeyDown={(event) => handleModelTreeKeyDown(event, index)}
         onMouseDown={(event) => {
-          event.preventDefault();
+          if (!isPackage) {
+            event.preventDefault();
+          }
           modelTreeRef.current?.focus();
         }}
         onClick={(event) => {

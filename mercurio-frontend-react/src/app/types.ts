@@ -81,15 +81,21 @@ export type DiagramLayout = {
   children: Array<{ layout: DiagramLayout; x: number; y: number }>;
 };
 
-export type DiagramManualNode = {
-  id: string;
-  type: string;
+export type DiagramViewport = { x: number; y: number; width: number; height: number };
+
+export type DiagramNode = {
+  qualified: string;
   name: string;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  pending: boolean;
+  kind: string;
 };
 
-export type DiagramViewport = { x: number; y: number; width: number; height: number };
+export type DiagramNodeOffset = { x: number; y: number };
+
+export type DiagramNodeSize = { width: number; height: number };
+
+export type DiagramFile = {
+  version: number;
+  nodes: DiagramNode[];
+  offsets?: Record<string, DiagramNodeOffset>;
+  sizes?: Record<string, DiagramNodeSize>;
+};

@@ -17,6 +17,7 @@ export function getTabIcon(tab: OpenTab): string {
   const ext = tab.path.split(".").pop()?.toLowerCase() || "";
   if (ext === "sysml") return "S";
   if (ext === "kerml") return "K";
+  if (ext === "diagram") return "DG";
   if (ext === "json" || ext === "jsonld") return "{}";
   return "F";
 }
@@ -28,6 +29,7 @@ export function getTabKindClass(tab: OpenTab): string {
   const ext = tab.path.split(".").pop()?.toLowerCase() || "";
   if (ext === "sysml") return "sysml";
   if (ext === "kerml") return "kerml";
+  if (ext === "diagram") return "diagram";
   if (ext === "json" || ext === "jsonld") return "json";
   return "file";
 }

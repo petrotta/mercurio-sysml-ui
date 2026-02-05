@@ -1,41 +1,29 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useEffect, useMemo, useRef, useState, type ReactElement } from "react";
-import type { DiagramLayout, DiagramManualNode, DiagramViewport, SymbolView } from "./types";
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type ReactElement } from "react";
+import type {
+  DiagramFile,
+  DiagramLayout,
+  DiagramNode,
+  DiagramNodeOffset,
+  DiagramNodeSize,
+  DiagramViewport,
+} from "./types";
 import { createDiagramRenderer } from "./diagramRenderer";
 import { useDiagramLayout } from "./useDiagramLayout";
 
-type DiagramNodeOffset = { x: number; y: number };
-type DiagramNodeSize = { width: number; height: number };
-
 type UseDiagramViewOptions = {
   activeDiagramPath: string | null;
-  activeTabPath: string | null;
-  deferredSymbols: SymbolView[];
-  selectedSymbol: SymbolView | null;
-  setSelectedSymbol: (symbol: SymbolView | null) => void;
-  selectSymbolInEditor: (symbol: SymbolView) => Promise<void> | void;
-  syncModelTreeToSymbol: (symbol: SymbolView) => void;
-  syncDiagramSelection: boolean;
   getKindKey: (kind: string) => string;
   renderTypeIcon: (kind: string, variant: "model" | "diagram") => ReactElement;
   rootPath: string;
-  runBackgroundCompile: (root: string) => Promise<void> | void;
   setCompileStatus: (status: string) => void;
 };
 
 export function useDiagramView({
   activeDiagramPath,
-  activeTabPath,
-  deferredSymbols,
-  selectedSymbol,
-  setSelectedSymbol,
-  selectSymbolInEditor,
-  syncModelTreeToSymbol,
-  syncDiagramSelection,
   getKindKey,
   renderTypeIcon,
   rootPath,
-  runBackgroundCompile,
   setCompileStatus,
 }: UseDiagramViewOptions) {
   const [diagramScale, setDiagramScale] = useState(1);
@@ -55,44 +43,124 @@ export function useDiagramView({
   const diagramPanPendingRef = useRef<{ x: number; y: number } | null>(null);
   const [palettePos, setPalettePos] = useState({ x: 16, y: 16 });
   const paletteDragRef = useRef<null | { startX: number; startY: number; baseX: number; baseY: number }>(null);
-  const [diagramManualNodes, setDiagramManualNodes] = useState<DiagramManualNode[]>([]);
   const paletteCreateRef = useRef<null | { type: string; name: string; startX: number; startY: number }>(null);
   const [paletteGhost, setPaletteGhost] = useState<null | { x: number; y: number; type: string }>(null);
+  const [diagramNodes, setDiagramNodes] = useState<DiagramNode[]>([]);
+  const diagramNodesRef = useRef<DiagramNode[]>([]);
+  const [selectedNode, setSelectedNode] = useState<DiagramNode | null>(null);
+  const [diagramDropActive, setDiagramDropActive] = useState(false);
+  const diagramLoadReqRef = useRef(0);
+  const diagramSaveTimerRef = useRef<number | null>(null);
+  const diagramLastSavedRef = useRef<Record<string, string>>({});
+  const diagramLoadingRef = useRef(false);
+  const pendingDropRef = useRef<null | { qualified: string; x: number; y: number }>(null);
 
-  const { diagramLayout, requestDiagramLayout, symbolByQualified } = useDiagramLayout({
+  const { diagramLayout, requestDiagramLayout, nodeByQualified } = useDiagramLayout({
     activeDiagramPath,
-    deferredSymbols,
+    diagramNodes,
   });
 
-  const { renderDiagramLayout, renderManualNode, renderMinimapLayout } = useMemo(
+  const { renderDiagramLayout, renderMinimapLayout } = useMemo(
     () =>
       createDiagramRenderer({
-        symbolByQualified,
+        nodeByQualified,
         getKindKey,
         renderTypeIcon,
-        selectedSymbol,
-        setSelectedSymbol,
-        selectSymbolInEditor,
-        syncModelTreeToSymbol,
-        syncDiagramSelection,
+        selectedNode,
+        setSelectedNode,
         diagramNodeOffsets,
         diagramNodeSizes,
         diagramDragRef,
         diagramResizeRef,
       }),
     [
-      symbolByQualified,
+      nodeByQualified,
       getKindKey,
       renderTypeIcon,
-      selectedSymbol,
-      setSelectedSymbol,
-      selectSymbolInEditor,
-      syncModelTreeToSymbol,
-      syncDiagramSelection,
+      selectedNode,
+      setSelectedNode,
       diagramNodeOffsets,
       diagramNodeSizes,
     ],
   );
+
+  useEffect(() => {
+    diagramNodesRef.current = diagramNodes;
+  }, [diagramNodes]);
+
+  useEffect(() => {
+    if (!activeDiagramPath || !rootPath) {
+      setDiagramNodes([]);
+      setDiagramNodeOffsets({});
+      setDiagramNodeSizes({});
+      setSelectedNode(null);
+      return;
+    }
+    const reqId = ++diagramLoadReqRef.current;
+    diagramLoadingRef.current = true;
+    const clearLoading = window.setTimeout(() => {
+      diagramLoadingRef.current = false;
+    }, 0);
+    invoke<DiagramFile>("read_diagram", { root: rootPath, path: activeDiagramPath })
+      .then((payload) => {
+        if (reqId !== diagramLoadReqRef.current) return;
+        const nodes = Array.isArray(payload?.nodes) ? payload.nodes : [];
+        setDiagramNodes(nodes);
+        setDiagramNodeOffsets(payload?.offsets || {});
+        setDiagramNodeSizes(payload?.sizes || {});
+        setSelectedNode(null);
+        setDiagramScale(1);
+        setDiagramOffset({ x: 0, y: 0 });
+        diagramLastSavedRef.current[activeDiagramPath] = JSON.stringify({
+          version: payload?.version ?? 1,
+          nodes,
+          offsets: payload?.offsets || {},
+          sizes: payload?.sizes || {},
+        });
+      })
+      .catch((error) => {
+        if (reqId !== diagramLoadReqRef.current) return;
+        setCompileStatus(`Failed to load diagram: ${String(error)}`);
+        setDiagramNodes([]);
+        setDiagramNodeOffsets({});
+        setDiagramNodeSizes({});
+      })
+      .finally(() => {
+        window.clearTimeout(clearLoading);
+        diagramLoadingRef.current = false;
+      });
+    return () => window.clearTimeout(clearLoading);
+  }, [activeDiagramPath, rootPath, setCompileStatus]);
+
+  useEffect(() => {
+    if (!rootPath || !activeDiagramPath) return;
+    if (diagramLoadingRef.current) return;
+    const payload: DiagramFile = {
+      version: 1,
+      nodes: diagramNodes,
+      offsets: diagramNodeOffsets,
+      sizes: diagramNodeSizes,
+    };
+    const serialized = JSON.stringify(payload);
+    if (diagramLastSavedRef.current[activeDiagramPath] === serialized) return;
+    if (diagramSaveTimerRef.current) {
+      window.clearTimeout(diagramSaveTimerRef.current);
+    }
+    diagramSaveTimerRef.current = window.setTimeout(() => {
+      void invoke("write_diagram", { root: rootPath, path: activeDiagramPath, diagram: payload })
+        .then(() => {
+          diagramLastSavedRef.current[activeDiagramPath] = serialized;
+        })
+        .catch((error) => {
+          setCompileStatus(`Failed to save diagram: ${String(error)}`);
+        });
+    }, 500);
+    return () => {
+      if (diagramSaveTimerRef.current) {
+        window.clearTimeout(diagramSaveTimerRef.current);
+      }
+    };
+  }, [diagramNodes, diagramNodeOffsets, diagramNodeSizes, activeDiagramPath, rootPath, setCompileStatus]);
 
   useEffect(() => {
     if (!diagramLayout || !diagramBodyRef.current) return;
@@ -207,42 +275,25 @@ export function useDiagramView({
         if (within) {
           const x = (paletteGhost!.x - body.left - diagramOffset.x) / diagramScale;
           const y = (paletteGhost!.y - body.top - diagramOffset.y) / diagramScale;
-          const tempId = crypto.randomUUID();
-          const tempName = `temp-${paletteCreateRef.current!.name.toLowerCase()}`;
-          setDiagramManualNodes((prev) => [
-            ...prev,
-            {
-              id: tempId,
-              type: paletteCreateRef.current!.type,
-              name: tempName,
-              x,
-              y,
-              width: 180,
-              height: 120,
-              pending: true,
-            },
-          ]);
-          if (!rootPath || !activeTabPath) {
-            setCompileStatus("Select a file before creating a package");
-            setDiagramManualNodes((prev) => prev.filter((node) => node.id !== tempId));
+          if (!rootPath || !activeDiagramPath) {
+            setCompileStatus("Open a diagram file before creating a node");
           } else {
-            invoke("create_package", {
-              payload: {
-                root: rootPath,
-                file: activeTabPath,
-                name: `Package_${Date.now()}`,
-              },
-            })
-              .then(() => {
-                setDiagramManualNodes((prev) => prev.filter((node) => node.id !== tempId));
-                void runBackgroundCompile(rootPath);
-              })
-              .catch((error) => {
-                setCompileStatus(`Create package failed: ${error}`);
-                setDiagramManualNodes((prev) =>
-                  prev.map((node) => (node.id === tempId ? { ...node, pending: false } : node)),
-                );
-              });
+            const baseName = paletteCreateRef.current!.name || "Node";
+            const existing = diagramNodesRef.current.map((node) => node.qualified);
+            let nextName = baseName;
+            let index = 1;
+            while (existing.includes(nextName)) {
+              index += 1;
+              nextName = `${baseName}_${index}`;
+            }
+            const qualified = nextName;
+            const kind = paletteCreateRef.current!.type;
+            pendingDropRef.current = { qualified, x, y };
+            setDiagramNodes((prev) => [...prev, { qualified, name: nextName, kind }]);
+            setDiagramNodeSizes((prev) => ({
+              ...prev,
+              [qualified]: { width: 180, height: 120 },
+            }));
           }
         }
       }
@@ -255,7 +306,93 @@ export function useDiagramView({
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
     };
-  }, [activeTabPath, diagramOffset, diagramScale, paletteGhost, rootPath, runBackgroundCompile, setCompileStatus]);
+  }, [activeDiagramPath, diagramOffset, diagramScale, paletteGhost, rootPath, setCompileStatus]);
+
+  useEffect(() => {
+    if (!diagramLayout || !pendingDropRef.current) return;
+    const pending = pendingDropRef.current;
+    const findPosition = (layout: DiagramLayout, target: string, baseX: number, baseY: number): { x: number; y: number } | null => {
+      if (layout.node.fullName === target) {
+        return { x: baseX, y: baseY };
+      }
+      for (const child of layout.children) {
+        const found = findPosition(child.layout, target, baseX + child.x, baseY + child.y);
+        if (found) return found;
+      }
+      return null;
+    };
+    const position = findPosition(diagramLayout, pending.qualified, 0, 0);
+    if (position) {
+      setDiagramNodeOffsets((prev) => ({
+        ...prev,
+        [pending.qualified]: { x: pending.x - position.x, y: pending.y - position.y },
+      }));
+      pendingDropRef.current = null;
+    }
+  }, [diagramLayout]);
+
+  const handleDiagramDrop = useCallback(
+    (event: DragEvent<HTMLDivElement>) => {
+      if (!rootPath || !activeDiagramPath) return;
+      if (!diagramBodyRef.current) return;
+      const raw = event.dataTransfer.getData("application/x-mercurio-diagram-node");
+      const fallbackText = event.dataTransfer.getData("text/plain");
+      if (!raw && !fallbackText) return;
+      let payload: { qualified: string; name?: string; kind?: string } | null = null;
+      if (raw) {
+        try {
+          payload = JSON.parse(raw);
+        } catch {
+          payload = null;
+        }
+      }
+      if (!payload && fallbackText) {
+        payload = {
+          qualified: fallbackText.trim(),
+          name: fallbackText.trim().split("::").pop(),
+          kind: "package",
+        };
+      }
+      if (!payload?.qualified) return;
+      if (!payload?.kind || payload.kind.toLowerCase() !== "package") return;
+      event.preventDefault();
+      setDiagramDropActive(false);
+      const body = diagramBodyRef.current.getBoundingClientRect();
+      const x = (event.clientX - body.left - diagramOffset.x) / diagramScale;
+      const y = (event.clientY - body.top - diagramOffset.y) / diagramScale;
+      const qualified = payload.qualified;
+      const exists = diagramNodesRef.current.some((node) => node.qualified === qualified);
+      if (!exists) {
+        setDiagramNodes((prev) => [
+          ...prev,
+          {
+            qualified,
+            name: payload?.name || qualified.split("::").pop() || qualified,
+            kind: payload?.kind || "",
+          },
+        ]);
+      }
+      pendingDropRef.current = { qualified, x, y };
+      setDiagramNodeSizes((prev) => ({
+        ...prev,
+        [qualified]: prev[qualified] || { width: 180, height: 120 },
+      }));
+    },
+    [rootPath, activeDiagramPath, diagramOffset, diagramScale],
+  );
+
+  const handleDiagramDragOver = useCallback((event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    setDiagramDropActive(true);
+  }, []);
+
+  const handleDiagramDragLeave = useCallback((event: DragEvent<HTMLDivElement>) => {
+    const current = event.currentTarget;
+    const related = event.relatedTarget as Node | null;
+    if (related && current.contains(related)) return;
+    setDiagramDropActive(false);
+  }, []);
 
   return {
     diagramScale,
@@ -273,15 +410,18 @@ export function useDiagramView({
     diagramPanRafRef,
     diagramPanPendingRef,
     diagramLayout,
-    diagramManualNodes,
+    diagramDropActive,
     palettePos,
     paletteGhost,
     paletteDragRef,
     paletteCreateRef,
     renderDiagramLayout,
-    renderManualNode,
     renderMinimapLayout,
     requestDiagramLayout,
     setPaletteGhost,
+    setDiagramDropActive,
+    handleDiagramDrop,
+    handleDiagramDragOver,
+    handleDiagramDragLeave,
   };
 }

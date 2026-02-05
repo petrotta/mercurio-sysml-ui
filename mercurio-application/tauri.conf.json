@@ -6,7 +6,7 @@
   "build": {
     "frontendDist": "../mercurio-frontend-react/dist",
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "npm --prefix ..\\mercurio\\mercurio-frontend-react run build"
+    "beforeBuildCommand": "npm --prefix mercurio-frontend-react run build && cargo build -p mercurio-cli --release --manifest-path Cargo.toml && powershell -NoProfile -Command \"$root = Resolve-Path ..; Copy-Item (Join-Path $root 'target\\\\release\\\\mercurio-cli.exe') (Join-Path $root 'target\\\\release\\\\mercurio-cli-x86_64-pc-windows-msvc.exe') -Force\""
   },
   "app": {
     "withGlobalTauri": true,
@@ -27,6 +27,19 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "externalBin": [
+      "..\\target\\release\\mercurio-cli"
+    ],
+    "windows": {
+      "wix": {
+        "fragmentPaths": [
+          "wix\\path-env.wxs"
+        ],
+        "componentGroupRefs": [
+          "PathEnvGroup"
+        ]
+      }
+    },
     "resources": [
       "stdlib-packaged/manifest.json",
       "stdlib-packaged/system-release-122025.zip"
