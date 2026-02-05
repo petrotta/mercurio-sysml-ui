@@ -88,8 +88,29 @@ export function App() {
     description?: string | null;
     organization?: string | null;
     default_library: boolean;
+    stdlib?: string | null;
+    library?: { path: string } | string | null;
+    src?: string[];
+    import_entries?: string[];
     raw_json?: string;
   } | null>(null);
+  const [showProjectProperties, setShowProjectProperties] = useState(false);
+  const [projectPropertiesBusy, setProjectPropertiesBusy] = useState(false);
+  const [projectPropertiesError, setProjectPropertiesError] = useState("");
+  const [projectPropertiesDraft, setProjectPropertiesDraft] = useState({
+    name: "",
+    author: "",
+    description: "",
+    organization: "",
+    src: [] as string[],
+    import_entries: [] as string[],
+  });
+  const [projectFileInput, setProjectFileInput] = useState("");
+  const [projectLibraryInput, setProjectLibraryInput] = useState("");
+  const [projectStdlibMode, setProjectStdlibMode] = useState<"default" | "version" | "custom">("default");
+  const [projectStdlibVersion, setProjectStdlibVersion] = useState("");
+  const [projectStdlibPath, setProjectStdlibPath] = useState("");
+  const [projectStdlibVersions, setProjectStdlibVersions] = useState<string[]>([]);
   const [showNewFile, setShowNewFile] = useState(false);
   const [newFileName, setNewFileName] = useState("");
   const [newFileParent, setNewFileParent] = useState<string>("");
@@ -391,6 +412,10 @@ export function App() {
         description?: string | null;
         organization?: string | null;
         default_library: boolean;
+        stdlib?: string | null;
+        library?: { path: string } | string | null;
+        src?: string[];
+        import_entries?: string[];
         raw_json?: string;
       }>("create_project_descriptor", {
         payload: {
@@ -412,7 +437,6 @@ export function App() {
       } catch (error) {
         setNewProjectError(`Open project failed: ${String(error)}`);
       }
-      openProjectDescriptorTab(descriptor || null);
       setCompileStatus("Project created");
     } catch (error) {
       setNewProjectBusy(false);
@@ -420,7 +444,7 @@ export function App() {
     }
   };
 
-    useEffect(() => {
+  useEffect(() => {
       const onMove = (event: PointerEvent) => {
       if (!draggingRef.current) return;
       const delta = event.clientX - startRef.current.x;
@@ -452,14 +476,18 @@ export function App() {
       setHasProjectDescriptor(false);
       return;
     }
-      invoke<{
-        name?: string | null;
-        author?: string | null;
-        description?: string | null;
-        organization?: string | null;
-        default_library: boolean;
-        raw_json?: string;
-      } | null>("get_project_descriptor", { root: rootPath })
+    invoke<{
+      name?: string | null;
+      author?: string | null;
+      description?: string | null;
+      organization?: string | null;
+      default_library: boolean;
+      stdlib?: string | null;
+      library?: { path: string } | string | null;
+      src?: string[];
+      import_entries?: string[];
+      raw_json?: string;
+    } | null>("get_project_descriptor", { root: rootPath })
         .then((descriptor) => {
           setProjectDescriptor(descriptor || null);
           setHasProjectDescriptor(!!descriptor);
@@ -468,7 +496,7 @@ export function App() {
           setProjectDescriptor(null);
           setHasProjectDescriptor(false);
         });
-    }, [rootPath]);
+  }, [rootPath]);
 
   useEffect(() => {
     if (!rootPath) return;
@@ -569,7 +597,6 @@ export function App() {
     setOpenTabs,
   });
   const {
-    openProjectDescriptorTab,
     selectTab,
     openAiViewTab,
     openDataViewTab,
@@ -655,24 +682,158 @@ export function App() {
     setContextMenu(null);
   };
 
-  const loadProjectInfo = async () => {
-    if (!rootPath) return;
+  const openProjectProperties = async () => {
+    if (!rootPath) {
+      setCompileStatus("Open a project folder first.");
+      return;
+    }
+    setProjectPropertiesError("");
+    setProjectPropertiesBusy(true);
     try {
+      const [descriptor, stdlibVersions] = await Promise.all([
+        invoke<{
+          name?: string | null;
+          author?: string | null;
+          description?: string | null;
+          organization?: string | null;
+          default_library: boolean;
+          stdlib?: string | null;
+          library?: { path: string } | string | null;
+          src?: string[];
+          import_entries?: string[];
+          raw_json?: string;
+        }>("ensure_project_descriptor", { root: rootPath }),
+        invoke<string[]>("list_stdlib_versions"),
+      ]);
+      setProjectDescriptor(descriptor || null);
+      setHasProjectDescriptor(!!descriptor);
+      setProjectPropertiesDraft({
+        name: descriptor?.name || "",
+        author: descriptor?.author || "",
+        description: descriptor?.description || "",
+        organization: descriptor?.organization || "",
+        src: descriptor?.src || [],
+        import_entries: descriptor?.import_entries || [],
+      });
+      const library = descriptor?.library;
+      if (library && typeof library === "object" && "path" in library) {
+        setProjectStdlibMode("custom");
+        setProjectStdlibPath(library.path || "");
+        setProjectStdlibVersion("");
+      } else if (typeof library === "string" && library.trim() && library.trim().toLowerCase() !== "default") {
+        setProjectStdlibMode("custom");
+        setProjectStdlibPath(library.trim());
+        setProjectStdlibVersion("");
+      } else if (descriptor?.stdlib && descriptor.stdlib.trim() && descriptor.stdlib.trim().toLowerCase() !== "default") {
+        setProjectStdlibMode("version");
+        setProjectStdlibVersion(descriptor.stdlib);
+        setProjectStdlibPath("");
+      } else {
+        setProjectStdlibMode("default");
+        setProjectStdlibVersion("");
+        setProjectStdlibPath("");
+      }
+      setProjectStdlibVersions(Array.isArray(stdlibVersions) ? stdlibVersions : []);
+      setShowProjectProperties(true);
+    } catch (error) {
+      setProjectPropertiesError(`Project properties failed: ${String(error)}`);
+      setShowProjectProperties(true);
+    } finally {
+      setProjectPropertiesBusy(false);
+    }
+  };
+
+  const addProjectFile = () => {
+    const value = projectFileInput.trim();
+    if (!value) return;
+    setProjectPropertiesDraft((prev) => ({
+      ...prev,
+      src: prev.src.includes(value) ? prev.src : [...prev.src, value],
+    }));
+    setProjectFileInput("");
+  };
+
+  const removeProjectFile = (value: string) => {
+    setProjectPropertiesDraft((prev) => ({
+      ...prev,
+      src: prev.src.filter((entry) => entry !== value),
+    }));
+  };
+
+  const addProjectLibrary = () => {
+    const value = projectLibraryInput.trim();
+    if (!value) return;
+    setProjectPropertiesDraft((prev) => ({
+      ...prev,
+      import_entries: prev.import_entries.includes(value) ? prev.import_entries : [...prev.import_entries, value],
+    }));
+    setProjectLibraryInput("");
+  };
+
+  const removeProjectLibrary = (value: string) => {
+    setProjectPropertiesDraft((prev) => ({
+      ...prev,
+      import_entries: prev.import_entries.filter((entry) => entry !== value),
+    }));
+  };
+
+  const saveProjectProperties = async () => {
+    if (!rootPath) return;
+    setProjectPropertiesError("");
+    if (projectStdlibMode === "version" && !projectStdlibVersion.trim()) {
+      setProjectPropertiesError("Select a stdlib version.");
+      return;
+    }
+    if (projectStdlibMode === "custom" && !projectStdlibPath.trim()) {
+      setProjectPropertiesError("Enter a stdlib path.");
+      return;
+    }
+    setProjectPropertiesBusy(true);
+    try {
+      const trimmedName = projectPropertiesDraft.name.trim();
+      const trimmedAuthor = projectPropertiesDraft.author.trim();
+      const trimmedDescription = projectPropertiesDraft.description.trim();
+      const trimmedOrganization = projectPropertiesDraft.organization.trim();
+      const stdlibPayload =
+        projectStdlibMode === "default"
+          ? "default"
+          : projectStdlibMode === "version"
+            ? projectStdlibVersion.trim()
+            : null;
+      const libraryPayload =
+        projectStdlibMode === "custom" ? { path: projectStdlibPath.trim() } : null;
       const descriptor = await invoke<{
         name?: string | null;
         author?: string | null;
         description?: string | null;
         organization?: string | null;
         default_library: boolean;
+        stdlib?: string | null;
+        library?: { path: string } | string | null;
+        src?: string[];
+        import_entries?: string[];
         raw_json?: string;
-      } | null>("get_project_descriptor", { root: rootPath });
+      }>("update_project_descriptor", {
+        payload: {
+          root: rootPath,
+          name: trimmedName || null,
+          author: trimmedAuthor || null,
+          description: trimmedDescription || null,
+          organization: trimmedOrganization || null,
+          src: projectPropertiesDraft.src,
+          import_entries: projectPropertiesDraft.import_entries,
+          stdlib: stdlibPayload,
+          library: libraryPayload,
+        },
+      });
       setProjectDescriptor(descriptor || null);
       setHasProjectDescriptor(!!descriptor);
-    } catch {
-      setProjectDescriptor(null);
-      setHasProjectDescriptor(false);
+      setShowProjectProperties(false);
+    } catch (error) {
+      setProjectPropertiesError(String(error));
+    } finally {
+      setProjectPropertiesBusy(false);
     }
-    openProjectDescriptorTab();
   };
 
   const createNewFile = async () => {
@@ -998,6 +1159,10 @@ export function App() {
           setShowSettings(false);
           return;
         }
+        if (showProjectProperties) {
+          setShowProjectProperties(false);
+          return;
+        }
         if (showExport) {
           setShowExport(false);
           return;
@@ -1048,7 +1213,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeTabPath, activeTabMeta, activeEditorPath, contextMenu, openMenu, showAiSettings, showExport, showNewFile, showNewProject, showOpenProject, showSettings, tabMenu]);
+  }, [activeTabPath, activeTabMeta, activeEditorPath, contextMenu, openMenu, showAiSettings, showExport, showNewFile, showNewProject, showOpenProject, showProjectProperties, showSettings, tabMenu]);
 
   const resetEndpointDraft = () => {
     setEndpointDraft({ name: "", url: "", type: "chat", provider: "openai", model: "", token: "" });
@@ -1392,6 +1557,7 @@ export function App() {
                   <div className="menu-dropdown" data-tauri-drag-region="false">
                     <button type="button" onClick={openNewProjectDialog}>New Project</button>
                     <button type="button" onClick={chooseProject}>Open Project</button>
+                    <button type="button" onClick={() => { setOpenMenu(null); void openProjectProperties(); }}>Project Properties</button>
                     <div className="menu-divider" />
                     <button type="button" onClick={() => { void invoke("window_close"); }}>Exit</button>
                   </div>
@@ -1433,7 +1599,7 @@ export function App() {
                 Diagram View
               </button>
               <div className="menu-divider" />
-              <button type="button" onClick={() => { setShowSettings(true); setOpenMenu(null); }}>Settings?</button>
+              <button type="button" onClick={() => { setShowSettings(true); setOpenMenu(null); }}>Settings</button>
               <button type="button">Logs</button>
             </div>
               ) : null}
@@ -1506,13 +1672,6 @@ export function App() {
                 </button>
               </div>
             <div className="project-actions inline">
-                <button
-                  type="button"
-                  className={`ghost icon-info ${hasProjectDescriptor ? "active" : ""}`}
-                  onClick={loadProjectInfo}
-                  aria-label="Project info"
-                  title="Project info"
-                />
                 <button type="button" className="icon-button" onClick={chooseProject} aria-label="Open Project" title="Open Project" />
                 <select className="recent-select" value="" onChange={(e) => openProject(e.target.value)} aria-label="Open recent" title="Open recent">
                   <option value="">Recent</option>
@@ -1526,6 +1685,7 @@ export function App() {
               <>
                 <span className="project-root-name">{rootPath.split(/[\\/]/).pop()}</span>
                 <span className="project-root-path">{rootPath}</span>
+                {!hasProjectDescriptor ? <span className="project-root-hint">No .project file</span> : null}
               </>
             ) : (
               "No project selected"
@@ -1966,6 +2126,151 @@ export function App() {
             </div>
           </div>
         ) : null}
+        {showProjectProperties ? (
+        <div className="modal">
+          <div className="modal-backdrop" onClick={() => setShowProjectProperties(false)} />
+          <div className="modal-card modal-wide legacy-modal" role="dialog" aria-modal="true" aria-labelledby="project-properties-title">
+            <div className="modal-header">
+              <h3 id="project-properties-title">Project Properties</h3>
+            </div>
+            <div className="modal-body">
+              <div className="project-properties">
+                <div className="project-properties-grid">
+                  <label className="field">
+                    <span className="field-label">Name</span>
+                    <input
+                      value={projectPropertiesDraft.name}
+                      onChange={(event) => setProjectPropertiesDraft((prev) => ({ ...prev, name: event.target.value }))}
+                    />
+                  </label>
+                  <label className="field">
+                    <span className="field-label">Author</span>
+                    <input
+                      value={projectPropertiesDraft.author}
+                      onChange={(event) => setProjectPropertiesDraft((prev) => ({ ...prev, author: event.target.value }))}
+                    />
+                  </label>
+                  <label className="field">
+                    <span className="field-label">Organization</span>
+                    <input
+                      value={projectPropertiesDraft.organization}
+                      onChange={(event) => setProjectPropertiesDraft((prev) => ({ ...prev, organization: event.target.value }))}
+                    />
+                  </label>
+                  <label className="field">
+                    <span className="field-label">Description</span>
+                    <input
+                      value={projectPropertiesDraft.description}
+                      onChange={(event) => setProjectPropertiesDraft((prev) => ({ ...prev, description: event.target.value }))}
+                    />
+                  </label>
+                </div>
+                <div className="project-properties-section">
+                  <div className="project-properties-title">Files</div>
+                  <div className="project-properties-list">
+                    {projectPropertiesDraft.src.length ? (
+                      projectPropertiesDraft.src.map((entry) => (
+                        <div key={entry} className="project-properties-item">
+                          <span>{entry}</span>
+                          <button type="button" className="ghost" onClick={() => removeProjectFile(entry)}>Remove</button>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="muted">No files configured.</div>
+                    )}
+                  </div>
+                  <div className="field-inline">
+                    <input
+                      value={projectFileInput}
+                      onChange={(event) => setProjectFileInput(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          addProjectFile();
+                        }
+                      }}
+                      placeholder="**/*.sysml"
+                    />
+                    <button type="button" className="ghost" onClick={addProjectFile}>Add</button>
+                  </div>
+                </div>
+                <div className="project-properties-section">
+                  <div className="project-properties-title">Libraries</div>
+                  <div className="project-properties-list">
+                    {projectPropertiesDraft.import_entries.length ? (
+                      projectPropertiesDraft.import_entries.map((entry) => (
+                        <div key={entry} className="project-properties-item">
+                          <span>{entry}</span>
+                          <button type="button" className="ghost" onClick={() => removeProjectLibrary(entry)}>Remove</button>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="muted">No libraries configured.</div>
+                    )}
+                  </div>
+                  <div className="field-inline">
+                    <input
+                      value={projectLibraryInput}
+                      onChange={(event) => setProjectLibraryInput(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          addProjectLibrary();
+                        }
+                      }}
+                      placeholder="**/*.sysmlx"
+                    />
+                    <button type="button" className="ghost" onClick={addProjectLibrary}>Add</button>
+                  </div>
+                </div>
+                <div className="project-properties-section">
+                  <div className="project-properties-title">Stdlib</div>
+                  <label className="field">
+                    <span className="field-label">Selection</span>
+                    <select
+                      value={projectStdlibMode}
+                      onChange={(event) => setProjectStdlibMode(event.target.value as "default" | "version" | "custom")}
+                    >
+                      <option value="default">Use default</option>
+                      <option value="version">Pick version</option>
+                      <option value="custom">Custom path</option>
+                    </select>
+                  </label>
+                  {projectStdlibMode === "version" ? (
+                    <label className="field">
+                      <span className="field-label">Version</span>
+                      <select
+                        value={projectStdlibVersion}
+                        onChange={(event) => setProjectStdlibVersion(event.target.value)}
+                      >
+                        <option value="">Select version</option>
+                        {projectStdlibVersions.map((version) => (
+                          <option key={version} value={version}>{version}</option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+                  {projectStdlibMode === "custom" ? (
+                    <label className="field">
+                      <span className="field-label">Path</span>
+                      <input
+                        value={projectStdlibPath}
+                        onChange={(event) => setProjectStdlibPath(event.target.value)}
+                        placeholder="C:\\path\\to\\stdlib"
+                      />
+                    </label>
+                  ) : null}
+                </div>
+                {projectPropertiesError ? <div className="field-hint error">{projectPropertiesError}</div> : null}
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="ghost" onClick={() => setShowProjectProperties(false)}>Cancel</button>
+              <button type="button" onClick={saveProjectProperties} disabled={projectPropertiesBusy}>Save</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
         {showExport ? (
         <div className="modal">
           <div className="modal-card">

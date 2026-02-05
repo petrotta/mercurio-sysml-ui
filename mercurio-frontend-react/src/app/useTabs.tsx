@@ -10,6 +10,10 @@ type DescriptorPayload = {
   description?: string | null;
   organization?: string | null;
   default_library: boolean;
+  stdlib?: string | null;
+  library?: { path: string } | string | null;
+  src?: string[];
+  import_entries?: string[];
   raw_json?: string;
 };
 

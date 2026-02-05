@@ -33,8 +33,9 @@ pub enum LibraryConfig {
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct ProjectConfig {
     pub library: Option<LibraryConfig>,
+    pub stdlib: Option<String>,
     pub src: Option<Vec<String>>,
-    #[serde(rename = "import")]
+    #[serde(rename = "import", alias = "import_entries")]
     pub import_entries: Option<Vec<String>>,
 }
 
@@ -55,6 +56,10 @@ pub struct ProjectDescriptorView {
     pub description: Option<String>,
     pub organization: Option<String>,
     pub default_library: bool,
+    pub stdlib: Option<String>,
+    pub library: Option<LibraryConfig>,
+    pub src: Vec<String>,
+    pub import_entries: Vec<String>,
     pub raw_json: String,
 }
 
@@ -656,7 +661,8 @@ pub fn compile_workspace_sync<F: Fn(CompileProgressPayload)>(
         .unwrap_or_default();
     let import_set: HashSet<PathBuf> = import_files.iter().cloned().collect();
 
-    let library_config = project_config.clone().and_then(|config| config.library);
+    let library_config = project_config.as_ref().and_then(|config| config.library.clone());
+    let stdlib_override = project_config.as_ref().and_then(|config| config.stdlib.clone());
     let (stdlib_loader, _stdlib_source, stdlib_path_for_log) = match library_config {
         Some(LibraryConfig::Path { path }) => {
             if path.trim().is_empty() {
@@ -696,12 +702,27 @@ pub fn compile_workspace_sync<F: Fn(CompileProgressPayload)>(
             }
         }
         None => {
-            let discovered = resolve_default_stdlib_path(
-                &root_path,
-                &state.stdlib_root,
-                default_stdlib.as_deref(),
-            );
-            (StdLibLoader::new(), "".to_string(), Some(discovered))
+            if let Some(stdlib_id) = stdlib_override {
+                let trimmed = stdlib_id.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+                    let discovered = resolve_default_stdlib_path(
+                        &root_path,
+                        &state.stdlib_root,
+                        default_stdlib.as_deref(),
+                    );
+                    (StdLibLoader::new(), "".to_string(), Some(discovered))
+                } else {
+                    let resolved = state.stdlib_root.join(trimmed);
+                    (StdLibLoader::new(), "".to_string(), Some(resolved))
+                }
+            } else {
+                let discovered = resolve_default_stdlib_path(
+                    &root_path,
+                    &state.stdlib_root,
+                    default_stdlib.as_deref(),
+                );
+                (StdLibLoader::new(), "".to_string(), Some(discovered))
+            }
         }
     };
     let project_set: HashSet<PathBuf> = files.iter().cloned().collect();
@@ -998,7 +1019,8 @@ pub fn export_model_to_path(
         }
     }
 
-    let library_config = project_config.clone().and_then(|config| config.library);
+    let library_config = project_config.as_ref().and_then(|config| config.library.clone());
+    let stdlib_override = project_config.as_ref().and_then(|config| config.stdlib.clone());
     let (stdlib_loader, stdlib_path_for_log) = match library_config {
         Some(LibraryConfig::Path { path }) => {
             if path.trim().is_empty() {
@@ -1038,12 +1060,27 @@ pub fn export_model_to_path(
             }
         }
         None => {
-            let discovered = resolve_default_stdlib_path(
-                &root_path,
-                &state.stdlib_root,
-                default_stdlib.as_deref(),
-            );
-            (StdLibLoader::new(), Some(discovered))
+            if let Some(stdlib_id) = stdlib_override {
+                let trimmed = stdlib_id.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+                    let discovered = resolve_default_stdlib_path(
+                        &root_path,
+                        &state.stdlib_root,
+                        default_stdlib.as_deref(),
+                    );
+                    (StdLibLoader::new(), Some(discovered))
+                } else {
+                    let resolved = state.stdlib_root.join(trimmed);
+                    (StdLibLoader::new(), Some(resolved))
+                }
+            } else {
+                let discovered = resolve_default_stdlib_path(
+                    &root_path,
+                    &state.stdlib_root,
+                    default_stdlib.as_deref(),
+                );
+                (StdLibLoader::new(), Some(discovered))
+            }
         }
     };
     let stdlib_path_exists = stdlib_path_for_log
@@ -1114,11 +1151,16 @@ pub fn export_model_to_path(
 }
 
 pub fn load_project_descriptor(root: &Path) -> Result<Option<ProjectDescriptor>, String> {
-    let config_path = root.join(".project.json");
-    if !config_path.exists() {
+    let config_path = root.join(".project");
+    let legacy_path = root.join(".project.json");
+    let path = if config_path.exists() {
+        config_path
+    } else if legacy_path.exists() {
+        legacy_path
+    } else {
         return Ok(None);
-    }
-    let content = fs::read_to_string(config_path).map_err(|e| e.to_string())?;
+    };
+    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let parsed: ProjectDescriptor = serde_json::from_str(&content).map_err(|e| e.to_string())?;
     Ok(Some(parsed))
 }
@@ -1135,7 +1177,12 @@ pub fn get_project_descriptor_view(root: &Path) -> Result<Option<ProjectDescript
     let default_library = matches!(
         descriptor.config.library,
         Some(LibraryConfig::Default(ref value)) if value == "default"
+    ) || matches!(
+        descriptor.config.stdlib,
+        Some(ref value) if value.eq_ignore_ascii_case("default")
     );
+    let src = descriptor.config.src.clone().unwrap_or_default();
+    let import_entries = descriptor.config.import_entries.clone().unwrap_or_default();
     let raw_json = serde_json::to_string_pretty(&descriptor).map_err(|e| e.to_string())?;
     Ok(Some(ProjectDescriptorView {
         name: descriptor.name,
@@ -1143,6 +1190,10 @@ pub fn get_project_descriptor_view(root: &Path) -> Result<Option<ProjectDescript
         description: descriptor.description,
         organization: descriptor.organization,
         default_library,
+        stdlib: descriptor.config.stdlib,
+        library: descriptor.config.library,
+        src,
+        import_entries,
         raw_json,
     }))
 }
