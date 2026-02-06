@@ -331,6 +331,36 @@ export function useDiagramView({
     }
   }, [diagramLayout]);
 
+  const addDiagramNodeFromPayload = useCallback(
+    (payload: { qualified: string; name?: string; kind?: string }, clientX: number, clientY: number) => {
+      if (!rootPath || !activeDiagramPath) return;
+      if (!diagramBodyRef.current) return;
+      if (!payload?.qualified) return;
+      setDiagramDropActive(false);
+      const body = diagramBodyRef.current.getBoundingClientRect();
+      const x = (clientX - body.left - diagramOffset.x) / diagramScale;
+      const y = (clientY - body.top - diagramOffset.y) / diagramScale;
+      const qualified = payload.qualified;
+      const exists = diagramNodesRef.current.some((node) => node.qualified === qualified);
+      if (!exists) {
+        setDiagramNodes((prev) => [
+          ...prev,
+          {
+            qualified,
+            name: payload?.name || qualified.split("::").pop() || qualified,
+            kind: payload?.kind || "",
+          },
+        ]);
+      }
+      pendingDropRef.current = { qualified, x, y };
+      setDiagramNodeSizes((prev) => ({
+        ...prev,
+        [qualified]: prev[qualified] || { width: 180, height: 120 },
+      }));
+    },
+    [rootPath, activeDiagramPath, diagramOffset, diagramScale],
+  );
+
   const handleDiagramDrop = useCallback(
     (event: DragEvent<HTMLDivElement>) => {
       if (!rootPath || !activeDiagramPath) return;
@@ -354,37 +384,17 @@ export function useDiagramView({
         };
       }
       if (!payload?.qualified) return;
-      if (!payload?.kind || payload.kind.toLowerCase() !== "package") return;
       event.preventDefault();
-      setDiagramDropActive(false);
-      const body = diagramBodyRef.current.getBoundingClientRect();
-      const x = (event.clientX - body.left - diagramOffset.x) / diagramScale;
-      const y = (event.clientY - body.top - diagramOffset.y) / diagramScale;
-      const qualified = payload.qualified;
-      const exists = diagramNodesRef.current.some((node) => node.qualified === qualified);
-      if (!exists) {
-        setDiagramNodes((prev) => [
-          ...prev,
-          {
-            qualified,
-            name: payload?.name || qualified.split("::").pop() || qualified,
-            kind: payload?.kind || "",
-          },
-        ]);
-      }
-      pendingDropRef.current = { qualified, x, y };
-      setDiagramNodeSizes((prev) => ({
-        ...prev,
-        [qualified]: prev[qualified] || { width: 180, height: 120 },
-      }));
+      addDiagramNodeFromPayload(payload, event.clientX, event.clientY);
     },
-    [rootPath, activeDiagramPath, diagramOffset, diagramScale],
+    [rootPath, activeDiagramPath, addDiagramNodeFromPayload],
   );
 
   const handleDiagramDragOver = useCallback((event: DragEvent<HTMLDivElement>) => {
     event.preventDefault();
     event.dataTransfer.dropEffect = "copy";
     setDiagramDropActive(true);
+    setCompileStatus("Diagram dragover");
   }, []);
 
   const handleDiagramDragLeave = useCallback((event: DragEvent<HTMLDivElement>) => {
@@ -420,6 +430,7 @@ export function useDiagramView({
     requestDiagramLayout,
     setPaletteGhost,
     setDiagramDropActive,
+    addDiagramNodeFromPayload,
     handleDiagramDrop,
     handleDiagramDragOver,
     handleDiagramDragLeave,

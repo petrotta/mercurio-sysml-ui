@@ -134,7 +134,7 @@ export function useTabs({
   const openAiViewTab = useCallback(() => {
     setOpenTabs((prev) => {
       if (prev.some((tab) => tab.path === AI_VIEW_TAB)) return prev;
-      return [...prev, { path: AI_VIEW_TAB, name: "AI", dirty: false, kind: "ai" }];
+      return [...prev, { path: AI_VIEW_TAB, name: "Agent", dirty: false, kind: "ai" }];
     });
     setActiveTabPath(AI_VIEW_TAB);
     setActiveEditorDoc(null, "", false);

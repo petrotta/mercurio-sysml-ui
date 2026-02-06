@@ -1,21 +1,15 @@
 type ModelHeaderProps = {
-  canTrack: boolean;
-  trackText: boolean;
   collapseAll: boolean;
   onCollapseAll: () => void;
   onExpandAll: () => void;
-  onToggleTrack: () => void;
   onToggleProperties: () => void;
   showProperties: boolean;
 };
 
 export function ModelHeader({
-  canTrack,
-  trackText,
   collapseAll,
   onCollapseAll,
   onExpandAll,
-  onToggleTrack,
   onToggleProperties,
   showProperties,
 }: ModelHeaderProps) {
@@ -41,14 +35,6 @@ export function ModelHeader({
       >
         +
       </button>
-      <button
-        type="button"
-        className={`ghost icon-track ${trackText ? "active" : ""}`}
-        onClick={onToggleTrack}
-        disabled={!canTrack}
-        title={trackText ? "Stop tracking text" : "Track text"}
-        aria-label={trackText ? "Stop tracking text" : "Track text"}
-      />
       <button
         type="button"
         className={`ghost icon-properties ${showProperties ? "active" : ""}`}

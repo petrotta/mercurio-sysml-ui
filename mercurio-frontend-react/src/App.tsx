@@ -209,6 +209,8 @@ export function App() {
   const [modelExpanded, setModelExpanded] = useState<Record<string, boolean>>({});
   const [modelSectionOpen, setModelSectionOpen] = useState({ project: true, library: true, errors: true });
   const modelTreeRef = useRef<HTMLDivElement | null>(null);
+  const modelPaneContainerRef = useRef<HTMLDivElement | null>(null);
+  const [modelPaneHeight, setModelPaneHeight] = useState(0);
   const navReqRef = useRef(0);
   const pendingNavRef = useRef<{
     path: string;
@@ -252,6 +254,7 @@ export function App() {
       monacoRef.current.editor.setTheme(appTheme === "light" ? "vs" : "vs-dark");
     }
   }, [appTheme]);
+
 
   useEffect(() => {
     activeTabPathRef.current = activeTabPath;
@@ -502,6 +505,18 @@ export function App() {
     if (!rootPath) return;
     void runBackgroundCompile(rootPath);
   }, [rootPath, backgroundCompileEnabled]);
+
+  useEffect(() => {
+    if (!modelPaneContainerRef.current) return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      setModelPaneHeight(Math.round(entry.contentRect.height));
+    });
+    observer.observe(modelPaneContainerRef.current);
+    return () => observer.disconnect();
+  }, []);
+
 
   const startDrag = (side: "left" | "right" | "model", event: React.PointerEvent) => {
     event.preventDefault();
@@ -1439,6 +1454,10 @@ export function App() {
     getKindKey,
   });
 
+  const effectiveModelTreeHeight = showPropertiesPane
+    ? modelTreeHeight
+    : Math.max(modelTreeHeight, modelPaneHeight || modelTreeHeight);
+
   const {
     modelListRef,
     modelSectionIndent,
@@ -1451,7 +1470,7 @@ export function App() {
     getModelRowHeight,
   } = useModelTreeSelection({
     modelRows,
-    modelTreeHeight,
+    modelTreeHeight: effectiveModelTreeHeight,
     setModelSectionOpen,
     setModelExpanded,
     selectedSymbol,
@@ -1581,7 +1600,7 @@ export function App() {
               <button type="button">Project Panel</button>
               <button type="button">Model Panel</button>
               <div className="menu-divider" />
-              <button type="button" onClick={() => { setOpenMenu(null); openAiViewTab(); }}>AI View</button>
+              <button type="button" onClick={() => { setOpenMenu(null); openAiViewTab(); }}>Agent</button>
               <button type="button" onClick={() => { setOpenMenu(null); openDataViewTab(); }}>Data Analysis View</button>
               <button
                 type="button"
@@ -1772,21 +1791,49 @@ export function App() {
                   projectDescriptor={projectDescriptor}
                 />
               ) : activeTabMeta?.kind !== "diagram" ? (
-                <MonacoEditor
-                  defaultValue=""
-                    onChange={(value) => {
-                      const next = value ?? "";
-                      if (suppressDirtyRef.current) {
-                        suppressDirtyRef.current = false;
-                        return;
-                      }
-                      onEditorChange(next);
-                    }}
-                  language="sysml"
-                  theme={appTheme === "light" ? "vs" : "vs-dark"}
-                  onMount={handleEditorMount}
-                  options={editorOptions}
-                />
+                <>
+                  <div className="editor-toolbar">
+                    <div className="editor-toolbar-group">
+                      <button
+                        type="button"
+                        className={`ghost icon-track ${trackText ? "active" : ""}`}
+                        onClick={() => setTrackText((prev) => !prev)}
+                        title={trackText ? "Stop tracking text" : "Track text"}
+                        aria-pressed={trackText}
+                        aria-label="Track text"
+                      />
+                      <span className="editor-toolbar-label">Track text</span>
+                    </div>
+                    <div className="editor-toolbar-group">
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={trackNow}
+                        disabled={!trackCandidate}
+                        title={trackCandidate ? "Select symbol near cursor" : "No symbol near cursor"}
+                      >
+                        Track now
+                      </button>
+                    </div>
+                  </div>
+                  <div className="editor-body">
+                    <MonacoEditor
+                      defaultValue=""
+                      onChange={(value) => {
+                        const next = value ?? "";
+                        if (suppressDirtyRef.current) {
+                          suppressDirtyRef.current = false;
+                          return;
+                        }
+                        onEditorChange(next);
+                      }}
+                      language="sysml"
+                      theme={appTheme === "light" ? "vs" : "vs-dark"}
+                      onMount={handleEditorMount}
+                      options={editorOptions}
+                    />
+                  </div>
+                </>
             ) : (
               <DiagramView
                 activeDiagramPath={activeDiagramPath}
@@ -1834,6 +1881,7 @@ export function App() {
               />
             )}
           </EditorPane>
+          <>
           <div
             className={`splitter ${rightCollapsed ? "collapsed" : ""}`}
             onPointerDown={rightCollapsed ? undefined : (event) => startDrag("right", event)}
@@ -1853,20 +1901,12 @@ export function App() {
             ) : null}
           </div>
           {rightCollapsed ? null : (
-            <section className="panel sidebar">
+            <section className="panel sidebar" ref={modelPaneContainerRef}>
               <div className="panel-header">
               <ModelHeader
-                canTrack={!!trackCandidate}
-                trackText={trackText}
                 collapseAll={collapseAllModel}
                 onCollapseAll={() => setCollapseAllModel(true)}
                 onExpandAll={() => setCollapseAllModel(false)}
-                onToggleTrack={() => {
-                  setTrackText((prev) => !prev);
-                  if (!trackText) {
-                    trackNow();
-                  }
-                }}
                 onToggleProperties={() => setShowPropertiesPane((prev) => !prev)}
                 showProperties={showPropertiesPane}
               />
@@ -1883,7 +1923,7 @@ export function App() {
               </button>
             </div>
             <ModelPane
-              modelTreeHeight={modelTreeHeight}
+              modelTreeHeight={effectiveModelTreeHeight}
               showPropertiesPane={showPropertiesPane}
               modelTreeRef={modelTreeRef}
               modelListRef={modelListRef}
@@ -1902,6 +1942,7 @@ export function App() {
             />
             </section>
           )}
+          </>
       </main>
         {tabMenu ? (
           <div className="context-menu tab-menu" style={{ left: tabMenu.x, top: tabMenu.y }}>

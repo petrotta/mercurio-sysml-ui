@@ -1063,6 +1063,7 @@ body.theme-light .theme-option.active {
 .model-pane.no-properties {
   grid-template-rows: 1fr;
 }
+
 .model-tree {
   border: 1px solid #2f3236;
   border-radius: 6px;
@@ -1204,6 +1205,7 @@ body.theme-light .model-empty-row {
   display: grid;
   gap: 2px;
 }
+
 .model-virtual-row {
   position: absolute;
   left: 0;
@@ -2170,6 +2172,45 @@ body.theme-light .tab-close:hover {
 
 body.theme-light .editor-host {
   background: #ffffff;
+}
+
+.editor-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 8px;
+  border-bottom: 1px solid #2f3236;
+  background: #202225;
+}
+
+body.theme-light .editor-toolbar {
+  border-color: #d6dbe3;
+  background: #f2f4f7;
+}
+
+.editor-toolbar-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.editor-toolbar-label {
+  font-size: 0.75rem;
+  color: #c8cbd0;
+}
+
+body.theme-light .editor-toolbar-label {
+  color: #455366;
+}
+
+.editor-body {
+  flex: 1;
+  min-height: 0;
+}
+
+.editor-body .monaco-editor {
+  height: 100%;
 }
 
 .view-header {
