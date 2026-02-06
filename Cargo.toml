@@ -1,0 +1,3 @@
+[workspace]
+members = ["mercurio-application", "mercurio-core", "mercurio-cli"]
+resolver = "2"

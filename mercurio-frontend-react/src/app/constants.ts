@@ -1,0 +1,11 @@
+export const ROOT_STORAGE_KEY = "mercurio.rootPath";
+export const RECENTS_KEY = "mercurio.recentProjects";
+export const AI_ENDPOINTS_KEY = "mercurio.ai.endpoints";
+export const AI_CHAT_KEY = "mercurio.ai.chatEndpoint";
+export const AI_EMBEDDINGS_KEY = "mercurio.ai.embeddingsEndpoint";
+export const PROJECT_LOCATION_KEY = "mercurio.projectLocation";
+export const THEME_KEY = "mercurio.theme";
+export const PROJECT_DESCRIPTOR_TAB = "__project_descriptor__";
+export const AI_VIEW_TAB = "__view_ai__";
+export const DATA_VIEW_TAB = "__view_data__";
+export const DIAGRAM_TAB_PREFIX = "__diagram__::";

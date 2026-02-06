@@ -5,40 +5,38 @@ import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import MonacoEditor, { loader, type OnMount } from "@monaco-editor/react";
 import { listen } from "@tauri-apps/api/event";
-import { List, type ListImperativeAPI, type RowComponentProps } from "react-window";
+import {
+  AI_CHAT_KEY,
+  AI_EMBEDDINGS_KEY,
+  AI_ENDPOINTS_KEY,
+  PROJECT_DESCRIPTOR_TAB,
+  PROJECT_LOCATION_KEY,
+  ROOT_STORAGE_KEY,
+  THEME_KEY,
+} from "./app/constants";
+import { loadRecents, saveRecents } from "./app/storage";
+import { useEditorState } from "./app/editorState";
+import { AiView } from "./app/components/AiView";
+import { ModelPane } from "./app/components/ModelPane";
+import { ModelHeader } from "./app/components/ModelHeader";
+import { EditorPane } from "./app/components/EditorPane";
+import { ProjectTree } from "./app/components/ProjectTree";
+import { DataView } from "./app/components/DataView";
+import { DescriptorView } from "./app/components/DescriptorView";
+import { DiagramView } from "./app/components/DiagramView";
+import { getKindKey, renderTypeIcon } from "./app/diagramIcons";
+import { useModelTracking } from "./app/useModelTracking";
+import { useDiagramView } from "./app/useDiagramView";
+import { useModelTree } from "./app/useModelTree";
+import { useModelTreeSelection } from "./app/useModelTreeSelection";
+import { createModelRowRenderer } from "./app/modelRowRenderer";
+import { useModelGroups } from "./app/useModelGroups";
+import { useTabs } from "./app/useTabs";
+import { useEditorNavigation } from "./app/useEditorNavigation";
+import { useCompileRunner } from "./app/useCompileRunner";
+import type { FileEntry, OpenTab, SymbolView } from "./app/types";
 
 loader.config({ paths: { vs: "/monaco/vs" } });
-
-type FileEntry = {
-  path: string;
-  name: string;
-  is_dir: boolean;
-  is_parent?: boolean;
-  is_action?: boolean;
-};
-
-const ROOT_STORAGE_KEY = "mercurio.rootPath";
-const RECENTS_KEY = "mercurio.recentProjects";
-const AI_ENDPOINTS_KEY = "mercurio.ai.endpoints";
-const AI_CHAT_KEY = "mercurio.ai.chatEndpoint";
-const AI_EMBEDDINGS_KEY = "mercurio.ai.embeddingsEndpoint";
-const PROJECT_LOCATION_KEY = "mercurio.projectLocation";
-const THEME_KEY = "mercurio.theme";
-const PROJECT_DESCRIPTOR_TAB = "__project_descriptor__";
-
-function loadRecents(): string[] {
-  try {
-    const raw = window.localStorage?.getItem(RECENTS_KEY);
-    const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveRecents(list: string[]) {
-  window.localStorage?.setItem(RECENTS_KEY, JSON.stringify(list));
-}
 
 export function App() {
   void getCurrentWindow();
@@ -59,26 +57,95 @@ export function App() {
   const [recentProjects, setRecentProjects] = useState<string[]>(() => loadRecents());
   const [treeEntries, setTreeEntries] = useState<FileEntry[]>([]);
   const [expanded, setExpanded] = useState<Record<string, FileEntry[]>>({});
-  const editorValueRef = useRef("");
-  const editorChangeRafRef = useRef<number | null>(null);
-  const [editorChangeTick, setEditorChangeTick] = useState(0);
-  const [openTabs, setOpenTabs] = useState<Array<{ path: string; name: string; dirty: boolean }>>([]);
+  const {
+    editorValueRef,
+    editorChangeTick,
+    cursorPos,
+    updateCursorPos,
+    onEditorChange,
+    activeDoc,
+    setActiveEditorDoc,
+    updateDocContent,
+    queuePendingEditorContent,
+    clearPendingEditorContent,
+    consumePendingEditorContent,
+    markSaved,
+    getDoc,
+    currentFilePathRef,
+  } = useEditorState();
+  const [openTabs, setOpenTabs] = useState<OpenTab[]>([]);
   const [activeTabPath, setActiveTabPath] = useState<string | null>(null);
-  const [editorViewMode, setEditorViewMode] = useState<"text" | "diagram">("text");
+  const activeTabPathRef = useRef<string | null>(null);
   const [descriptorViewMode, setDescriptorViewMode] = useState<"view" | "json">("view");
-  const [tabContent, setTabContent] = useState<Record<string, string>>({});
   const suppressDirtyRef = useRef(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; entry: FileEntry; scope: "root" | "node" } | null>(null);
+  const [tabMenu, setTabMenu] = useState<{ x: number; y: number; path: string } | null>(null);
+  const [tabOverflowOpen, setTabOverflowOpen] = useState(false);
   const [showProjectInfo, setShowProjectInfo] = useState(false);
   const [hasProjectDescriptor, setHasProjectDescriptor] = useState(false);
+  const [gitInfo, setGitInfo] = useState<{
+    repo_root: string;
+    branch: string;
+    ahead: number;
+    behind: number;
+    clean: boolean;
+    remote_url?: string | null;
+  } | null>(null);
+  const [gitStatus, setGitStatus] = useState<{
+    staged: string[];
+    unstaged: string[];
+    untracked: string[];
+  } | null>(null);
+  const [showGitDialog, setShowGitDialog] = useState(false);
+  const [gitStatusBusy, setGitStatusBusy] = useState(false);
+  const [gitStatusError, setGitStatusError] = useState("");
+  const [gitCommitMessage, setGitCommitMessage] = useState("");
+  const [gitCommitBusy, setGitCommitBusy] = useState(false);
+  const [gitCommitError, setGitCommitError] = useState("");
+  const [gitCommitSelection, setGitCommitSelection] = useState<Record<string, boolean>>({});
+  const [gitCommitSectionsOpen, setGitCommitSectionsOpen] = useState({
+    changes: true,
+    unversioned: false,
+  });
+  const [gitPushBusy, setGitPushBusy] = useState(false);
+  const [gitPushError, setGitPushError] = useState("");
+  const [gitBranches, setGitBranches] = useState<string[]>([]);
+  const [gitCurrentBranch, setGitCurrentBranch] = useState("");
+  const [gitCreateBranchName, setGitCreateBranchName] = useState("");
+  const [gitCreateBranchCheckout, setGitCreateBranchCheckout] = useState(true);
+  const [gitCheckoutBranchName, setGitCheckoutBranchName] = useState("");
+  const [gitBranchBusy, setGitBranchBusy] = useState(false);
+  const [gitBranchError, setGitBranchError] = useState("");
+  const [showGitBranchDialog, setShowGitBranchDialog] = useState(false);
   const [projectDescriptor, setProjectDescriptor] = useState<{
     name?: string | null;
     author?: string | null;
     description?: string | null;
     organization?: string | null;
     default_library: boolean;
+    stdlib?: string | null;
+    library?: { path: string } | string | null;
+    src?: string[];
+    import_entries?: string[];
     raw_json?: string;
   } | null>(null);
+  const [showProjectProperties, setShowProjectProperties] = useState(false);
+  const [projectPropertiesBusy, setProjectPropertiesBusy] = useState(false);
+  const [projectPropertiesError, setProjectPropertiesError] = useState("");
+  const [projectPropertiesDraft, setProjectPropertiesDraft] = useState({
+    name: "",
+    author: "",
+    description: "",
+    organization: "",
+    src: [] as string[],
+    import_entries: [] as string[],
+  });
+  const [projectFileInput, setProjectFileInput] = useState("");
+  const [projectLibraryInput, setProjectLibraryInput] = useState("");
+  const [projectStdlibMode, setProjectStdlibMode] = useState<"default" | "version" | "custom">("default");
+  const [projectStdlibVersion, setProjectStdlibVersion] = useState("");
+  const [projectStdlibPath, setProjectStdlibPath] = useState("");
+  const [projectStdlibVersions, setProjectStdlibVersions] = useState<string[]>([]);
   const [showNewFile, setShowNewFile] = useState(false);
   const [newFileName, setNewFileName] = useState("");
   const [newFileParent, setNewFileParent] = useState<string>("");
@@ -102,23 +169,33 @@ export function App() {
   const [newProjectDefaultLib, setNewProjectDefaultLib] = useState(true);
   const [newProjectBusy, setNewProjectBusy] = useState(false);
   const [newProjectError, setNewProjectError] = useState("");
-  const [rightPaneMode, setRightPaneMode] = useState<"model" | "ai">("model");
-  const [cursorPos, setCursorPos] = useState<{ line: number; col: number } | null>(null);
+  const [centerView, setCenterView] = useState<"file" | "diagram" | "ai" | "data">("file");
+  // cursorPos is managed by useEditorState
   const [aiInput, setAiInput] = useState("");
-  const [aiMessages, setAiMessages] = useState<Array<{ role: "user" | "assistant"; text: string; pendingId?: number }>>([]);
+  const [aiMessages, setAiMessages] = useState<Array<{
+    role: "user" | "assistant";
+    text: string;
+    pendingId?: number;
+    steps?: Array<{ kind: string; detail: string }>;
+  }>>([]);
   const [showAiSettings, setShowAiSettings] = useState(false);
   const [aiEndpoints, setAiEndpoints] = useState<Array<{
     id: string;
     name: string;
     url: string;
     type: "chat" | "embeddings";
+    provider: "openai" | "anthropic";
     model: string;
     token: string;
   }>>(() => {
     try {
       const raw = window.localStorage?.getItem(AI_ENDPOINTS_KEY);
       const parsed = raw ? JSON.parse(raw) : [];
-      return Array.isArray(parsed) ? parsed : [];
+      if (!Array.isArray(parsed)) return [];
+      return parsed.map((item: any) => ({
+        ...item,
+        provider: item?.provider === "anthropic" ? "anthropic" : "openai",
+      }));
     } catch {
       return [];
     }
@@ -134,75 +211,52 @@ export function App() {
     name: string;
     url: string;
     type: "chat" | "embeddings";
+    provider: "openai" | "anthropic";
     model: string;
     token: string;
-  }>({ name: "", url: "", type: "chat", model: "", token: "" });
+  }>({ name: "", url: "", type: "chat", provider: "openai", model: "", token: "" });
   const [endpointTestStatus, setEndpointTestStatus] = useState<Record<string, string>>({});
   const aiRequestRef = useRef(0);
-  const [, setCompileStatus] = useState("Background compile: idle");
-  const [compileRunId, setCompileRunId] = useState<number | null>(null);
-  const [compileToast, setCompileToast] = useState<{
-    open: boolean;
-    ok: boolean | null;
-    lines: string[];
-    parseErrors: Array<{ path: string; errors: string[] }>;
-    details: string[];
-    parsedFiles: string[];
-  }>({
-    open: false,
-    ok: null,
-    lines: [],
-    parseErrors: [],
-    details: [],
-    parsedFiles: [],
-  });
-  const compileToastTimerRef = useRef<number | null>(null);
-  const backgroundCompileRef = useRef<number | null>(null);
-  const backgroundCompileTokenRef = useRef(0);
-  const [backgroundCompileEnabled, setBackgroundCompileEnabled] = useState(true);
-  const [projectSymbolsLoaded, setProjectSymbolsLoaded] = useState(false);
-  const [symbols, setSymbols] = useState<Array<{
-    name: string;
-    kind: string;
-    file_path: string;
-    qualified_name: string;
-    file: number;
-    start_line: number;
-    start_col: number;
-    end_line: number;
-    end_col: number;
-    doc?: string | null;
-    properties: Array<{
-      name: string;
-      label: string;
-      value: { type: "text"; value: string } | { type: "list"; items: string[] } | { type: "bool"; value: boolean } | { type: "number"; value: number };
-      hint?: string | null;
-      group?: string | null;
-    }>;
-  }>>([]);
-  const [unresolved, setUnresolved] = useState<Array<{ file_path: string; message: string; line: number; column: number }>>([]);
-  const [libraryPath, setLibraryPath] = useState<string | null>(null);
-  const [selectedSymbol, setSelectedSymbol] = useState<typeof symbols[number] | null>(null);
-  const [currentFilePath, setCurrentFilePath] = useState<string | null>(null);
+  const {
+    setCompileStatus,
+    compileRunId,
+    compileToast,
+    setCompileToast,
+    runCompile,
+    cancelCompile,
+    runBackgroundCompile,
+    runBackgroundCompileWithUnsaved,
+    cancelBackgroundCompile,
+    backgroundCompileEnabled,
+    setBackgroundCompileEnabled,
+    backgroundCompileActive,
+    symbols,
+    unresolved,
+    libraryPath,
+    projectSymbolsLoaded,
+  } = useCompileRunner({ rootPath });
+  const [dataExcludeStdlib, setDataExcludeStdlib] = useState(true);
+  const [selectedSymbol, setSelectedSymbol] = useState<SymbolView | null>(null);
   const [modelTreeHeight, setModelTreeHeight] = useState(260);
-  const [modelTreeViewportHeight, setModelTreeViewportHeight] = useState(0);
   const [collapseAllModel, setCollapseAllModel] = useState(false);
   const [showPropertiesPane, setShowPropertiesPane] = useState(true);
+  const [trackText, setTrackText] = useState(false);
   const [modelExpanded, setModelExpanded] = useState<Record<string, boolean>>({});
   const [modelSectionOpen, setModelSectionOpen] = useState({ project: true, library: true, errors: true });
   const modelTreeRef = useRef<HTMLDivElement | null>(null);
+  const modelPaneContainerRef = useRef<HTMLDivElement | null>(null);
+  const [modelPaneHeight, setModelPaneHeight] = useState(0);
   const navReqRef = useRef(0);
   const pendingNavRef = useRef<{
     path: string;
     name?: string;
     selection?: { startLine: number; startCol: number; endLine: number; endCol: number };
   } | null>(null);
+  const lastCompiledContentRef = useRef<Record<string, string>>({});
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
   const cursorListenerRef = useRef<null | { dispose: () => void }>(null);
   const parseReqRef = useRef(0);
-  const pendingEditorContentRef = useRef<string | null>(null);
-  const pendingEditorPathRef = useRef<string | null>(null);
     const editorOptions: Parameters<typeof MonacoEditor>[0]["options"] = {
       minimap: { enabled: false },
       fontSize: 14,
@@ -212,46 +266,21 @@ export function App() {
       occurrencesHighlight: "off",
       automaticLayout: true,
     };
-  const [diagramScale, setDiagramScale] = useState(1);
-  const [diagramOffset, setDiagramOffset] = useState({ x: 0, y: 0 });
-  const diagramPanRef = useRef<null | { x: number; y: number; startX: number; startY: number }>(null);
-  const diagramBodyRef = useRef<HTMLDivElement | null>(null);
-  const diagramViewportRef = useRef<null | { startX: number; startY: number; baseX: number; baseY: number }>(null);
-  const [diagramViewport, setDiagramViewport] = useState<{ x: number; y: number; width: number; height: number }>({
-    x: 0,
-    y: 0,
-    width: 80,
-    height: 60,
-  });
-  const [diagramNodeOffsets, setDiagramNodeOffsets] = useState<Record<string, { x: number; y: number }>>({});
-  const [diagramNodeSizes, setDiagramNodeSizes] = useState<Record<string, { width: number; height: number }>>({});
-  const [syncDiagramSelection, setSyncDiagramSelection] = useState(false);
-  const diagramDragRef = useRef<null | {
-    node: string;
-    startX: number;
-    startY: number;
-    base: { x: number; y: number };
-  }>(null);
-  const diagramResizeRef = useRef<null | {
-    node: string;
-    startX: number;
-    startY: number;
-    base: { width: number; height: number };
-  }>(null);
-  const diagramBoundsRef = useRef<Record<string, { minX: number; maxX: number; minY: number; maxY: number }>>({});
-  const diagramWorkerRef = useRef<Worker | null>(null);
-  const diagramLayoutReqRef = useRef(0);
-  const diagramRafRef = useRef<number | null>(null);
-  const diagramPendingRef = useRef<{ offsets?: Record<string, { x: number; y: number }>; sizes?: Record<string, { width: number; height: number }> }>({});
-  const diagramPanRafRef = useRef<number | null>(null);
-  const diagramPanPendingRef = useRef<{ x: number; y: number } | null>(null);
-  const [diagramLayout, setDiagramLayout] = useState<DiagramLayout | null>(null);
-  const [palettePos, setPalettePos] = useState({ x: 16, y: 16 });
-  const paletteDragRef = useRef<null | { startX: number; startY: number; baseX: number; baseY: number }>(null);
-  const [diagramManualNodes, setDiagramManualNodes] = useState<Array<{ id: string; type: string; name: string; x: number; y: number; width: number; height: number; pending: boolean }>>([]);
-  const paletteCreateRef = useRef<null | { type: string; name: string; startX: number; startY: number }>(null);
-  const [paletteGhost, setPaletteGhost] = useState<null | { x: number; y: number; type: string }>(null);
   const fsChangeTimerRef = useRef<number | null>(null);
+  const activeTabMeta = useMemo(
+    () => openTabs.find((tab) => tab.path === activeTabPath) || null,
+    [openTabs, activeTabPath],
+  );
+  const activeEditorPath = useMemo(() => {
+    if (!activeTabMeta) return null;
+    if (activeTabMeta.path === PROJECT_DESCRIPTOR_TAB) return null;
+    if (activeTabMeta.kind === "ai" || activeTabMeta.kind === "data" || activeTabMeta.kind === "diagram") return null;
+    return activeTabMeta.path;
+  }, [activeTabMeta]);
+  const activeDiagramPath = useMemo(() => {
+    if (activeTabMeta?.kind === "diagram") return activeTabMeta.sourcePath || null;
+    return null;
+  }, [activeTabMeta]);
 
   useEffect(() => {
     document.body.classList.toggle("theme-light", appTheme === "light");
@@ -261,6 +290,15 @@ export function App() {
     }
   }, [appTheme]);
 
+
+  useEffect(() => {
+    activeTabPathRef.current = activeTabPath;
+  }, [activeTabPath]);
+
+  useEffect(() => {
+    currentFilePathRef.current = activeDoc.path;
+  }, [activeDoc, currentFilePathRef]);
+
   useEffect(() => {
     const onDocClick = (event: MouseEvent) => {
       const target = event.target as HTMLElement | null;
@@ -269,6 +307,12 @@ export function App() {
       }
       if (!target || !target.closest(".context-menu")) {
         setContextMenu(null);
+      }
+      if (!target || !target.closest(".tab-menu")) {
+        setTabMenu(null);
+      }
+      if (!target || !target.closest(".tab-overflow")) {
+        setTabOverflowOpen(false);
       }
     };
     document.addEventListener("click", onDocClick);
@@ -294,19 +338,6 @@ export function App() {
       window.localStorage?.removeItem(AI_EMBEDDINGS_KEY);
     }
   }, [selectedEmbeddingsEndpoint]);
-
-  useEffect(() => {
-    const worker = new Worker(new URL("./diagramWorker.ts", import.meta.url), { type: "module" });
-    diagramWorkerRef.current = worker;
-    return () => {
-      worker.terminate();
-      diagramWorkerRef.current = null;
-    };
-  }, []);
-
-  useEffect(() => {
-    setProjectSymbolsLoaded(false);
-  }, [rootPath]);
 
   const rememberProjectLocation = (path: string) => {
     if (!path) return;
@@ -419,6 +450,10 @@ export function App() {
         description?: string | null;
         organization?: string | null;
         default_library: boolean;
+        stdlib?: string | null;
+        library?: { path: string } | string | null;
+        src?: string[];
+        import_entries?: string[];
         raw_json?: string;
       }>("create_project_descriptor", {
         payload: {
@@ -440,7 +475,6 @@ export function App() {
       } catch (error) {
         setNewProjectError(`Open project failed: ${String(error)}`);
       }
-      openProjectDescriptorTab(descriptor || null);
       setCompileStatus("Project created");
     } catch (error) {
       setNewProjectBusy(false);
@@ -448,7 +482,7 @@ export function App() {
     }
   };
 
-    useEffect(() => {
+  useEffect(() => {
       const onMove = (event: PointerEvent) => {
       if (!draggingRef.current) return;
       const delta = event.clientX - startRef.current.x;
@@ -478,16 +512,21 @@ export function App() {
     if (!rootPath) {
       setProjectDescriptor(null);
       setHasProjectDescriptor(false);
+      setGitInfo(null);
       return;
     }
-      invoke<{
-        name?: string | null;
-        author?: string | null;
-        description?: string | null;
-        organization?: string | null;
-        default_library: boolean;
-        raw_json?: string;
-      } | null>("get_project_descriptor", { root: rootPath })
+    invoke<{
+      name?: string | null;
+      author?: string | null;
+      description?: string | null;
+      organization?: string | null;
+      default_library: boolean;
+      stdlib?: string | null;
+      library?: { path: string } | string | null;
+      src?: string[];
+      import_entries?: string[];
+      raw_json?: string;
+    } | null>("get_project_descriptor", { root: rootPath })
         .then((descriptor) => {
           setProjectDescriptor(descriptor || null);
           setHasProjectDescriptor(!!descriptor);
@@ -496,7 +535,8 @@ export function App() {
           setProjectDescriptor(null);
           setHasProjectDescriptor(false);
         });
-    }, [rootPath]);
+    void refreshGitInfo(rootPath);
+  }, [rootPath]);
 
   useEffect(() => {
     if (!rootPath) return;
@@ -504,138 +544,16 @@ export function App() {
   }, [rootPath, backgroundCompileEnabled]);
 
   useEffect(() => {
-    if (rightPaneMode !== "model") return;
-    const container = modelTreeRef.current;
-    if (!container) return;
-    const updateHeight = () => {
-      setModelTreeViewportHeight(container.clientHeight);
-    };
-    updateHeight();
-    const resizeObserver = new ResizeObserver(() => updateHeight());
-    resizeObserver.observe(container);
-    return () => resizeObserver.disconnect();
-  }, [rightPaneMode, modelTreeHeight, showPropertiesPane]);
-
-  useEffect(() => {
-    const onMove = (event: PointerEvent) => {
-      if (diagramDragRef.current) {
-        const { node, startX, startY, base } = diagramDragRef.current;
-        const deltaX = event.clientX - startX;
-        const deltaY = event.clientY - startY;
-        const bounds = diagramBoundsRef.current[node];
-        const nextX = base.x + deltaX;
-        const nextY = base.y + deltaY;
-        const clampedX = bounds ? Math.min(bounds.maxX, Math.max(bounds.minX, nextX)) : nextX;
-        const clampedY = bounds ? Math.min(bounds.maxY, Math.max(bounds.minY, nextY)) : nextY;
-        diagramPendingRef.current.offsets = {
-          ...(diagramPendingRef.current.offsets || {}),
-          [node]: { x: clampedX, y: clampedY },
-        };
-      }
-      if (diagramResizeRef.current) {
-        const { node, startX, startY, base } = diagramResizeRef.current;
-        const deltaX = event.clientX - startX;
-        const deltaY = event.clientY - startY;
-        diagramPendingRef.current.sizes = {
-          ...(diagramPendingRef.current.sizes || {}),
-          [node]: {
-            width: Math.max(120, base.width + deltaX),
-            height: Math.max(60, base.height + deltaY),
-          },
-        };
-      }
-      if (diagramDragRef.current || diagramResizeRef.current) {
-        if (diagramRafRef.current == null) {
-          diagramRafRef.current = window.requestAnimationFrame(() => {
-            const pending = diagramPendingRef.current;
-            if (pending.offsets) {
-              setDiagramNodeOffsets((prev) => ({ ...prev, ...pending.offsets }));
-            }
-            if (pending.sizes) {
-              setDiagramNodeSizes((prev) => ({ ...prev, ...pending.sizes }));
-            }
-            diagramPendingRef.current = {};
-            diagramRafRef.current = null;
-          });
-        }
-      }
-      if (paletteDragRef.current) {
-        const deltaX = event.clientX - paletteDragRef.current.startX;
-        const deltaY = event.clientY - paletteDragRef.current.startY;
-        setPalettePos({
-          x: paletteDragRef.current.baseX + deltaX,
-          y: paletteDragRef.current.baseY + deltaY,
-        });
-      }
-      if (paletteCreateRef.current) {
-        setPaletteGhost({ x: event.clientX, y: event.clientY, type: paletteCreateRef.current.type });
-      }
-    };
-    const onUp = () => {
-      diagramDragRef.current = null;
-      diagramResizeRef.current = null;
-      diagramViewportRef.current = null;
-      paletteDragRef.current = null;
-      if (paletteCreateRef.current && diagramBodyRef.current) {
-        const body = diagramBodyRef.current.getBoundingClientRect();
-        const within =
-          paletteGhost &&
-          paletteGhost.x >= body.left &&
-          paletteGhost.x <= body.right &&
-          paletteGhost.y >= body.top &&
-          paletteGhost.y <= body.bottom;
-        if (within) {
-          const x = (paletteGhost!.x - body.left - diagramOffset.x) / diagramScale;
-          const y = (paletteGhost!.y - body.top - diagramOffset.y) / diagramScale;
-          const tempId = crypto.randomUUID();
-          const tempName = `temp-${paletteCreateRef.current!.name.toLowerCase()}`;
-          setDiagramManualNodes((prev) => [
-            ...prev,
-            {
-              id: tempId,
-              type: paletteCreateRef.current!.type,
-              name: tempName,
-              x,
-              y,
-              width: 180,
-              height: 120,
-              pending: true,
-            },
-          ]);
-          if (!rootPath || !activeTabPath) {
-            setCompileStatus("Select a file before creating a package");
-            setDiagramManualNodes((prev) => prev.filter((node) => node.id !== tempId));
-          } else {
-            invoke("create_package", {
-              payload: {
-                root: rootPath,
-                file: activeTabPath,
-                name: `Package_${Date.now()}`,
-              },
-            })
-              .then(() => {
-                setDiagramManualNodes((prev) => prev.filter((node) => node.id !== tempId));
-                void runBackgroundCompile(rootPath);
-              })
-              .catch((error) => {
-                setCompileStatus(`Create package failed: ${error}`);
-                setDiagramManualNodes((prev) =>
-                  prev.map((node) => (node.id === tempId ? { ...node, pending: false } : node)),
-                );
-              });
-          }
-        }
-      }
-      paletteCreateRef.current = null;
-      setPaletteGhost(null);
-    };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-    return () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-    };
+    if (!modelPaneContainerRef.current) return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      setModelPaneHeight(Math.round(entry.contentRect.height));
+    });
+    observer.observe(modelPaneContainerRef.current);
+    return () => observer.disconnect();
   }, []);
+
 
   const startDrag = (side: "left" | "right" | "model", event: React.PointerEvent) => {
     event.preventDefault();
@@ -661,29 +579,47 @@ export function App() {
     setExpanded({});
   };
 
+  const refreshGitInfo = async (path: string) => {
+    if (!path) {
+      setGitInfo(null);
+      return;
+    }
+    try {
+      const info = await invoke<{
+        repo_root: string;
+        branch: string;
+        ahead: number;
+        behind: number;
+        clean: boolean;
+        remote_url?: string | null;
+      } | null>("detect_git_repo", { root: path });
+      setGitInfo(info || null);
+    } catch {
+      setGitInfo(null);
+    }
+  };
+
   const openProject = async (path: string) => {
     if (!path) return;
     if (compileRunId) {
-      void invoke("cancel_compile", { run_id: compileRunId }).catch(() => {});
-      setCompileRunId(null);
+      await cancelCompile();
     }
-    if (backgroundCompileRef.current) {
-      void invoke("cancel_compile", { run_id: backgroundCompileRef.current }).catch(() => {});
-      backgroundCompileRef.current = null;
-    }
-    backgroundCompileTokenRef.current += 1;
+    await cancelBackgroundCompile();
     closeAllTabs();
     setSelectedSymbol(null);
-    setEditorViewMode("text");
+    setCenterView("file");
     setDescriptorViewMode("view");
     setProjectDescriptor(null);
     setHasProjectDescriptor(false);
+    setGitInfo(null);
+    setGitStatus(null);
     setRootPath(path);
     window.localStorage?.setItem(ROOT_STORAGE_KEY, path);
     const next = [path, ...recentProjects.filter((p) => p !== path)].slice(0, 8);
     setRecentProjects(next);
     saveRecents(next);
     await refreshRoot(path);
+    void refreshGitInfo(path);
   };
 
   const chooseProject = () => {
@@ -718,59 +654,61 @@ export function App() {
     const children = await invoke<FileEntry[]>("list_dir", { path: entry.path });
     setExpanded((prev) => ({ ...prev, [entry.path]: children || [] }));
   };
-
-  const applyEditorSelection = (
-    editor: Parameters<OnMount>[0],
-    selection?: { startLine: number; startCol: number; endLine: number; endCol: number },
-  ) => {
-    if (!selection) return;
-    editor.setSelection({
-      startLineNumber: selection.startLine || 1,
-      startColumn: selection.startCol || 1,
-      endLineNumber: selection.endLine || selection.startLine || 1,
-      endColumn: selection.endCol || selection.startCol || 1,
-    });
-    editor.revealLineInCenter(selection.startLine || 1);
-  };
-
-  const navigateTo = async (target: {
-    path: string;
-    name?: string;
-    selection?: { startLine: number; startCol: number; endLine: number; endCol: number };
-  }) => {
-    const reqId = ++navReqRef.current;
-    pendingNavRef.current = target;
-    if (currentFilePath !== target.path) {
-      const content = await invoke<string>("read_file", { path: target.path });
-      if (reqId !== navReqRef.current) return;
-        suppressDirtyRef.current = true;
-        editorValueRef.current = content || "";
-        if (editorRef.current && editorViewMode === "text" && activeTabPath !== PROJECT_DESCRIPTOR_TAB) {
-          editorRef.current.setValue(editorValueRef.current);
-        } else {
-          pendingEditorContentRef.current = editorValueRef.current;
-          pendingEditorPathRef.current = target.path;
-        }
-      setCurrentFilePath(target.path);
-      setActiveTabPath(target.path);
-      setOpenTabs((prev) => {
-        if (prev.some((tab) => tab.path === target.path)) return prev;
-        const name = target.name || target.path.split(/[\\/]/).pop() || "Untitled";
-        return [...prev, { path: target.path, name, dirty: false }];
-      });
-      setTabContent((prev) => ({ ...prev, [target.path]: content || "" }));
-    }
-    if (reqId !== navReqRef.current) return;
-    if (editorRef.current) {
-      applyEditorSelection(editorRef.current, target.selection);
-      editorRef.current.focus();
-      pendingNavRef.current = null;
-    }
-  };
+  const { navigateTo, applyEditorSelection } = useEditorNavigation({
+    centerView,
+    setCenterView,
+    activeDocPath: activeDoc.path,
+    getDoc,
+    setActiveEditorDoc,
+    queuePendingEditorContent,
+    editorValueRef,
+    suppressDirtyRef,
+    editorRef,
+    currentFilePathRef,
+    activeTabPathRef,
+    navReqRef,
+    pendingNavRef,
+    setActiveTabPath,
+    setOpenTabs,
+  });
+  const {
+    selectTab,
+    openAiViewTab,
+    openDataViewTab,
+    openDiagramViewTab,
+    reorderTabs,
+    closeTab,
+    closeAllTabs,
+    closeOtherTabs,
+  } = useTabs({
+    openTabs,
+    setOpenTabs,
+    activeTabPath,
+    setActiveTabPath,
+    activeTabPathRef,
+    setCenterView,
+    setActiveEditorDoc,
+    setDescriptorViewMode,
+    setShowProjectInfo,
+    setProjectDescriptor,
+    setHasProjectDescriptor,
+    clearPendingEditorContent,
+    editorRef,
+    suppressDirtyRef,
+    navReqRef,
+    pendingNavRef,
+    selectedSymbol,
+    setSelectedSymbol,
+    navigateTo,
+  });
 
   const openFile = async (entry: FileEntry) => {
     if (entry.is_dir) {
       void toggleExpand(entry);
+      return;
+    }
+    if (entry.path.toLowerCase().endsWith(".diagram")) {
+      openDiagramViewTab(entry.path);
       return;
     }
     await navigateTo({ path: entry.path, name: entry.name });
@@ -820,24 +758,364 @@ export function App() {
     setContextMenu(null);
   };
 
-  const loadProjectInfo = async () => {
-    if (!rootPath) return;
+  const openProjectProperties = async () => {
+    if (!rootPath) {
+      setCompileStatus("Open a project folder first.");
+      return;
+    }
+    setProjectPropertiesError("");
+    setProjectPropertiesBusy(true);
     try {
+      const [descriptor, stdlibVersions] = await Promise.all([
+        invoke<{
+          name?: string | null;
+          author?: string | null;
+          description?: string | null;
+          organization?: string | null;
+          default_library: boolean;
+          stdlib?: string | null;
+          library?: { path: string } | string | null;
+          src?: string[];
+          import_entries?: string[];
+          raw_json?: string;
+        }>("ensure_project_descriptor", { root: rootPath }),
+        invoke<string[]>("list_stdlib_versions"),
+      ]);
+      setProjectDescriptor(descriptor || null);
+      setHasProjectDescriptor(!!descriptor);
+      setProjectPropertiesDraft({
+        name: descriptor?.name || "",
+        author: descriptor?.author || "",
+        description: descriptor?.description || "",
+        organization: descriptor?.organization || "",
+        src: descriptor?.src || [],
+        import_entries: descriptor?.import_entries || [],
+      });
+      const library = descriptor?.library;
+      if (library && typeof library === "object" && "path" in library) {
+        setProjectStdlibMode("custom");
+        setProjectStdlibPath(library.path || "");
+        setProjectStdlibVersion("");
+      } else if (typeof library === "string" && library.trim() && library.trim().toLowerCase() !== "default") {
+        setProjectStdlibMode("custom");
+        setProjectStdlibPath(library.trim());
+        setProjectStdlibVersion("");
+      } else if (descriptor?.stdlib && descriptor.stdlib.trim() && descriptor.stdlib.trim().toLowerCase() !== "default") {
+        setProjectStdlibMode("version");
+        setProjectStdlibVersion(descriptor.stdlib);
+        setProjectStdlibPath("");
+      } else {
+        setProjectStdlibMode("default");
+        setProjectStdlibVersion("");
+        setProjectStdlibPath("");
+      }
+      setProjectStdlibVersions(Array.isArray(stdlibVersions) ? stdlibVersions : []);
+      setShowProjectProperties(true);
+    } catch (error) {
+      setProjectPropertiesError(`Project properties failed: ${String(error)}`);
+      setShowProjectProperties(true);
+    } finally {
+      setProjectPropertiesBusy(false);
+    }
+  };
+
+  const openGitDialog = async () => {
+    setShowGitDialog(true);
+    setGitCommitError("");
+    setGitPushError("");
+    setGitCommitMessage("");
+    setGitCommitSelection({});
+    setGitCommitSectionsOpen({ changes: true, unversioned: false });
+    if (!gitInfo) {
+      setGitStatus(null);
+      setGitStatusBusy(false);
+      setGitStatusError("No git repository detected.");
+      return;
+    }
+    setGitStatusBusy(true);
+    setGitStatusError("");
+    try {
+      const status = await invoke<{
+        staged: string[];
+        unstaged: string[];
+        untracked: string[];
+      }>("git_status", { repoRoot: gitInfo.repo_root });
+      setGitStatus(status);
+      setGitCommitSelection((prev) => {
+        if (Object.keys(prev).length) return prev;
+        const next: Record<string, boolean> = {};
+        status.staged.forEach((path) => {
+          next[path] = true;
+        });
+        return next;
+      });
+    } catch (error) {
+      setGitStatus(null);
+      setGitStatusError(`Failed to load git status: ${String(error)}`);
+    } finally {
+      setGitStatusBusy(false);
+    }
+  };
+
+  const copyRepoUrl = async () => {
+    if (!gitInfo?.remote_url) return;
+    try {
+      await navigator.clipboard.writeText(gitInfo.remote_url);
+    } catch {
+      // No-op for now.
+    }
+  };
+
+  const refreshGitBranches = async () => {
+    if (!gitInfo) return;
+    try {
+      const branches = await invoke<{ current: string; branches: string[] }>("git_list_branches", { repoRoot: gitInfo.repo_root });
+      setGitCurrentBranch(branches.current || "");
+      setGitBranches(branches.branches || []);
+      setGitCheckoutBranchName((prev) => prev || branches.current || "");
+    } catch (error) {
+      setGitBranchError(`Failed to load branches: ${String(error)}`);
+    }
+  };
+
+  const openGitBranchDialog = async () => {
+    setGitBranchError("");
+    setGitCreateBranchName("");
+    setGitCreateBranchCheckout(true);
+    setShowGitBranchDialog(true);
+    await refreshGitBranches();
+  };
+
+  const runGitCreateBranch = async () => {
+    if (!gitInfo || gitBranchBusy) return;
+    const name = gitCreateBranchName.trim();
+    if (!name) {
+      setGitBranchError("Branch name is required.");
+      return;
+    }
+    setGitBranchBusy(true);
+    setGitBranchError("");
+    try {
+      await invoke("git_create_branch", { repoRoot: gitInfo.repo_root, name, checkout: gitCreateBranchCheckout });
+      await refreshGitBranches();
+      await refreshGitInfo(gitInfo.repo_root);
+      if (gitCreateBranchCheckout) {
+        setGitCheckoutBranchName(name);
+      }
+      setGitCreateBranchName("");
+      setCompileStatus("Branch created");
+    } catch (error) {
+      setGitBranchError(`Create branch failed: ${String(error)}`);
+    } finally {
+      setGitBranchBusy(false);
+    }
+  };
+
+  const runGitCheckoutBranch = async () => {
+    if (!gitInfo || gitBranchBusy) return;
+    const name = gitCheckoutBranchName.trim();
+    if (!name) {
+      setGitBranchError("Select a branch to checkout.");
+      return;
+    }
+    setGitBranchBusy(true);
+    setGitBranchError("");
+    try {
+      await invoke("git_checkout_branch", { repoRoot: gitInfo.repo_root, name });
+      await refreshGitBranches();
+      await refreshGitInfo(gitInfo.repo_root);
+      setCompileStatus("Checked out branch");
+    } catch (error) {
+      setGitBranchError(`Checkout failed: ${String(error)}`);
+    } finally {
+      setGitBranchBusy(false);
+    }
+  };
+
+
+  const toggleCommitSelection = (path: string) => {
+    setGitCommitSelection((prev) => ({ ...prev, [path]: !prev[path] }));
+  };
+
+  const toggleCommitSectionAll = (section: "changes" | "unversioned", checked: boolean) => {
+    if (!gitStatus) return;
+    const paths = section === "changes"
+      ? [...gitStatus.staged, ...gitStatus.unstaged]
+      : [...gitStatus.untracked];
+    setGitCommitSelection((prev) => {
+      const next = { ...prev };
+      paths.forEach((path) => {
+        next[path] = checked;
+      });
+      return next;
+    });
+  };
+
+  const stageCommitSelection = async () => {
+    if (!gitInfo || !gitStatus) return false;
+    const selected = Object.entries(gitCommitSelection)
+      .filter(([, value]) => value)
+      .map(([path]) => path);
+    if (!selected.length) {
+      setGitCommitError("Select files to commit.");
+      return false;
+    }
+    const stagedSet = new Set(gitStatus.staged);
+    const toUnstage = gitStatus.staged.filter((path) => !gitCommitSelection[path]);
+    const toStage = selected.filter((path) => !stagedSet.has(path));
+    try {
+      if (toUnstage.length) {
+        await invoke("git_unstage_paths", { repoRoot: gitInfo.repo_root, paths: toUnstage });
+      }
+      if (toStage.length) {
+        await invoke("git_stage_paths", { repoRoot: gitInfo.repo_root, paths: toStage });
+      }
+      const status = await invoke<{
+        staged: string[];
+        unstaged: string[];
+        untracked: string[];
+      }>("git_status", { repoRoot: gitInfo.repo_root });
+      setGitStatus(status);
+      return true;
+    } catch (error) {
+      setGitCommitError(`Stage failed: ${String(error)}`);
+      return false;
+    }
+  };
+
+  const runGitCommitFlow = async (pushAfter: boolean) => {
+    if (!gitInfo || gitCommitBusy || gitPushBusy) return;
+    const message = gitCommitMessage.trim();
+    if (!message) {
+      setGitCommitError("Commit message is required.");
+      return;
+    }
+    setGitCommitBusy(true);
+    setGitPushBusy(pushAfter);
+    setGitCommitError("");
+    setGitPushError("");
+    try {
+      const ok = await stageCommitSelection();
+      if (!ok) {
+        return;
+      }
+      await invoke<string>("git_commit", { repoRoot: gitInfo.repo_root, message });
+      if (pushAfter) {
+        await invoke("git_push", { repoRoot: gitInfo.repo_root });
+      }
+      await refreshGitInfo(gitInfo.repo_root);
+      const status = await invoke<{
+        staged: string[];
+        unstaged: string[];
+        untracked: string[];
+      }>("git_status", { repoRoot: gitInfo.repo_root });
+      setGitStatus(status);
+      setShowGitDialog(false);
+      setGitCommitMessage("");
+      setCompileStatus(pushAfter ? "Commit and push complete" : "Commit created");
+    } catch (error) {
+      if (pushAfter) {
+        setGitPushError(`Commit/push failed: ${String(error)}`);
+      } else {
+        setGitCommitError(`Commit failed: ${String(error)}`);
+      }
+    } finally {
+      setGitCommitBusy(false);
+      setGitPushBusy(false);
+    }
+  };
+
+  const addProjectFile = () => {
+    const value = projectFileInput.trim();
+    if (!value) return;
+    setProjectPropertiesDraft((prev) => ({
+      ...prev,
+      src: prev.src.includes(value) ? prev.src : [...prev.src, value],
+    }));
+    setProjectFileInput("");
+  };
+
+  const removeProjectFile = (value: string) => {
+    setProjectPropertiesDraft((prev) => ({
+      ...prev,
+      src: prev.src.filter((entry) => entry !== value),
+    }));
+  };
+
+  const addProjectLibrary = () => {
+    const value = projectLibraryInput.trim();
+    if (!value) return;
+    setProjectPropertiesDraft((prev) => ({
+      ...prev,
+      import_entries: prev.import_entries.includes(value) ? prev.import_entries : [...prev.import_entries, value],
+    }));
+    setProjectLibraryInput("");
+  };
+
+  const removeProjectLibrary = (value: string) => {
+    setProjectPropertiesDraft((prev) => ({
+      ...prev,
+      import_entries: prev.import_entries.filter((entry) => entry !== value),
+    }));
+  };
+
+  const saveProjectProperties = async () => {
+    if (!rootPath) return;
+    setProjectPropertiesError("");
+    if (projectStdlibMode === "version" && !projectStdlibVersion.trim()) {
+      setProjectPropertiesError("Select a stdlib version.");
+      return;
+    }
+    if (projectStdlibMode === "custom" && !projectStdlibPath.trim()) {
+      setProjectPropertiesError("Enter a stdlib path.");
+      return;
+    }
+    setProjectPropertiesBusy(true);
+    try {
+      const trimmedName = projectPropertiesDraft.name.trim();
+      const trimmedAuthor = projectPropertiesDraft.author.trim();
+      const trimmedDescription = projectPropertiesDraft.description.trim();
+      const trimmedOrganization = projectPropertiesDraft.organization.trim();
+      const stdlibPayload =
+        projectStdlibMode === "default"
+          ? "default"
+          : projectStdlibMode === "version"
+            ? projectStdlibVersion.trim()
+            : null;
+      const libraryPayload =
+        projectStdlibMode === "custom" ? { path: projectStdlibPath.trim() } : null;
       const descriptor = await invoke<{
         name?: string | null;
         author?: string | null;
         description?: string | null;
         organization?: string | null;
         default_library: boolean;
+        stdlib?: string | null;
+        library?: { path: string } | string | null;
+        src?: string[];
+        import_entries?: string[];
         raw_json?: string;
-      } | null>("get_project_descriptor", { root: rootPath });
+      }>("update_project_descriptor", {
+        payload: {
+          root: rootPath,
+          name: trimmedName || null,
+          author: trimmedAuthor || null,
+          description: trimmedDescription || null,
+          organization: trimmedOrganization || null,
+          src: projectPropertiesDraft.src,
+          import_entries: projectPropertiesDraft.import_entries,
+          stdlib: stdlibPayload,
+          library: libraryPayload,
+        },
+      });
       setProjectDescriptor(descriptor || null);
       setHasProjectDescriptor(!!descriptor);
-    } catch {
-      setProjectDescriptor(null);
-      setHasProjectDescriptor(false);
+      setShowProjectProperties(false);
+    } catch (error) {
+      setProjectPropertiesError(String(error));
+    } finally {
+      setProjectPropertiesBusy(false);
     }
-    openProjectDescriptorTab();
   };
 
   const createNewFile = async () => {
@@ -848,9 +1126,19 @@ export function App() {
     const parent = normParentCandidate.startsWith(normRoot) ? parentCandidate : rootPath;
     const trimmed = newFileName.trim();
     const baseName = trimmed.split(/[\\/]/).pop() || trimmed;
-    const extension = newFileType === "kerml" ? ".kerml" : ".sysml";
+    const extension =
+      newFileType === "diagram" ? ".diagram" : newFileType === "kerml" ? ".kerml" : ".sysml";
     const finalName = baseName.toLowerCase().endsWith(extension) ? baseName : `${baseName}${extension}`;
-    await invoke("create_file", { root: rootPath, parent, name: finalName });
+    if (newFileType === "diagram") {
+      const createdPath = await invoke<string>("create_file", { root: rootPath, parent, name: finalName });
+      await invoke("write_diagram", {
+        root: rootPath,
+        path: createdPath,
+        diagram: { version: 1, nodes: [], offsets: {}, sizes: {} },
+      });
+    } else {
+      await invoke("create_file", { root: rootPath, parent, name: finalName });
+    }
     setShowNewFile(false);
     setNewFileName("");
     await refreshRoot(rootPath);
@@ -900,14 +1188,32 @@ export function App() {
   }, [rootPath]);
 
   useEffect(() => {
-    const unlistenPromise = listen("fs-changed", () => {
+    const unlistenPromise = listen<{ path: string; kind: string }>("fs-changed", async (event) => {
       if (!rootPath) return;
+      const changedPath = event?.payload?.path;
+      if (changedPath) {
+        const cached = getDoc(changedPath);
+        if (cached && !cached.dirty) {
+          try {
+            const content = await invoke<string>("read_file", { path: changedPath });
+            console.log("[fs] reload", changedPath, "len", content?.length ?? 0);
+            updateDocContent(changedPath, content || "", false);
+            if (currentFilePathRef.current === changedPath && editorRef.current && centerView === "file") {
+              suppressDirtyRef.current = true;
+              editorRef.current.setValue(content || "");
+            }
+          } catch (error) {
+            console.log("[fs] reload failed", changedPath, String(error));
+          }
+        }
+      }
       if (fsChangeTimerRef.current) {
         window.clearTimeout(fsChangeTimerRef.current);
       }
       fsChangeTimerRef.current = window.setTimeout(() => {
         fsChangeTimerRef.current = null;
         void refreshRoot(rootPath);
+        void runBackgroundCompile(rootPath);
       }, 200);
     });
     return () => {
@@ -920,257 +1226,11 @@ export function App() {
   }, [rootPath]);
 
   useEffect(() => {
-    const unlistenPromise = listen<{
-      run_id: number;
-      stage: string;
-      file?: string;
-      index?: number;
-      total?: number;
-    }>("compile-progress", (event) => {
-      const payload = event.payload;
-      if (!payload) return;
-      const stage = payload.stage || "running";
-      if (payload.run_id && compileRunId && payload.run_id !== compileRunId) {
-        return;
-      }
-      const detail = payload.file ? `${stage}: ${payload.file}` : stage;
-      const prefix = compileRunId ? "Compile" : "Background compile";
-      setCompileStatus(`${prefix}: ${detail}`);
-      if (compileRunId && payload.run_id === compileRunId) {
-        setCompileToast((prev) => ({ ...prev, open: true, lines: [...prev.lines, detail].slice(-8) }));
-      }
-    });
-    return () => {
-      unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
-    };
   }, [compileRunId]);
 
-  const runCompile = async () => {
-    if (!rootPath) return;
-    if (backgroundCompileRef.current) {
-      void invoke("cancel_compile", { run_id: backgroundCompileRef.current }).catch(() => {});
-      backgroundCompileRef.current = null;
-    }
-    const runId = Date.now();
-    setCompileRunId(runId);
-    setCompileToast({ open: true, ok: null, lines: ["starting..."], parseErrors: [], details: [], parsedFiles: [] });
-    setCompileStatus("Compile: starting...");
-    try {
-      const response = await invoke<{
-        ok: boolean;
-        files?: Array<{ path: string; ok: boolean; errors: string[]; symbol_count: number }>;
-        parsed_files?: string[];
-        parse_duration_ms?: number;
-        analysis_duration_ms?: number;
-        stdlib_duration_ms?: number;
-        total_duration_ms?: number;
-        stdlib_cache_hit?: boolean;
-        symbols: Array<{
-          name: string;
-          kind: string;
-          file_path: string;
-          qualified_name: string;
-          file: number;
-          start_line: number;
-          start_col: number;
-          end_line: number;
-          end_col: number;
-          doc?: string | null;
-          properties: Array<{
-            name: string;
-            label: string;
-            value: { type: "text"; value: string } | { type: "list"; items: string[] } | { type: "bool"; value: boolean } | { type: "number"; value: number };
-            hint?: string | null;
-            group?: string | null;
-          }>;
-        }>;
-        unresolved: Array<{ file_path: string; message: string; line: number; column: number }>;
-        library_path?: string | null;
-      }>("compile_workspace", {
-        payload: {
-          root: rootPath,
-          run_id: runId,
-          allow_parse_errors: true,
-          unsaved: [],
-        },
-      });
-      setSymbols(response?.symbols || []);
-      setUnresolved(response?.unresolved || []);
-      setLibraryPath(response?.library_path ?? null);
-      setProjectSymbolsLoaded(true);
-      setProjectSymbolsLoaded(true);
-      setProjectSymbolsLoaded(true);
-      const ok = !!response?.ok;
-      const parseErrors = (response?.files || [])
-        .filter((file) => !file.ok && file.errors && file.errors.length)
-        .map((file) => ({ path: file.path, errors: file.errors }));
-      const details: string[] = [];
-      if (typeof response?.stdlib_cache_hit === "boolean") {
-        details.push(`Stdlib: ${response.stdlib_cache_hit ? "cache hit" : "reloaded"}`);
-      }
-      if (typeof response?.stdlib_duration_ms === "number") {
-        details.push(`Stdlib load: ${response.stdlib_duration_ms} ms`);
-      }
-      if (typeof response?.parse_duration_ms === "number") {
-        details.push(`Parse: ${response.parse_duration_ms} ms`);
-      }
-      if (typeof response?.analysis_duration_ms === "number") {
-        details.push(`Analysis: ${response.analysis_duration_ms} ms`);
-      }
-      if (typeof response?.total_duration_ms === "number") {
-        details.push(`Total: ${response.total_duration_ms} ms`);
-      }
-      const parsedFiles = response?.parsed_files || [];
-      if (parsedFiles.length) {
-        details.push(`Files parsed: ${parsedFiles.length}`);
-      }
-      if (response?.symbols?.length != null) {
-        details.push(`Symbols: ${response.symbols.length}`);
-      }
-      if (response?.unresolved?.length != null) {
-        details.push(`Unresolved: ${response.unresolved.length}`);
-      }
-      setCompileStatus(ok ? "Compile: complete" : "Compile: finished with errors");
-      setCompileToast((prev) => ({ ...prev, ok, open: true, parseErrors, details, parsedFiles }));
-      if (ok) {
-        if (compileToastTimerRef.current) {
-          window.clearTimeout(compileToastTimerRef.current);
-        }
-        compileToastTimerRef.current = window.setTimeout(() => {
-          setCompileToast((prev) => ({ ...prev, open: false }));
-          compileToastTimerRef.current = null;
-        }, 2000);
-      }
-    } catch (error) {
-      setCompileStatus(`Compile: failed: ${error}`);
-      setCompileToast((prev) => ({
-        ...prev,
-        ok: false,
-        open: true,
-        lines: [...prev.lines, `failed: ${String(error)}`].slice(-8),
-      }));
-    } finally {
-      setCompileRunId(null);
-    }
-  };
 
-  const cancelCompile = async () => {
-    if (!compileRunId) return;
-    await invoke("cancel_compile", { run_id: compileRunId });
-    setCompileStatus("Compile: canceling...");
-  };
 
-  const runBackgroundCompile = async (path: string) => {
-    if (!backgroundCompileEnabled || !path || compileRunId || backgroundCompileRef.current) return;
-    const runId = Date.now();
-    const token = backgroundCompileTokenRef.current;
-    backgroundCompileRef.current = runId;
-    setCompileStatus("Background compile: starting...");
-    try {
-      const response = await invoke<{
-        ok: boolean;
-        symbols: Array<{
-          name: string;
-          kind: string;
-          file_path: string;
-          qualified_name: string;
-          file: number;
-          start_line: number;
-          start_col: number;
-          end_line: number;
-          end_col: number;
-          doc?: string | null;
-          properties: Array<{
-            name: string;
-            label: string;
-            value: { type: "text"; value: string } | { type: "list"; items: string[] } | { type: "bool"; value: boolean } | { type: "number"; value: number };
-            hint?: string | null;
-            group?: string | null;
-          }>;
-        }>;
-        unresolved: Array<{ file_path: string; message: string; line: number; column: number }>;
-        library_path?: string | null;
-      }>("compile_workspace", {
-        payload: {
-          root: path,
-          run_id: runId,
-          allow_parse_errors: true,
-          unsaved: [],
-        },
-      });
-      if (token !== backgroundCompileTokenRef.current || path !== rootPath) {
-        return;
-      }
-      setSymbols(response?.symbols || []);
-      setUnresolved(response?.unresolved || []);
-      setLibraryPath(response?.library_path ?? null);
-      setCompileStatus(response?.ok ? "Background compile: complete" : "Background compile: finished with errors");
-    } catch (error) {
-      if (token === backgroundCompileTokenRef.current) {
-        setCompileStatus(`Background compile: failed: ${error}`);
-      }
-    } finally {
-      if (token === backgroundCompileTokenRef.current) {
-        backgroundCompileRef.current = null;
-      }
-    }
-  };
 
-  const runBackgroundCompileWithUnsaved = async (path: string, filePath: string, content: string) => {
-    if (!backgroundCompileEnabled || !path || compileRunId || backgroundCompileRef.current) return;
-    const runId = Date.now();
-    const token = backgroundCompileTokenRef.current;
-    backgroundCompileRef.current = runId;
-    setCompileStatus("Background compile: starting...");
-    try {
-      const response = await invoke<{
-        ok: boolean;
-        symbols: Array<{
-          name: string;
-          kind: string;
-          file_path: string;
-          qualified_name: string;
-          file: number;
-          start_line: number;
-          start_col: number;
-          end_line: number;
-          end_col: number;
-          doc?: string | null;
-          properties: Array<{
-            name: string;
-            label: string;
-            value: { type: "text"; value: string } | { type: "list"; items: string[] } | { type: "bool"; value: boolean } | { type: "number"; value: number };
-            hint?: string | null;
-            group?: string | null;
-          }>;
-        }>;
-        unresolved: Array<{ file_path: string; message: string; line: number; column: number }>;
-        library_path?: string | null;
-      }>("compile_workspace", {
-        payload: {
-          root: path,
-          run_id: runId,
-          allow_parse_errors: true,
-          unsaved: [{ path: filePath, content }],
-        },
-      });
-      if (token !== backgroundCompileTokenRef.current || path !== rootPath) {
-        return;
-      }
-      setSymbols(response?.symbols || []);
-      setUnresolved(response?.unresolved || []);
-      setLibraryPath(response?.library_path ?? null);
-      setCompileStatus(response?.ok ? "Background compile: complete" : "Background compile: finished with errors");
-    } catch (error) {
-      if (token === backgroundCompileTokenRef.current) {
-        setCompileStatus(`Background compile: failed: ${error}`);
-      }
-    } finally {
-      if (token === backgroundCompileTokenRef.current) {
-        backgroundCompileRef.current = null;
-      }
-    }
-  };
 
   const handleEditorMount: OnMount = (editorInstance, monaco) => {
     editorRef.current = editorInstance;
@@ -1180,19 +1240,18 @@ export function App() {
       cursorListenerRef.current = null;
     }
     cursorListenerRef.current = editorInstance.onDidChangeCursorPosition((event) => {
-      setCursorPos({ line: event.position.lineNumber, col: event.position.column });
+      updateCursorPos(event.position.lineNumber, event.position.column);
     });
     const initialPos = editorInstance.getPosition();
     if (initialPos) {
-      setCursorPos({ line: initialPos.lineNumber, col: initialPos.column });
+      updateCursorPos(initialPos.lineNumber, initialPos.column);
     }
-    if (pendingEditorContentRef.current && (!pendingEditorPathRef.current || pendingEditorPathRef.current === currentFilePath)) {
-      editorInstance.setValue(pendingEditorContentRef.current);
-      pendingEditorContentRef.current = null;
-      pendingEditorPathRef.current = null;
+    const pendingEditorContent = consumePendingEditorContent(currentFilePathRef.current);
+    if (pendingEditorContent != null) {
+      editorInstance.setValue(pendingEditorContent);
     }
-    if (pendingNavRef.current && pendingNavRef.current.path === currentFilePath) {
-      applyEditorSelection(editorInstance, pendingNavRef.current.selection);
+    if (pendingNavRef.current && pendingNavRef.current.path === currentFilePathRef.current) {
+      applyEditorSelection(pendingNavRef.current.selection);
       editorInstance.focus();
       pendingNavRef.current = null;
     }
@@ -1279,7 +1338,7 @@ export function App() {
   };
 
   useEffect(() => {
-    if (!activeTabPath || activeTabPath === PROJECT_DESCRIPTOR_TAB) return;
+    if (!activeEditorPath) return;
     const monaco = monacoRef.current;
     const editor = editorRef.current;
     if (!monaco || !editor) return;
@@ -1290,7 +1349,7 @@ export function App() {
       invoke<{
         path: string;
         errors: Array<{ message: string; line: number; column: number; kind: string }>;
-      }>("get_parse_errors_for_content", { path: activeTabPath, content: editorValueRef.current })
+      }>("get_parse_errors_for_content", { path: activeEditorPath, content: editorValueRef.current })
         .then((payload) => {
           if (reqId !== parseReqRef.current) return;
           const markers = (payload?.errors || []).map((err) => ({
@@ -1309,17 +1368,21 @@ export function App() {
         });
     }, 450);
     return () => window.clearTimeout(timer);
-  }, [editorChangeTick, activeTabPath]);
+  }, [editorChangeTick, activeEditorPath]);
 
   useEffect(() => {
-    if (!rootPath || !activeTabPath || activeTabPath === PROJECT_DESCRIPTOR_TAB) return;
+    if (!rootPath || !activeEditorPath) return;
+    if (!activeDoc.dirty) return;
+    const content = editorValueRef.current;
+    if (lastCompiledContentRef.current[activeEditorPath] === content) return;
     const timer = window.setTimeout(() => {
-      void runBackgroundCompileWithUnsaved(rootPath, activeTabPath, editorValueRef.current);
+      lastCompiledContentRef.current[activeEditorPath] = content;
+      void runBackgroundCompileWithUnsaved(rootPath, activeEditorPath, content);
     }, 800);
     return () => window.clearTimeout(timer);
-  }, [editorChangeTick, activeTabPath, rootPath]);
+  }, [editorChangeTick, activeEditorPath, rootPath, activeDoc.dirty]);
 
-  const selectSymbolInEditor = async (symbol: typeof symbols[number]) => {
+  const selectSymbolInEditor = async (symbol: SymbolView) => {
     if (!symbol) return;
     if (symbol.name?.startsWith("<anon")) return;
     if (!symbol.file_path) return;
@@ -1339,125 +1402,33 @@ export function App() {
     });
   };
 
-  const openProjectDescriptorTab = (descriptor?: {
-    name?: string | null;
-    author?: string | null;
-    description?: string | null;
-    organization?: string | null;
-    default_library: boolean;
-    raw_json?: string;
-  } | null) => {
-    if (descriptor) {
-      setProjectDescriptor(descriptor);
-      setHasProjectDescriptor(true);
-    }
-    setEditorViewMode("text");
-    setShowProjectInfo(true);
-    setDescriptorViewMode("view");
-    setOpenTabs((prev) => {
-      if (prev.some((tab) => tab.path === PROJECT_DESCRIPTOR_TAB)) return prev;
-      return [...prev, { path: PROJECT_DESCRIPTOR_TAB, name: "Project Descriptor", dirty: false }];
-    });
-    setActiveTabPath(PROJECT_DESCRIPTOR_TAB);
-  };
-
-  const selectTab = async (path: string) => {
-    if (path === activeTabPath) return;
-    if (path === PROJECT_DESCRIPTOR_TAB) {
-      setEditorViewMode("text");
-      setDescriptorViewMode("view");
-      setActiveTabPath(path);
-      return;
-    }
-    await navigateTo({ path });
-  };
-
-  useEffect(() => {
-    if (!currentFilePath || !editorRef.current) return;
-    const pending = pendingNavRef.current;
-    if (!pending || pending.path !== currentFilePath) return;
-    pendingNavRef.current = null;
-    applyEditorSelection(editorRef.current, pending.selection);
-    editorRef.current.focus();
-  }, [currentFilePath]);
-
-  useEffect(() => {
-    if (!activeTabPath || activeTabPath === PROJECT_DESCRIPTOR_TAB) {
-      setCursorPos(null);
-      return;
-    }
-    const editor = editorRef.current;
-    if (!editor) return;
-    const pos = editor.getPosition();
-    if (pos) {
-      setCursorPos({ line: pos.lineNumber, col: pos.column });
-    }
-  }, [activeTabPath, editorViewMode]);
-
-  const closeTab = (path: string) => {
-    navReqRef.current += 1;
-    pendingNavRef.current = null;
-    setOpenTabs((prev) => prev.filter((tab) => tab.path !== path));
-    if (path === PROJECT_DESCRIPTOR_TAB) {
-      setShowProjectInfo(false);
-    }
-    if (activeTabPath === path) {
-      const remaining = openTabs.filter((tab) => tab.path !== path);
-      const next = remaining[remaining.length - 1];
-      if (next) {
-        void selectTab(next.path);
-      } else {
-        setActiveTabPath(null);
-        editorValueRef.current = "";
-        if (editorRef.current) {
-          editorRef.current.setValue("");
-        }
-        setCurrentFilePath(null);
-      }
-    }
-    if (selectedSymbol && selectedSymbol.file_path === path) {
-      setSelectedSymbol(null);
-    }
-  };
-
-  const closeAllTabs = () => {
-    navReqRef.current += 1;
-    pendingNavRef.current = null;
-    setOpenTabs([]);
-    setActiveTabPath(null);
-    editorValueRef.current = "";
-    if (editorRef.current) {
-      editorRef.current.setValue("");
-    }
-    setCurrentFilePath(null);
-  };
 
   const saveActiveTab = async () => {
-    if (!activeTabPath || activeTabPath === PROJECT_DESCRIPTOR_TAB) return;
-    await invoke("write_file", { path: activeTabPath, content: editorValueRef.current });
-    setOpenTabs((prev) => prev.map((tab) => (tab.path === activeTabPath ? { ...tab, dirty: false } : tab)));
-    setTabContent((prev) => ({ ...prev, [activeTabPath]: editorValueRef.current }));
+    if (!activeEditorPath) return;
+    console.log("[save] write_file", activeEditorPath, "len", editorValueRef.current.length);
+    await invoke("write_file", { path: activeEditorPath, content: editorValueRef.current });
+    setOpenTabs((prev) => prev.map((tab) => (tab.path === activeEditorPath ? { ...tab, dirty: false } : tab)));
+    markSaved();
   };
 
   useEffect(() => {
-    if (!activeTabPath) return;
+    if (!activeEditorPath) return;
     if (suppressDirtyRef.current) {
       suppressDirtyRef.current = false;
       setOpenTabs((prev) =>
         prev.map((tab) =>
-          tab.path === activeTabPath ? { ...tab, dirty: false } : tab,
+          tab.path === activeEditorPath ? { ...tab, dirty: false } : tab,
         ),
       );
       return;
     }
-    const baseline = tabContent[activeTabPath] ?? "";
-    const isDirty = editorValueRef.current !== baseline;
+    const isDirty = activeDoc.path === activeEditorPath ? activeDoc.dirty : false;
     setOpenTabs((prev) =>
       prev.map((tab) =>
-        tab.path === activeTabPath ? { ...tab, dirty: isDirty } : tab,
+        tab.path === activeEditorPath ? { ...tab, dirty: isDirty } : tab,
       ),
     );
-  }, [editorChangeTick]);
+  }, [editorChangeTick, activeEditorPath, activeDoc]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1473,6 +1444,10 @@ export function App() {
           setContextMenu(null);
           return;
         }
+        if (tabMenu) {
+          setTabMenu(null);
+          return;
+        }
         if (showProjectInfo && activeTabPath === PROJECT_DESCRIPTOR_TAB) {
           closeTab(PROJECT_DESCRIPTOR_TAB);
           return;
@@ -1483,6 +1458,10 @@ export function App() {
         }
         if (showSettings) {
           setShowSettings(false);
+          return;
+        }
+        if (showProjectProperties) {
+          setShowProjectProperties(false);
           return;
         }
         if (showExport) {
@@ -1519,19 +1498,26 @@ export function App() {
           setDescriptorViewMode((prev) => (prev === "view" ? "json" : "view"));
           return;
         }
-        if (editorRef.current && activeTabPath) {
-          pendingEditorContentRef.current = editorValueRef.current;
-          pendingEditorPathRef.current = activeTabPath;
+        if (activeTabMeta?.kind === "diagram") {
+          if (activeTabMeta.sourcePath) {
+            void navigateTo({ path: activeTabMeta.sourcePath });
+          }
+          return;
         }
-        setEditorViewMode((prev) => (prev === "text" ? "diagram" : "text"));
+        if (!activeEditorPath) return;
+        if (!activeEditorPath.toLowerCase().endsWith(".diagram")) return;
+        if (editorRef.current) {
+          queuePendingEditorContent(activeEditorPath, editorValueRef.current);
+        }
+        openDiagramViewTab(activeEditorPath);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeTabPath, contextMenu, openMenu, showAiSettings, showExport, showNewFile, showNewProject, showOpenProject, showSettings]);
+  }, [activeTabPath, activeTabMeta, activeEditorPath, contextMenu, openMenu, showAiSettings, showExport, showNewFile, showNewProject, showOpenProject, showProjectProperties, showSettings, tabMenu]);
 
   const resetEndpointDraft = () => {
-    setEndpointDraft({ name: "", url: "", type: "chat", model: "", token: "" });
+    setEndpointDraft({ name: "", url: "", type: "chat", provider: "openai", model: "", token: "" });
   };
 
   const saveEndpointDraft = () => {
@@ -1542,14 +1528,30 @@ export function App() {
       if (endpointDraft.id) {
         return prev.map((endpoint) =>
           endpoint.id === endpointDraft.id
-            ? { ...endpoint, name, url, type: endpointDraft.type, model: endpointDraft.model.trim(), token: endpointDraft.token }
+            ? {
+                ...endpoint,
+                name,
+                url,
+                type: endpointDraft.type,
+                provider: endpointDraft.provider,
+                model: endpointDraft.model.trim(),
+                token: endpointDraft.token,
+              }
             : endpoint,
         );
       }
       const id = crypto.randomUUID();
       return [
         ...prev,
-        { id, name, url, type: endpointDraft.type, model: endpointDraft.model.trim(), token: endpointDraft.token },
+        {
+          id,
+          name,
+          url,
+          type: endpointDraft.type,
+          provider: endpointDraft.provider,
+          model: endpointDraft.model.trim(),
+          token: endpointDraft.token,
+        },
       ];
     });
     resetEndpointDraft();
@@ -1585,6 +1587,7 @@ export function App() {
         payload: {
           url: endpoint.url || "",
           type: endpoint.type,
+          provider: endpoint.provider,
           model: endpoint.model || null,
           token: endpoint.token || null,
         },
@@ -1622,26 +1625,79 @@ export function App() {
       );
       return;
     }
+    const buildModelContext = () => {
+      const activePath = activeEditorPath || activeDoc.path || "";
+      const projectSymbols = symbols.filter((symbol) => !(libraryPath && symbol.file_path.startsWith(libraryPath)));
+      const activeSymbols = activePath
+        ? projectSymbols.filter((symbol) => symbol.file_path === activePath).slice(0, 40)
+        : [];
+      const unresolvedTop = unresolved.slice(0, 20);
+      const snippet =
+        activePath && activeDoc.path === activePath
+          ? editorValueRef.current.slice(0, 8000)
+          : "";
+      const symbolLines = activeSymbols.map(
+        (symbol) =>
+          `- ${symbol.kind} ${symbol.qualified_name} @ ${symbol.file_path}:${(symbol.start_line ?? 0) + 1}`,
+      );
+      const unresolvedLines = unresolvedTop.map(
+        (item) => `- ${item.file_path}:${(item.line ?? 0) + 1}:${(item.column ?? 0) + 1} ${item.message}`,
+      );
+      return [
+        `root: ${rootPath || "unknown"}`,
+        `active_file: ${activePath || "none"}`,
+        `symbol_count: ${projectSymbols.length}`,
+        "",
+        "active_file_symbols:",
+        ...(symbolLines.length ? symbolLines : ["- none"]),
+        "",
+        "unresolved_top:",
+        ...(unresolvedLines.length ? unresolvedLines : ["- none"]),
+        "",
+        "active_file_content:",
+        snippet || "(not loaded)",
+      ].join("\n");
+    };
+
     const history = aiMessages.filter((msg) => msg.text !== "...");
-    const messages = [...history, { role: "user" as const, text }];
+    const contextText = buildModelContext();
+    const messages = [
+      {
+        role: "user" as const,
+        text:
+          "Model context (read-only). Use it as ground truth when answering about this workspace:\n\n" +
+          contextText,
+      },
+      ...history,
+      { role: "user" as const, text },
+    ];
     try {
-      const response = await invoke<any>("ai_chat_completion", {
+      const response = await invoke<any>("ai_agent_run", {
         payload: {
           url: endpoint.url,
+          provider: endpoint.provider,
           model: endpoint.model || null,
           token: endpoint.token || null,
           max_tokens: 512,
+          root: rootPath || null,
+          enable_tools: true,
           messages: messages.map((msg) => ({ role: msg.role, content: msg.text })),
         },
       });
       const content =
+        response?.message ??
         response?.choices?.[0]?.message?.content ??
         response?.choices?.[0]?.text ??
+        response?.content?.find?.((part: any) => part?.type === "text")?.text ??
         response?.message ??
         "";
       const nextText = content || "No response.";
       setAiMessages((prev) =>
-        prev.map((msg) => (msg.pendingId === requestId ? { ...msg, text: nextText, pendingId: undefined } : msg)),
+        prev.map((msg) =>
+          msg.pendingId === requestId
+            ? { ...msg, text: nextText, pendingId: undefined, steps: Array.isArray(response?.steps) ? response.steps : [] }
+            : msg,
+        ),
       );
     } catch (error) {
       setAiMessages((prev) =>
@@ -1652,942 +1708,154 @@ export function App() {
     }
   };
 
-  const tree = useMemo(() => {
-    const renderEntries = (entries: FileEntry[], depth = 0) => {
-      return entries.map((entry) => {
-        const isExpanded = Boolean(expanded[entry.path]);
-        const ext = entry.name.toLowerCase().split(".").pop() || "";
-        const iconLabel =
-          entry.is_dir
-            ? ""
-            : ext === "sysml"
-              ? "s"
-              : ext === "kerml"
-                ? "k"
-                : ext === "json" || ext === "jsonld"
-                  ? "{}"
-                  : "";
-        return (
-          <div key={`${entry.path}-${depth}`} className="tree-node">
-            <div
-              className={`tree-row ${entry.is_dir ? "dir" : "file"}`}
-              style={{ paddingLeft: `${10 + depth * 14}px` }}
-              onClick={() => openFile(entry)}
-              onContextMenu={(e) => showContext(e, entry)}
-            >
-              <span className="tree-caret">{entry.is_dir ? (isExpanded ? "v" : ">") : ""}</span>
-              <span className={`tree-icon ${entry.is_dir ? "folder" : "file"}`}>
-                {iconLabel ? <span className="tree-icon-label">{iconLabel}</span> : null}
-              </span>
-              <span className="tree-label">{entry.name}</span>
-            </div>
-            {entry.is_dir && isExpanded ? (
-              <div className="tree-children">
-                {renderEntries(expanded[entry.path] || [], depth + 1)}
-              </div>
-            ) : null}
-          </div>
-        );
-      });
-    };
-
-    return renderEntries(treeEntries, 0);
-  }, [treeEntries, expanded]);
-
   const deferredSymbols = useDeferredValue(symbols);
   const deferredUnresolved = useDeferredValue(unresolved);
 
-  const groupedSymbols = useMemo(() => {
-    const groups = new Map<string, typeof symbols>();
-    deferredSymbols.forEach((symbol) => {
-      const key = symbol.file_path || "unknown";
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key)?.push(symbol);
+  useEffect(() => {
+    if (!selectedSymbol) return;
+    if (!deferredSymbols.length) {
+      setSelectedSymbol(null);
+      return;
+    }
+    const match = deferredSymbols.find((symbol) => {
+      if (selectedSymbol.qualified_name && symbol.qualified_name) {
+        return symbol.qualified_name === selectedSymbol.qualified_name;
+      }
+      return symbol.file_path === selectedSymbol.file_path && symbol.name === selectedSymbol.name;
     });
-    return Array.from(groups.entries()).map(([path, list]) => ({
-      path,
-      list: list.sort((a, b) => a.name.localeCompare(b.name)),
-    }));
-  }, [deferredSymbols]);
+    setSelectedSymbol(match || null);
+  }, [deferredSymbols, selectedSymbol]);
 
-  const projectGroups = useMemo(() => {
-    const prefix = rootPath ? rootPath.toLowerCase() : "";
-    const libPrefix = libraryPath ? libraryPath.toLowerCase() : "";
-    return groupedSymbols.filter((group) => {
-      const path = group.path.toLowerCase();
-      if (libPrefix && path.startsWith(libPrefix)) return false;
-      return prefix ? path.startsWith(prefix) : true;
-    });
-  }, [groupedSymbols, rootPath, libraryPath]);
+  const {
+    projectGroups,
+    libraryGroups,
+    projectCounts,
+    libraryCounts,
+    errorCounts,
+    dataViewSymbolKindCounts,
+  } = useModelGroups({
+    deferredSymbols,
+    deferredUnresolved,
+    rootPath,
+    libraryPath,
+    dataExcludeStdlib,
+  });
 
-  const libraryGroups = useMemo(() => {
-    const libPrefix = libraryPath ? libraryPath.toLowerCase() : "";
-    if (!libPrefix) return [];
-    return groupedSymbols.filter((group) => group.path.toLowerCase().startsWith(libPrefix));
-  }, [groupedSymbols, libraryPath]);
-
-  const projectCounts = useMemo(() => {
-    const fileCount = projectGroups.length;
-    const symbolCount = projectGroups.reduce((sum, group) => sum + group.list.length, 0);
-    return { fileCount, symbolCount };
-  }, [projectGroups]);
-
-  const libraryCounts = useMemo(() => {
-    const fileCount = libraryGroups.length;
-    const symbolCount = libraryGroups.reduce((sum, group) => sum + group.list.length, 0);
-    return { fileCount, symbolCount };
-  }, [libraryGroups]);
-
-  const errorCounts = useMemo(() => {
-    const fileCount = new Set(deferredUnresolved.map((entry) => entry.file_path)).size;
-    const symbolCount = deferredUnresolved.length;
-    return { fileCount, symbolCount };
-  }, [deferredUnresolved]);
-
-  type SymbolNode = {
-    name: string;
-    fullName: string;
-    symbols: typeof symbols;
-    children: Map<string, SymbolNode>;
-  };
-
-  const buildSymbolTree = (list: typeof symbols) => {
-    const root: SymbolNode = {
-      name: "root",
-      fullName: "",
-      symbols: [],
-      children: new Map(),
-    };
-    list.forEach((symbol) => {
-      const qualified = symbol.qualified_name || symbol.name;
-      const segments = qualified.split("::").filter(Boolean);
-      let cursor = root;
-      segments.forEach((segment, index) => {
-        if (!cursor.children.has(segment)) {
-          cursor.children.set(segment, {
-            name: segment,
-            fullName: cursor.fullName ? `${cursor.fullName}::${segment}` : segment,
-            symbols: [],
-            children: new Map(),
-          });
-        }
-        cursor = cursor.children.get(segment)!;
-        if (index === segments.length - 1) {
-          cursor.symbols.push(symbol);
-        }
-      });
-    });
-    return root;
-  };
-
-  const getKindKey = (kind: string) => {
-    const value = (kind || "").toLowerCase();
-    if (value.includes("package")) return "package";
-    if (value.includes("part def")) return "part-def";
-    if (value.includes("part") && value.includes("usage")) return "part";
-    if (value.includes("part")) return "part";
-    if (value.includes("requirement")) return "requirement";
-    if (value.includes("port")) return "port";
-    if (value.includes("interface")) return "interface";
-    if (value.includes("action")) return "action";
-    if (value.includes("state")) return "state";
-    if (value.includes("item")) return "item";
-    if (value.includes("constraint")) return "constraint";
-    if (value.includes("allocation")) return "allocation";
-    if (value.includes("connection")) return "connection";
-    if (value.includes("viewpoint")) return "viewpoint";
-    if (value.includes("view")) return "view";
-    if (value.includes("concern")) return "concern";
-    if (value.includes("usecase")) return "usecase";
-    if (value.includes("enum")) return "enum";
-    if (value.includes("attribute")) return "attribute";
-    return "default";
-  };
-
-  const renderTypeIcon = (kind: string, variant: "model" | "diagram") => {
-    const key = getKindKey(kind);
-    return (
-      <span className={`type-icon type-${key} ${variant}`} aria-hidden="true">
-        <svg viewBox="0 0 16 16" focusable="false" aria-hidden="true">
-          {key === "package" ? (
-            <>
-              <rect x="2" y="5" width="12" height="8" rx="1.5" />
-              <rect x="2" y="2" width="6" height="3" rx="1" />
-            </>
-          ) : key === "part-def" ? (
-            <>
-              <rect x="2" y="2" width="12" height="12" rx="2" />
-              <path d="M5 6h6M5 9h6" />
-            </>
-          ) : key === "part" ? (
-            <>
-              <rect x="3" y="3" width="10" height="10" rx="2" />
-              <circle cx="5.5" cy="5.5" r="1" />
-            </>
-          ) : key === "requirement" ? (
-            <>
-              <rect x="2" y="2" width="12" height="12" rx="2" />
-              <path d="M5 5h6M5 8h6M5 11h4" />
-            </>
-          ) : key === "port" ? (
-            <>
-              <circle cx="8" cy="8" r="5" />
-              <path d="M8 3v10M3 8h10" />
-            </>
-          ) : key === "interface" ? (
-            <>
-              <rect x="3" y="3" width="10" height="10" rx="2" />
-              <path d="M5 8h6" />
-            </>
-          ) : key === "action" ? (
-            <>
-              <path d="M3 3h6l4 5-4 5H3z" />
-            </>
-          ) : key === "state" ? (
-            <>
-              <rect x="3" y="4" width="10" height="8" rx="4" />
-            </>
-          ) : key === "item" ? (
-            <>
-              <rect x="2.5" y="3" width="11" height="10" rx="2" />
-            </>
-          ) : key === "constraint" ? (
-            <>
-              <path d="M4 4h8v8H4z" />
-              <path d="M6 6h4M6 8h4M6 10h4" />
-            </>
-          ) : key === "allocation" ? (
-            <>
-              <path d="M3 8h10M8 3v10" />
-              <circle cx="8" cy="8" r="5" />
-            </>
-          ) : key === "connection" ? (
-            <>
-              <circle cx="4" cy="8" r="2" />
-              <circle cx="12" cy="8" r="2" />
-              <path d="M6 8h4" />
-            </>
-          ) : key === "view" ? (
-            <>
-              <rect x="2.5" y="3" width="11" height="10" rx="2" />
-              <path d="M4 5h8M4 8h8M4 11h5" />
-            </>
-          ) : key === "viewpoint" ? (
-            <>
-              <circle cx="8" cy="8" r="5" />
-              <path d="M8 4v8M4 8h8" />
-            </>
-          ) : key === "concern" ? (
-            <>
-              <path d="M8 3l5 5-5 5-5-5z" />
-            </>
-          ) : key === "usecase" ? (
-            <>
-              <ellipse cx="8" cy="8" rx="5" ry="3" />
-            </>
-          ) : key === "enum" ? (
-            <>
-              <rect x="3" y="3" width="10" height="10" rx="2" />
-              <path d="M5 6h6M5 8h6M5 10h6" />
-            </>
-          ) : key === "attribute" ? (
-            <>
-              <rect x="4" y="4" width="8" height="8" rx="1" />
-              <path d="M6 8h4" />
-            </>
-          ) : (
-            <>
-              <circle cx="8" cy="8" r="5" />
-            </>
-          )}
-        </svg>
-      </span>
-    );
-  };
-
-  const buildRowsForTree = (
-    root: SymbolNode,
-    rootLabel: string | undefined,
-    rootKey: string,
-    expanded: Record<string, boolean>,
-    collapseAll: boolean,
-  ) => {
-    const rows: Array<{
-      id: string;
-      name: string;
-      kindLabel: string;
-      kindKey: string;
-      depth: number;
-      node: SymbolNode;
-      hasChildren: boolean;
-      expanded: boolean;
-    }> = [];
-    const walk = (node: SymbolNode, depth: number, isTop: boolean, pathKey: string) => {
-      const displayName = isTop && node.name === "root" && rootLabel ? rootLabel : node.name;
-      const nodeId = `${rootKey}::${node.fullName || pathKey}`;
-      const kindLabel = node.symbols.map((symbol) => symbol.kind).filter(Boolean).join(", ");
-      const kindKey = getKindKey(node.symbols[0]?.kind || "");
-      const hasChildren = node.children.size > 0;
-      const expandedState = collapseAll ? false : expanded[nodeId] ?? false;
-      const isVirtualRoot = node.name === "root" && node.symbols.length === 0;
-      if (!isVirtualRoot) {
-        rows.push({
-          id: nodeId,
-          name: displayName,
-          kindLabel,
-          kindKey,
-          depth,
-          node,
-          hasChildren,
-          expanded: expandedState,
-        });
-      }
-      if (hasChildren && (expandedState || isVirtualRoot)) {
-        const byNameCount = new Map<string, number>();
-        Array.from(node.children.values())
-          .sort((a, b) => a.name.localeCompare(b.name))
-          .forEach((child) => {
-            const keyBase = child.name || "node";
-            const count = (byNameCount.get(keyBase) || 0) + 1;
-            byNameCount.set(keyBase, count);
-            const childKey = `${pathKey}::${keyBase}#${count}`;
-            walk(child, isVirtualRoot ? depth : depth + 1, false, childKey);
-          });
-      }
-    };
-    walk(root, 0, true, rootKey || "root");
-    return rows;
-  };
-
-  type ModelRow =
-    | { type: "section"; key: string; section: "project" | "library" | "errors"; label: string; countLabel: string }
-    | {
-        type: "symbol";
-        key: string;
-        name: string;
-        kindLabel: string;
-        kindKey: string;
-        depth: number;
-        node: SymbolNode;
-        hasChildren: boolean;
-        expanded: boolean;
-      }
-    | { type: "empty"; key: string; text: string }
-    | { type: "error"; key: string; issue: (typeof deferredUnresolved)[number] };
-
-  const modelRows = useMemo<ModelRow[]>(() => {
-    const rows: ModelRow[] = [];
-    const pushSymbolGroups = (groups: typeof projectGroups, sectionKey: string) => {
-      groups.forEach((group) => {
-        const rootLabel = group.path.split(/[\\/]/).pop() || group.path;
-        const fileRow: SymbolNode = {
-          name: rootLabel,
-          fullName: `${sectionKey}::${group.path}`,
-          symbols: [],
-          children: new Map([[rootLabel, buildSymbolTree(group.list)]]),
-        };
-        const builtRows = buildRowsForTree(fileRow, rootLabel, `${sectionKey}::${group.path}`, modelExpanded, collapseAllModel);
-        builtRows.forEach((row) => {
-          rows.push({
-            type: "symbol",
-            key: row.id,
-            name: row.name,
-            kindLabel: row.kindLabel,
-            kindKey: row.kindKey,
-            depth: row.depth,
-            node: row.node,
-            hasChildren: row.hasChildren,
-            expanded: row.expanded,
-          });
-        });
-      });
-    };
-    const addSection = (
-      section: "project" | "library" | "errors",
-      label: string,
-      countLabel: string,
-      addBody: () => void,
-      emptyLabel: string,
-    ) => {
-      rows.push({ type: "section", key: `section-${section}`, section, label, countLabel });
-      if (!modelSectionOpen[section]) return;
-      const beforeCount = rows.length;
-      addBody();
-      if (rows.length === beforeCount) {
-        rows.push({ type: "empty", key: `empty-${section}`, text: emptyLabel });
-      }
-    };
-    addSection(
-      "project",
-      "Project",
-      `${projectCounts.fileCount} files • ${projectCounts.symbolCount} symbols`,
-      () => {
-        if (projectGroups.length) {
-          pushSymbolGroups(projectGroups, "project");
-        }
-      },
-      projectSymbolsLoaded ? "No project symbols." : "Loading project symbols...",
-    );
-    addSection(
-      "library",
-      "Library",
-      `${libraryCounts.fileCount} files • ${libraryCounts.symbolCount} symbols`,
-      () => {
-        if (libraryGroups.length) {
-          pushSymbolGroups(libraryGroups, "library");
-        }
-      },
-      "No library symbols loaded.",
-    );
-    addSection(
-      "errors",
-      "Errors",
-      `${errorCounts.fileCount} files • ${errorCounts.symbolCount} issues`,
-      () => {
-        deferredUnresolved.forEach((issue, index) => {
-          rows.push({
-            type: "error",
-            key: `error-${issue.file_path}-${issue.line}-${issue.column}-${index}`,
-            issue,
-          });
-        });
-      },
-      "No semantic errors.",
-    );
-    return rows;
-  }, [
+  const { modelRows } = useModelTree({
     projectGroups,
     libraryGroups,
     deferredUnresolved,
     modelExpanded,
     collapseAllModel,
     modelSectionOpen,
-    projectCounts.fileCount,
-    projectCounts.symbolCount,
-    libraryCounts.fileCount,
-    libraryCounts.symbolCount,
-    errorCounts.fileCount,
-    errorCounts.symbolCount,
+    projectCounts,
+    libraryCounts,
+    errorCounts,
     projectSymbolsLoaded,
-  ]);
+    getKindKey,
+  });
 
-  const modelListRef = useRef<ListImperativeAPI | null>(null);
-  const pendingScrollSymbolRef = useRef<string | null>(null);
-  const [modelCursorIndex, setModelCursorIndex] = useState<number | null>(null);
-  const modelSectionIndent = 12;
-  const getModelRowHeight = (row: ModelRow) => {
-    if (row.type === "section") return 28;
-    if (row.type === "error") return 64;
-    if (row.type === "empty") return 24;
-    return 24;
-  };
+  const effectiveModelTreeHeight = showPropertiesPane
+    ? modelTreeHeight
+    : Math.max(modelTreeHeight, modelPaneHeight || modelTreeHeight);
 
-  const modelListHeight = Math.max(120, (modelTreeViewportHeight || modelTreeHeight) - 16);
+  const {
+    modelListRef,
+    modelSectionIndent,
+    modelListHeight,
+    modelCursorIndex,
+    setModelCursorIndex,
+    findSelectedSymbolIndex,
+    syncModelTreeToSymbol,
+    handleModelTreeKeyDown,
+    getModelRowHeight,
+  } = useModelTreeSelection({
+    modelRows,
+    modelTreeHeight: effectiveModelTreeHeight,
+    setModelSectionOpen,
+    setModelExpanded,
+    selectedSymbol,
+    setSelectedSymbol,
+    selectSymbolInEditor,
+    navigateTo,
+    projectGroups,
+    libraryGroups,
+  });
 
-  const findSelectedSymbolIndex = () => {
-    if (!selectedSymbol) return -1;
-    return modelRows.findIndex((row) => {
-      if (row.type !== "symbol") return false;
-      if (selectedSymbol.qualified_name) {
-        return row.node.symbols.some((sym) => sym.qualified_name === selectedSymbol.qualified_name);
-      }
-      return row.node.symbols.some((sym) => sym.file_path === selectedSymbol.file_path && sym.name === selectedSymbol.name);
-    });
-  };
+  const {
+    diagramScale,
+    setDiagramScale,
+    diagramOffset,
+    setDiagramOffset,
+    diagramPanRef,
+    diagramBodyRef,
+    diagramViewportRef,
+    diagramViewport,
+    diagramPanRafRef,
+    diagramPanPendingRef,
+    diagramLayout,
+    diagramDropActive,
+    palettePos,
+    paletteGhost,
+    paletteDragRef,
+    paletteCreateRef,
+    renderDiagramLayout,
+    renderMinimapLayout,
+    requestDiagramLayout,
+    setDiagramNodeOffsets,
+    setDiagramNodeSizes,
+    setPaletteGhost,
+    handleDiagramDrop,
+    handleDiagramDragOver,
+    handleDiagramDragLeave,
+  } = useDiagramView({
+    activeDiagramPath,
+    getKindKey,
+    renderTypeIcon,
+    rootPath,
+    setCompileStatus,
+  });
 
-  const activateModelRow = (row: ModelRow, index: number) => {
-    if (row.type === "section") {
-      setModelSectionOpen((prev) => ({ ...prev, [row.section]: !prev[row.section] }));
-      return;
-    }
-    if (row.type === "symbol") {
-      const symbol = row.node.symbols[0];
-      if (symbol) {
-        setSelectedSymbol(symbol);
-        void selectSymbolInEditor(symbol);
-      }
-      return;
-    }
-    if (row.type === "error") {
-      const issue = row.issue;
-      const path = issue.file_path;
-      if (!path) return;
-      void navigateTo({
-        path,
-        name: path.split(/[\\/]/).pop() || "Untitled",
-        selection: {
-          startLine: issue.line || 1,
-          startCol: issue.column || 1,
-          endLine: issue.line || 1,
-          endCol: (issue.column || 1) + 1,
-        },
-      });
-      return;
-    }
-    if (row.type === "empty") {
-      setModelCursorIndex(index);
-    }
-  };
+  const { trackCandidate, trackNow } = useModelTracking({
+    symbols,
+    activeEditorPath,
+    cursorPos,
+    enabled: trackText,
+    onTrack: (symbol) => {
+      setSelectedSymbol(symbol);
+      syncModelTreeToSymbol(symbol);
+    },
+  });
 
-  const handleModelTreeKeyDown = (event: React.KeyboardEvent<HTMLDivElement>, indexOverride?: number) => {
-    if (!modelRows.length) return;
-    const key = event.key;
-    if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Enter"].includes(key)) return;
-    event.preventDefault();
-    event.stopPropagation();
-
-    const currentIndex = modelCursorIndex ?? indexOverride ?? 0;
-    if (modelCursorIndex == null) {
-      setModelCursorIndex(currentIndex);
-    }
-    if (key === "ArrowUp") {
-      setModelCursorIndex(Math.max(0, currentIndex - 1));
-      return;
-    }
-    if (key === "ArrowDown") {
-      setModelCursorIndex(Math.min(modelRows.length - 1, currentIndex + 1));
-      return;
-    }
-
-    const row = modelRows[currentIndex];
-    if (!row) return;
-    if (key === "Enter") {
-      activateModelRow(row, currentIndex);
-      return;
-    }
-    if (key === "ArrowRight") {
-      if (row.type === "section") {
-        setModelSectionOpen((prev) => ({ ...prev, [row.section]: true }));
-      } else if (row.type === "symbol" && row.hasChildren && !row.expanded) {
-        setModelExpanded((prev) => ({ ...prev, [row.key]: true }));
-      }
-      return;
-    }
-    if (key === "ArrowLeft") {
-      if (row.type === "section") {
-        setModelSectionOpen((prev) => ({ ...prev, [row.section]: false }));
-      } else if (row.type === "symbol" && row.hasChildren && row.expanded) {
-        setModelExpanded((prev) => ({ ...prev, [row.key]: false }));
-      }
-    }
-  };
-
-  const syncModelTreeToSymbol = (symbol: typeof symbols[number]) => {
-    if (!symbol?.file_path) return;
-    const qualified = symbol.qualified_name || symbol.name;
-    const projectGroup = projectGroups.find((group) => group.path === symbol.file_path);
-    const libraryGroup = projectGroup ? null : libraryGroups.find((group) => group.path === symbol.file_path);
-    const section = projectGroup ? "project" : libraryGroup ? "library" : null;
-    if (!section) return;
-    const group = projectGroup || libraryGroup;
-    if (!group) return;
-    const rootKey = `${section}::${group.path}`;
-    const nextExpanded: Record<string, boolean> = {};
-    nextExpanded[`${rootKey}::${rootKey}`] = true;
-    if (qualified) {
-      const segments = qualified.split("::").filter(Boolean);
-      let prefix = "";
-      segments.forEach((segment) => {
-        prefix = prefix ? `${prefix}::${segment}` : segment;
-        nextExpanded[`${rootKey}::${prefix}`] = true;
-      });
-    }
-    setModelSectionOpen((prev) => ({ ...prev, [section]: true }));
-    setModelExpanded((prev) => ({ ...prev, ...nextExpanded }));
-    pendingScrollSymbolRef.current = qualified;
-  };
-
-  useEffect(() => {
-    if (!pendingScrollSymbolRef.current) return;
-    const target = pendingScrollSymbolRef.current;
-    const index = modelRows.findIndex((row) => {
-      if (row.type !== "symbol") return false;
-      if (row.node.fullName === target) return true;
-      return row.node.symbols.some((sym) => (sym.qualified_name || sym.name) === target);
-    });
-    if (index >= 0) {
-      modelListRef.current?.scrollToRow({ index, align: "center" });
-      pendingScrollSymbolRef.current = null;
-    }
-  }, [modelRows]);
-
-  useEffect(() => {
-    if (modelCursorIndex == null) return;
-    if (modelCursorIndex < 0 || modelCursorIndex >= modelRows.length) {
-      setModelCursorIndex(modelRows.length ? 0 : null);
-      return;
-    }
-    modelListRef.current?.scrollToRow({ index: modelCursorIndex, align: "smart" });
-  }, [modelCursorIndex, modelRows.length]);
-
-  const renderModelRow = ({ index, style, rows }: RowComponentProps<{ rows: ModelRow[] }>) => {
-    const row = rows[index];
-    if (!row) return null;
-    const isFocused = modelCursorIndex === index;
-    if (row.type === "section") {
-      const isOpen = modelSectionOpen[row.section];
-      return (
-        <div
-          style={style}
-          className={`model-section-row ${isFocused ? "model-row-focused" : ""}`}
-          role="button"
-          tabIndex={-1}
-          onKeyDown={(event) => handleModelTreeKeyDown(event, index)}
-          onMouseDown={(event) => {
-            event.preventDefault();
-            modelTreeRef.current?.focus();
-          }}
-          onClick={() => {
-            setModelCursorIndex(index);
-            setModelSectionOpen((prev) => ({ ...prev, [row.section]: !isOpen }));
-          }}
-        >
-          <span className="model-section-toggle">{isOpen ? "-" : "+"}</span>
-          <span className="model-section-label">{row.label}</span>
-          <span className="model-section-count">{row.countLabel}</span>
-        </div>
-      );
-    }
-    if (row.type === "empty") {
-      return (
-        <div
-          style={{ ...style, paddingLeft: `${modelSectionIndent}px` }}
-          className={`model-empty-row ${isFocused ? "model-row-focused" : ""}`}
-          onClick={() => setModelCursorIndex(index)}
-          role="button"
-          tabIndex={-1}
-          onKeyDown={(event) => handleModelTreeKeyDown(event, index)}
-          onMouseDown={(event) => {
-            event.preventDefault();
-            modelTreeRef.current?.focus();
-          }}
-        >
-          {row.text}
-        </div>
-      );
-    }
-    if (row.type === "error") {
-      const issue = row.issue;
-      return (
-        <div
-          style={{ ...style, paddingLeft: `${modelSectionIndent}px` }}
-          className={`error-row ${isFocused ? "model-row-focused" : ""}`}
-          role="button"
-          tabIndex={-1}
-          onKeyDown={(event) => handleModelTreeKeyDown(event, index)}
-          onMouseDown={(event) => {
-            event.preventDefault();
-            modelTreeRef.current?.focus();
-          }}
-          onClick={() => {
-            setModelCursorIndex(index);
-            const path = issue.file_path;
-            if (!path) return;
-            void navigateTo({
-              path,
-              name: path.split(/[\\/]/).pop() || "Untitled",
-              selection: {
-                startLine: issue.line || 1,
-                startCol: issue.column || 1,
-                endLine: issue.line || 1,
-                endCol: (issue.column || 1) + 1,
-              },
-            });
-          }}
-        >
-          <div className="error-title">{issue.file_path}:{issue.line}:{issue.column}</div>
-          <div className="error-message">{issue.message}</div>
-        </div>
-      );
-    }
-    const symbol = row.node.symbols[0];
-    const isSelected =
-      !!symbol &&
-      (selectedSymbol?.qualified_name
-        ? selectedSymbol.qualified_name === symbol.qualified_name
-        : selectedSymbol?.file_path === symbol.file_path && selectedSymbol?.name === symbol.name);
-    return (
-      <div
-        style={{ ...style, paddingLeft: `${modelSectionIndent + 8 + row.depth * 14}px` }}
-        className={`model-virtual-row ${isSelected ? "selected" : ""} ${isFocused ? "model-row-focused" : ""}`}
-        role="button"
-        tabIndex={-1}
-        onKeyDown={(event) => handleModelTreeKeyDown(event, index)}
-        onMouseDown={(event) => {
-          event.preventDefault();
-          modelTreeRef.current?.focus();
-        }}
-        onClick={(event) => {
-          event.stopPropagation();
-          setModelCursorIndex(index);
-          if (symbol) {
-            setSelectedSymbol(symbol);
-            void selectSymbolInEditor(symbol);
-          }
-        }}
-        onDoubleClick={(event) => {
-          event.stopPropagation();
-          if (symbol) {
-            void selectSymbolInEditor(symbol);
-          }
-        }}
-      >
-        <span
-          className="model-caret"
-          onClick={(event) => {
-            event.stopPropagation();
-            if (row.hasChildren) {
-              setModelExpanded((prev) => ({ ...prev, [row.key]: !row.expanded }));
-            }
-          }}
-        >
-          {row.hasChildren ? (row.expanded ? "-" : "+") : ""}
-        </span>
-        {renderTypeIcon(row.kindKey, "model")}
-        <span className="model-name">{row.name}</span>
-        {row.kindLabel ? <span className="model-kind">{row.kindLabel}</span> : null}
-      </div>
-    );
-  };
-
-  const fileSymbols = useMemo(() => {
-    if (!activeTabPath) return [];
-    return deferredSymbols.filter((symbol) => symbol.file_path === activeTabPath);
-  }, [deferredSymbols, activeTabPath]);
-
-  const symbolByQualified = useMemo(() => {
-    const map = new Map<string, typeof symbols[number]>();
-    fileSymbols.forEach((symbol) => map.set(symbol.qualified_name, symbol));
-    return map;
-  }, [fileSymbols]);
-
-  const requestDiagramLayout = () => {
-    if (!diagramWorkerRef.current) return;
-    if (!fileSymbols.length) {
-      setDiagramLayout(null);
-      return;
-    }
-    const worker = diagramWorkerRef.current;
-    const reqId = ++diagramLayoutReqRef.current;
-    worker.postMessage({
-      type: "layout",
-      reqId,
-      nodes: fileSymbols.map((symbol) => ({
-        qualified: symbol.qualified_name,
-        name: symbol.name,
-        kind: symbol.kind,
-      })),
-    });
-    const onMessage = (event: MessageEvent) => {
-      const data = event.data as { type: string; reqId: number; layout?: DiagramLayout };
-      if (data?.type !== "layout" || data.reqId !== reqId) return;
-      setDiagramLayout(data.layout || null);
-      worker.removeEventListener("message", onMessage);
-    };
-    worker.addEventListener("message", onMessage);
-  };
-
-  useEffect(() => {
-    requestDiagramLayout();
-  }, [fileSymbols]);
-
-
-  type DiagramLayout = {
-    node: { name: string; fullName: string; kind: string };
-    width: number;
-    height: number;
-    children: Array<{ layout: DiagramLayout; x: number; y: number }>;
-  };
-
-  const renderDiagramLayout = (layout: DiagramLayout) => {
-    if (layout.node.name === "root") {
-      return (
-        <div className="diagram-content" style={{ width: `${layout.width}px`, height: `${layout.height}px` }}>
-          {layout.children.map((child) => (
-            <div
-              key={child.layout.node.fullName}
-              className="diagram-position"
-              style={{ left: `${child.x}px`, top: `${child.y}px` }}
-            >
-              {renderDiagramLayout(child.layout)}
-            </div>
-          ))}
-        </div>
-      );
-    }
-      const symbol = symbolByQualified.get(layout.node.fullName);
-      const kindLabel = symbol?.kind || layout.node.kind;
-      const kindKey = getKindKey(kindLabel || "");
-    const isSelected = selectedSymbol?.qualified_name === layout.node.fullName;
-    const offset = diagramNodeOffsets[layout.node.fullName] || { x: 0, y: 0 };
-    const sizeOverride = diagramNodeSizes[layout.node.fullName];
-    return (
-      <div
-        className={`diagram-node ${isSelected ? "selected" : ""}`}
-        style={{
-          width: `${sizeOverride?.width ?? layout.width}px`,
-          height: `${sizeOverride?.height ?? layout.height}px`,
-          transform: `translate(${offset.x}px, ${offset.y}px)`,
-        }}
-        role="button"
-        tabIndex={0}
-        onPointerDown={(event) => {
-          event.stopPropagation();
-          diagramDragRef.current = {
-            node: layout.node.fullName,
-            startX: event.clientX,
-            startY: event.clientY,
-            base: offset,
-          };
-          (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-        }}
-        onClick={(event) => {
-          event.stopPropagation();
-          if (symbol) {
-            setSelectedSymbol(symbol);
-            void selectSymbolInEditor(symbol);
-            if (syncDiagramSelection) {
-              syncModelTreeToSymbol(symbol);
-            }
-          }
-        }}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" && symbol) {
-            setSelectedSymbol(symbol);
-            void selectSymbolInEditor(symbol);
-          }
-        }}
-      >
-        <div className="diagram-node-header">
-          {renderTypeIcon(kindKey, "diagram")}
-          <span className="diagram-node-name">{layout.node.name}</span>
-          {kindLabel ? <span className="diagram-node-kind">{kindLabel}</span> : null}
-        </div>
-        {layout.children.map((child) => {
-          const childOffset = diagramNodeOffsets[child.layout.node.fullName] || { x: 0, y: 0 };
-          return (
-            <div
-              key={child.layout.node.fullName}
-              className="diagram-position"
-              style={{ left: `${child.x + childOffset.x}px`, top: `${child.y + childOffset.y}px` }}
-            >
-              {renderDiagramLayout(child.layout)}
-            </div>
-          );
-        })}
-        <div
-          className="diagram-resize-handle"
-          onPointerDown={(event) => {
-            event.stopPropagation();
-            diagramResizeRef.current = {
-              node: layout.node.fullName,
-              startX: event.clientX,
-              startY: event.clientY,
-              base: {
-                width: sizeOverride?.width ?? layout.width,
-                height: sizeOverride?.height ?? layout.height,
-              },
-            };
-            (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-          }}
-        />
-      </div>
-    );
-  };
-
-  const renderManualNode = (node: { id: string; type: string; name: string; x: number; y: number; width: number; height: number; pending: boolean }) => {
-    const kindKey = getKindKey(node.type);
-    return (
-      <div
-        key={node.id}
-        className={`diagram-node manual ${node.pending ? "pending" : ""}`}
-        style={{
-          width: `${node.width}px`,
-          height: `${node.height}px`,
-          transform: `translate(${node.x}px, ${node.y}px)`,
-        }}
-      >
-        <div className="diagram-node-header">
-          {renderTypeIcon(kindKey, "diagram")}
-          <span className="diagram-node-name">{node.name}</span>
-        </div>
-      </div>
-    );
-  };
-
-
-  const renderMinimapLayout = (layout: DiagramLayout) => {
-    if (layout.node.name === "root") {
-      return (
-        <div className="minimap-content" style={{ width: `${layout.width}px`, height: `${layout.height}px` }}>
-          {layout.children.map((child) => (
-            <div
-              key={child.layout.node.fullName}
-              className="diagram-position"
-              style={{ left: `${child.x}px`, top: `${child.y}px` }}
-            >
-              {renderMinimapLayout(child.layout)}
-            </div>
-          ))}
-        </div>
-      );
-    }
-    return (
-      <div className="minimap-node" style={{ width: `${layout.width}px`, height: `${layout.height}px` }}>
-        {layout.children.map((child) => (
-          <div
-            key={child.layout.node.fullName}
-            className="diagram-position"
-            style={{ left: `${child.x}px`, top: `${child.y}px` }}
-          >
-            {renderMinimapLayout(child.layout)}
-          </div>
-        ))}
-      </div>
-    );
-  };
-
-  useEffect(() => {
-    if (!diagramLayout || !diagramBodyRef.current) return;
-    const body = diagramBodyRef.current.getBoundingClientRect();
-    const canvasWidth = diagramLayout.width * diagramScale;
-    const canvasHeight = diagramLayout.height * diagramScale;
-    const viewWidth = Math.min(140, Math.max(60, (body.width / Math.max(canvasWidth, 1)) * 140));
-    const viewHeight = Math.min(100, Math.max(40, (body.height / Math.max(canvasHeight, 1)) * 100));
-    const miniScaleX = 140 / Math.max(canvasWidth, 1);
-    const miniScaleY = 100 / Math.max(canvasHeight, 1);
-    const viewX = Math.min(140 - viewWidth, Math.max(0, -diagramOffset.x * miniScaleX));
-    const viewY = Math.min(100 - viewHeight, Math.max(0, -diagramOffset.y * miniScaleY));
-    setDiagramViewport({ x: viewX, y: viewY, width: viewWidth, height: viewHeight });
-  }, [diagramLayout, diagramScale, diagramOffset]);
-
-  const diagramBounds = useMemo(() => {
-    if (!diagramLayout) return {};
-    const bounds: Record<string, { minX: number; maxX: number; minY: number; maxY: number }> = {};
-    const walk = (layout: DiagramLayout) => {
-      const sizeOverride = diagramNodeSizes[layout.node.fullName];
-      const width = sizeOverride?.width ?? layout.width;
-      const height = sizeOverride?.height ?? layout.height;
-      layout.children.forEach((child) => {
-        const childSizeOverride = diagramNodeSizes[child.layout.node.fullName];
-        const childWidth = childSizeOverride?.width ?? child.layout.width;
-        const childHeight = childSizeOverride?.height ?? child.layout.height;
-        bounds[child.layout.node.fullName] = {
-          minX: -child.x,
-          maxX: width - childWidth - child.x,
-          minY: -child.y,
-          maxY: height - childHeight - child.y,
-        };
-        walk(child.layout);
-      });
-    };
-    walk(diagramLayout);
-    return bounds;
-  }, [diagramLayout, diagramNodeSizes]);
-
-  useEffect(() => {
-    diagramBoundsRef.current = diagramBounds;
-  }, [diagramBounds]);
+  const renderModelRow = useMemo(
+    () =>
+      createModelRowRenderer({
+        modelCursorIndex,
+        modelSectionOpen,
+        modelSectionIndent,
+        modelTreeRef,
+        handleModelTreeKeyDown,
+        setModelCursorIndex,
+        setModelSectionOpen,
+        setModelExpanded,
+        selectedSymbol,
+        setSelectedSymbol,
+        selectSymbolInEditor,
+        navigateTo,
+        renderTypeIcon,
+      }),
+    [
+      modelCursorIndex,
+      modelSectionOpen,
+      modelSectionIndent,
+      handleModelTreeKeyDown,
+      selectedSymbol,
+      setSelectedSymbol,
+      selectSymbolInEditor,
+      navigateTo,
+      renderTypeIcon,
+    ],
+  );
 
     return (
       <div
@@ -2609,6 +1877,7 @@ export function App() {
                   <div className="menu-dropdown" data-tauri-drag-region="false">
                     <button type="button" onClick={openNewProjectDialog}>New Project</button>
                     <button type="button" onClick={chooseProject}>Open Project</button>
+                    <button type="button" onClick={() => { setOpenMenu(null); void openProjectProperties(); }}>Project Properties</button>
                     <div className="menu-divider" />
                     <button type="button" onClick={() => { void invoke("window_close"); }}>Exit</button>
                   </div>
@@ -2632,8 +1901,52 @@ export function App() {
               <button type="button">Project Panel</button>
               <button type="button">Model Panel</button>
               <div className="menu-divider" />
-              <button type="button" onClick={() => { setShowSettings(true); setOpenMenu(null); }}>Settings…</button>
+              <button type="button" onClick={() => { setOpenMenu(null); openAiViewTab(); }}>Agent</button>
+              <button type="button" onClick={() => { setOpenMenu(null); openDataViewTab(); }}>Data Analysis View</button>
+              <button
+                type="button"
+                onClick={() => {
+                  setOpenMenu(null);
+                  if (activeEditorPath && activeEditorPath.toLowerCase().endsWith(".diagram")) {
+                    if (editorRef.current) {
+                      queuePendingEditorContent(activeEditorPath, editorValueRef.current);
+                    }
+                    openDiagramViewTab(activeEditorPath);
+                  }
+                }}
+                disabled={!activeEditorPath || !activeEditorPath.toLowerCase().endsWith(".diagram")}
+              >
+                Diagram View
+              </button>
+              <div className="menu-divider" />
+              <button type="button" onClick={() => { setShowSettings(true); setOpenMenu(null); }}>Settings</button>
               <button type="button">Logs</button>
+            </div>
+              ) : null}
+            </div>
+            <div className="menu-item">
+              <button type="button" className="menu-button" onClick={() => setOpenMenu(openMenu === "Collab" ? null : "Collab")}>Collab</button>
+              {openMenu === "Collab" ? (
+            <div className="menu-dropdown" data-tauri-drag-region="false">
+              <button type="button" onClick={() => { setOpenMenu(null); void openGitDialog(); }} disabled={!gitInfo}>Collab...</button>
+              <button type="button" onClick={() => { setOpenMenu(null); void openGitBranchDialog(); }} disabled={!gitInfo}>Branches...</button>
+              <button type="button" disabled>Model Changes</button>
+              <div className="menu-divider" />
+              <button
+                type="button"
+                disabled={!gitInfo?.repo_root}
+                onClick={() => {
+                  setOpenMenu(null);
+                  if (gitInfo?.repo_root) {
+                    void invoke("open_in_explorer", { path: gitInfo.repo_root });
+                  }
+                }}
+              >
+                Open Repo Folder
+              </button>
+              <button type="button" onClick={() => { setOpenMenu(null); void copyRepoUrl(); }} disabled={!gitInfo?.remote_url}>
+                Copy Repo URL
+              </button>
             </div>
               ) : null}
             </div>
@@ -2705,13 +2018,6 @@ export function App() {
                 </button>
               </div>
             <div className="project-actions inline">
-                <button
-                  type="button"
-                  className={`ghost icon-info ${hasProjectDescriptor ? "active" : ""}`}
-                  onClick={loadProjectInfo}
-                  aria-label="Project info"
-                  title="Project info"
-                />
                 <button type="button" className="icon-button" onClick={chooseProject} aria-label="Open Project" title="Open Project" />
                 <select className="recent-select" value="" onChange={(e) => openProject(e.target.value)} aria-label="Open recent" title="Open recent">
                   <option value="">Recent</option>
@@ -2725,12 +2031,19 @@ export function App() {
               <>
                 <span className="project-root-name">{rootPath.split(/[\\/]/).pop()}</span>
                 <span className="project-root-path">{rootPath}</span>
+                {!hasProjectDescriptor ? <span className="project-root-hint">No .project file</span> : null}
               </>
             ) : (
               "No project selected"
             )}
           </div>
-            <div className="file-tree" onContextMenu={showRootContext}>{tree}</div>
+            <ProjectTree
+              treeEntries={treeEntries}
+              expanded={expanded}
+              onOpenFile={openFile}
+              onContextMenu={showContext}
+              onRootContextMenu={showRootContext}
+            />
             </section>
           )}
           <div
@@ -2751,47 +2064,43 @@ export function App() {
               </button>
             ) : null}
           </div>
-          <section className="panel editor">
-            <div className="panel-header editor-tabs">
-              <div className="tabs">
-                {openTabs.length ? (
-                openTabs.map((tab) => (
-                  <button
-                    key={tab.path}
-                    type="button"
-                    className={`tab ${tab.path === activeTabPath ? "active" : ""}`}
-                    onClick={() => selectTab(tab.path)}
-                      onContextMenu={(event) => {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        setActiveTabPath(tab.path);
-                        if (tab.path === PROJECT_DESCRIPTOR_TAB) {
-                          setEditorViewMode("text");
-                          setDescriptorViewMode((prev) => (prev === "view" ? "json" : "view"));
-                          return;
-                        }
-                        setEditorViewMode((prev) => (prev === "text" ? "diagram" : "text"));
-                      }}
-                    >
-                    <span className="tab-label">{tab.name}</span>
-                    {tab.dirty ? <span className="tab-dirty" aria-hidden="true">•</span> : null}
-                    <span className="tab-close" onClick={(event) => { event.stopPropagation(); closeTab(tab.path); }}>x</span>
-                  </button>
-                ))
-              ) : (
-                <div className="muted">No files open.</div>
-              )}
-            </div>
-              {openTabs.length > 6 ? (
-                <select className="tab-dropdown" value={activeTabPath || ""} onChange={(event) => selectTab(event.target.value)}>
-                  {openTabs.map((tab) => (
-                    <option key={tab.path} value={tab.path}>{tab.name}</option>
-                  ))}
-                </select>
-              ) : null}
-            </div>
-            <div className="editor-host" id="monaco-root">
-              {!activeTabPath ? (
+          <EditorPane
+            openTabs={openTabs}
+            activeTabPath={activeTabPath}
+            tabOverflowOpen={tabOverflowOpen}
+            onSetTabOverflowOpen={setTabOverflowOpen}
+            onSelectTab={(path) => {
+              void selectTab(path);
+            }}
+            onCloseTab={closeTab}
+            onReorderTabs={reorderTabs}
+            onTabContextMenu={(path, x, y) => {
+              setActiveTabPath(path);
+              setTabMenu({ x, y, path });
+            }}
+          >
+            {activeTabMeta?.kind === "ai" ? (
+                <AiView
+                  aiMessages={aiMessages}
+                  aiInput={aiInput}
+                  onInputChange={setAiInput}
+                  onOpenSettings={() => setShowAiSettings(true)}
+                  onSend={() => {
+                    const text = aiInput.trim();
+                    if (!text) return;
+                    void sendAiMessage(text);
+                  }}
+                />
+              ) : activeTabMeta?.kind === "data" ? (
+                <DataView
+                  dataExcludeStdlib={dataExcludeStdlib}
+                  onToggleExcludeStdlib={setDataExcludeStdlib}
+                  projectCounts={projectCounts}
+                  libraryCounts={libraryCounts}
+                  errorCounts={errorCounts}
+                  dataViewSymbolKindCounts={dataViewSymbolKindCounts}
+                />
+              ) : !activeTabPath ? (
                 <div className="editor-placeholder">
                   <div className="welcome-screen">
                       <div className="welcome-title">Welcome to Mercurio</div>
@@ -2800,259 +2109,106 @@ export function App() {
                         <button type="button" className="ghost" onClick={openNewProjectDialog}>New Project</button>
                         <button type="button" className="ghost" onClick={chooseProject}>Open Project</button>
                       </div>
-                      <div className="welcome-hint">Tip: Press F10 to toggle diagram view.</div>
+                      <div className="welcome-hint">Tip: Open a .diagram file to view diagrams.</div>
                     </div>
                   </div>
               ) : activeTabPath === PROJECT_DESCRIPTOR_TAB ? (
-                <div className="descriptor-view">
-                  <div className="descriptor-header">Project Descriptor</div>
-                  {descriptorViewMode === "view" ? (
-                    projectDescriptor ? (
-                      <div className="descriptor-grid">
-                        <div className="descriptor-row">
-                          <div className="descriptor-label">Name</div>
-                          <div className="descriptor-value">{projectDescriptor.name || "—"}</div>
-                        </div>
-                        <div className="descriptor-row">
-                          <div className="descriptor-label">Author</div>
-                          <div className="descriptor-value">{projectDescriptor.author || "—"}</div>
-                        </div>
-                        <div className="descriptor-row">
-                          <div className="descriptor-label">Organization</div>
-                          <div className="descriptor-value">{projectDescriptor.organization || "—"}</div>
-                        </div>
-                        <div className="descriptor-row">
-                          <div className="descriptor-label">Description</div>
-                          <div className="descriptor-value">{projectDescriptor.description || "—"}</div>
-                        </div>
-                        <div className="descriptor-row">
-                          <div className="descriptor-label">Default library</div>
-                          <div className="descriptor-value">{projectDescriptor.default_library ? "Yes" : "No"}</div>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="muted">No project descriptor found.</div>
-                    )
-                  ) : (
-                    <pre className="descriptor-json">
-                      {projectDescriptor?.raw_json || "{}"}
-                    </pre>
-                  )}
-                </div>
-              ) : editorViewMode === "text" ? (
-                <MonacoEditor
-                  defaultValue=""
-                  onChange={(value) => {
-                    editorValueRef.current = value ?? "";
-                    if (editorChangeRafRef.current == null) {
-                      editorChangeRafRef.current = window.requestAnimationFrame(() => {
-                        setEditorChangeTick((tick) => tick + 1);
-                        editorChangeRafRef.current = null;
-                      });
-                    }
-                  }}
-                  language="sysml"
-                  theme={appTheme === "light" ? "vs" : "vs-dark"}
-                  onMount={handleEditorMount}
-                  options={editorOptions}
+                <DescriptorView
+                  descriptorViewMode={descriptorViewMode}
+                  projectDescriptor={projectDescriptor}
                 />
-              ) : (
-                <div className="diagram-surface">
-                  <div className="diagram-header">
-                  <span>Diagram view (F10 to toggle)</span>
-                  <div className="diagram-controls">
-                    <button
-                      type="button"
-                      className="ghost toggle-btn"
-                      onClick={() => setEditorViewMode("text")}
-                      title="Switch to text (F10)"
-                    >
-                      Text
-                    </button>
-                    <button
-                      type="button"
-                      className={`ghost ${syncDiagramSelection ? "active" : ""}`}
-                      onClick={() => setSyncDiagramSelection((prev) => !prev)}
-                      title="Sync diagram selection to model tree"
-                    >
-                      Sync
-                    </button>
-                    <button
-                      type="button"
-                      className="ghost"
-                      onClick={() => {
-                        setDiagramNodeOffsets({});
-                        setDiagramNodeSizes({});
-                        setDiagramOffset({ x: 0, y: 0 });
-                        requestDiagramLayout();
-                      }}
-                    >
-                      Auto-layout
-                    </button>
-                    <button type="button" className="ghost" onClick={() => setDiagramScale((s) => Math.min(2.0, s + 0.1))}>+</button>
-                    <button type="button" className="ghost" onClick={() => setDiagramScale((s) => Math.max(0.4, s - 0.1))}>-</button>
-                    <button
-                      type="button"
-                      className="ghost"
-                      onClick={() => {
-                        setDiagramScale(1);
-                        setDiagramOffset({ x: 0, y: 0 });
-                      }}
-                    >
-                      Reset
-                    </button>
-                  </div>
-                </div>
-                <div
-                  className="diagram-body"
-                  ref={diagramBodyRef}
-                  onPointerDown={(event) => {
-                    const target = event.target as HTMLElement | null;
-                    if (target?.closest(".diagram-node") || target?.closest(".diagram-viewport")) return;
-                    diagramPanRef.current = {
-                      x: diagramOffset.x,
-                      y: diagramOffset.y,
-                      startX: event.clientX,
-                      startY: event.clientY,
-                    };
-                    (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-                  }}
-                  onPointerMove={(event) => {
-                    if (!diagramPanRef.current) return;
-                    const deltaX = event.clientX - diagramPanRef.current.startX;
-                    const deltaY = event.clientY - diagramPanRef.current.startY;
-                    diagramPanPendingRef.current = {
-                      x: diagramPanRef.current.x + deltaX,
-                      y: diagramPanRef.current.y + deltaY,
-                    };
-                    if (diagramPanRafRef.current == null) {
-                      diagramPanRafRef.current = window.requestAnimationFrame(() => {
-                        if (diagramPanPendingRef.current) {
-                          setDiagramOffset(diagramPanPendingRef.current);
-                        }
-                        diagramPanPendingRef.current = null;
-                        diagramPanRafRef.current = null;
-                      });
-                    }
-                  }}
-                  onPointerUp={() => {
-                    diagramPanRef.current = null;
-                  }}
-                >
-                  {diagramLayout ? (
-                    <>
-                      <div
-                        className="diagram-canvas"
-                        style={{
-                          transform: `translate(${diagramOffset.x}px, ${diagramOffset.y}px) scale(${diagramScale})`,
-                        }}
-                      >
-                        {renderDiagramLayout(diagramLayout)}
-                        {diagramManualNodes.map((node) => renderManualNode(node))}
-                      </div>
-                      {paletteGhost ? (
-                        <div
-                          className="diagram-ghost"
-                          style={{ left: `${paletteGhost.x}px`, top: `${paletteGhost.y}px` }}
-                        >
-                          {renderTypeIcon(paletteGhost.type, "diagram")}
-                        </div>
-                      ) : null}
-                      <div
-                        className="diagram-palette"
-                        style={{ left: `${palettePos.x}px`, top: `${palettePos.y}px` }}
-                      >
-                        <div
-                          className="diagram-palette-header"
-                          onPointerDown={(event) => {
-                            event.stopPropagation();
-                            paletteDragRef.current = {
-                              startX: event.clientX,
-                              startY: event.clientY,
-                              baseX: palettePos.x,
-                              baseY: palettePos.y,
-                            };
-                            (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-                          }}
-                        >
-                          Palette
-                        </div>
-                        <button
-                          type="button"
-                          className="diagram-palette-item"
-                          onPointerDown={(event) => {
-                            event.stopPropagation();
-                            paletteCreateRef.current = { type: "package", name: "Package", startX: event.clientX, startY: event.clientY };
-                            setPaletteGhost({ x: event.clientX, y: event.clientY, type: "package" });
-                            (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-                          }}
-                        >
-                          {renderTypeIcon("package", "diagram")}
-                          <span>Package</span>
-                        </button>
-                      </div>
-                      <div className="diagram-minimap">
-                        {diagramLayout ? (
-                          <div className="diagram-minimap-canvas">
-                            <div
-                              className="diagram-minimap-scale"
-                              style={{
-                                transform: `scale(${140 / Math.max(diagramLayout.width * diagramScale, 1)}, ${100 / Math.max(diagramLayout.height * diagramScale, 1)})`,
-                              }}
-                            >
-                              {renderMinimapLayout(diagramLayout)}
-                            </div>
-                          </div>
-                        ) : null}
-                        <div
-                          className="diagram-viewport"
-                          style={{
-                            left: `${diagramViewport.x}px`,
-                            top: `${diagramViewport.y}px`,
-                            width: `${diagramViewport.width}px`,
-                            height: `${diagramViewport.height}px`,
-                          }}
-                          onPointerDown={(event) => {
-                            event.stopPropagation();
-                            diagramViewportRef.current = {
-                              startX: event.clientX,
-                              startY: event.clientY,
-                              baseX: diagramViewport.x,
-                              baseY: diagramViewport.y,
-                            };
-                            (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-                          }}
-                          onPointerMove={(event) => {
-                            if (!diagramViewportRef.current || !diagramLayout || !diagramBodyRef.current) return;
-                            const deltaX = event.clientX - diagramViewportRef.current.startX;
-                            const deltaY = event.clientY - diagramViewportRef.current.startY;
-                            const nextX = Math.min(140 - diagramViewport.width, Math.max(0, diagramViewportRef.current.baseX + deltaX));
-                            const nextY = Math.min(100 - diagramViewport.height, Math.max(0, diagramViewportRef.current.baseY + deltaY));
-                            const canvasWidth = diagramLayout.width * diagramScale;
-                            const canvasHeight = diagramLayout.height * diagramScale;
-                            const miniScaleX = 140 / Math.max(canvasWidth, 1);
-                            const miniScaleY = 100 / Math.max(canvasHeight, 1);
-                            setDiagramOffset({
-                              x: -nextX / miniScaleX,
-                              y: -nextY / miniScaleY,
-                            });
-                          }}
-                          onPointerUp={() => {
-                            diagramViewportRef.current = null;
-                          }}
-                        />
-                      </div>
-                    </>
-                  ) : (
-                    <div className="diagram-placeholder">
-                      No symbols found for {activeTabPath ? activeTabPath.split(/[\\/]/).pop() : "file"}.
+              ) : activeTabMeta?.kind !== "diagram" ? (
+                <>
+                  <div className="editor-toolbar">
+                    <div className="editor-toolbar-group">
+                      <button
+                        type="button"
+                        className={`ghost icon-track ${trackText ? "active" : ""}`}
+                        onClick={() => setTrackText((prev) => !prev)}
+                        title={trackText ? "Stop tracking text" : "Track text"}
+                        aria-pressed={trackText}
+                        aria-label="Track text"
+                      />
+                      <span className="editor-toolbar-label">Track text</span>
                     </div>
-                  )}
-                </div>
-              </div>
+                    <div className="editor-toolbar-group">
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={trackNow}
+                        disabled={!trackCandidate}
+                        title={trackCandidate ? "Select symbol near cursor" : "No symbol near cursor"}
+                      >
+                        Track now
+                      </button>
+                    </div>
+                  </div>
+                  <div className="editor-body">
+                    <MonacoEditor
+                      defaultValue=""
+                      onChange={(value) => {
+                        const next = value ?? "";
+                        if (suppressDirtyRef.current) {
+                          suppressDirtyRef.current = false;
+                          return;
+                        }
+                        onEditorChange(next);
+                      }}
+                      language="sysml"
+                      theme={appTheme === "light" ? "vs" : "vs-dark"}
+                      onMount={handleEditorMount}
+                      options={editorOptions}
+                    />
+                  </div>
+                </>
+            ) : (
+              <DiagramView
+                activeDiagramPath={activeDiagramPath}
+                diagramLayout={diagramLayout}
+                diagramScale={diagramScale}
+                diagramOffset={diagramOffset}
+                diagramViewport={diagramViewport}
+                paletteGhost={paletteGhost}
+                palettePos={palettePos}
+                diagramBodyRef={diagramBodyRef}
+                diagramPanRef={diagramPanRef}
+                diagramPanPendingRef={diagramPanPendingRef}
+                diagramPanRafRef={diagramPanRafRef}
+                diagramViewportRef={diagramViewportRef}
+                paletteDragRef={paletteDragRef}
+                paletteCreateRef={paletteCreateRef}
+                diagramDropActive={diagramDropActive}
+                onSwitchToText={() => {
+                  if (activeDiagramPath) {
+                    void navigateTo({ path: activeDiagramPath });
+                  } else {
+                    setCenterView("file");
+                  }
+                }}
+                onAutoLayout={() => {
+                  setDiagramNodeOffsets({});
+                  setDiagramNodeSizes({});
+                  setDiagramOffset({ x: 0, y: 0 });
+                  requestDiagramLayout();
+                }}
+                onZoomIn={() => setDiagramScale((s) => Math.min(2.0, s + 0.1))}
+                onZoomOut={() => setDiagramScale((s) => Math.max(0.4, s - 0.1))}
+                onReset={() => {
+                  setDiagramScale(1);
+                  setDiagramOffset({ x: 0, y: 0 });
+                }}
+                onDiagramDrop={handleDiagramDrop}
+                onDiagramDragOver={handleDiagramDragOver}
+                onDiagramDragLeave={handleDiagramDragLeave}
+                setDiagramOffset={setDiagramOffset}
+                setPaletteGhost={setPaletteGhost}
+                renderDiagramLayout={renderDiagramLayout}
+                renderMinimapLayout={renderMinimapLayout}
+                renderTypeIcon={renderTypeIcon}
+              />
             )}
-          </div>
-        </section>
+          </EditorPane>
+          <>
           <div
             className={`splitter ${rightCollapsed ? "collapsed" : ""}`}
             onPointerDown={rightCollapsed ? undefined : (event) => startDrag("right", event)}
@@ -3072,31 +2228,15 @@ export function App() {
             ) : null}
           </div>
           {rightCollapsed ? null : (
-            <section className="panel sidebar">
+            <section className="panel sidebar" ref={modelPaneContainerRef}>
               <div className="panel-header">
-              <select
-                className="ghost pane-select"
-                value={rightPaneMode}
-                onChange={(event) => setRightPaneMode(event.target.value as "model" | "ai")}
-                aria-label="Right pane mode"
-              >
-                <option value="model">Model</option>
-                <option value="ai">AI</option>
-              </select>
-            {rightPaneMode === "model" ? (
-              <button type="button" className="ghost" onClick={() => setCollapseAllModel((prev) => !prev)}>
-                {collapseAllModel ? "Expand all" : "Collapse all"}
-              </button>
-            ) : null}
-              {rightPaneMode === "model" ? (
-                <button
-                  type="button"
-                  className={`ghost icon-properties ${showPropertiesPane ? "active" : ""}`}
-                  onClick={() => setShowPropertiesPane((prev) => !prev)}
-                  aria-label="Toggle properties"
-                  title={showPropertiesPane ? "Hide properties" : "Show properties"}
-                />
-              ) : null}
+              <ModelHeader
+                collapseAll={collapseAllModel}
+                onCollapseAll={() => setCollapseAllModel(true)}
+                onExpandAll={() => setCollapseAllModel(false)}
+                onToggleProperties={() => setShowPropertiesPane((prev) => !prev)}
+                showProperties={showPropertiesPane}
+              />
               <button
                 type="button"
                 className="ghost collapse-btn"
@@ -3108,152 +2248,62 @@ export function App() {
               >
                 »
               </button>
-              {rightPaneMode === "ai" ? (
-                <button type="button" className="ghost icon-gear" onClick={() => setShowAiSettings(true)} aria-label="AI settings" title="AI settings" />
-              ) : null}
             </div>
-          {rightPaneMode === "model" ? (
-            <div
-              className={`model-pane ${showPropertiesPane ? "" : "no-properties"}`}
-              style={{ ["--model-tree-height" as string]: `${modelTreeHeight}px` }}
-            >
-              <div
-                className="model-tree"
-                ref={modelTreeRef}
-                tabIndex={0}
-                onKeyDown={handleModelTreeKeyDown}
-                onMouseDown={() => {
-                  if (document.activeElement !== modelTreeRef.current) {
-                    modelTreeRef.current?.focus();
-                  }
-                }}
-                onFocus={() => {
-                  if (modelCursorIndex != null || !modelRows.length) return;
-                  const selectedIndex = findSelectedSymbolIndex();
-                  setModelCursorIndex(selectedIndex >= 0 ? selectedIndex : 0);
-                }}
-              >
-                <List
-                  listRef={modelListRef}
-                  rowCount={modelRows.length}
-                  rowHeight={(index) => getModelRowHeight(modelRows[index])}
-                  rowComponent={renderModelRow}
-                  rowProps={{ rows: modelRows }}
-                  overscanCount={6}
-                  style={{ height: modelListHeight, width: "100%" }}
-                />
-              </div>
-              {showPropertiesPane ? (
-                <>
-                  <div className="h-splitter" onPointerDown={(event) => startDrag("model", event)} />
-                  <div className="properties-pane">
-                    <div className="properties-header" />
-                    {selectedSymbol ? (
-                      <div className="properties-body">
-                        <div className="properties-title">
-                          <span>{selectedSymbol.name}</span>
-                          <span className="model-kind">{selectedSymbol.kind}</span>
-                        </div>
-                        {selectedSymbol.doc ? <div className="properties-doc">{selectedSymbol.doc}</div> : null}
-                        <div className="properties-list">
-                          {selectedSymbol.properties.length ? (
-                            selectedSymbol.properties.map((prop, index) => (
-                              <div key={`${prop.name}-${index}`} className="properties-row">
-                                <div className="properties-key">{prop.label}</div>
-                                <div className="properties-value">
-                                  {"type" in prop.value && prop.value.type === "text" ? prop.value.value : null}
-                                  {"type" in prop.value && prop.value.type === "bool" ? (prop.value.value ? "true" : "false") : null}
-                                  {"type" in prop.value && prop.value.type === "number" ? String(prop.value.value) : null}
-                                  {"type" in prop.value && prop.value.type === "list" ? prop.value.items.join(", ") : null}
-                                </div>
-                              </div>
-                            ))
-                          ) : (
-                            <div className="muted">No properties.</div>
-                          )}
-                        </div>
-                        <details className="properties-section" key={`parse-${selectedSymbol.qualified_name}`}>
-                          <summary>Parse information</summary>
-                          <div className="properties-parse">
-                            {selectedSymbol.file == null &&
-                            selectedSymbol.start_line == null &&
-                            selectedSymbol.start_col == null &&
-                            selectedSymbol.end_line == null &&
-                            selectedSymbol.end_col == null ? (
-                              <div className="muted">No parse data available.</div>
-                              ) : (
-                                <>
-                                  <div className="properties-row">
-                                    <div className="properties-key">File id</div>
-                                    <div className="properties-value">
-                                      {selectedSymbol.file == null ? "—" : String(selectedSymbol.file)}
-                                    </div>
-                                  </div>
-                                  <div className="properties-row">
-                                    <div className="properties-key">File path</div>
-                                    <div className="properties-value">{selectedSymbol.file_path ?? "—"}</div>
-                                  </div>
-                                <div className="properties-row">
-                                  <div className="properties-key">Start line</div>
-                                  <div className="properties-value">{selectedSymbol.start_line ?? "—"}</div>
-                                </div>
-                                <div className="properties-row">
-                                  <div className="properties-key">Start column</div>
-                                  <div className="properties-value">{selectedSymbol.start_col ?? "—"}</div>
-                                </div>
-                                <div className="properties-row">
-                                  <div className="properties-key">End line</div>
-                                  <div className="properties-value">{selectedSymbol.end_line ?? "—"}</div>
-                                </div>
-                                <div className="properties-row">
-                                  <div className="properties-key">End column</div>
-                                  <div className="properties-value">{selectedSymbol.end_col ?? "—"}</div>
-                                </div>
-                              </>
-                            )}
-                          </div>
-                        </details>
-                      </div>
-                    ) : (
-                      <div className="muted">Select a model element to view its properties.</div>
-                    )}
-                  </div>
-                </>
-              ) : null}
-            </div>
-          ) : (
-            <div className="ai-pane">
-              <div className="ai-messages">
-                {aiMessages.length ? (
-                  aiMessages.map((msg, idx) => (
-                    <div key={idx} className={`ai-message ${msg.role}`}>{msg.text}</div>
-                  ))
-                ) : (
-                  <div className="muted">Ask about your model.</div>
-                )}
-              </div>
-              <div className="ai-input">
-                <textarea
-                  value={aiInput}
-                  onChange={(e) => setAiInput(e.target.value)}
-                  placeholder="Type a prompt..."
-                />
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const text = aiInput.trim();
-                      if (!text) return;
-                      void sendAiMessage(text);
-                    }}
-                  >
-                    Send
-                  </button>
-              </div>
-            </div>
-          )}
+            <ModelPane
+              modelTreeHeight={effectiveModelTreeHeight}
+              showPropertiesPane={showPropertiesPane}
+              modelTreeRef={modelTreeRef}
+              modelListRef={modelListRef}
+              modelRows={modelRows}
+              modelListHeight={modelListHeight}
+              getModelRowHeight={getModelRowHeight}
+              renderModelRow={renderModelRow}
+              handleModelTreeKeyDown={handleModelTreeKeyDown}
+              onModelTreeFocus={() => {
+                if (modelCursorIndex != null || !modelRows.length) return;
+                const selectedIndex = findSelectedSymbolIndex();
+                setModelCursorIndex(selectedIndex >= 0 ? selectedIndex : 0);
+              }}
+              startDrag={startDrag}
+              selectedSymbol={selectedSymbol}
+            />
             </section>
           )}
+          </>
       </main>
+        {tabMenu ? (
+          <div className="context-menu tab-menu" style={{ left: tabMenu.x, top: tabMenu.y }}>
+            <button
+              type="button"
+              onClick={() => {
+                closeTab(tabMenu.path);
+                setTabMenu(null);
+              }}
+            >
+              Close
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                closeOtherTabs(tabMenu.path);
+                setTabMenu(null);
+              }}
+              disabled={openTabs.length <= 1}
+            >
+              Close Others
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                closeAllTabs();
+                setTabMenu(null);
+              }}
+              disabled={!openTabs.length}
+            >
+              Close All
+            </button>
+          </div>
+        ) : null}
         {contextMenu ? (
           <div className="context-menu" style={{ left: contextMenu.x, top: contextMenu.y }}>
             {contextMenu.scope === "root" ? (
@@ -3293,6 +2343,7 @@ export function App() {
                   <select value={newFileType} onChange={(e) => setNewFileType(e.target.value)}>
                     <option value="sysml">.sysml</option>
                     <option value="kerml">.kerml</option>
+                    <option value="diagram">.diagram</option>
                   </select>
                 </label>
                 <div className="field">
@@ -3443,6 +2494,341 @@ export function App() {
             </div>
           </div>
         ) : null}
+      {showProjectProperties ? (
+        <div className="modal">
+          <div className="modal-backdrop" onClick={() => setShowProjectProperties(false)} />
+          <div className="modal-card modal-wide legacy-modal" role="dialog" aria-modal="true" aria-labelledby="project-properties-title">
+            <div className="modal-header">
+              <h3 id="project-properties-title">Project Properties</h3>
+            </div>
+            <div className="modal-body">
+              <div className="project-properties">
+                <div className="project-properties-grid">
+                  <label className="field">
+                    <span className="field-label">Name</span>
+                    <input
+                      value={projectPropertiesDraft.name}
+                      onChange={(event) => setProjectPropertiesDraft((prev) => ({ ...prev, name: event.target.value }))}
+                    />
+                  </label>
+                  <label className="field">
+                    <span className="field-label">Author</span>
+                    <input
+                      value={projectPropertiesDraft.author}
+                      onChange={(event) => setProjectPropertiesDraft((prev) => ({ ...prev, author: event.target.value }))}
+                    />
+                  </label>
+                  <label className="field">
+                    <span className="field-label">Organization</span>
+                    <input
+                      value={projectPropertiesDraft.organization}
+                      onChange={(event) => setProjectPropertiesDraft((prev) => ({ ...prev, organization: event.target.value }))}
+                    />
+                  </label>
+                  <label className="field">
+                    <span className="field-label">Description</span>
+                    <input
+                      value={projectPropertiesDraft.description}
+                      onChange={(event) => setProjectPropertiesDraft((prev) => ({ ...prev, description: event.target.value }))}
+                    />
+                  </label>
+                </div>
+                <div className="project-properties-section">
+                  <div className="project-properties-title">Files</div>
+                  <div className="project-properties-list">
+                    {projectPropertiesDraft.src.length ? (
+                      projectPropertiesDraft.src.map((entry) => (
+                        <div key={entry} className="project-properties-item">
+                          <span>{entry}</span>
+                          <button type="button" className="ghost" onClick={() => removeProjectFile(entry)}>Remove</button>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="muted">No files configured.</div>
+                    )}
+                  </div>
+                  <div className="field-inline">
+                    <input
+                      value={projectFileInput}
+                      onChange={(event) => setProjectFileInput(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          addProjectFile();
+                        }
+                      }}
+                      placeholder="**/*.sysml"
+                    />
+                    <button type="button" className="ghost" onClick={addProjectFile}>Add</button>
+                  </div>
+                </div>
+                <div className="project-properties-section">
+                  <div className="project-properties-title">Libraries</div>
+                  <div className="project-properties-list">
+                    {projectPropertiesDraft.import_entries.length ? (
+                      projectPropertiesDraft.import_entries.map((entry) => (
+                        <div key={entry} className="project-properties-item">
+                          <span>{entry}</span>
+                          <button type="button" className="ghost" onClick={() => removeProjectLibrary(entry)}>Remove</button>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="muted">No libraries configured.</div>
+                    )}
+                  </div>
+                  <div className="field-inline">
+                    <input
+                      value={projectLibraryInput}
+                      onChange={(event) => setProjectLibraryInput(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          addProjectLibrary();
+                        }
+                      }}
+                      placeholder="**/*.sysmlx"
+                    />
+                    <button type="button" className="ghost" onClick={addProjectLibrary}>Add</button>
+                  </div>
+                </div>
+                <div className="project-properties-section">
+                  <div className="project-properties-title">Stdlib</div>
+                  <label className="field">
+                    <span className="field-label">Selection</span>
+                    <select
+                      value={projectStdlibMode}
+                      onChange={(event) => setProjectStdlibMode(event.target.value as "default" | "version" | "custom")}
+                    >
+                      <option value="default">Use default</option>
+                      <option value="version">Pick version</option>
+                      <option value="custom">Custom path</option>
+                    </select>
+                  </label>
+                  {projectStdlibMode === "version" ? (
+                    <label className="field">
+                      <span className="field-label">Version</span>
+                      <select
+                        value={projectStdlibVersion}
+                        onChange={(event) => setProjectStdlibVersion(event.target.value)}
+                      >
+                        <option value="">Select version</option>
+                        {projectStdlibVersions.map((version) => (
+                          <option key={version} value={version}>{version}</option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+                  {projectStdlibMode === "custom" ? (
+                    <label className="field">
+                      <span className="field-label">Path</span>
+                      <input
+                        value={projectStdlibPath}
+                        onChange={(event) => setProjectStdlibPath(event.target.value)}
+                        placeholder="C:\\path\\to\\stdlib"
+                      />
+                    </label>
+                  ) : null}
+                </div>
+                {projectPropertiesError ? <div className="field-hint error">{projectPropertiesError}</div> : null}
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="ghost" onClick={() => setShowProjectProperties(false)}>Cancel</button>
+              <button type="button" onClick={saveProjectProperties} disabled={projectPropertiesBusy}>Save</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {showGitDialog ? (
+        <div className="modal">
+          <div className="modal-backdrop" onClick={() => setShowGitDialog(false)} />
+          <div className="modal-card modal-wide legacy-modal" role="dialog" aria-modal="true" aria-labelledby="git-dialog-title">
+            <div className="modal-header">
+              <h3 id="git-dialog-title">Collab</h3>
+            </div>
+            <div className="modal-body">
+              {gitInfo ? (
+                <div className="field">
+                  <div className="field-label">Repo</div>
+                  <div className="field-inline">
+                    <span>{gitInfo.repo_root}</span>
+                  </div>
+                  <div className="field-hint">
+                    Branch: {gitInfo.branch} - Ahead {gitInfo.ahead} - Behind {gitInfo.behind} - {gitInfo.clean ? "Clean" : "Has changes"}
+                  </div>
+                  {gitInfo.remote_url ? (
+                    <div className="field-hint">Remote: {gitInfo.remote_url}</div>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="muted">No git repository detected.</div>
+              )}
+              {gitStatusBusy ? (
+                <div className="muted">Loading status...</div>
+              ) : null}
+              {gitStatusError ? (
+                <div className="field-hint error">{gitStatusError}</div>
+              ) : null}
+              {gitStatus ? (
+                <div className="project-properties-section">
+                  <div className="project-properties-title">Select files</div>
+                  <div className="project-properties-list commit-section-scroll">
+                    <div className="project-properties-item section-toggle">
+                      <input
+                        type="checkbox"
+                        checked={
+                          gitStatus.staged.length + gitStatus.unstaged.length > 0 &&
+                          [...gitStatus.staged, ...gitStatus.unstaged].every((path) => gitCommitSelection[path])
+                        }
+                        onChange={(event) => toggleCommitSectionAll("changes", event.target.checked)}
+                      />
+                      <button
+                        type="button"
+                        className="ghost toggle-btn"
+                        onClick={() => setGitCommitSectionsOpen((prev) => ({ ...prev, changes: !prev.changes }))}
+                        aria-expanded={gitCommitSectionsOpen.changes}
+                      >
+                        {gitCommitSectionsOpen.changes ? "-" : "+"}
+                      </button>
+                      <span>Changes</span>
+                      <span>{gitStatus.staged.length + gitStatus.unstaged.length}</span>
+                    </div>
+                    {gitCommitSectionsOpen.changes ? (
+                      <div className="commit-section-list">
+                        {[...gitStatus.staged.map((path) => ({ path, state: "staged" as const })), ...gitStatus.unstaged.map((path) => ({ path, state: "unstaged" as const }))].map(({ path, state }) => (
+                          <label key={`change-${path}`} className="project-properties-item commit-item">
+                            <input
+                              type="checkbox"
+                              checked={!!gitCommitSelection[path]}
+                              onChange={() => toggleCommitSelection(path)}
+                            />
+                            <span>{path}</span>
+                            <span className="muted">{state}</span>
+                          </label>
+                        ))}
+                      </div>
+                    ) : null}
+                    <div className="project-properties-item section-toggle">
+                      <input
+                        type="checkbox"
+                        checked={
+                          gitStatus.untracked.length > 0 &&
+                          gitStatus.untracked.every((path) => gitCommitSelection[path])
+                        }
+                        onChange={(event) => toggleCommitSectionAll("unversioned", event.target.checked)}
+                      />
+                      <button
+                        type="button"
+                        className="ghost toggle-btn"
+                        onClick={() => setGitCommitSectionsOpen((prev) => ({ ...prev, unversioned: !prev.unversioned }))}
+                        aria-expanded={gitCommitSectionsOpen.unversioned}
+                      >
+                        {gitCommitSectionsOpen.unversioned ? "-" : "+"}
+                      </button>
+                      <span>Unversioned files</span>
+                      <span>{gitStatus.untracked.length}</span>
+                    </div>
+                    {gitCommitSectionsOpen.unversioned ? (
+                      <div className="commit-section-list">
+                        {gitStatus.untracked.map((path) => (
+                          <label key={`unversioned-${path}`} className="project-properties-item commit-item">
+                            <input
+                              type="checkbox"
+                              checked={!!gitCommitSelection[path]}
+                              onChange={() => toggleCommitSelection(path)}
+                            />
+                            <span>{path}</span>
+                          </label>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+              <label className="field field-commit-message">
+                <span className="field-label">Commit message</span>
+                <textarea
+                  value={gitCommitMessage}
+                  onChange={(event) => setGitCommitMessage(event.target.value)}
+                  placeholder="Describe your changes"
+                  rows={3}
+                />
+              </label>
+              {gitCommitError ? <div className="field-hint error">{gitCommitError}</div> : null}
+              {gitPushError ? <div className="field-hint error">{gitPushError}</div> : null}
+              {gitBranchError ? <div className="field-hint error">{gitBranchError}</div> : null}
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="ghost" onClick={() => setShowGitDialog(false)}>Close</button>
+              <button type="button" onClick={() => runGitCommitFlow(false)} disabled={!gitInfo || gitCommitBusy || gitPushBusy}>Commit</button>
+              <button type="button" onClick={() => runGitCommitFlow(true)} disabled={!gitInfo || gitCommitBusy || gitPushBusy}>Commit &amp; Push</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {showGitBranchDialog ? (
+        <div className="modal">
+          <div className="modal-backdrop" onClick={() => setShowGitBranchDialog(false)} />
+          <div className="modal-card legacy-modal" role="dialog" aria-modal="true" aria-labelledby="git-branch-title">
+            <div className="modal-header">
+              <h3 id="git-branch-title">Branches</h3>
+            </div>
+            <div className="modal-body">
+              {gitInfo ? (
+                <div className="field">
+                  <div className="field-hint">Repo: {gitInfo.repo_root}</div>
+                  {gitCurrentBranch ? (
+                    <div className="field-hint">Current branch: {gitCurrentBranch}</div>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="muted">No git repository detected.</div>
+              )}
+              <div className="project-properties-section">
+                <div className="project-properties-title">Create branch</div>
+                <div className="field-inline">
+                  <input
+                    value={gitCreateBranchName}
+                    onChange={(event) => setGitCreateBranchName(event.target.value)}
+                    placeholder="new-branch-name"
+                  />
+                  <label className="inline-checkbox">
+                    <input
+                      type="checkbox"
+                      checked={gitCreateBranchCheckout}
+                      onChange={(event) => setGitCreateBranchCheckout(event.target.checked)}
+                    />
+                    <span>Checkout</span>
+                  </label>
+                  <button type="button" className="ghost" onClick={runGitCreateBranch} disabled={!gitInfo || gitBranchBusy}>Create</button>
+                </div>
+              </div>
+              <div className="project-properties-section">
+                <div className="project-properties-title">Checkout branch</div>
+                <div className="field-inline">
+                  <select
+                    value={gitCheckoutBranchName}
+                    onChange={(event) => setGitCheckoutBranchName(event.target.value)}
+                  >
+                    <option value="">Select branch</option>
+                    {gitBranches.map((branch) => (
+                      <option key={branch} value={branch}>
+                        {branch === gitCurrentBranch ? `${branch} (current)` : branch}
+                      </option>
+                    ))}
+                  </select>
+                  <button type="button" className="ghost" onClick={runGitCheckoutBranch} disabled={!gitInfo || gitBranchBusy}>Checkout</button>
+                  <button type="button" className="ghost" onClick={refreshGitBranches} disabled={!gitInfo || gitBranchBusy}>Refresh</button>
+                </div>
+              </div>
+              {gitBranchError ? <div className="field-hint error">{gitBranchError}</div> : null}
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="ghost" onClick={() => setShowGitBranchDialog(false)}>Close</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
         {showExport ? (
         <div className="modal">
           <div className="modal-card">
@@ -3516,7 +2902,7 @@ export function App() {
                     <div key={endpoint.id} className="endpoint-row">
                       <div className="endpoint-main">
                         <div className="endpoint-title">{endpoint.name}</div>
-                        <div className="endpoint-meta">{endpoint.type.toUpperCase()} • {endpoint.url}</div>
+                        <div className="endpoint-meta">{endpoint.provider.toUpperCase()} / {endpoint.type.toUpperCase()} / {endpoint.url}</div>
                         {endpoint.model ? <div className="endpoint-meta">Model: {endpoint.model}</div> : null}
                         {endpointTestStatus[endpoint.id] ? (
                           <div className={`endpoint-status ${endpointTestStatus[endpoint.id].startsWith("pass") ? "ok" : endpointTestStatus[endpoint.id].startsWith("fail") ? "fail" : ""}`}>
@@ -3588,13 +2974,24 @@ export function App() {
                 </label>
                 <label className="field">
                   <span className="field-label">URL</span>
-                  <input value={endpointDraft.url} onChange={(e) => setEndpointDraft({ ...endpointDraft, url: e.target.value })} placeholder="https://api.openai.com" />
+                  <input
+                    value={endpointDraft.url}
+                    onChange={(e) => setEndpointDraft({ ...endpointDraft, url: e.target.value })}
+                    placeholder={endpointDraft.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com"}
+                  />
                 </label>
                 <label className="field">
                   <span className="field-label">Type</span>
                   <select value={endpointDraft.type} onChange={(e) => setEndpointDraft({ ...endpointDraft, type: e.target.value as "chat" | "embeddings" })}>
                     <option value="chat">Chat</option>
                     <option value="embeddings">Embeddings</option>
+                  </select>
+                </label>
+                <label className="field">
+                  <span className="field-label">Provider</span>
+                  <select value={endpointDraft.provider} onChange={(e) => setEndpointDraft({ ...endpointDraft, provider: e.target.value as "openai" | "anthropic" })}>
+                    <option value="openai">OpenAI-compatible</option>
+                    <option value="anthropic">Anthropic</option>
                   </select>
                 </label>
                 <label className="field">
@@ -3657,11 +3054,11 @@ export function App() {
             {errorCounts.symbolCount ? (
               <span className="status-error-badge">{errorCounts.symbolCount}</span>
             ) : null}
-            {cursorPos && activeTabPath && activeTabPath !== PROJECT_DESCRIPTOR_TAB ? (
+            {cursorPos && activeEditorPath ? (
               <span className="status-cursor">Ln {cursorPos.line}, Col {cursorPos.col}</span>
             ) : null}
             <span
-              className={`status-compile-indicator ${backgroundCompileRef.current ? "active" : ""} ${backgroundCompileEnabled ? "" : "disabled"}`}
+              className={`status-compile-indicator ${backgroundCompileActive ? "active" : ""} ${backgroundCompileEnabled ? "" : "disabled"}`}
               title={backgroundCompileEnabled ? "Background compile enabled (right-click to disable)" : "Background compile disabled (right-click to enable)"}
               onContextMenu={(event) => {
                 event.preventDefault();
