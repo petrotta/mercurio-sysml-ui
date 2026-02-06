@@ -65,6 +65,7 @@ export function App() {
     onEditorChange,
     activeDoc,
     setActiveEditorDoc,
+    updateDocContent,
     queuePendingEditorContent,
     clearPendingEditorContent,
     consumePendingEditorContent,
@@ -82,6 +83,40 @@ export function App() {
   const [tabOverflowOpen, setTabOverflowOpen] = useState(false);
   const [showProjectInfo, setShowProjectInfo] = useState(false);
   const [hasProjectDescriptor, setHasProjectDescriptor] = useState(false);
+  const [gitInfo, setGitInfo] = useState<{
+    repo_root: string;
+    branch: string;
+    ahead: number;
+    behind: number;
+    clean: boolean;
+    remote_url?: string | null;
+  } | null>(null);
+  const [gitStatus, setGitStatus] = useState<{
+    staged: string[];
+    unstaged: string[];
+    untracked: string[];
+  } | null>(null);
+  const [showGitDialog, setShowGitDialog] = useState(false);
+  const [gitStatusBusy, setGitStatusBusy] = useState(false);
+  const [gitStatusError, setGitStatusError] = useState("");
+  const [gitCommitMessage, setGitCommitMessage] = useState("");
+  const [gitCommitBusy, setGitCommitBusy] = useState(false);
+  const [gitCommitError, setGitCommitError] = useState("");
+  const [gitCommitSelection, setGitCommitSelection] = useState<Record<string, boolean>>({});
+  const [gitCommitSectionsOpen, setGitCommitSectionsOpen] = useState({
+    changes: true,
+    unversioned: false,
+  });
+  const [gitPushBusy, setGitPushBusy] = useState(false);
+  const [gitPushError, setGitPushError] = useState("");
+  const [gitBranches, setGitBranches] = useState<string[]>([]);
+  const [gitCurrentBranch, setGitCurrentBranch] = useState("");
+  const [gitCreateBranchName, setGitCreateBranchName] = useState("");
+  const [gitCreateBranchCheckout, setGitCreateBranchCheckout] = useState(true);
+  const [gitCheckoutBranchName, setGitCheckoutBranchName] = useState("");
+  const [gitBranchBusy, setGitBranchBusy] = useState(false);
+  const [gitBranchError, setGitBranchError] = useState("");
+  const [showGitBranchDialog, setShowGitBranchDialog] = useState(false);
   const [projectDescriptor, setProjectDescriptor] = useState<{
     name?: string | null;
     author?: string | null;
@@ -477,6 +512,7 @@ export function App() {
     if (!rootPath) {
       setProjectDescriptor(null);
       setHasProjectDescriptor(false);
+      setGitInfo(null);
       return;
     }
     invoke<{
@@ -499,6 +535,7 @@ export function App() {
           setProjectDescriptor(null);
           setHasProjectDescriptor(false);
         });
+    void refreshGitInfo(rootPath);
   }, [rootPath]);
 
   useEffect(() => {
@@ -542,6 +579,26 @@ export function App() {
     setExpanded({});
   };
 
+  const refreshGitInfo = async (path: string) => {
+    if (!path) {
+      setGitInfo(null);
+      return;
+    }
+    try {
+      const info = await invoke<{
+        repo_root: string;
+        branch: string;
+        ahead: number;
+        behind: number;
+        clean: boolean;
+        remote_url?: string | null;
+      } | null>("detect_git_repo", { root: path });
+      setGitInfo(info || null);
+    } catch {
+      setGitInfo(null);
+    }
+  };
+
   const openProject = async (path: string) => {
     if (!path) return;
     if (compileRunId) {
@@ -554,12 +611,15 @@ export function App() {
     setDescriptorViewMode("view");
     setProjectDescriptor(null);
     setHasProjectDescriptor(false);
+    setGitInfo(null);
+    setGitStatus(null);
     setRootPath(path);
     window.localStorage?.setItem(ROOT_STORAGE_KEY, path);
     const next = [path, ...recentProjects.filter((p) => p !== path)].slice(0, 8);
     setRecentProjects(next);
     saveRecents(next);
     await refreshRoot(path);
+    void refreshGitInfo(path);
   };
 
   const chooseProject = () => {
@@ -634,6 +694,7 @@ export function App() {
     setHasProjectDescriptor,
     clearPendingEditorContent,
     editorRef,
+    suppressDirtyRef,
     navReqRef,
     pendingNavRef,
     selectedSymbol,
@@ -755,6 +816,212 @@ export function App() {
       setShowProjectProperties(true);
     } finally {
       setProjectPropertiesBusy(false);
+    }
+  };
+
+  const openGitDialog = async () => {
+    setShowGitDialog(true);
+    setGitCommitError("");
+    setGitPushError("");
+    setGitCommitMessage("");
+    setGitCommitSelection({});
+    setGitCommitSectionsOpen({ changes: true, unversioned: false });
+    if (!gitInfo) {
+      setGitStatus(null);
+      setGitStatusBusy(false);
+      setGitStatusError("No git repository detected.");
+      return;
+    }
+    setGitStatusBusy(true);
+    setGitStatusError("");
+    try {
+      const status = await invoke<{
+        staged: string[];
+        unstaged: string[];
+        untracked: string[];
+      }>("git_status", { repoRoot: gitInfo.repo_root });
+      setGitStatus(status);
+      setGitCommitSelection((prev) => {
+        if (Object.keys(prev).length) return prev;
+        const next: Record<string, boolean> = {};
+        status.staged.forEach((path) => {
+          next[path] = true;
+        });
+        return next;
+      });
+    } catch (error) {
+      setGitStatus(null);
+      setGitStatusError(`Failed to load git status: ${String(error)}`);
+    } finally {
+      setGitStatusBusy(false);
+    }
+  };
+
+  const copyRepoUrl = async () => {
+    if (!gitInfo?.remote_url) return;
+    try {
+      await navigator.clipboard.writeText(gitInfo.remote_url);
+    } catch {
+      // No-op for now.
+    }
+  };
+
+  const refreshGitBranches = async () => {
+    if (!gitInfo) return;
+    try {
+      const branches = await invoke<{ current: string; branches: string[] }>("git_list_branches", { repoRoot: gitInfo.repo_root });
+      setGitCurrentBranch(branches.current || "");
+      setGitBranches(branches.branches || []);
+      setGitCheckoutBranchName((prev) => prev || branches.current || "");
+    } catch (error) {
+      setGitBranchError(`Failed to load branches: ${String(error)}`);
+    }
+  };
+
+  const openGitBranchDialog = async () => {
+    setGitBranchError("");
+    setGitCreateBranchName("");
+    setGitCreateBranchCheckout(true);
+    setShowGitBranchDialog(true);
+    await refreshGitBranches();
+  };
+
+  const runGitCreateBranch = async () => {
+    if (!gitInfo || gitBranchBusy) return;
+    const name = gitCreateBranchName.trim();
+    if (!name) {
+      setGitBranchError("Branch name is required.");
+      return;
+    }
+    setGitBranchBusy(true);
+    setGitBranchError("");
+    try {
+      await invoke("git_create_branch", { repoRoot: gitInfo.repo_root, name, checkout: gitCreateBranchCheckout });
+      await refreshGitBranches();
+      await refreshGitInfo(gitInfo.repo_root);
+      if (gitCreateBranchCheckout) {
+        setGitCheckoutBranchName(name);
+      }
+      setGitCreateBranchName("");
+      setCompileStatus("Branch created");
+    } catch (error) {
+      setGitBranchError(`Create branch failed: ${String(error)}`);
+    } finally {
+      setGitBranchBusy(false);
+    }
+  };
+
+  const runGitCheckoutBranch = async () => {
+    if (!gitInfo || gitBranchBusy) return;
+    const name = gitCheckoutBranchName.trim();
+    if (!name) {
+      setGitBranchError("Select a branch to checkout.");
+      return;
+    }
+    setGitBranchBusy(true);
+    setGitBranchError("");
+    try {
+      await invoke("git_checkout_branch", { repoRoot: gitInfo.repo_root, name });
+      await refreshGitBranches();
+      await refreshGitInfo(gitInfo.repo_root);
+      setCompileStatus("Checked out branch");
+    } catch (error) {
+      setGitBranchError(`Checkout failed: ${String(error)}`);
+    } finally {
+      setGitBranchBusy(false);
+    }
+  };
+
+
+  const toggleCommitSelection = (path: string) => {
+    setGitCommitSelection((prev) => ({ ...prev, [path]: !prev[path] }));
+  };
+
+  const toggleCommitSectionAll = (section: "changes" | "unversioned", checked: boolean) => {
+    if (!gitStatus) return;
+    const paths = section === "changes"
+      ? [...gitStatus.staged, ...gitStatus.unstaged]
+      : [...gitStatus.untracked];
+    setGitCommitSelection((prev) => {
+      const next = { ...prev };
+      paths.forEach((path) => {
+        next[path] = checked;
+      });
+      return next;
+    });
+  };
+
+  const stageCommitSelection = async () => {
+    if (!gitInfo || !gitStatus) return false;
+    const selected = Object.entries(gitCommitSelection)
+      .filter(([, value]) => value)
+      .map(([path]) => path);
+    if (!selected.length) {
+      setGitCommitError("Select files to commit.");
+      return false;
+    }
+    const stagedSet = new Set(gitStatus.staged);
+    const toUnstage = gitStatus.staged.filter((path) => !gitCommitSelection[path]);
+    const toStage = selected.filter((path) => !stagedSet.has(path));
+    try {
+      if (toUnstage.length) {
+        await invoke("git_unstage_paths", { repoRoot: gitInfo.repo_root, paths: toUnstage });
+      }
+      if (toStage.length) {
+        await invoke("git_stage_paths", { repoRoot: gitInfo.repo_root, paths: toStage });
+      }
+      const status = await invoke<{
+        staged: string[];
+        unstaged: string[];
+        untracked: string[];
+      }>("git_status", { repoRoot: gitInfo.repo_root });
+      setGitStatus(status);
+      return true;
+    } catch (error) {
+      setGitCommitError(`Stage failed: ${String(error)}`);
+      return false;
+    }
+  };
+
+  const runGitCommitFlow = async (pushAfter: boolean) => {
+    if (!gitInfo || gitCommitBusy || gitPushBusy) return;
+    const message = gitCommitMessage.trim();
+    if (!message) {
+      setGitCommitError("Commit message is required.");
+      return;
+    }
+    setGitCommitBusy(true);
+    setGitPushBusy(pushAfter);
+    setGitCommitError("");
+    setGitPushError("");
+    try {
+      const ok = await stageCommitSelection();
+      if (!ok) {
+        return;
+      }
+      await invoke<string>("git_commit", { repoRoot: gitInfo.repo_root, message });
+      if (pushAfter) {
+        await invoke("git_push", { repoRoot: gitInfo.repo_root });
+      }
+      await refreshGitInfo(gitInfo.repo_root);
+      const status = await invoke<{
+        staged: string[];
+        unstaged: string[];
+        untracked: string[];
+      }>("git_status", { repoRoot: gitInfo.repo_root });
+      setGitStatus(status);
+      setShowGitDialog(false);
+      setGitCommitMessage("");
+      setCompileStatus(pushAfter ? "Commit and push complete" : "Commit created");
+    } catch (error) {
+      if (pushAfter) {
+        setGitPushError(`Commit/push failed: ${String(error)}`);
+      } else {
+        setGitCommitError(`Commit failed: ${String(error)}`);
+      }
+    } finally {
+      setGitCommitBusy(false);
+      setGitPushBusy(false);
     }
   };
 
@@ -921,14 +1188,32 @@ export function App() {
   }, [rootPath]);
 
   useEffect(() => {
-    const unlistenPromise = listen("fs-changed", () => {
+    const unlistenPromise = listen<{ path: string; kind: string }>("fs-changed", async (event) => {
       if (!rootPath) return;
+      const changedPath = event?.payload?.path;
+      if (changedPath) {
+        const cached = getDoc(changedPath);
+        if (cached && !cached.dirty) {
+          try {
+            const content = await invoke<string>("read_file", { path: changedPath });
+            console.log("[fs] reload", changedPath, "len", content?.length ?? 0);
+            updateDocContent(changedPath, content || "", false);
+            if (currentFilePathRef.current === changedPath && editorRef.current && centerView === "file") {
+              suppressDirtyRef.current = true;
+              editorRef.current.setValue(content || "");
+            }
+          } catch (error) {
+            console.log("[fs] reload failed", changedPath, String(error));
+          }
+        }
+      }
       if (fsChangeTimerRef.current) {
         window.clearTimeout(fsChangeTimerRef.current);
       }
       fsChangeTimerRef.current = window.setTimeout(() => {
         fsChangeTimerRef.current = null;
         void refreshRoot(rootPath);
+        void runBackgroundCompile(rootPath);
       }, 200);
     });
     return () => {
@@ -1120,6 +1405,7 @@ export function App() {
 
   const saveActiveTab = async () => {
     if (!activeEditorPath) return;
+    console.log("[save] write_file", activeEditorPath, "len", editorValueRef.current.length);
     await invoke("write_file", { path: activeEditorPath, content: editorValueRef.current });
     setOpenTabs((prev) => prev.map((tab) => (tab.path === activeEditorPath ? { ...tab, dirty: false } : tab)));
     markSaved();
@@ -1425,6 +1711,21 @@ export function App() {
   const deferredSymbols = useDeferredValue(symbols);
   const deferredUnresolved = useDeferredValue(unresolved);
 
+  useEffect(() => {
+    if (!selectedSymbol) return;
+    if (!deferredSymbols.length) {
+      setSelectedSymbol(null);
+      return;
+    }
+    const match = deferredSymbols.find((symbol) => {
+      if (selectedSymbol.qualified_name && symbol.qualified_name) {
+        return symbol.qualified_name === selectedSymbol.qualified_name;
+      }
+      return symbol.file_path === selectedSymbol.file_path && symbol.name === selectedSymbol.name;
+    });
+    setSelectedSymbol(match || null);
+  }, [deferredSymbols, selectedSymbol]);
+
   const {
     projectGroups,
     libraryGroups,
@@ -1620,6 +1921,32 @@ export function App() {
               <div className="menu-divider" />
               <button type="button" onClick={() => { setShowSettings(true); setOpenMenu(null); }}>Settings</button>
               <button type="button">Logs</button>
+            </div>
+              ) : null}
+            </div>
+            <div className="menu-item">
+              <button type="button" className="menu-button" onClick={() => setOpenMenu(openMenu === "Collab" ? null : "Collab")}>Collab</button>
+              {openMenu === "Collab" ? (
+            <div className="menu-dropdown" data-tauri-drag-region="false">
+              <button type="button" onClick={() => { setOpenMenu(null); void openGitDialog(); }} disabled={!gitInfo}>Collab...</button>
+              <button type="button" onClick={() => { setOpenMenu(null); void openGitBranchDialog(); }} disabled={!gitInfo}>Branches...</button>
+              <button type="button" disabled>Model Changes</button>
+              <div className="menu-divider" />
+              <button
+                type="button"
+                disabled={!gitInfo?.repo_root}
+                onClick={() => {
+                  setOpenMenu(null);
+                  if (gitInfo?.repo_root) {
+                    void invoke("open_in_explorer", { path: gitInfo.repo_root });
+                  }
+                }}
+              >
+                Open Repo Folder
+              </button>
+              <button type="button" onClick={() => { setOpenMenu(null); void copyRepoUrl(); }} disabled={!gitInfo?.remote_url}>
+                Copy Repo URL
+              </button>
             </div>
               ) : null}
             </div>
@@ -2167,7 +2494,7 @@ export function App() {
             </div>
           </div>
         ) : null}
-        {showProjectProperties ? (
+      {showProjectProperties ? (
         <div className="modal">
           <div className="modal-backdrop" onClick={() => setShowProjectProperties(false)} />
           <div className="modal-card modal-wide legacy-modal" role="dialog" aria-modal="true" aria-labelledby="project-properties-title">
@@ -2308,6 +2635,196 @@ export function App() {
             <div className="modal-actions">
               <button type="button" className="ghost" onClick={() => setShowProjectProperties(false)}>Cancel</button>
               <button type="button" onClick={saveProjectProperties} disabled={projectPropertiesBusy}>Save</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {showGitDialog ? (
+        <div className="modal">
+          <div className="modal-backdrop" onClick={() => setShowGitDialog(false)} />
+          <div className="modal-card modal-wide legacy-modal" role="dialog" aria-modal="true" aria-labelledby="git-dialog-title">
+            <div className="modal-header">
+              <h3 id="git-dialog-title">Collab</h3>
+            </div>
+            <div className="modal-body">
+              {gitInfo ? (
+                <div className="field">
+                  <div className="field-label">Repo</div>
+                  <div className="field-inline">
+                    <span>{gitInfo.repo_root}</span>
+                  </div>
+                  <div className="field-hint">
+                    Branch: {gitInfo.branch} - Ahead {gitInfo.ahead} - Behind {gitInfo.behind} - {gitInfo.clean ? "Clean" : "Has changes"}
+                  </div>
+                  {gitInfo.remote_url ? (
+                    <div className="field-hint">Remote: {gitInfo.remote_url}</div>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="muted">No git repository detected.</div>
+              )}
+              {gitStatusBusy ? (
+                <div className="muted">Loading status...</div>
+              ) : null}
+              {gitStatusError ? (
+                <div className="field-hint error">{gitStatusError}</div>
+              ) : null}
+              {gitStatus ? (
+                <div className="project-properties-section">
+                  <div className="project-properties-title">Select files</div>
+                  <div className="project-properties-list commit-section-scroll">
+                    <div className="project-properties-item section-toggle">
+                      <input
+                        type="checkbox"
+                        checked={
+                          gitStatus.staged.length + gitStatus.unstaged.length > 0 &&
+                          [...gitStatus.staged, ...gitStatus.unstaged].every((path) => gitCommitSelection[path])
+                        }
+                        onChange={(event) => toggleCommitSectionAll("changes", event.target.checked)}
+                      />
+                      <button
+                        type="button"
+                        className="ghost toggle-btn"
+                        onClick={() => setGitCommitSectionsOpen((prev) => ({ ...prev, changes: !prev.changes }))}
+                        aria-expanded={gitCommitSectionsOpen.changes}
+                      >
+                        {gitCommitSectionsOpen.changes ? "-" : "+"}
+                      </button>
+                      <span>Changes</span>
+                      <span>{gitStatus.staged.length + gitStatus.unstaged.length}</span>
+                    </div>
+                    {gitCommitSectionsOpen.changes ? (
+                      <div className="commit-section-list">
+                        {[...gitStatus.staged.map((path) => ({ path, state: "staged" as const })), ...gitStatus.unstaged.map((path) => ({ path, state: "unstaged" as const }))].map(({ path, state }) => (
+                          <label key={`change-${path}`} className="project-properties-item commit-item">
+                            <input
+                              type="checkbox"
+                              checked={!!gitCommitSelection[path]}
+                              onChange={() => toggleCommitSelection(path)}
+                            />
+                            <span>{path}</span>
+                            <span className="muted">{state}</span>
+                          </label>
+                        ))}
+                      </div>
+                    ) : null}
+                    <div className="project-properties-item section-toggle">
+                      <input
+                        type="checkbox"
+                        checked={
+                          gitStatus.untracked.length > 0 &&
+                          gitStatus.untracked.every((path) => gitCommitSelection[path])
+                        }
+                        onChange={(event) => toggleCommitSectionAll("unversioned", event.target.checked)}
+                      />
+                      <button
+                        type="button"
+                        className="ghost toggle-btn"
+                        onClick={() => setGitCommitSectionsOpen((prev) => ({ ...prev, unversioned: !prev.unversioned }))}
+                        aria-expanded={gitCommitSectionsOpen.unversioned}
+                      >
+                        {gitCommitSectionsOpen.unversioned ? "-" : "+"}
+                      </button>
+                      <span>Unversioned files</span>
+                      <span>{gitStatus.untracked.length}</span>
+                    </div>
+                    {gitCommitSectionsOpen.unversioned ? (
+                      <div className="commit-section-list">
+                        {gitStatus.untracked.map((path) => (
+                          <label key={`unversioned-${path}`} className="project-properties-item commit-item">
+                            <input
+                              type="checkbox"
+                              checked={!!gitCommitSelection[path]}
+                              onChange={() => toggleCommitSelection(path)}
+                            />
+                            <span>{path}</span>
+                          </label>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+              <label className="field field-commit-message">
+                <span className="field-label">Commit message</span>
+                <textarea
+                  value={gitCommitMessage}
+                  onChange={(event) => setGitCommitMessage(event.target.value)}
+                  placeholder="Describe your changes"
+                  rows={3}
+                />
+              </label>
+              {gitCommitError ? <div className="field-hint error">{gitCommitError}</div> : null}
+              {gitPushError ? <div className="field-hint error">{gitPushError}</div> : null}
+              {gitBranchError ? <div className="field-hint error">{gitBranchError}</div> : null}
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="ghost" onClick={() => setShowGitDialog(false)}>Close</button>
+              <button type="button" onClick={() => runGitCommitFlow(false)} disabled={!gitInfo || gitCommitBusy || gitPushBusy}>Commit</button>
+              <button type="button" onClick={() => runGitCommitFlow(true)} disabled={!gitInfo || gitCommitBusy || gitPushBusy}>Commit &amp; Push</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {showGitBranchDialog ? (
+        <div className="modal">
+          <div className="modal-backdrop" onClick={() => setShowGitBranchDialog(false)} />
+          <div className="modal-card legacy-modal" role="dialog" aria-modal="true" aria-labelledby="git-branch-title">
+            <div className="modal-header">
+              <h3 id="git-branch-title">Branches</h3>
+            </div>
+            <div className="modal-body">
+              {gitInfo ? (
+                <div className="field">
+                  <div className="field-hint">Repo: {gitInfo.repo_root}</div>
+                  {gitCurrentBranch ? (
+                    <div className="field-hint">Current branch: {gitCurrentBranch}</div>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="muted">No git repository detected.</div>
+              )}
+              <div className="project-properties-section">
+                <div className="project-properties-title">Create branch</div>
+                <div className="field-inline">
+                  <input
+                    value={gitCreateBranchName}
+                    onChange={(event) => setGitCreateBranchName(event.target.value)}
+                    placeholder="new-branch-name"
+                  />
+                  <label className="inline-checkbox">
+                    <input
+                      type="checkbox"
+                      checked={gitCreateBranchCheckout}
+                      onChange={(event) => setGitCreateBranchCheckout(event.target.checked)}
+                    />
+                    <span>Checkout</span>
+                  </label>
+                  <button type="button" className="ghost" onClick={runGitCreateBranch} disabled={!gitInfo || gitBranchBusy}>Create</button>
+                </div>
+              </div>
+              <div className="project-properties-section">
+                <div className="project-properties-title">Checkout branch</div>
+                <div className="field-inline">
+                  <select
+                    value={gitCheckoutBranchName}
+                    onChange={(event) => setGitCheckoutBranchName(event.target.value)}
+                  >
+                    <option value="">Select branch</option>
+                    {gitBranches.map((branch) => (
+                      <option key={branch} value={branch}>
+                        {branch === gitCurrentBranch ? `${branch} (current)` : branch}
+                      </option>
+                    ))}
+                  </select>
+                  <button type="button" className="ghost" onClick={runGitCheckoutBranch} disabled={!gitInfo || gitBranchBusy}>Checkout</button>
+                  <button type="button" className="ghost" onClick={refreshGitBranches} disabled={!gitInfo || gitBranchBusy}>Refresh</button>
+                </div>
+              </div>
+              {gitBranchError ? <div className="field-hint error">{gitBranchError}</div> : null}
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="ghost" onClick={() => setShowGitBranchDialog(false)}>Close</button>
             </div>
           </div>
         </div>

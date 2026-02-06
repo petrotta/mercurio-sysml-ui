@@ -64,16 +64,31 @@ export function useEditorNavigation({
     const currentPath = currentFilePathRef.current;
     if (currentPath !== target.path) {
       const cached = getDoc(target.path);
+      console.log("[nav] open", target.path, "cached?", !!cached, "dirty?", cached?.dirty);
       if (cached) {
-        suppressDirtyRef.current = true;
-        setActiveEditorDoc(target.path, cached.text, cached.dirty);
-        queuePendingEditorContent(target.path, cached.text);
-        if (editorRef.current && centerView === "file" && activeTabPathRef.current !== PROJECT_DESCRIPTOR_TAB) {
-          editorRef.current.setValue(cached.text);
+        if (cached.dirty) {
+          console.log("[nav] using cached dirty content", cached.text.length);
+          suppressDirtyRef.current = true;
+          setActiveEditorDoc(target.path, cached.text, cached.dirty);
+          queuePendingEditorContent(target.path, cached.text);
+          if (editorRef.current && centerView === "file" && activeTabPathRef.current !== PROJECT_DESCRIPTOR_TAB) {
+            editorRef.current.setValue(cached.text);
+          }
+        } else {
+          const content = await invoke<string>("read_file", { path: target.path });
+          if (reqId !== navReqRef.current) return;
+          console.log("[nav] read_file content length", content?.length ?? 0);
+          suppressDirtyRef.current = true;
+          setActiveEditorDoc(target.path, content || "", false);
+          queuePendingEditorContent(target.path, content || "");
+          if (editorRef.current && centerView === "file" && activeTabPathRef.current !== PROJECT_DESCRIPTOR_TAB) {
+            editorRef.current.setValue(content || "");
+          }
         }
       } else {
         const content = await invoke<string>("read_file", { path: target.path });
         if (reqId !== navReqRef.current) return;
+        console.log("[nav] read_file (no cache) content length", content?.length ?? 0);
         suppressDirtyRef.current = true;
         setActiveEditorDoc(target.path, content || "", false);
         // Always queue content for the next editor mount in case the current ref is stale.

@@ -37,6 +37,7 @@ type UseTabsOptions = {
   setHasProjectDescriptor: (value: boolean) => void;
   clearPendingEditorContent: () => void;
   editorRef: MutableRefObject<{ setValue: (value: string) => void } | null>;
+  suppressDirtyRef: MutableRefObject<boolean>;
   navReqRef: MutableRefObject<number>;
   pendingNavRef: MutableRefObject<{
     path: string;
@@ -62,6 +63,7 @@ export function useTabs({
   setHasProjectDescriptor,
   clearPendingEditorContent,
   editorRef,
+  suppressDirtyRef,
   navReqRef,
   pendingNavRef,
   selectedSymbol,
@@ -202,6 +204,7 @@ export function useTabs({
           setCenterView("file");
           setActiveEditorDoc(null, "", false);
           if (editorRef.current) {
+            suppressDirtyRef.current = true;
             editorRef.current.setValue("");
           }
           clearPendingEditorContent();
@@ -240,6 +243,7 @@ export function useTabs({
     setCenterView("file");
     setActiveEditorDoc(null, "", false);
     if (editorRef.current) {
+      suppressDirtyRef.current = true;
       editorRef.current.setValue("");
     }
     clearPendingEditorContent();
