@@ -6,6 +6,16 @@ export type FileEntry = {
   is_action?: boolean;
 };
 
+export type AiEndpoint = {
+  id: string;
+  name: string;
+  url: string;
+  type: "chat" | "embeddings";
+  provider: "openai" | "anthropic";
+  model: string;
+  token: string;
+};
+
 export type TabKind = "file" | "descriptor" | "diagram" | "ai" | "data";
 
 export type OpenTab = {
