@@ -16,6 +16,8 @@ type ModelPaneProps = {
   onModelTreeFocus: () => void;
   startDrag: (side: "left" | "right" | "model", event: PointerEvent) => void;
   selectedSymbol: SymbolView | null;
+  getDoc: (path: string) => { path: string; text: string; dirty: boolean } | null;
+  readFile: (path: string) => Promise<string>;
 };
 
 export function ModelPane({
@@ -31,6 +33,8 @@ export function ModelPane({
   onModelTreeFocus,
   startDrag,
   selectedSymbol,
+  getDoc,
+  readFile,
 }: ModelPaneProps) {
   return (
     <div
@@ -62,7 +66,7 @@ export function ModelPane({
       {showPropertiesPane ? (
         <>
           <div className="h-splitter" onPointerDown={(event) => startDrag("model", event)} />
-          <PropertiesPane selectedSymbol={selectedSymbol} />
+          <PropertiesPane selectedSymbol={selectedSymbol} getDoc={getDoc} readFile={readFile} />
         </>
       ) : null}
     </div>

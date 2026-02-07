@@ -13,7 +13,6 @@ use zip::ZipArchive;
 
 mod commands;
 mod agent;
-mod rag;
 
 // Re-exported Tauri commands from focused modules.
 use commands::{
@@ -25,7 +24,6 @@ use commands::{
     window_close, window_minimize, window_toggle_maximize, write_diagram, write_file,
 };
 
-use rag::{rag_index_update, rag_query};
 
 use mercurio_core::{
     cancel_compile as core_cancel_compile,
@@ -646,8 +644,6 @@ pub fn run() {
             ai_embeddings,
             ai_agent_run
             ,
-            rag_index_update,
-            rag_query
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

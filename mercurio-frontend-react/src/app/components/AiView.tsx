@@ -18,7 +18,6 @@ type AiViewProps = {
   onRunStep: (step: { id: string; label: string; recommended: boolean; action: string }) => void;
   onCycleHistory: (direction: "up" | "down") => void;
   onClear: () => void;
-  ragInfo?: { count: number; indexing: boolean };
 };
 
 export function AiView(props: AiViewProps) {
@@ -45,13 +44,7 @@ export function AiView(props: AiViewProps) {
 
   return (
     <div className="ai-view">
-      <div className="view-header">
-        {props.ragInfo ? (
-          <div className="ai-rag-status">
-            {props.ragInfo.indexing ? "Indexing..." : `RAG: ${props.ragInfo.count}`}
-          </div>
-        ) : null}
-      </div>
+      <div className="view-header" />
       <div className="ai-pane" style={{ gridTemplateRows: `1fr 6px ${inputHeight}px` }}>
         <div
           className="ai-messages"

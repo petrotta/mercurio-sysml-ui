@@ -7,7 +7,6 @@ import MonacoEditor, { loader, type OnMount } from "@monaco-editor/react";
 import { listen } from "@tauri-apps/api/event";
 import {
   AI_CHAT_KEY,
-  AI_EMBEDDINGS_KEY,
   AI_ENDPOINTS_KEY,
   PROJECT_DESCRIPTOR_TAB,
   PROJECT_LOCATION_KEY,
@@ -27,7 +26,6 @@ import { DiagramView } from "./app/components/DiagramView";
 import { getKindKey, renderTypeIcon } from "./app/diagramIcons";
 import { useModelTracking } from "./app/useModelTracking";
 import { useDiagramView } from "./app/useDiagramView";
-import { getRagContext, resetRagIndex, updateRagIndexFromCompile } from "./app/ragService";
 import { useModelTree } from "./app/useModelTree";
 import { useModelTreeSelection } from "./app/useModelTreeSelection";
 import { createModelRowRenderer } from "./app/modelRowRenderer";
@@ -175,7 +173,6 @@ export function App() {
   // cursorPos is managed by useEditorState
   const [aiInput, setAiInput] = useState("");
   const [aiHistoryIndex, setAiHistoryIndex] = useState<number | null>(null);
-  const [aiRagInfo, setAiRagInfo] = useState<{ count: number; indexing: boolean }>({ count: 0, indexing: false });
   const [aiMessages, setAiMessages] = useState<Array<{
     role: "user" | "assistant";
     text: string;
@@ -215,9 +212,6 @@ export function App() {
   const [selectedChatEndpoint, setSelectedChatEndpoint] = useState<string | null>(
     () => window.localStorage?.getItem(AI_CHAT_KEY) || null,
   );
-  const [selectedEmbeddingsEndpoint, setSelectedEmbeddingsEndpoint] = useState<string | null>(
-    () => window.localStorage?.getItem(AI_EMBEDDINGS_KEY) || null,
-  );
   const [endpointDraft, setEndpointDraft] = useState<{
     id?: string;
     name: string;
@@ -246,7 +240,6 @@ export function App() {
     unresolved,
     libraryPath,
     projectSymbolsLoaded,
-    parsedFiles,
   } = useCompileRunner({ rootPath });
   const [dataExcludeStdlib, setDataExcludeStdlib] = useState(true);
   const [selectedSymbol, setSelectedSymbol] = useState<SymbolView | null>(null);
@@ -336,6 +329,7 @@ export function App() {
     window.localStorage?.setItem(AI_ENDPOINTS_KEY, JSON.stringify(aiEndpoints));
   }, [aiEndpoints]);
 
+
   useEffect(() => {
     if (selectedChatEndpoint) {
       window.localStorage?.setItem(AI_CHAT_KEY, selectedChatEndpoint);
@@ -344,13 +338,6 @@ export function App() {
     }
   }, [selectedChatEndpoint]);
 
-  useEffect(() => {
-    if (selectedEmbeddingsEndpoint) {
-      window.localStorage?.setItem(AI_EMBEDDINGS_KEY, selectedEmbeddingsEndpoint);
-    } else {
-      window.localStorage?.removeItem(AI_EMBEDDINGS_KEY);
-    }
-  }, [selectedEmbeddingsEndpoint]);
 
   const rememberProjectLocation = (path: string) => {
     if (!path) return;
@@ -1229,29 +1216,10 @@ export function App() {
   }, [rootPath]);
 
   useEffect(() => {
-    resetRagIndex();
-    setAiRagInfo({ count: 0, indexing: false });
-  }, [rootPath]);
-
-  useEffect(() => {
-    if (!rootPath || !selectedEmbeddingsEndpoint) return;
-    const endpoint = getEmbeddingsEndpoint();
-    if (!endpoint) return;
-    void updateRagIndexFromCompile({
-      rootPath,
-      symbols,
-      parsedFiles: parsedFiles || [],
-      endpoint,
-      setInfo: setAiRagInfo,
-    });
-  }, [parsedFiles, rootPath, selectedEmbeddingsEndpoint, symbols]);
-
-  useEffect(() => {
     const unlistenPromise = listen<{ path: string; kind: string }>("fs-changed", async (event) => {
       if (!rootPath) return;
       const changedPath = event?.payload?.path;
       if (changedPath) {
-        resetRagIndex();
         const cached = getDoc(changedPath);
         if (cached && !cached.dirty) {
           try {
@@ -1469,12 +1437,6 @@ export function App() {
     markSaved();
   };
 
-  const getEmbeddingsEndpoint = () => {
-    const id = selectedEmbeddingsEndpoint;
-    if (!id) return null;
-    return aiEndpoints.find((endpoint) => endpoint.id === id && endpoint.type === "embeddings") || null;
-  };
-
   useEffect(() => {
     if (!activeEditorPath) return;
     if (suppressDirtyRef.current) {
@@ -1631,7 +1593,6 @@ export function App() {
       return next;
     });
     if (selectedChatEndpoint === endpointId) setSelectedChatEndpoint(null);
-    if (selectedEmbeddingsEndpoint === endpointId) setSelectedEmbeddingsEndpoint(null);
   };
 
   const testEndpoint = async (endpointId: string) => {
@@ -1732,28 +1693,22 @@ export function App() {
       };
       const contextText = clampText(contextTextRaw, 12000);
       const historyTrimmed = history.slice(-12);
-      const embeddingsEndpoint = getEmbeddingsEndpoint();
-      const ragContextRaw = embeddingsEndpoint && rootPath
-        ? await getRagContext({ rootPath, endpoint: embeddingsEndpoint, query: text })
-        : "";
-      const ragContext = clampText(ragContextRaw, 6000);
-    const projectNote =
-      rootPath && lastAiProjectRef.current !== rootPath
-        ? [{ role: "user" as const, text: `Project changed to: ${rootPath}` }]
-        : [];
+      const projectNote =
+        rootPath && lastAiProjectRef.current !== rootPath
+          ? [{ role: "user" as const, text: `Project changed to: ${rootPath}` }]
+          : [];
     lastAiProjectRef.current = rootPath || null;
-    const messages = [
-      {
-        role: "user" as const,
-        text:
-          "Model context (read-only). Use it as ground truth when answering about this workspace:\n\n" +
-          contextText,
-      },
-      ...(ragContext ? [{ role: "user" as const, text: ragContext }] : []),
-      ...projectNote,
+      const messages = [
+        {
+          role: "user" as const,
+          text:
+            "Model context (read-only). Use it as ground truth when answering about this workspace:\n\n" +
+            contextText,
+        },
+        ...projectNote,
         ...historyTrimmed.map((msg) => ({ role: msg.role, text: msg.raw ?? msg.text })),
-      { role: "user" as const, text },
-    ];
+        { role: "user" as const, text },
+      ];
     try {
       const response = await runAgent({
         url: endpoint.url,
@@ -2362,7 +2317,6 @@ export function App() {
                       onRunStep={runAiNextStep}
                       onCycleHistory={cycleAiHistory}
                       onClear={clearAiMessages}
-                      ragInfo={aiRagInfo}
                       onSend={() => {
                         const text = aiInput.trim();
                         if (!text) return;
@@ -2544,6 +2498,11 @@ export function App() {
               }}
               startDrag={startDrag}
               selectedSymbol={selectedSymbol}
+              getDoc={getDoc}
+              readFile={async (path: string) => {
+                const content = await invoke<string>("read_file", { path });
+                return content || "";
+              }}
             />
             </section>
           )}
@@ -3242,28 +3201,6 @@ export function App() {
                       </button>
                     </div>
                   </label>
-                  <label className="field">
-                    <span className="field-label">Embeddings endpoint</span>
-                    <div className="field-inline">
-                      <select
-                        value={selectedEmbeddingsEndpoint || ""}
-                        onChange={(event) => setSelectedEmbeddingsEndpoint(event.target.value || null)}
-                      >
-                        <option value="">None</option>
-                        {aiEndpoints.filter((endpoint) => endpoint.type === "embeddings").map((endpoint) => (
-                          <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>
-                        ))}
-                      </select>
-                      <button
-                        type="button"
-                        className="ghost"
-                        disabled={!selectedEmbeddingsEndpoint}
-                        onClick={() => selectedEmbeddingsEndpoint && testEndpoint(selectedEmbeddingsEndpoint)}
-                      >
-                        Test
-                      </button>
-                    </div>
-                  </label>
                 </div>
                 <div className="endpoint-form">
                   <div className="endpoint-form-title">{endpointDraft.id ? "Edit endpoint" : "Add endpoint"}</div>
@@ -3283,7 +3220,6 @@ export function App() {
                     <span className="field-label">Type</span>
                     <select value={endpointDraft.type} onChange={(e) => setEndpointDraft({ ...endpointDraft, type: e.target.value as "chat" | "embeddings" })}>
                       <option value="chat">Chat</option>
-                      <option value="embeddings">Embeddings</option>
                     </select>
                   </label>
                   <label className="field">

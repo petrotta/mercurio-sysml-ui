@@ -1,10 +1,92 @@
+import { useEffect, useState } from "react";
 import type { SymbolView } from "../types";
 
 type PropertiesPaneProps = {
   selectedSymbol: SymbolView | null;
+  getDoc: (path: string) => { path: string; text: string; dirty: boolean } | null;
+  readFile: (path: string) => Promise<string>;
 };
 
-export function PropertiesPane({ selectedSymbol }: PropertiesPaneProps) {
+const extractSnippet = (
+  content: string,
+  startLine: number | null | undefined,
+  startCol: number | null | undefined,
+  endLine: number | null | undefined,
+  endCol: number | null | undefined,
+) => {
+  if (startLine == null || endLine == null) return null;
+  const lines = content.split(/\r?\n/);
+  if (startLine < 0 || endLine < 0 || startLine >= lines.length) return null;
+  const lastLine = Math.min(endLine, lines.length - 1);
+  const start = Math.max(0, startLine);
+  const end = Math.max(start, lastLine);
+  if (start === end) {
+    const line = lines[start] ?? "";
+    const startIdx = Math.max(0, startCol ?? 0);
+    const endIdx = endCol == null ? line.length : Math.min(line.length, Math.max(startIdx, endCol));
+    return line.slice(startIdx, endIdx);
+  }
+  const chunk = lines.slice(start, end + 1);
+  if (chunk.length === 0) return null;
+  if (startCol != null) {
+    chunk[0] = chunk[0].slice(Math.max(0, startCol));
+  }
+  if (endCol != null) {
+    const lastIndex = chunk.length - 1;
+    chunk[lastIndex] = chunk[lastIndex].slice(0, Math.max(0, endCol));
+  }
+  return chunk.join("\n");
+};
+
+export function PropertiesPane({ selectedSymbol, getDoc, readFile }: PropertiesPaneProps) {
+  const [rawSnippet, setRawSnippet] = useState<string | null>(null);
+  const [rawLoading, setRawLoading] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    const loadSnippet = async () => {
+      if (!selectedSymbol || !selectedSymbol.file_path) {
+        setRawSnippet(null);
+        setRawLoading(false);
+        return;
+      }
+      const cached = getDoc(selectedSymbol.file_path);
+      if (cached) {
+        const snippet = extractSnippet(
+          cached.text,
+          selectedSymbol.start_line,
+          selectedSymbol.start_col,
+          selectedSymbol.end_line,
+          selectedSymbol.end_col,
+        );
+        setRawSnippet(snippet);
+        setRawLoading(false);
+        return;
+      }
+      setRawLoading(true);
+      try {
+        const content = await readFile(selectedSymbol.file_path);
+        if (!active) return;
+        const snippet = extractSnippet(
+          content,
+          selectedSymbol.start_line,
+          selectedSymbol.start_col,
+          selectedSymbol.end_line,
+          selectedSymbol.end_col,
+        );
+        setRawSnippet(snippet);
+      } catch {
+        if (active) setRawSnippet(null);
+      } finally {
+        if (active) setRawLoading(false);
+      }
+    };
+    void loadSnippet();
+    return () => {
+      active = false;
+    };
+  }, [getDoc, readFile, selectedSymbol]);
+
   return (
     <div className="properties-pane">
       <div className="properties-header" />
@@ -70,6 +152,18 @@ export function PropertiesPane({ selectedSymbol }: PropertiesPaneProps) {
                     <div className="properties-value">{selectedSymbol.end_col ?? "—"}</div>
                   </div>
                 </>
+              )}
+            </div>
+          </details>
+          <details className="properties-section" key={`raw-${selectedSymbol.qualified_name}`}>
+            <summary>Raw source</summary>
+            <div className="properties-parse">
+              {rawLoading ? (
+                <div className="muted">Loading source...</div>
+              ) : rawSnippet ? (
+                <pre className="properties-raw">{rawSnippet}</pre>
+              ) : (
+                <div className="muted">No source available.</div>
               )}
             </div>
           </details>

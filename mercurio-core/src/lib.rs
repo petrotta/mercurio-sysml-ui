@@ -289,9 +289,12 @@ pub fn resolve_user_local_dir() -> PathBuf {
             .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
     }
 }
+pub fn resolve_mercurio_user_dir() -> PathBuf {
+    resolve_user_local_dir().join(".mercurio")
+}
 
 pub fn ensure_mercurio_paths() -> Result<MercurioPaths, String> {
-    let root = resolve_user_local_dir().join(".mercurio");
+    let root = resolve_mercurio_user_dir();
     let stdlib_root = root.join("stdlib");
     fs::create_dir_all(&stdlib_root).map_err(|e| e.to_string())?;
     let settings_path = root.join("settings.json");
@@ -902,7 +905,7 @@ pub fn compile_workspace_sync<F: Fn(CompileProgressPayload)>(
                     .stack_size(64 * 1024 * 1024)
                     .spawn(move || {
                         let mut checker = SemanticChecker::new(&symbol_index);
-                        for (index, file_id) in project_file_ids.into_iter().enumerate() {
+                        for (_index, file_id) in project_file_ids.into_iter().enumerate() {
                             let canceled = canceled_compiles
                                 .lock()
                                 .map(|set| set.contains(&run_id))
