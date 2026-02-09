@@ -49,6 +49,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
   const [unresolved, setUnresolved] = useState<UnresolvedIssue[]>([]);
   const [libraryPath, setLibraryPath] = useState<string | null>(null);
   const [projectSymbolsLoaded, setProjectSymbolsLoaded] = useState(false);
+  const [parsedFiles, setParsedFiles] = useState<string[]>([]);
 
   useEffect(() => {
     setProjectSymbolsLoaded(false);
@@ -103,6 +104,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
       setUnresolved(response?.unresolved || []);
       setLibraryPath(response?.library_path ?? null);
       setProjectSymbolsLoaded(true);
+      setParsedFiles(response?.parsed_files || []);
       const ok = !!response?.ok;
       const parseErrors = (response?.files || [])
         .filter((file) => !file.ok && file.errors && file.errors.length)
@@ -185,6 +187,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
       setUnresolved(response?.unresolved || []);
       setLibraryPath(response?.library_path ?? null);
       setProjectSymbolsLoaded(true);
+      setParsedFiles(response?.parsed_files || []);
       setCompileStatus(response?.ok ? "Background compile: complete" : "Background compile: finished with errors");
     } catch (error) {
       if (token === backgroundCompileTokenRef.current) {
@@ -219,6 +222,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
       setUnresolved(response?.unresolved || []);
       setLibraryPath(response?.library_path ?? null);
       setProjectSymbolsLoaded(true);
+      setParsedFiles(response?.parsed_files || []);
       setCompileStatus(response?.ok ? "Background compile: complete" : "Background compile: finished with errors");
     } catch (error) {
       if (token === backgroundCompileTokenRef.current) {
@@ -259,5 +263,6 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
     unresolved,
     libraryPath,
     projectSymbolsLoaded,
+    parsedFiles,
   };
 }

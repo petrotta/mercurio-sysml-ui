@@ -1,6 +1,6 @@
 import type { KeyboardEvent, RefObject, ReactElement } from "react";
 import type { RowComponentProps } from "react-window";
-import type { ModelRow, SymbolView } from "./types";
+import type { ModelRow, SymbolNode, SymbolView } from "./types";
 
 type NavigateTarget = {
   path: string;
@@ -41,7 +41,7 @@ export function createModelRowRenderer(options: ModelRowRendererOptions) {
     renderTypeIcon,
   } = options;
 
-  const findFirstSymbol = (node: ModelRow["node"]): SymbolView | null => {
+  const findFirstSymbol = (node: SymbolNode): SymbolView | null => {
     if (node.symbols.length) return node.symbols[0];
     for (const child of node.children.values()) {
       const found = findFirstSymbol(child);
@@ -146,7 +146,7 @@ export function createModelRowRenderer(options: ModelRowRendererOptions) {
         role="button"
         tabIndex={-1}
         onKeyDown={(event) => handleModelTreeKeyDown(event, index)}
-        onMouseDown={(event) => {
+        onMouseDown={() => {
           modelTreeRef.current?.focus();
         }}
         onClick={(event) => {

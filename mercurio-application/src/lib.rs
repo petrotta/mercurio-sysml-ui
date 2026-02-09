@@ -12,16 +12,18 @@ use tauri::{Emitter, EventTarget, Manager};
 use zip::ZipArchive;
 
 mod commands;
+mod agent;
 
 // Re-exported Tauri commands from focused modules.
 use commands::{
-    ai_agent_run, ai_chat_completion, ai_test_endpoint, create_dir, create_file, create_package, delete_path,
+    ai_agent_run, ai_chat_completion, ai_embeddings, ai_test_endpoint, create_dir, create_file, create_package, delete_path,
     detect_git_repo, git_checkout_branch, git_commit, git_create_branch, git_list_branches, git_push,
     git_stage_paths, git_status, git_unstage_paths,
     get_default_root, get_default_stdlib, get_startup_path, list_dir, list_stdlib_versions,
     open_in_explorer, path_exists, read_diagram, read_file, rename_path, set_default_stdlib,
     window_close, window_minimize, window_toggle_maximize, write_diagram, write_file,
 };
+
 
 use mercurio_core::{
     cancel_compile as core_cancel_compile,
@@ -639,7 +641,9 @@ pub fn run() {
             export_compiled_model,
             ai_test_endpoint,
             ai_chat_completion,
+            ai_embeddings,
             ai_agent_run
+            ,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

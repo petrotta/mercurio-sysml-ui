@@ -64,10 +64,8 @@ export function useEditorNavigation({
     const currentPath = currentFilePathRef.current;
     if (currentPath !== target.path) {
       const cached = getDoc(target.path);
-      console.log("[nav] open", target.path, "cached?", !!cached, "dirty?", cached?.dirty);
       if (cached) {
         if (cached.dirty) {
-          console.log("[nav] using cached dirty content", cached.text.length);
           suppressDirtyRef.current = true;
           setActiveEditorDoc(target.path, cached.text, cached.dirty);
           queuePendingEditorContent(target.path, cached.text);
@@ -77,7 +75,6 @@ export function useEditorNavigation({
         } else {
           const content = await invoke<string>("read_file", { path: target.path });
           if (reqId !== navReqRef.current) return;
-          console.log("[nav] read_file content length", content?.length ?? 0);
           suppressDirtyRef.current = true;
           setActiveEditorDoc(target.path, content || "", false);
           queuePendingEditorContent(target.path, content || "");
@@ -88,7 +85,6 @@ export function useEditorNavigation({
       } else {
         const content = await invoke<string>("read_file", { path: target.path });
         if (reqId !== navReqRef.current) return;
-        console.log("[nav] read_file (no cache) content length", content?.length ?? 0);
         suppressDirtyRef.current = true;
         setActiveEditorDoc(target.path, content || "", false);
         // Always queue content for the next editor mount in case the current ref is stale.

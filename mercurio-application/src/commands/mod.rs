@@ -11,7 +11,7 @@ pub mod git;
 pub mod stdlib;
 pub mod window;
 
-pub use ai::{ai_agent_run, ai_chat_completion, ai_test_endpoint};
+pub use ai::{ai_agent_run, ai_chat_completion, ai_embeddings, ai_test_endpoint};
 pub use core::{get_default_root, get_startup_path};
 pub use diagram::{read_diagram, write_diagram};
 pub use fs_ops::{
