@@ -65,11 +65,22 @@ export function useEditorNavigation({
     if (currentPath !== target.path) {
       const cached = getDoc(target.path);
       if (cached) {
-        suppressDirtyRef.current = true;
-        setActiveEditorDoc(target.path, cached.text, cached.dirty);
-        queuePendingEditorContent(target.path, cached.text);
-        if (editorRef.current && centerView === "file" && activeTabPathRef.current !== PROJECT_DESCRIPTOR_TAB) {
-          editorRef.current.setValue(cached.text);
+        if (cached.dirty) {
+          suppressDirtyRef.current = true;
+          setActiveEditorDoc(target.path, cached.text, cached.dirty);
+          queuePendingEditorContent(target.path, cached.text);
+          if (editorRef.current && centerView === "file" && activeTabPathRef.current !== PROJECT_DESCRIPTOR_TAB) {
+            editorRef.current.setValue(cached.text);
+          }
+        } else {
+          const content = await invoke<string>("read_file", { path: target.path });
+          if (reqId !== navReqRef.current) return;
+          suppressDirtyRef.current = true;
+          setActiveEditorDoc(target.path, content || "", false);
+          queuePendingEditorContent(target.path, content || "");
+          if (editorRef.current && centerView === "file" && activeTabPathRef.current !== PROJECT_DESCRIPTOR_TAB) {
+            editorRef.current.setValue(content || "");
+          }
         }
       } else {
         const content = await invoke<string>("read_file", { path: target.path });

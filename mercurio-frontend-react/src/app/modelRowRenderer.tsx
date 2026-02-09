@@ -1,6 +1,6 @@
 import type { KeyboardEvent, RefObject, ReactElement } from "react";
 import type { RowComponentProps } from "react-window";
-import type { ModelRow, SymbolView } from "./types";
+import type { ModelRow, SymbolNode, SymbolView } from "./types";
 
 type NavigateTarget = {
   path: string;
@@ -40,6 +40,15 @@ export function createModelRowRenderer(options: ModelRowRendererOptions) {
     navigateTo,
     renderTypeIcon,
   } = options;
+
+  const findFirstSymbol = (node: SymbolNode): SymbolView | null => {
+    if (node.symbols.length) return node.symbols[0];
+    for (const child of node.children.values()) {
+      const found = findFirstSymbol(child);
+      if (found) return found;
+    }
+    return null;
+  };
 
   return ({ index, style, rows }: RowComponentProps<{ rows: ModelRow[] }>) => {
     const row = rows[index];
@@ -124,36 +133,20 @@ export function createModelRowRenderer(options: ModelRowRendererOptions) {
         </div>
       );
     }
-    const symbol = row.node.symbols[0];
+    const symbol = row.node.symbols[0] || findFirstSymbol(row.node);
     const isSelected =
       !!symbol &&
       (selectedSymbol?.qualified_name
         ? selectedSymbol.qualified_name === symbol.qualified_name
         : selectedSymbol?.file_path === symbol.file_path && selectedSymbol?.name === symbol.name);
-    const isPackage = !!symbol?.kind && symbol.kind.toLowerCase() === "package";
     return (
       <div
         style={{ ...style, paddingLeft: `${modelSectionIndent + 8 + row.depth * 14}px` }}
         className={`model-virtual-row ${isSelected ? "selected" : ""} ${isFocused ? "model-row-focused" : ""}`}
         role="button"
         tabIndex={-1}
-        draggable={isPackage}
-        onDragStart={(event) => {
-          if (!symbol || !isPackage) return;
-          const payload = {
-            qualified: symbol.qualified_name,
-            name: symbol.name,
-            kind: symbol.kind,
-          };
-          event.dataTransfer.setData("application/x-mercurio-diagram-node", JSON.stringify(payload));
-          event.dataTransfer.setData("text/plain", symbol.qualified_name || symbol.name || "package");
-          event.dataTransfer.effectAllowed = "copy";
-        }}
         onKeyDown={(event) => handleModelTreeKeyDown(event, index)}
-        onMouseDown={(event) => {
-          if (!isPackage) {
-            event.preventDefault();
-          }
+        onMouseDown={() => {
           modelTreeRef.current?.focus();
         }}
         onClick={(event) => {
@@ -161,7 +154,6 @@ export function createModelRowRenderer(options: ModelRowRendererOptions) {
           setModelCursorIndex(index);
           if (symbol) {
             setSelectedSymbol(symbol);
-            void selectSymbolInEditor(symbol);
           }
         }}
         onDoubleClick={(event) => {

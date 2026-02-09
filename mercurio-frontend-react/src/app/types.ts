@@ -6,6 +6,16 @@ export type FileEntry = {
   is_action?: boolean;
 };
 
+export type AiEndpoint = {
+  id: string;
+  name: string;
+  url: string;
+  type: "chat" | "embeddings";
+  provider: "openai" | "anthropic";
+  model: string;
+  token: string;
+};
+
 export type TabKind = "file" | "descriptor" | "diagram" | "ai" | "data";
 
 export type OpenTab = {
@@ -40,6 +50,10 @@ export type SymbolView = {
   start_col: number;
   end_line: number;
   end_col: number;
+  expr_start_line?: number;
+  expr_start_col?: number;
+  expr_end_line?: number;
+  expr_end_col?: number;
   doc?: string | null;
   properties: SymbolProperty[];
 };

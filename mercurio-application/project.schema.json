@@ -1,10 +1,26 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://mercurio.local/schemas/project.schema.json",
-  "title": "Mercurio Project Configuration",
+  "title": "Mercurio Project Descriptor",
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "name": {
+      "type": "string",
+      "description": "Project display name."
+    },
+    "author": {
+      "type": "string",
+      "description": "Primary author or maintainer."
+    },
+    "description": {
+      "type": "string",
+      "description": "Short project description."
+    },
+    "organization": {
+      "type": "string",
+      "description": "Organization or team name."
+    },
     "library": {
       "description": "Library configuration: use the built-in default library or provide a custom path.",
       "oneOf": [
@@ -24,6 +40,10 @@
           "required": ["path"]
         }
       ]
+    },
+    "stdlib": {
+      "description": "Selected stdlib version id or \"default\" to use the app default.",
+      "type": "string"
     },
     "src": {
       "description": "Source entries to include. Supports explicit file paths, top-level wildcards like \"*.sysml\", or recursive wildcards like \"**/*.sysml\".",

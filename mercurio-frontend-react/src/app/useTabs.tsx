@@ -10,6 +10,10 @@ type DescriptorPayload = {
   description?: string | null;
   organization?: string | null;
   default_library: boolean;
+  stdlib?: string | null;
+  library?: { path: string } | string | null;
+  src?: string[];
+  import_entries?: string[];
   raw_json?: string;
 };
 
@@ -33,6 +37,7 @@ type UseTabsOptions = {
   setHasProjectDescriptor: (value: boolean) => void;
   clearPendingEditorContent: () => void;
   editorRef: MutableRefObject<{ setValue: (value: string) => void } | null>;
+  suppressDirtyRef: MutableRefObject<boolean>;
   navReqRef: MutableRefObject<number>;
   pendingNavRef: MutableRefObject<{
     path: string;
@@ -58,6 +63,7 @@ export function useTabs({
   setHasProjectDescriptor,
   clearPendingEditorContent,
   editorRef,
+  suppressDirtyRef,
   navReqRef,
   pendingNavRef,
   selectedSymbol,
@@ -130,7 +136,7 @@ export function useTabs({
   const openAiViewTab = useCallback(() => {
     setOpenTabs((prev) => {
       if (prev.some((tab) => tab.path === AI_VIEW_TAB)) return prev;
-      return [...prev, { path: AI_VIEW_TAB, name: "AI", dirty: false, kind: "ai" }];
+      return [...prev, { path: AI_VIEW_TAB, name: "Agent", dirty: false, kind: "ai" }];
     });
     setActiveTabPath(AI_VIEW_TAB);
     setActiveEditorDoc(null, "", false);
@@ -198,6 +204,7 @@ export function useTabs({
           setCenterView("file");
           setActiveEditorDoc(null, "", false);
           if (editorRef.current) {
+            suppressDirtyRef.current = true;
             editorRef.current.setValue("");
           }
           clearPendingEditorContent();
@@ -236,6 +243,7 @@ export function useTabs({
     setCenterView("file");
     setActiveEditorDoc(null, "", false);
     if (editorRef.current) {
+      suppressDirtyRef.current = true;
       editorRef.current.setValue("");
     }
     clearPendingEditorContent();

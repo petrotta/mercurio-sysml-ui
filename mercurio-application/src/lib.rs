@@ -12,14 +12,18 @@ use tauri::{Emitter, EventTarget, Manager};
 use zip::ZipArchive;
 
 mod commands;
+mod agent;
 
 // Re-exported Tauri commands from focused modules.
 use commands::{
-    ai_agent_run, ai_chat_completion, ai_test_endpoint, create_dir, create_file, create_package, delete_path,
+    ai_agent_run, ai_chat_completion, ai_embeddings, ai_test_endpoint, create_dir, create_file, create_package, delete_path,
+    detect_git_repo, git_checkout_branch, git_commit, git_create_branch, git_list_branches, git_push,
+    git_stage_paths, git_status, git_unstage_paths,
     get_default_root, get_default_stdlib, get_startup_path, list_dir, list_stdlib_versions,
     open_in_explorer, path_exists, read_diagram, read_file, rename_path, set_default_stdlib,
     window_close, window_minimize, window_toggle_maximize, write_diagram, write_file,
 };
+
 
 use mercurio_core::{
     cancel_compile as core_cancel_compile,
@@ -42,6 +46,7 @@ use mercurio_core::{
     ProjectDescriptor,
     ProjectDescriptorView,
     UnsavedFile,
+    load_project_descriptor,
 };
 
 #[derive(Serialize)]
@@ -59,6 +64,20 @@ struct CreateProjectDescriptorPayload {
     description: Option<String>,
     organization: Option<String>,
     use_default_library: bool,
+}
+
+#[derive(Deserialize)]
+struct UpdateProjectDescriptorPayload {
+    root: String,
+    name: Option<String>,
+    author: Option<String>,
+    description: Option<String>,
+    organization: Option<String>,
+    src: Option<Vec<String>>,
+    #[serde(rename = "import", alias = "import_entries")]
+    import_entries: Option<Vec<String>>,
+    stdlib: Option<String>,
+    library: Option<LibraryConfig>,
 }
 
 #[derive(Serialize)]
@@ -212,6 +231,29 @@ fn resolve_under_root(root: &Path, target: &Path) -> Result<PathBuf, String> {
         return Err("Path escapes root".to_string());
     }
     Ok(canonical)
+}
+
+fn build_default_descriptor(name: Option<String>) -> ProjectDescriptor {
+    ProjectDescriptor {
+        name,
+        author: None,
+        description: None,
+        organization: None,
+        config: ProjectConfig {
+            library: None,
+            stdlib: Some("default".to_string()),
+            src: Some(vec!["**/*.sysml".to_string(), "**/*.kerml".to_string()]),
+            import_entries: Some(vec!["**/*.sysmlx".to_string(), "**/*.kermlx".to_string()]),
+        },
+    }
+}
+
+fn write_project_descriptor(root: &Path, descriptor: &ProjectDescriptor) -> Result<ProjectDescriptorView, String> {
+    let content = serde_json::to_string_pretty(descriptor).map_err(|e| e.to_string())?;
+    let config_path = root.join(".project");
+    fs::write(config_path, &content).map_err(|e| e.to_string())?;
+    get_project_descriptor_view(root)?
+        .ok_or_else(|| "Failed to load project descriptor".to_string())
 }
 
 #[tauri::command]
@@ -376,8 +418,9 @@ fn create_project_descriptor(payload: CreateProjectDescriptorPayload) -> Result<
     }
     fs::create_dir_all(&root_path).map_err(|e| e.to_string())?;
     let config = ProjectConfig {
-        library: if payload.use_default_library {
-            Some(LibraryConfig::Default("default".to_string()))
+        library: None,
+        stdlib: if payload.use_default_library {
+            Some("default".to_string())
         } else {
             None
         },
@@ -391,20 +434,67 @@ fn create_project_descriptor(payload: CreateProjectDescriptorPayload) -> Result<
         organization: payload.organization,
         config,
     };
-    let content = serde_json::to_string_pretty(&descriptor).map_err(|e| e.to_string())?;
-    let config_path = root_path.join(".project.json");
-    fs::write(config_path, &content).map_err(|e| e.to_string())?;
-    Ok(ProjectDescriptorView {
-        name: descriptor.name,
-        author: descriptor.author,
-        description: descriptor.description,
-        organization: descriptor.organization,
-        default_library: matches!(
-            descriptor.config.library,
-            Some(LibraryConfig::Default(ref value)) if value == "default"
-        ),
-        raw_json: content,
-    })
+    write_project_descriptor(&root_path, &descriptor)
+}
+
+#[tauri::command]
+fn ensure_project_descriptor(root: String) -> Result<ProjectDescriptorView, String> {
+    let root_path = PathBuf::from(root);
+    if !root_path.exists() {
+        return Err("Root path does not exist".to_string());
+    }
+
+    let config_path = root_path.join(".project");
+    if config_path.exists() {
+        return get_project_descriptor_view(&root_path)?
+            .ok_or_else(|| "Failed to load project descriptor".to_string());
+    }
+
+    if let Some(legacy) = load_project_descriptor(&root_path)? {
+        write_project_descriptor(&root_path, &legacy)
+    } else {
+        let name = root_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|value| value.to_string());
+        let descriptor = build_default_descriptor(name);
+        write_project_descriptor(&root_path, &descriptor)
+    }
+}
+
+#[tauri::command]
+fn update_project_descriptor(
+    state: tauri::State<'_, AppState>,
+    payload: UpdateProjectDescriptorPayload,
+) -> Result<ProjectDescriptorView, String> {
+    let root_path = PathBuf::from(&payload.root);
+    if !root_path.exists() {
+        return Err("Root path does not exist".to_string());
+    }
+
+    if let Some(stdlib_id) = payload.stdlib.as_ref() {
+        let trimmed = stdlib_id.trim();
+        if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("default") {
+            let candidate = state.core.stdlib_root.join(trimmed);
+            if !candidate.exists() || !candidate.is_dir() {
+                return Err("Stdlib version not found".to_string());
+            }
+        }
+    }
+
+    let descriptor = ProjectDescriptor {
+        name: payload.name,
+        author: payload.author,
+        description: payload.description,
+        organization: payload.organization,
+        config: ProjectConfig {
+            library: payload.library,
+            stdlib: payload.stdlib,
+            src: payload.src,
+            import_entries: payload.import_entries,
+        },
+    };
+    write_project_descriptor(&root_path, &descriptor)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -454,6 +544,8 @@ pub fn run() {
             let open_file = MenuItemBuilder::with_id("file.open_file", "Open File...")
                 .accelerator("Ctrl+O")
                 .build(app)?;
+            let project_properties = MenuItemBuilder::with_id("file.project_properties", "Project Properties...")
+                .build(app)?;
             let export_model = MenuItemBuilder::with_id("file.export_model", "Export Model...")
                 .build(app)?;
             let compile = MenuItemBuilder::with_id("build.compile", "Compile Workspace")
@@ -467,6 +559,7 @@ pub fn run() {
             let file_menu = SubmenuBuilder::new(app, "File")
                 .item(&open_folder)
                 .item(&open_file)
+                .item(&project_properties)
                 .separator()
                 .item(&export_model)
                 .separator()
@@ -495,6 +588,7 @@ pub fn run() {
             let action = match event.id().as_ref() {
                 "file.open_folder" => Some("open-folder"),
                 "file.open_file" => Some("open-file"),
+                "file.project_properties" => Some("project-properties"),
                 "file.export_model" => Some("export-model"),
                 "build.compile" => Some("compile-workspace"),
                 "view.toggle_project" => Some("toggle-project"),
@@ -528,6 +622,17 @@ pub fn run() {
             get_parse_errors_for_content,
             get_project_descriptor,
             create_project_descriptor,
+            ensure_project_descriptor,
+            update_project_descriptor,
+            detect_git_repo,
+            git_commit,
+            git_create_branch,
+            git_checkout_branch,
+            git_list_branches,
+            git_push,
+            git_stage_paths,
+            git_status,
+            git_unstage_paths,
             window_minimize,
             window_toggle_maximize,
             window_close,
@@ -536,7 +641,9 @@ pub fn run() {
             export_compiled_model,
             ai_test_endpoint,
             ai_chat_completion,
+            ai_embeddings,
             ai_agent_run
+            ,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

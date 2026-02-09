@@ -55,6 +55,16 @@ export function useEditorState() {
     currentFilePathRef.current = path;
   }, []);
 
+  const updateDocContent = useCallback((path: string, text: string, dirty = false) => {
+    setDocsByPath((prev) => {
+      if (!prev[path]) return prev;
+      return { ...prev, [path]: { text, dirty } };
+    });
+    if (currentFilePathRef.current === path) {
+      editorValueRef.current = text;
+    }
+  }, []);
+
   const queuePendingEditorContent = useCallback((path: string, text: string) => {
     pendingEditorContentRef.current = text;
     pendingEditorPathRef.current = path;
@@ -102,6 +112,7 @@ export function useEditorState() {
     updateCursorPos,
     activeDoc,
     setActiveEditorDoc,
+    updateDocContent,
     queuePendingEditorContent,
     clearPendingEditorContent,
     consumePendingEditorContent,

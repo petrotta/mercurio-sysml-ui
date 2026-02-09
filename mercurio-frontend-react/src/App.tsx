@@ -7,7 +7,6 @@ import MonacoEditor, { loader, type OnMount } from "@monaco-editor/react";
 import { listen } from "@tauri-apps/api/event";
 import {
   AI_CHAT_KEY,
-  AI_EMBEDDINGS_KEY,
   AI_ENDPOINTS_KEY,
   PROJECT_DESCRIPTOR_TAB,
   PROJECT_LOCATION_KEY,
@@ -34,6 +33,7 @@ import { useModelGroups } from "./app/useModelGroups";
 import { useTabs } from "./app/useTabs";
 import { useEditorNavigation } from "./app/useEditorNavigation";
 import { useCompileRunner } from "./app/useCompileRunner";
+import { runAgent } from "./app/agentClient";
 import type { FileEntry, OpenTab, SymbolView } from "./app/types";
 
 loader.config({ paths: { vs: "/monaco/vs" } });
@@ -65,6 +65,7 @@ export function App() {
     onEditorChange,
     activeDoc,
     setActiveEditorDoc,
+    updateDocContent,
     queuePendingEditorContent,
     clearPendingEditorContent,
     consumePendingEditorContent,
@@ -82,14 +83,69 @@ export function App() {
   const [tabOverflowOpen, setTabOverflowOpen] = useState(false);
   const [showProjectInfo, setShowProjectInfo] = useState(false);
   const [hasProjectDescriptor, setHasProjectDescriptor] = useState(false);
+  const [gitInfo, setGitInfo] = useState<{
+    repo_root: string;
+    branch: string;
+    ahead: number;
+    behind: number;
+    clean: boolean;
+    remote_url?: string | null;
+  } | null>(null);
+  const [gitStatus, setGitStatus] = useState<{
+    staged: string[];
+    unstaged: string[];
+    untracked: string[];
+  } | null>(null);
+  const [showGitDialog, setShowGitDialog] = useState(false);
+  const [gitStatusBusy, setGitStatusBusy] = useState(false);
+  const [gitStatusError, setGitStatusError] = useState("");
+  const [gitCommitMessage, setGitCommitMessage] = useState("");
+  const [gitCommitBusy, setGitCommitBusy] = useState(false);
+  const [gitCommitError, setGitCommitError] = useState("");
+  const [gitCommitSelection, setGitCommitSelection] = useState<Record<string, boolean>>({});
+  const [gitCommitSectionsOpen, setGitCommitSectionsOpen] = useState({
+    changes: true,
+    unversioned: false,
+  });
+  const [gitPushBusy, setGitPushBusy] = useState(false);
+  const [gitPushError, setGitPushError] = useState("");
+  const [gitBranches, setGitBranches] = useState<string[]>([]);
+  const [gitCurrentBranch, setGitCurrentBranch] = useState("");
+  const [gitCreateBranchName, setGitCreateBranchName] = useState("");
+  const [gitCreateBranchCheckout, setGitCreateBranchCheckout] = useState(true);
+  const [gitCheckoutBranchName, setGitCheckoutBranchName] = useState("");
+  const [gitBranchBusy, setGitBranchBusy] = useState(false);
+  const [gitBranchError, setGitBranchError] = useState("");
+  const [showGitBranchDialog, setShowGitBranchDialog] = useState(false);
   const [projectDescriptor, setProjectDescriptor] = useState<{
     name?: string | null;
     author?: string | null;
     description?: string | null;
     organization?: string | null;
     default_library: boolean;
+    stdlib?: string | null;
+    library?: { path: string } | string | null;
+    src?: string[];
+    import_entries?: string[];
     raw_json?: string;
   } | null>(null);
+  const [showProjectProperties, setShowProjectProperties] = useState(false);
+  const [projectPropertiesBusy, setProjectPropertiesBusy] = useState(false);
+  const [projectPropertiesError, setProjectPropertiesError] = useState("");
+  const [projectPropertiesDraft, setProjectPropertiesDraft] = useState({
+    name: "",
+    author: "",
+    description: "",
+    organization: "",
+    src: [] as string[],
+    import_entries: [] as string[],
+  });
+  const [projectFileInput, setProjectFileInput] = useState("");
+  const [projectLibraryInput, setProjectLibraryInput] = useState("");
+  const [projectStdlibMode, setProjectStdlibMode] = useState<"default" | "version" | "custom">("default");
+  const [projectStdlibVersion, setProjectStdlibVersion] = useState("");
+  const [projectStdlibPath, setProjectStdlibPath] = useState("");
+  const [projectStdlibVersions, setProjectStdlibVersions] = useState<string[]>([]);
   const [showNewFile, setShowNewFile] = useState(false);
   const [newFileName, setNewFileName] = useState("");
   const [newFileParent, setNewFileParent] = useState<string>("");
@@ -116,13 +172,22 @@ export function App() {
   const [centerView, setCenterView] = useState<"file" | "diagram" | "ai" | "data">("file");
   // cursorPos is managed by useEditorState
   const [aiInput, setAiInput] = useState("");
+  const [aiHistoryIndex, setAiHistoryIndex] = useState<number | null>(null);
   const [aiMessages, setAiMessages] = useState<Array<{
     role: "user" | "assistant";
     text: string;
+    raw?: string;
     pendingId?: number;
     steps?: Array<{ kind: string; detail: string }>;
+    nextSteps?: Array<{ id: string; label: string; recommended: boolean; action: string }>;
   }>>([]);
-  const [showAiSettings, setShowAiSettings] = useState(false);
+  const [aiFloatingSteps, setAiFloatingSteps] = useState<Array<{ id: string; label: string; recommended: boolean; action: string }>>([]);
+  const [aiFloatingPos, setAiFloatingPos] = useState<{ x: number; y: number }>(() => ({
+    x: window.innerWidth - 280,
+    y: window.innerHeight - 380,
+  }));
+  const aiFloatingDragRef = useRef<null | { startX: number; startY: number; baseX: number; baseY: number }>(null);
+  const lastAiProjectRef = useRef<string | null>(null);
   const [aiEndpoints, setAiEndpoints] = useState<Array<{
     id: string;
     name: string;
@@ -146,9 +211,6 @@ export function App() {
   });
   const [selectedChatEndpoint, setSelectedChatEndpoint] = useState<string | null>(
     () => window.localStorage?.getItem(AI_CHAT_KEY) || null,
-  );
-  const [selectedEmbeddingsEndpoint, setSelectedEmbeddingsEndpoint] = useState<string | null>(
-    () => window.localStorage?.getItem(AI_EMBEDDINGS_KEY) || null,
   );
   const [endpointDraft, setEndpointDraft] = useState<{
     id?: string;
@@ -188,6 +250,8 @@ export function App() {
   const [modelExpanded, setModelExpanded] = useState<Record<string, boolean>>({});
   const [modelSectionOpen, setModelSectionOpen] = useState({ project: true, library: true, errors: true });
   const modelTreeRef = useRef<HTMLDivElement | null>(null);
+  const modelPaneContainerRef = useRef<HTMLDivElement | null>(null);
+  const [modelPaneHeight, setModelPaneHeight] = useState(0);
   const navReqRef = useRef(0);
   const pendingNavRef = useRef<{
     path: string;
@@ -232,6 +296,7 @@ export function App() {
     }
   }, [appTheme]);
 
+
   useEffect(() => {
     activeTabPathRef.current = activeTabPath;
   }, [activeTabPath]);
@@ -264,6 +329,7 @@ export function App() {
     window.localStorage?.setItem(AI_ENDPOINTS_KEY, JSON.stringify(aiEndpoints));
   }, [aiEndpoints]);
 
+
   useEffect(() => {
     if (selectedChatEndpoint) {
       window.localStorage?.setItem(AI_CHAT_KEY, selectedChatEndpoint);
@@ -272,13 +338,6 @@ export function App() {
     }
   }, [selectedChatEndpoint]);
 
-  useEffect(() => {
-    if (selectedEmbeddingsEndpoint) {
-      window.localStorage?.setItem(AI_EMBEDDINGS_KEY, selectedEmbeddingsEndpoint);
-    } else {
-      window.localStorage?.removeItem(AI_EMBEDDINGS_KEY);
-    }
-  }, [selectedEmbeddingsEndpoint]);
 
   const rememberProjectLocation = (path: string) => {
     if (!path) return;
@@ -391,6 +450,10 @@ export function App() {
         description?: string | null;
         organization?: string | null;
         default_library: boolean;
+        stdlib?: string | null;
+        library?: { path: string } | string | null;
+        src?: string[];
+        import_entries?: string[];
         raw_json?: string;
       }>("create_project_descriptor", {
         payload: {
@@ -412,7 +475,6 @@ export function App() {
       } catch (error) {
         setNewProjectError(`Open project failed: ${String(error)}`);
       }
-      openProjectDescriptorTab(descriptor || null);
       setCompileStatus("Project created");
     } catch (error) {
       setNewProjectBusy(false);
@@ -420,8 +482,8 @@ export function App() {
     }
   };
 
-    useEffect(() => {
-      const onMove = (event: PointerEvent) => {
+  useEffect(() => {
+    const onMove = (event: PointerEvent) => {
       if (!draggingRef.current) return;
       const delta = event.clientX - startRef.current.x;
       if (draggingRef.current === "left") {
@@ -447,19 +509,49 @@ export function App() {
     }, []);
 
   useEffect(() => {
+    const onMove = (event: PointerEvent) => {
+      if (!aiFloatingDragRef.current) return;
+      const deltaX = event.clientX - aiFloatingDragRef.current.startX;
+      const deltaY = event.clientY - aiFloatingDragRef.current.startY;
+      const nextX = aiFloatingDragRef.current.baseX + deltaX;
+      const nextY = aiFloatingDragRef.current.baseY + deltaY;
+      const maxX = Math.max(0, window.innerWidth - 280);
+      const maxY = Math.max(0, window.innerHeight - 160);
+      setAiFloatingPos({
+        x: Math.min(Math.max(0, nextX), maxX),
+        y: Math.min(Math.max(0, nextY), maxY),
+      });
+    };
+    const onUp = () => {
+      aiFloatingDragRef.current = null;
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+  }, []);
+
+  useEffect(() => {
     if (!rootPath) {
       setProjectDescriptor(null);
       setHasProjectDescriptor(false);
+      setGitInfo(null);
       return;
     }
-      invoke<{
-        name?: string | null;
-        author?: string | null;
-        description?: string | null;
-        organization?: string | null;
-        default_library: boolean;
-        raw_json?: string;
-      } | null>("get_project_descriptor", { root: rootPath })
+    invoke<{
+      name?: string | null;
+      author?: string | null;
+      description?: string | null;
+      organization?: string | null;
+      default_library: boolean;
+      stdlib?: string | null;
+      library?: { path: string } | string | null;
+      src?: string[];
+      import_entries?: string[];
+      raw_json?: string;
+    } | null>("get_project_descriptor", { root: rootPath })
         .then((descriptor) => {
           setProjectDescriptor(descriptor || null);
           setHasProjectDescriptor(!!descriptor);
@@ -468,12 +560,25 @@ export function App() {
           setProjectDescriptor(null);
           setHasProjectDescriptor(false);
         });
-    }, [rootPath]);
+    void refreshGitInfo(rootPath);
+  }, [rootPath]);
 
   useEffect(() => {
     if (!rootPath) return;
     void runBackgroundCompile(rootPath);
   }, [rootPath, backgroundCompileEnabled]);
+
+  useEffect(() => {
+    if (!modelPaneContainerRef.current) return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      setModelPaneHeight(Math.round(entry.contentRect.height));
+    });
+    observer.observe(modelPaneContainerRef.current);
+    return () => observer.disconnect();
+  }, []);
+
 
   const startDrag = (side: "left" | "right" | "model", event: React.PointerEvent) => {
     event.preventDefault();
@@ -499,6 +604,26 @@ export function App() {
     setExpanded({});
   };
 
+  const refreshGitInfo = async (path: string) => {
+    if (!path) {
+      setGitInfo(null);
+      return;
+    }
+    try {
+      const info = await invoke<{
+        repo_root: string;
+        branch: string;
+        ahead: number;
+        behind: number;
+        clean: boolean;
+        remote_url?: string | null;
+      } | null>("detect_git_repo", { root: path });
+      setGitInfo(info || null);
+    } catch {
+      setGitInfo(null);
+    }
+  };
+
   const openProject = async (path: string) => {
     if (!path) return;
     if (compileRunId) {
@@ -511,12 +636,15 @@ export function App() {
     setDescriptorViewMode("view");
     setProjectDescriptor(null);
     setHasProjectDescriptor(false);
+    setGitInfo(null);
+    setGitStatus(null);
     setRootPath(path);
     window.localStorage?.setItem(ROOT_STORAGE_KEY, path);
     const next = [path, ...recentProjects.filter((p) => p !== path)].slice(0, 8);
     setRecentProjects(next);
     saveRecents(next);
     await refreshRoot(path);
+    void refreshGitInfo(path);
   };
 
   const chooseProject = () => {
@@ -569,7 +697,6 @@ export function App() {
     setOpenTabs,
   });
   const {
-    openProjectDescriptorTab,
     selectTab,
     openAiViewTab,
     openDataViewTab,
@@ -592,6 +719,7 @@ export function App() {
     setHasProjectDescriptor,
     clearPendingEditorContent,
     editorRef,
+    suppressDirtyRef,
     navReqRef,
     pendingNavRef,
     selectedSymbol,
@@ -655,24 +783,364 @@ export function App() {
     setContextMenu(null);
   };
 
-  const loadProjectInfo = async () => {
-    if (!rootPath) return;
+  const openProjectProperties = async () => {
+    if (!rootPath) {
+      setCompileStatus("Open a project folder first.");
+      return;
+    }
+    setProjectPropertiesError("");
+    setProjectPropertiesBusy(true);
     try {
+      const [descriptor, stdlibVersions] = await Promise.all([
+        invoke<{
+          name?: string | null;
+          author?: string | null;
+          description?: string | null;
+          organization?: string | null;
+          default_library: boolean;
+          stdlib?: string | null;
+          library?: { path: string } | string | null;
+          src?: string[];
+          import_entries?: string[];
+          raw_json?: string;
+        }>("ensure_project_descriptor", { root: rootPath }),
+        invoke<string[]>("list_stdlib_versions"),
+      ]);
+      setProjectDescriptor(descriptor || null);
+      setHasProjectDescriptor(!!descriptor);
+      setProjectPropertiesDraft({
+        name: descriptor?.name || "",
+        author: descriptor?.author || "",
+        description: descriptor?.description || "",
+        organization: descriptor?.organization || "",
+        src: descriptor?.src || [],
+        import_entries: descriptor?.import_entries || [],
+      });
+      const library = descriptor?.library;
+      if (library && typeof library === "object" && "path" in library) {
+        setProjectStdlibMode("custom");
+        setProjectStdlibPath(library.path || "");
+        setProjectStdlibVersion("");
+      } else if (typeof library === "string" && library.trim() && library.trim().toLowerCase() !== "default") {
+        setProjectStdlibMode("custom");
+        setProjectStdlibPath(library.trim());
+        setProjectStdlibVersion("");
+      } else if (descriptor?.stdlib && descriptor.stdlib.trim() && descriptor.stdlib.trim().toLowerCase() !== "default") {
+        setProjectStdlibMode("version");
+        setProjectStdlibVersion(descriptor.stdlib);
+        setProjectStdlibPath("");
+      } else {
+        setProjectStdlibMode("default");
+        setProjectStdlibVersion("");
+        setProjectStdlibPath("");
+      }
+      setProjectStdlibVersions(Array.isArray(stdlibVersions) ? stdlibVersions : []);
+      setShowProjectProperties(true);
+    } catch (error) {
+      setProjectPropertiesError(`Project properties failed: ${String(error)}`);
+      setShowProjectProperties(true);
+    } finally {
+      setProjectPropertiesBusy(false);
+    }
+  };
+
+  const openGitDialog = async () => {
+    setShowGitDialog(true);
+    setGitCommitError("");
+    setGitPushError("");
+    setGitCommitMessage("");
+    setGitCommitSelection({});
+    setGitCommitSectionsOpen({ changes: true, unversioned: false });
+    if (!gitInfo) {
+      setGitStatus(null);
+      setGitStatusBusy(false);
+      setGitStatusError("No git repository detected.");
+      return;
+    }
+    setGitStatusBusy(true);
+    setGitStatusError("");
+    try {
+      const status = await invoke<{
+        staged: string[];
+        unstaged: string[];
+        untracked: string[];
+      }>("git_status", { repoRoot: gitInfo.repo_root });
+      setGitStatus(status);
+      setGitCommitSelection((prev) => {
+        if (Object.keys(prev).length) return prev;
+        const next: Record<string, boolean> = {};
+        status.staged.forEach((path) => {
+          next[path] = true;
+        });
+        return next;
+      });
+    } catch (error) {
+      setGitStatus(null);
+      setGitStatusError(`Failed to load git status: ${String(error)}`);
+    } finally {
+      setGitStatusBusy(false);
+    }
+  };
+
+  const copyRepoUrl = async () => {
+    if (!gitInfo?.remote_url) return;
+    try {
+      await navigator.clipboard.writeText(gitInfo.remote_url);
+    } catch {
+      // No-op for now.
+    }
+  };
+
+  const refreshGitBranches = async () => {
+    if (!gitInfo) return;
+    try {
+      const branches = await invoke<{ current: string; branches: string[] }>("git_list_branches", { repoRoot: gitInfo.repo_root });
+      setGitCurrentBranch(branches.current || "");
+      setGitBranches(branches.branches || []);
+      setGitCheckoutBranchName((prev) => prev || branches.current || "");
+    } catch (error) {
+      setGitBranchError(`Failed to load branches: ${String(error)}`);
+    }
+  };
+
+  const openGitBranchDialog = async () => {
+    setGitBranchError("");
+    setGitCreateBranchName("");
+    setGitCreateBranchCheckout(true);
+    setShowGitBranchDialog(true);
+    await refreshGitBranches();
+  };
+
+  const runGitCreateBranch = async () => {
+    if (!gitInfo || gitBranchBusy) return;
+    const name = gitCreateBranchName.trim();
+    if (!name) {
+      setGitBranchError("Branch name is required.");
+      return;
+    }
+    setGitBranchBusy(true);
+    setGitBranchError("");
+    try {
+      await invoke("git_create_branch", { repoRoot: gitInfo.repo_root, name, checkout: gitCreateBranchCheckout });
+      await refreshGitBranches();
+      await refreshGitInfo(gitInfo.repo_root);
+      if (gitCreateBranchCheckout) {
+        setGitCheckoutBranchName(name);
+      }
+      setGitCreateBranchName("");
+      setCompileStatus("Branch created");
+    } catch (error) {
+      setGitBranchError(`Create branch failed: ${String(error)}`);
+    } finally {
+      setGitBranchBusy(false);
+    }
+  };
+
+  const runGitCheckoutBranch = async () => {
+    if (!gitInfo || gitBranchBusy) return;
+    const name = gitCheckoutBranchName.trim();
+    if (!name) {
+      setGitBranchError("Select a branch to checkout.");
+      return;
+    }
+    setGitBranchBusy(true);
+    setGitBranchError("");
+    try {
+      await invoke("git_checkout_branch", { repoRoot: gitInfo.repo_root, name });
+      await refreshGitBranches();
+      await refreshGitInfo(gitInfo.repo_root);
+      setCompileStatus("Checked out branch");
+    } catch (error) {
+      setGitBranchError(`Checkout failed: ${String(error)}`);
+    } finally {
+      setGitBranchBusy(false);
+    }
+  };
+
+
+  const toggleCommitSelection = (path: string) => {
+    setGitCommitSelection((prev) => ({ ...prev, [path]: !prev[path] }));
+  };
+
+  const toggleCommitSectionAll = (section: "changes" | "unversioned", checked: boolean) => {
+    if (!gitStatus) return;
+    const paths = section === "changes"
+      ? [...gitStatus.staged, ...gitStatus.unstaged]
+      : [...gitStatus.untracked];
+    setGitCommitSelection((prev) => {
+      const next = { ...prev };
+      paths.forEach((path) => {
+        next[path] = checked;
+      });
+      return next;
+    });
+  };
+
+  const stageCommitSelection = async () => {
+    if (!gitInfo || !gitStatus) return false;
+    const selected = Object.entries(gitCommitSelection)
+      .filter(([, value]) => value)
+      .map(([path]) => path);
+    if (!selected.length) {
+      setGitCommitError("Select files to commit.");
+      return false;
+    }
+    const stagedSet = new Set(gitStatus.staged);
+    const toUnstage = gitStatus.staged.filter((path) => !gitCommitSelection[path]);
+    const toStage = selected.filter((path) => !stagedSet.has(path));
+    try {
+      if (toUnstage.length) {
+        await invoke("git_unstage_paths", { repoRoot: gitInfo.repo_root, paths: toUnstage });
+      }
+      if (toStage.length) {
+        await invoke("git_stage_paths", { repoRoot: gitInfo.repo_root, paths: toStage });
+      }
+      const status = await invoke<{
+        staged: string[];
+        unstaged: string[];
+        untracked: string[];
+      }>("git_status", { repoRoot: gitInfo.repo_root });
+      setGitStatus(status);
+      return true;
+    } catch (error) {
+      setGitCommitError(`Stage failed: ${String(error)}`);
+      return false;
+    }
+  };
+
+  const runGitCommitFlow = async (pushAfter: boolean) => {
+    if (!gitInfo || gitCommitBusy || gitPushBusy) return;
+    const message = gitCommitMessage.trim();
+    if (!message) {
+      setGitCommitError("Commit message is required.");
+      return;
+    }
+    setGitCommitBusy(true);
+    setGitPushBusy(pushAfter);
+    setGitCommitError("");
+    setGitPushError("");
+    try {
+      const ok = await stageCommitSelection();
+      if (!ok) {
+        return;
+      }
+      await invoke<string>("git_commit", { repoRoot: gitInfo.repo_root, message });
+      if (pushAfter) {
+        await invoke("git_push", { repoRoot: gitInfo.repo_root });
+      }
+      await refreshGitInfo(gitInfo.repo_root);
+      const status = await invoke<{
+        staged: string[];
+        unstaged: string[];
+        untracked: string[];
+      }>("git_status", { repoRoot: gitInfo.repo_root });
+      setGitStatus(status);
+      setShowGitDialog(false);
+      setGitCommitMessage("");
+      setCompileStatus(pushAfter ? "Commit and push complete" : "Commit created");
+    } catch (error) {
+      if (pushAfter) {
+        setGitPushError(`Commit/push failed: ${String(error)}`);
+      } else {
+        setGitCommitError(`Commit failed: ${String(error)}`);
+      }
+    } finally {
+      setGitCommitBusy(false);
+      setGitPushBusy(false);
+    }
+  };
+
+  const addProjectFile = () => {
+    const value = projectFileInput.trim();
+    if (!value) return;
+    setProjectPropertiesDraft((prev) => ({
+      ...prev,
+      src: prev.src.includes(value) ? prev.src : [...prev.src, value],
+    }));
+    setProjectFileInput("");
+  };
+
+  const removeProjectFile = (value: string) => {
+    setProjectPropertiesDraft((prev) => ({
+      ...prev,
+      src: prev.src.filter((entry) => entry !== value),
+    }));
+  };
+
+  const addProjectLibrary = () => {
+    const value = projectLibraryInput.trim();
+    if (!value) return;
+    setProjectPropertiesDraft((prev) => ({
+      ...prev,
+      import_entries: prev.import_entries.includes(value) ? prev.import_entries : [...prev.import_entries, value],
+    }));
+    setProjectLibraryInput("");
+  };
+
+  const removeProjectLibrary = (value: string) => {
+    setProjectPropertiesDraft((prev) => ({
+      ...prev,
+      import_entries: prev.import_entries.filter((entry) => entry !== value),
+    }));
+  };
+
+  const saveProjectProperties = async () => {
+    if (!rootPath) return;
+    setProjectPropertiesError("");
+    if (projectStdlibMode === "version" && !projectStdlibVersion.trim()) {
+      setProjectPropertiesError("Select a stdlib version.");
+      return;
+    }
+    if (projectStdlibMode === "custom" && !projectStdlibPath.trim()) {
+      setProjectPropertiesError("Enter a stdlib path.");
+      return;
+    }
+    setProjectPropertiesBusy(true);
+    try {
+      const trimmedName = projectPropertiesDraft.name.trim();
+      const trimmedAuthor = projectPropertiesDraft.author.trim();
+      const trimmedDescription = projectPropertiesDraft.description.trim();
+      const trimmedOrganization = projectPropertiesDraft.organization.trim();
+      const stdlibPayload =
+        projectStdlibMode === "default"
+          ? "default"
+          : projectStdlibMode === "version"
+            ? projectStdlibVersion.trim()
+            : null;
+      const libraryPayload =
+        projectStdlibMode === "custom" ? { path: projectStdlibPath.trim() } : null;
       const descriptor = await invoke<{
         name?: string | null;
         author?: string | null;
         description?: string | null;
         organization?: string | null;
         default_library: boolean;
+        stdlib?: string | null;
+        library?: { path: string } | string | null;
+        src?: string[];
+        import_entries?: string[];
         raw_json?: string;
-      } | null>("get_project_descriptor", { root: rootPath });
+      }>("update_project_descriptor", {
+        payload: {
+          root: rootPath,
+          name: trimmedName || null,
+          author: trimmedAuthor || null,
+          description: trimmedDescription || null,
+          organization: trimmedOrganization || null,
+          src: projectPropertiesDraft.src,
+          import_entries: projectPropertiesDraft.import_entries,
+          stdlib: stdlibPayload,
+          library: libraryPayload,
+        },
+      });
       setProjectDescriptor(descriptor || null);
       setHasProjectDescriptor(!!descriptor);
-    } catch {
-      setProjectDescriptor(null);
-      setHasProjectDescriptor(false);
+      setShowProjectProperties(false);
+    } catch (error) {
+      setProjectPropertiesError(String(error));
+    } finally {
+      setProjectPropertiesBusy(false);
     }
-    openProjectDescriptorTab();
   };
 
   const createNewFile = async () => {
@@ -682,24 +1150,27 @@ export function App() {
     const normParentCandidate = parentCandidate.replace(/[\\/]+/g, "\\").toLowerCase();
     const parent = normParentCandidate.startsWith(normRoot) ? parentCandidate : rootPath;
     const trimmed = newFileName.trim();
-    const baseName = trimmed.split(/[\\/]/).pop() || trimmed;
-    const extension =
-      newFileType === "diagram" ? ".diagram" : newFileType === "kerml" ? ".kerml" : ".sysml";
-    const finalName = baseName.toLowerCase().endsWith(extension) ? baseName : `${baseName}${extension}`;
-    if (newFileType === "diagram") {
-      const createdPath = await invoke<string>("create_file", { root: rootPath, parent, name: finalName });
-      await invoke("write_diagram", {
-        root: rootPath,
-        path: createdPath,
-        diagram: { version: 1, nodes: [], offsets: {}, sizes: {} },
-      });
-    } else {
-      await invoke("create_file", { root: rootPath, parent, name: finalName });
-    }
-    setShowNewFile(false);
-    setNewFileName("");
-    await refreshRoot(rootPath);
-  };
+      const baseName = trimmed.split(/[\\/]/).pop() || trimmed;
+      const extension =
+        newFileType === "diagram" ? ".diagram" : newFileType === "kerml" ? ".kerml" : ".sysml";
+      const finalName = baseName.toLowerCase().endsWith(extension) ? baseName : `${baseName}${extension}`;
+      const normalizedParent = parent.replace(/[\\/]+$/, "");
+      const createdPath = `${normalizedParent}\\${finalName}`;
+      if (newFileType === "diagram") {
+        await invoke<string>("create_file", { root: rootPath, parent, name: finalName });
+        await invoke("write_diagram", {
+          root: rootPath,
+          path: createdPath,
+          diagram: { version: 1, nodes: [], offsets: {}, sizes: {} },
+        });
+      } else {
+        await invoke("create_file", { root: rootPath, parent, name: finalName });
+      }
+      setShowNewFile(false);
+      setNewFileName("");
+      await refreshRoot(rootPath);
+      await navigateTo({ path: createdPath, name: finalName });
+    };
 
   const openExportDialog = () => {
     setExportFormat("jsonld");
@@ -745,14 +1216,31 @@ export function App() {
   }, [rootPath]);
 
   useEffect(() => {
-    const unlistenPromise = listen("fs-changed", () => {
+    const unlistenPromise = listen<{ path: string; kind: string }>("fs-changed", async (event) => {
       if (!rootPath) return;
+      const changedPath = event?.payload?.path;
+      if (changedPath) {
+        const cached = getDoc(changedPath);
+        if (cached && !cached.dirty) {
+          try {
+            const content = await invoke<string>("read_file", { path: changedPath });
+            updateDocContent(changedPath, content || "", false);
+            if (currentFilePathRef.current === changedPath && editorRef.current && centerView === "file") {
+              suppressDirtyRef.current = true;
+              editorRef.current.setValue(content || "");
+            }
+          } catch {
+            // ignore
+          }
+        }
+      }
       if (fsChangeTimerRef.current) {
         window.clearTimeout(fsChangeTimerRef.current);
       }
       fsChangeTimerRef.current = window.setTimeout(() => {
         fsChangeTimerRef.current = null;
         void refreshRoot(rootPath);
+        void runBackgroundCompile(rootPath);
       }, 200);
     });
     return () => {
@@ -990,12 +1478,12 @@ export function App() {
           closeTab(PROJECT_DESCRIPTOR_TAB);
           return;
         }
-        if (showAiSettings) {
-          setShowAiSettings(false);
-          return;
-        }
         if (showSettings) {
           setShowSettings(false);
+          return;
+        }
+        if (showProjectProperties) {
+          setShowProjectProperties(false);
           return;
         }
         if (showExport) {
@@ -1048,7 +1536,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeTabPath, activeTabMeta, activeEditorPath, contextMenu, openMenu, showAiSettings, showExport, showNewFile, showNewProject, showOpenProject, showSettings, tabMenu]);
+  }, [activeTabPath, activeTabMeta, activeEditorPath, contextMenu, openMenu, showExport, showNewFile, showNewProject, showOpenProject, showProjectProperties, showSettings, tabMenu]);
 
   const resetEndpointDraft = () => {
     setEndpointDraft({ name: "", url: "", type: "chat", provider: "openai", model: "", token: "" });
@@ -1105,7 +1593,6 @@ export function App() {
       return next;
     });
     if (selectedChatEndpoint === endpointId) setSelectedChatEndpoint(null);
-    if (selectedEmbeddingsEndpoint === endpointId) setSelectedEmbeddingsEndpoint(null);
   };
 
   const testEndpoint = async (endpointId: string) => {
@@ -1141,8 +1628,13 @@ export function App() {
   const sendAiMessage = async (text: string) => {
     const endpoint = selectedChatEndpoint ? aiEndpoints.find((item) => item.id === selectedChatEndpoint) : null;
     const requestId = ++aiRequestRef.current;
-    setAiMessages((prev) => [...prev, { role: "user", text }, { role: "assistant", text: "...", pendingId: requestId }]);
+    setAiMessages((prev) => [
+      ...prev,
+      { role: "user", text, raw: text },
+      { role: "assistant", text: "...", raw: "...", pendingId: requestId },
+    ]);
     setAiInput("");
+    setAiHistoryIndex(null);
     if (!endpoint) {
       setAiMessages((prev) =>
         prev.map((msg) =>
@@ -1193,46 +1685,205 @@ export function App() {
       ].join("\n");
     };
 
-    const history = aiMessages.filter((msg) => msg.text !== "...");
-    const contextText = buildModelContext();
-    const messages = [
-      {
-        role: "user" as const,
-        text:
-          "Model context (read-only). Use it as ground truth when answering about this workspace:\n\n" +
-          contextText,
-      },
-      ...history,
-      { role: "user" as const, text },
-    ];
-    try {
-      const response = await invoke<any>("ai_agent_run", {
-        payload: {
-          url: endpoint.url,
-          provider: endpoint.provider,
-          model: endpoint.model || null,
-          token: endpoint.token || null,
-          max_tokens: 512,
-          root: rootPath || null,
-          enable_tools: true,
-          messages: messages.map((msg) => ({ role: msg.role, content: msg.text })),
+      const history = aiMessages.filter((msg) => msg.text !== "...");
+      const contextTextRaw = buildModelContext();
+      const clampText = (value: string, limit: number) => {
+        if (value.length <= limit) return value;
+        return value.slice(0, limit) + "\n... (truncated)";
+      };
+      const contextText = clampText(contextTextRaw, 12000);
+      const historyTrimmed = history.slice(-12);
+      const projectNote =
+        rootPath && lastAiProjectRef.current !== rootPath
+          ? [{ role: "user" as const, text: `Project changed to: ${rootPath}` }]
+          : [];
+    lastAiProjectRef.current = rootPath || null;
+      const messages = [
+        {
+          role: "user" as const,
+          text:
+            "Model context (read-only). Use it as ground truth when answering about this workspace:\n\n" +
+            contextText,
         },
+        ...projectNote,
+        ...historyTrimmed.map((msg) => ({ role: msg.role, text: msg.raw ?? msg.text })),
+        { role: "user" as const, text },
+      ];
+    try {
+      const response = await runAgent({
+        url: endpoint.url,
+        provider: endpoint.provider,
+        model: endpoint.model || null,
+        token: endpoint.token || null,
+        root: rootPath || null,
+        enable_tools: true,
+        messages: messages.map((msg) => ({ role: msg.role, content: msg.text })),
       });
-      const content =
-        response?.message ??
-        response?.choices?.[0]?.message?.content ??
-        response?.choices?.[0]?.text ??
-        response?.content?.find?.((part: any) => part?.type === "text")?.text ??
-        response?.message ??
-        "";
-      const nextText = content || "No response.";
+        const content = response?.message || "";
+        const extractFirstJsonObject = (text: string) => {
+          let inString = false;
+          let escape = false;
+          let depth = 0;
+          let start = -1;
+          for (let i = 0; i < text.length; i += 1) {
+            const ch = text[i];
+            if (escape) {
+              escape = false;
+              continue;
+            }
+            if (ch === "\\") {
+              escape = true;
+              continue;
+            }
+            if (ch === "\"") {
+              inString = !inString;
+              continue;
+            }
+            if (inString) continue;
+            if (ch === "{") {
+              if (depth === 0) start = i;
+              depth += 1;
+            } else if (ch === "}") {
+              depth = Math.max(0, depth - 1);
+              if (depth === 0 && start >= 0) {
+                return text.slice(start, i + 1);
+              }
+            }
+          }
+          return null;
+        };
+
+        const fixLooseJson = (value: string) => value.replace(/\\(?![\\/"bfnrtu])/g, "\\\\");
+
+        const parseAgentJson = (text: string) => {
+          if (!text) return null;
+          let candidate = text.trim();
+          if (candidate.startsWith("```")) {
+            candidate = candidate.replace(/^```[a-zA-Z]*\s*/, "");
+            candidate = candidate.replace(/```\s*$/, "");
+            candidate = candidate.trim();
+          }
+          const extracted = extractFirstJsonObject(candidate);
+          if (extracted) {
+            candidate = extracted;
+          }
+          try {
+            const parsed = JSON.parse(candidate);
+            return parsed && typeof parsed === "object" ? parsed : null;
+          } catch {
+            try {
+              const fixed = fixLooseJson(candidate);
+              const parsed = JSON.parse(fixed);
+              return parsed && typeof parsed === "object" ? parsed : null;
+            } catch {
+              return null;
+            }
+          }
+        };
+        const parsedAgent = parseAgentJson(content);
+        let parsedSummary: string | undefined;
+        let parsedSteps: Array<{ id: string; label: string; recommended: boolean; action: string }> | undefined;
+        let parsedToolNote: string | undefined;
+        if (parsedAgent && typeof parsedAgent === "object" && typeof parsedAgent.action === "string") {
+          if (parsedAgent.action === "final" && typeof parsedAgent.content === "string") {
+            const parsedFinal = parseAgentJson(parsedAgent.content);
+            if (parsedFinal && typeof parsedFinal.summary === "string") {
+              parsedSummary = parsedFinal.summary;
+            }
+            if (Array.isArray(parsedFinal?.next_steps)) {
+              parsedSteps = parsedFinal.next_steps
+                .map((step: any, index: number) => ({
+                  id: typeof step?.id === "string" && step.id.trim() ? step.id : String(index + 1),
+                  label: typeof step?.label === "string" ? step.label : "",
+                  recommended: Boolean(step?.recommended),
+                  action: typeof step?.action === "string" ? step.action : "",
+                }))
+                .filter((step: { label: string; action: string }) => step.label || step.action);
+            }
+          } else {
+            const detail = parsedAgent.path || parsedAgent.query || parsedAgent.detail || "";
+            parsedToolNote = `Tool request: ${parsedAgent.action}${detail ? ` ${detail}` : ""}`;
+          }
+        } else {
+          parsedSummary = parsedAgent && typeof parsedAgent.summary === "string" ? parsedAgent.summary : undefined;
+          parsedSteps = Array.isArray(parsedAgent?.next_steps)
+            ? parsedAgent.next_steps
+                .map((step: any, index: number) => ({
+                  id: typeof step?.id === "string" && step.id.trim() ? step.id : String(index + 1),
+                  label: typeof step?.label === "string" ? step.label : "",
+                  recommended: Boolean(step?.recommended),
+                  action: typeof step?.action === "string" ? step.action : "",
+                }))
+                .filter((step: { label: string; action: string }) => step.label || step.action)
+            : undefined;
+        }
+        const nextText =
+          response?.final_response?.summary ||
+          parsedSummary ||
+          parsedToolNote ||
+          content ||
+          "No response.";
+        const toolEdits = (response?.steps || [])
+          .filter((step) => step.kind === "tool" && typeof step.detail === "string")
+          .map((step) => step.detail);
+        if (toolEdits.length && rootPath) {
+          const rootBase = rootPath.replace(/[\\/]+$/, "");
+          const resolveToolPath = (rawPath: string) => {
+            const trimmed = rawPath.trim();
+            if (!trimmed) return null;
+            if (/^[A-Za-z]:[\\/]/.test(trimmed) || trimmed.startsWith("\\\\")) {
+              return trimmed;
+            }
+            const cleaned = trimmed.replace(/^[\\/]+/, "");
+            return `${rootBase}\\${cleaned}`;
+          };
+          const touched = new Set<string>();
+          for (const detail of toolEdits) {
+            if (detail.startsWith("write_file:")) {
+              const resolved = resolveToolPath(detail.slice("write_file:".length));
+              if (resolved) touched.add(resolved);
+            } else if (detail.startsWith("apply_patch:")) {
+              const resolved = resolveToolPath(detail.slice("apply_patch:".length));
+              if (resolved) touched.add(resolved);
+            }
+          }
+          if (touched.size) {
+            await Promise.all(
+              Array.from(touched).map(async (path) => {
+                try {
+                  const content = await invoke<string>("read_file", { path });
+                  updateDocContent(path, content || "", false);
+                  if (currentFilePathRef.current === path && editorRef.current && centerView === "file") {
+                    suppressDirtyRef.current = true;
+                    editorRef.current.setValue(content || "");
+                  }
+                } catch {
+                  // ignore tool sync errors
+                }
+              }),
+            );
+          }
+        }
+        const nextSteps = Array.isArray(response?.final_response?.next_steps)
+          ? response.final_response.next_steps
+          : parsedSteps;
       setAiMessages((prev) =>
         prev.map((msg) =>
           msg.pendingId === requestId
-            ? { ...msg, text: nextText, pendingId: undefined, steps: Array.isArray(response?.steps) ? response.steps : [] }
+            ? {
+                ...msg,
+                text: nextText,
+                raw: content || nextText,
+                pendingId: undefined,
+                steps: Array.isArray(response?.steps) ? response.steps : [],
+                nextSteps,
+              }
             : msg,
         ),
       );
+      if (nextSteps && nextSteps.length) {
+        setAiFloatingSteps(nextSteps);
+      }
     } catch (error) {
       setAiMessages((prev) =>
         prev.map((msg) =>
@@ -1242,8 +1893,68 @@ export function App() {
     }
   };
 
+    const cycleAiHistory = (direction: "up" | "down") => {
+      const history = aiMessages.filter((msg) => msg.role === "user").map((msg) => msg.text);
+      if (!history.length) return;
+      let nextIndex = aiHistoryIndex ?? history.length;
+    if (direction === "up") {
+      nextIndex = Math.max(0, nextIndex - 1);
+    } else {
+      nextIndex = Math.min(history.length, nextIndex + 1);
+    }
+    if (nextIndex === history.length) {
+      setAiHistoryIndex(null);
+      setAiInput("");
+      return;
+    }
+    setAiHistoryIndex(nextIndex);
+    setAiInput(history[nextIndex] || "");
+  };
+
+    const runAiNextStep = (step: { id: string; label: string; recommended: boolean; action: string }) => {
+      const content = step.action || step.label;
+      if (!content.trim()) return;
+      setAiInput(content);
+      void sendAiMessage(content);
+    };
+
+    const clearAiMessages = () => {
+      setAiMessages([]);
+      setAiFloatingSteps([]);
+      setAiHistoryIndex(null);
+    };
+
+  const parseErrorLocation = (text: string) => {
+    if (!text) return null;
+    const colonMatch = text.match(/:(\d+):(\d+)/);
+    if (colonMatch) {
+      return { line: Number(colonMatch[1]) || 1, col: Number(colonMatch[2]) || 1 };
+    }
+    const lineMatch = text.match(/line\s+(\d+)/i);
+    const colMatch = text.match(/col(?:umn)?\s+(\d+)/i);
+    if (lineMatch) {
+      return { line: Number(lineMatch[1]) || 1, col: colMatch ? Number(colMatch[1]) || 1 : 1 };
+    }
+    return null;
+  };
+
   const deferredSymbols = useDeferredValue(symbols);
   const deferredUnresolved = useDeferredValue(unresolved);
+
+  useEffect(() => {
+    if (!selectedSymbol) return;
+    if (!deferredSymbols.length) {
+      setSelectedSymbol(null);
+      return;
+    }
+    const match = deferredSymbols.find((symbol) => {
+      if (selectedSymbol.qualified_name && symbol.qualified_name) {
+        return symbol.qualified_name === selectedSymbol.qualified_name;
+      }
+      return symbol.file_path === selectedSymbol.file_path && symbol.name === selectedSymbol.name;
+    });
+    setSelectedSymbol(match || null);
+  }, [deferredSymbols, selectedSymbol]);
 
   const {
     projectGroups,
@@ -1274,6 +1985,10 @@ export function App() {
     getKindKey,
   });
 
+  const effectiveModelTreeHeight = showPropertiesPane
+    ? modelTreeHeight
+    : Math.max(modelTreeHeight, modelPaneHeight || modelTreeHeight);
+
   const {
     modelListRef,
     modelSectionIndent,
@@ -1286,7 +2001,7 @@ export function App() {
     getModelRowHeight,
   } = useModelTreeSelection({
     modelRows,
-    modelTreeHeight,
+    modelTreeHeight: effectiveModelTreeHeight,
     setModelSectionOpen,
     setModelExpanded,
     selectedSymbol,
@@ -1392,6 +2107,7 @@ export function App() {
                   <div className="menu-dropdown" data-tauri-drag-region="false">
                     <button type="button" onClick={openNewProjectDialog}>New Project</button>
                     <button type="button" onClick={chooseProject}>Open Project</button>
+                    <button type="button" onClick={() => { setOpenMenu(null); void openProjectProperties(); }}>Project Properties</button>
                     <div className="menu-divider" />
                     <button type="button" onClick={() => { void invoke("window_close"); }}>Exit</button>
                   </div>
@@ -1415,7 +2131,7 @@ export function App() {
               <button type="button">Project Panel</button>
               <button type="button">Model Panel</button>
               <div className="menu-divider" />
-              <button type="button" onClick={() => { setOpenMenu(null); openAiViewTab(); }}>AI View</button>
+              <button type="button" onClick={() => { setOpenMenu(null); openAiViewTab(); }}>Agent</button>
               <button type="button" onClick={() => { setOpenMenu(null); openDataViewTab(); }}>Data Analysis View</button>
               <button
                 type="button"
@@ -1433,8 +2149,34 @@ export function App() {
                 Diagram View
               </button>
               <div className="menu-divider" />
-              <button type="button" onClick={() => { setShowSettings(true); setOpenMenu(null); }}>Settings?</button>
+              <button type="button" onClick={() => { setShowSettings(true); setOpenMenu(null); }}>Settings</button>
               <button type="button">Logs</button>
+            </div>
+              ) : null}
+            </div>
+            <div className="menu-item">
+              <button type="button" className="menu-button" onClick={() => setOpenMenu(openMenu === "Collab" ? null : "Collab")}>Collab</button>
+              {openMenu === "Collab" ? (
+            <div className="menu-dropdown" data-tauri-drag-region="false">
+              <button type="button" onClick={() => { setOpenMenu(null); void openGitDialog(); }} disabled={!gitInfo}>Collab...</button>
+              <button type="button" onClick={() => { setOpenMenu(null); void openGitBranchDialog(); }} disabled={!gitInfo}>Branches...</button>
+              <button type="button" disabled>Model Changes</button>
+              <div className="menu-divider" />
+              <button
+                type="button"
+                disabled={!gitInfo?.repo_root}
+                onClick={() => {
+                  setOpenMenu(null);
+                  if (gitInfo?.repo_root) {
+                    void invoke("open_in_explorer", { path: gitInfo.repo_root });
+                  }
+                }}
+              >
+                Open Repo Folder
+              </button>
+              <button type="button" onClick={() => { setOpenMenu(null); void copyRepoUrl(); }} disabled={!gitInfo?.remote_url}>
+                Copy Repo URL
+              </button>
             </div>
               ) : null}
             </div>
@@ -1506,13 +2248,6 @@ export function App() {
                 </button>
               </div>
             <div className="project-actions inline">
-                <button
-                  type="button"
-                  className={`ghost icon-info ${hasProjectDescriptor ? "active" : ""}`}
-                  onClick={loadProjectInfo}
-                  aria-label="Project info"
-                  title="Project info"
-                />
                 <button type="button" className="icon-button" onClick={chooseProject} aria-label="Open Project" title="Open Project" />
                 <select className="recent-select" value="" onChange={(e) => openProject(e.target.value)} aria-label="Open recent" title="Open recent">
                   <option value="">Recent</option>
@@ -1526,6 +2261,7 @@ export function App() {
               <>
                 <span className="project-root-name">{rootPath.split(/[\\/]/).pop()}</span>
                 <span className="project-root-path">{rootPath}</span>
+                {!hasProjectDescriptor ? <span className="project-root-hint">No .project file</span> : null}
               </>
             ) : (
               "No project selected"
@@ -1574,17 +2310,19 @@ export function App() {
             }}
           >
             {activeTabMeta?.kind === "ai" ? (
-                <AiView
-                  aiMessages={aiMessages}
-                  aiInput={aiInput}
-                  onInputChange={setAiInput}
-                  onOpenSettings={() => setShowAiSettings(true)}
-                  onSend={() => {
-                    const text = aiInput.trim();
-                    if (!text) return;
-                    void sendAiMessage(text);
-                  }}
-                />
+                    <AiView
+                      aiMessages={aiMessages}
+                      aiInput={aiInput}
+                      onInputChange={setAiInput}
+                      onRunStep={runAiNextStep}
+                      onCycleHistory={cycleAiHistory}
+                      onClear={clearAiMessages}
+                      onSend={() => {
+                        const text = aiInput.trim();
+                        if (!text) return;
+                        void sendAiMessage(text);
+                    }}
+                  />
               ) : activeTabMeta?.kind === "data" ? (
                 <DataView
                   dataExcludeStdlib={dataExcludeStdlib}
@@ -1612,21 +2350,49 @@ export function App() {
                   projectDescriptor={projectDescriptor}
                 />
               ) : activeTabMeta?.kind !== "diagram" ? (
-                <MonacoEditor
-                  defaultValue=""
-                    onChange={(value) => {
-                      const next = value ?? "";
-                      if (suppressDirtyRef.current) {
-                        suppressDirtyRef.current = false;
-                        return;
-                      }
-                      onEditorChange(next);
-                    }}
-                  language="sysml"
-                  theme={appTheme === "light" ? "vs" : "vs-dark"}
-                  onMount={handleEditorMount}
-                  options={editorOptions}
-                />
+                <>
+                  <div className="editor-toolbar">
+                    <div className="editor-toolbar-group">
+                      <button
+                        type="button"
+                        className={`ghost icon-track ${trackText ? "active" : ""}`}
+                        onClick={() => setTrackText((prev) => !prev)}
+                        title={trackText ? "Stop tracking text" : "Track text"}
+                        aria-pressed={trackText}
+                        aria-label="Track text"
+                      />
+                      <span className="editor-toolbar-label">Track text</span>
+                    </div>
+                    <div className="editor-toolbar-group">
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={trackNow}
+                        disabled={!trackCandidate}
+                        title={trackCandidate ? "Select symbol near cursor" : "No symbol near cursor"}
+                      >
+                        Track now
+                      </button>
+                    </div>
+                  </div>
+                  <div className="editor-body">
+                    <MonacoEditor
+                      defaultValue=""
+                      onChange={(value) => {
+                        const next = value ?? "";
+                        if (suppressDirtyRef.current) {
+                          suppressDirtyRef.current = false;
+                          return;
+                        }
+                        onEditorChange(next);
+                      }}
+                      language="sysml"
+                      theme={appTheme === "light" ? "vs" : "vs-dark"}
+                      onMount={handleEditorMount}
+                      options={editorOptions}
+                    />
+                  </div>
+                </>
             ) : (
               <DiagramView
                 activeDiagramPath={activeDiagramPath}
@@ -1674,6 +2440,7 @@ export function App() {
               />
             )}
           </EditorPane>
+          <>
           <div
             className={`splitter ${rightCollapsed ? "collapsed" : ""}`}
             onPointerDown={rightCollapsed ? undefined : (event) => startDrag("right", event)}
@@ -1693,20 +2460,12 @@ export function App() {
             ) : null}
           </div>
           {rightCollapsed ? null : (
-            <section className="panel sidebar">
+            <section className="panel sidebar" ref={modelPaneContainerRef}>
               <div className="panel-header">
               <ModelHeader
-                canTrack={!!trackCandidate}
-                trackText={trackText}
                 collapseAll={collapseAllModel}
                 onCollapseAll={() => setCollapseAllModel(true)}
                 onExpandAll={() => setCollapseAllModel(false)}
-                onToggleTrack={() => {
-                  setTrackText((prev) => !prev);
-                  if (!trackText) {
-                    trackNow();
-                  }
-                }}
                 onToggleProperties={() => setShowPropertiesPane((prev) => !prev)}
                 showProperties={showPropertiesPane}
               />
@@ -1723,7 +2482,7 @@ export function App() {
               </button>
             </div>
             <ModelPane
-              modelTreeHeight={modelTreeHeight}
+              modelTreeHeight={effectiveModelTreeHeight}
               showPropertiesPane={showPropertiesPane}
               modelTreeRef={modelTreeRef}
               modelListRef={modelListRef}
@@ -1739,9 +2498,15 @@ export function App() {
               }}
               startDrag={startDrag}
               selectedSymbol={selectedSymbol}
+              getDoc={getDoc}
+              readFile={async (path: string) => {
+                const content = await invoke<string>("read_file", { path });
+                return content || "";
+              }}
             />
             </section>
           )}
+          </>
       </main>
         {tabMenu ? (
           <div className="context-menu tab-menu" style={{ left: tabMenu.x, top: tabMenu.y }}>
@@ -1966,6 +2731,341 @@ export function App() {
             </div>
           </div>
         ) : null}
+      {showProjectProperties ? (
+        <div className="modal">
+          <div className="modal-backdrop" onClick={() => setShowProjectProperties(false)} />
+          <div className="modal-card modal-wide legacy-modal" role="dialog" aria-modal="true" aria-labelledby="project-properties-title">
+            <div className="modal-header">
+              <h3 id="project-properties-title">Project Properties</h3>
+            </div>
+            <div className="modal-body">
+              <div className="project-properties">
+                <div className="project-properties-grid">
+                  <label className="field">
+                    <span className="field-label">Name</span>
+                    <input
+                      value={projectPropertiesDraft.name}
+                      onChange={(event) => setProjectPropertiesDraft((prev) => ({ ...prev, name: event.target.value }))}
+                    />
+                  </label>
+                  <label className="field">
+                    <span className="field-label">Author</span>
+                    <input
+                      value={projectPropertiesDraft.author}
+                      onChange={(event) => setProjectPropertiesDraft((prev) => ({ ...prev, author: event.target.value }))}
+                    />
+                  </label>
+                  <label className="field">
+                    <span className="field-label">Organization</span>
+                    <input
+                      value={projectPropertiesDraft.organization}
+                      onChange={(event) => setProjectPropertiesDraft((prev) => ({ ...prev, organization: event.target.value }))}
+                    />
+                  </label>
+                  <label className="field">
+                    <span className="field-label">Description</span>
+                    <input
+                      value={projectPropertiesDraft.description}
+                      onChange={(event) => setProjectPropertiesDraft((prev) => ({ ...prev, description: event.target.value }))}
+                    />
+                  </label>
+                </div>
+                <div className="project-properties-section">
+                  <div className="project-properties-title">Files</div>
+                  <div className="project-properties-list">
+                    {projectPropertiesDraft.src.length ? (
+                      projectPropertiesDraft.src.map((entry) => (
+                        <div key={entry} className="project-properties-item">
+                          <span>{entry}</span>
+                          <button type="button" className="ghost" onClick={() => removeProjectFile(entry)}>Remove</button>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="muted">No files configured.</div>
+                    )}
+                  </div>
+                  <div className="field-inline">
+                    <input
+                      value={projectFileInput}
+                      onChange={(event) => setProjectFileInput(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          addProjectFile();
+                        }
+                      }}
+                      placeholder="**/*.sysml"
+                    />
+                    <button type="button" className="ghost" onClick={addProjectFile}>Add</button>
+                  </div>
+                </div>
+                <div className="project-properties-section">
+                  <div className="project-properties-title">Libraries</div>
+                  <div className="project-properties-list">
+                    {projectPropertiesDraft.import_entries.length ? (
+                      projectPropertiesDraft.import_entries.map((entry) => (
+                        <div key={entry} className="project-properties-item">
+                          <span>{entry}</span>
+                          <button type="button" className="ghost" onClick={() => removeProjectLibrary(entry)}>Remove</button>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="muted">No libraries configured.</div>
+                    )}
+                  </div>
+                  <div className="field-inline">
+                    <input
+                      value={projectLibraryInput}
+                      onChange={(event) => setProjectLibraryInput(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          event.preventDefault();
+                          addProjectLibrary();
+                        }
+                      }}
+                      placeholder="**/*.sysmlx"
+                    />
+                    <button type="button" className="ghost" onClick={addProjectLibrary}>Add</button>
+                  </div>
+                </div>
+                <div className="project-properties-section">
+                  <div className="project-properties-title">Stdlib</div>
+                  <label className="field">
+                    <span className="field-label">Selection</span>
+                    <select
+                      value={projectStdlibMode}
+                      onChange={(event) => setProjectStdlibMode(event.target.value as "default" | "version" | "custom")}
+                    >
+                      <option value="default">Use default</option>
+                      <option value="version">Pick version</option>
+                      <option value="custom">Custom path</option>
+                    </select>
+                  </label>
+                  {projectStdlibMode === "version" ? (
+                    <label className="field">
+                      <span className="field-label">Version</span>
+                      <select
+                        value={projectStdlibVersion}
+                        onChange={(event) => setProjectStdlibVersion(event.target.value)}
+                      >
+                        <option value="">Select version</option>
+                        {projectStdlibVersions.map((version) => (
+                          <option key={version} value={version}>{version}</option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+                  {projectStdlibMode === "custom" ? (
+                    <label className="field">
+                      <span className="field-label">Path</span>
+                      <input
+                        value={projectStdlibPath}
+                        onChange={(event) => setProjectStdlibPath(event.target.value)}
+                        placeholder="C:\\path\\to\\stdlib"
+                      />
+                    </label>
+                  ) : null}
+                </div>
+                {projectPropertiesError ? <div className="field-hint error">{projectPropertiesError}</div> : null}
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="ghost" onClick={() => setShowProjectProperties(false)}>Cancel</button>
+              <button type="button" onClick={saveProjectProperties} disabled={projectPropertiesBusy}>Save</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {showGitDialog ? (
+        <div className="modal">
+          <div className="modal-backdrop" onClick={() => setShowGitDialog(false)} />
+          <div className="modal-card modal-wide legacy-modal" role="dialog" aria-modal="true" aria-labelledby="git-dialog-title">
+            <div className="modal-header">
+              <h3 id="git-dialog-title">Collab</h3>
+            </div>
+            <div className="modal-body">
+              {gitInfo ? (
+                <div className="field">
+                  <div className="field-label">Repo</div>
+                  <div className="field-inline">
+                    <span>{gitInfo.repo_root}</span>
+                  </div>
+                  <div className="field-hint">
+                    Branch: {gitInfo.branch} - Ahead {gitInfo.ahead} - Behind {gitInfo.behind} - {gitInfo.clean ? "Clean" : "Has changes"}
+                  </div>
+                  {gitInfo.remote_url ? (
+                    <div className="field-hint">Remote: {gitInfo.remote_url}</div>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="muted">No git repository detected.</div>
+              )}
+              {gitStatusBusy ? (
+                <div className="muted">Loading status...</div>
+              ) : null}
+              {gitStatusError ? (
+                <div className="field-hint error">{gitStatusError}</div>
+              ) : null}
+              {gitStatus ? (
+                <div className="project-properties-section">
+                  <div className="project-properties-title">Select files</div>
+                  <div className="project-properties-list commit-section-scroll">
+                    <div className="project-properties-item section-toggle">
+                      <input
+                        type="checkbox"
+                        checked={
+                          gitStatus.staged.length + gitStatus.unstaged.length > 0 &&
+                          [...gitStatus.staged, ...gitStatus.unstaged].every((path) => gitCommitSelection[path])
+                        }
+                        onChange={(event) => toggleCommitSectionAll("changes", event.target.checked)}
+                      />
+                      <button
+                        type="button"
+                        className="ghost toggle-btn"
+                        onClick={() => setGitCommitSectionsOpen((prev) => ({ ...prev, changes: !prev.changes }))}
+                        aria-expanded={gitCommitSectionsOpen.changes}
+                      >
+                        {gitCommitSectionsOpen.changes ? "-" : "+"}
+                      </button>
+                      <span>Changes</span>
+                      <span>{gitStatus.staged.length + gitStatus.unstaged.length}</span>
+                    </div>
+                    {gitCommitSectionsOpen.changes ? (
+                      <div className="commit-section-list">
+                        {[...gitStatus.staged.map((path) => ({ path, state: "staged" as const })), ...gitStatus.unstaged.map((path) => ({ path, state: "unstaged" as const }))].map(({ path, state }) => (
+                          <label key={`change-${path}`} className="project-properties-item commit-item">
+                            <input
+                              type="checkbox"
+                              checked={!!gitCommitSelection[path]}
+                              onChange={() => toggleCommitSelection(path)}
+                            />
+                            <span>{path}</span>
+                            <span className="muted">{state}</span>
+                          </label>
+                        ))}
+                      </div>
+                    ) : null}
+                    <div className="project-properties-item section-toggle">
+                      <input
+                        type="checkbox"
+                        checked={
+                          gitStatus.untracked.length > 0 &&
+                          gitStatus.untracked.every((path) => gitCommitSelection[path])
+                        }
+                        onChange={(event) => toggleCommitSectionAll("unversioned", event.target.checked)}
+                      />
+                      <button
+                        type="button"
+                        className="ghost toggle-btn"
+                        onClick={() => setGitCommitSectionsOpen((prev) => ({ ...prev, unversioned: !prev.unversioned }))}
+                        aria-expanded={gitCommitSectionsOpen.unversioned}
+                      >
+                        {gitCommitSectionsOpen.unversioned ? "-" : "+"}
+                      </button>
+                      <span>Unversioned files</span>
+                      <span>{gitStatus.untracked.length}</span>
+                    </div>
+                    {gitCommitSectionsOpen.unversioned ? (
+                      <div className="commit-section-list">
+                        {gitStatus.untracked.map((path) => (
+                          <label key={`unversioned-${path}`} className="project-properties-item commit-item">
+                            <input
+                              type="checkbox"
+                              checked={!!gitCommitSelection[path]}
+                              onChange={() => toggleCommitSelection(path)}
+                            />
+                            <span>{path}</span>
+                          </label>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+              <label className="field field-commit-message">
+                <span className="field-label">Commit message</span>
+                <textarea
+                  value={gitCommitMessage}
+                  onChange={(event) => setGitCommitMessage(event.target.value)}
+                  placeholder="Describe your changes"
+                  rows={3}
+                />
+              </label>
+              {gitCommitError ? <div className="field-hint error">{gitCommitError}</div> : null}
+              {gitPushError ? <div className="field-hint error">{gitPushError}</div> : null}
+              {gitBranchError ? <div className="field-hint error">{gitBranchError}</div> : null}
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="ghost" onClick={() => setShowGitDialog(false)}>Close</button>
+              <button type="button" onClick={() => runGitCommitFlow(false)} disabled={!gitInfo || gitCommitBusy || gitPushBusy}>Commit</button>
+              <button type="button" onClick={() => runGitCommitFlow(true)} disabled={!gitInfo || gitCommitBusy || gitPushBusy}>Commit &amp; Push</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {showGitBranchDialog ? (
+        <div className="modal">
+          <div className="modal-backdrop" onClick={() => setShowGitBranchDialog(false)} />
+          <div className="modal-card legacy-modal" role="dialog" aria-modal="true" aria-labelledby="git-branch-title">
+            <div className="modal-header">
+              <h3 id="git-branch-title">Branches</h3>
+            </div>
+            <div className="modal-body">
+              {gitInfo ? (
+                <div className="field">
+                  <div className="field-hint">Repo: {gitInfo.repo_root}</div>
+                  {gitCurrentBranch ? (
+                    <div className="field-hint">Current branch: {gitCurrentBranch}</div>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="muted">No git repository detected.</div>
+              )}
+              <div className="project-properties-section">
+                <div className="project-properties-title">Create branch</div>
+                <div className="field-inline">
+                  <input
+                    value={gitCreateBranchName}
+                    onChange={(event) => setGitCreateBranchName(event.target.value)}
+                    placeholder="new-branch-name"
+                  />
+                  <label className="inline-checkbox">
+                    <input
+                      type="checkbox"
+                      checked={gitCreateBranchCheckout}
+                      onChange={(event) => setGitCreateBranchCheckout(event.target.checked)}
+                    />
+                    <span>Checkout</span>
+                  </label>
+                  <button type="button" className="ghost" onClick={runGitCreateBranch} disabled={!gitInfo || gitBranchBusy}>Create</button>
+                </div>
+              </div>
+              <div className="project-properties-section">
+                <div className="project-properties-title">Checkout branch</div>
+                <div className="field-inline">
+                  <select
+                    value={gitCheckoutBranchName}
+                    onChange={(event) => setGitCheckoutBranchName(event.target.value)}
+                  >
+                    <option value="">Select branch</option>
+                    {gitBranches.map((branch) => (
+                      <option key={branch} value={branch}>
+                        {branch === gitCurrentBranch ? `${branch} (current)` : branch}
+                      </option>
+                    ))}
+                  </select>
+                  <button type="button" className="ghost" onClick={runGitCheckoutBranch} disabled={!gitInfo || gitBranchBusy}>Checkout</button>
+                  <button type="button" className="ghost" onClick={refreshGitBranches} disabled={!gitInfo || gitBranchBusy}>Refresh</button>
+                </div>
+              </div>
+              {gitBranchError ? <div className="field-hint error">{gitBranchError}</div> : null}
+            </div>
+            <div className="modal-actions">
+              <button type="button" className="ghost" onClick={() => setShowGitBranchDialog(false)}>Close</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
         {showExport ? (
         <div className="modal">
           <div className="modal-card">
@@ -2025,132 +3125,6 @@ export function App() {
           </div>
         </div>
       ) : null}
-      {showAiSettings ? (
-        <div className="modal">
-          <div className="modal-backdrop" onClick={() => setShowAiSettings(false)} />
-          <div className="modal-card modal-wide legacy-modal" role="dialog" aria-modal="true" aria-labelledby="ai-settings-title">
-            <div className="modal-header">
-              <h3 id="ai-settings-title">AI Settings</h3>
-            </div>
-            <div className="modal-body">
-              <div className="endpoint-list">
-                {aiEndpoints.length ? (
-                  aiEndpoints.map((endpoint) => (
-                    <div key={endpoint.id} className="endpoint-row">
-                      <div className="endpoint-main">
-                        <div className="endpoint-title">{endpoint.name}</div>
-                        <div className="endpoint-meta">{endpoint.provider.toUpperCase()} / {endpoint.type.toUpperCase()} / {endpoint.url}</div>
-                        {endpoint.model ? <div className="endpoint-meta">Model: {endpoint.model}</div> : null}
-                        {endpointTestStatus[endpoint.id] ? (
-                          <div className={`endpoint-status ${endpointTestStatus[endpoint.id].startsWith("pass") ? "ok" : endpointTestStatus[endpoint.id].startsWith("fail") ? "fail" : ""}`}>
-                            {endpointTestStatus[endpoint.id]}
-                          </div>
-                        ) : null}
-                      </div>
-                      <div className="endpoint-actions">
-                        <button type="button" className="ghost" onClick={() => editEndpoint(endpoint.id)}>Edit</button>
-                        <button type="button" className="ghost" onClick={() => deleteEndpoint(endpoint.id)}>Delete</button>
-                      </div>
-                    </div>
-                  ))
-                ) : (
-                  <div className="muted">No endpoints configured.</div>
-                )}
-              </div>
-              <div className="endpoint-selectors">
-                <label className="field">
-                  <span className="field-label">Chat endpoint</span>
-                  <div className="field-inline">
-                    <select
-                      value={selectedChatEndpoint || ""}
-                      onChange={(event) => setSelectedChatEndpoint(event.target.value || null)}
-                    >
-                      <option value="">None</option>
-                      {aiEndpoints.filter((endpoint) => endpoint.type === "chat").map((endpoint) => (
-                        <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>
-                      ))}
-                    </select>
-                    <button
-                      type="button"
-                      className="ghost"
-                      disabled={!selectedChatEndpoint}
-                      onClick={() => selectedChatEndpoint && testEndpoint(selectedChatEndpoint)}
-                    >
-                      Test
-                    </button>
-                  </div>
-                </label>
-                <label className="field">
-                  <span className="field-label">Embeddings endpoint</span>
-                  <div className="field-inline">
-                    <select
-                      value={selectedEmbeddingsEndpoint || ""}
-                      onChange={(event) => setSelectedEmbeddingsEndpoint(event.target.value || null)}
-                    >
-                      <option value="">None</option>
-                      {aiEndpoints.filter((endpoint) => endpoint.type === "embeddings").map((endpoint) => (
-                        <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>
-                      ))}
-                    </select>
-                    <button
-                      type="button"
-                      className="ghost"
-                      disabled={!selectedEmbeddingsEndpoint}
-                      onClick={() => selectedEmbeddingsEndpoint && testEndpoint(selectedEmbeddingsEndpoint)}
-                    >
-                      Test
-                    </button>
-                  </div>
-                </label>
-              </div>
-              <div className="endpoint-form">
-                <div className="endpoint-form-title">{endpointDraft.id ? "Edit endpoint" : "Add endpoint"}</div>
-                <label className="field">
-                  <span className="field-label">Name</span>
-                  <input value={endpointDraft.name} onChange={(e) => setEndpointDraft({ ...endpointDraft, name: e.target.value })} />
-                </label>
-                <label className="field">
-                  <span className="field-label">URL</span>
-                  <input
-                    value={endpointDraft.url}
-                    onChange={(e) => setEndpointDraft({ ...endpointDraft, url: e.target.value })}
-                    placeholder={endpointDraft.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com"}
-                  />
-                </label>
-                <label className="field">
-                  <span className="field-label">Type</span>
-                  <select value={endpointDraft.type} onChange={(e) => setEndpointDraft({ ...endpointDraft, type: e.target.value as "chat" | "embeddings" })}>
-                    <option value="chat">Chat</option>
-                    <option value="embeddings">Embeddings</option>
-                  </select>
-                </label>
-                <label className="field">
-                  <span className="field-label">Provider</span>
-                  <select value={endpointDraft.provider} onChange={(e) => setEndpointDraft({ ...endpointDraft, provider: e.target.value as "openai" | "anthropic" })}>
-                    <option value="openai">OpenAI-compatible</option>
-                    <option value="anthropic">Anthropic</option>
-                  </select>
-                </label>
-                <label className="field">
-                  <span className="field-label">Model</span>
-                  <input value={endpointDraft.model} onChange={(e) => setEndpointDraft({ ...endpointDraft, model: e.target.value })} />
-                </label>
-                <label className="field">
-                  <span className="field-label">Token</span>
-                  <input type="password" value={endpointDraft.token} onChange={(e) => setEndpointDraft({ ...endpointDraft, token: e.target.value })} />
-                </label>
-                <div className="modal-actions">
-                  <button type="button" className="ghost" onClick={resetEndpointDraft}>Clear</button>
-                  <button type="button" onClick={saveEndpointDraft}>{endpointDraft.id ? "Update" : "Add"}</button>
-                </div>
-              </div>
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="ghost" onClick={() => setShowAiSettings(false)}>Close</button>
-            </div>
-          </div>
-        </div>
-      ) : null}
       {showSettings ? (
         <div className="modal">
           <div className="modal-backdrop" onClick={() => setShowSettings(false)} />
@@ -2178,6 +3152,97 @@ export function App() {
                   </button>
                 </div>
               </div>
+              <div className="project-properties-section">
+                <div className="project-properties-title">AI Settings</div>
+                <div className="endpoint-list">
+                  {aiEndpoints.length ? (
+                    aiEndpoints.map((endpoint) => (
+                      <div key={endpoint.id} className="endpoint-row">
+                        <div className="endpoint-main">
+                          <div className="endpoint-title">{endpoint.name}</div>
+                          <div className="endpoint-meta">{endpoint.provider.toUpperCase()} / {endpoint.type.toUpperCase()} / {endpoint.url}</div>
+                          {endpoint.model ? <div className="endpoint-meta">Model: {endpoint.model}</div> : null}
+                          {endpointTestStatus[endpoint.id] ? (
+                            <div className={`endpoint-status ${endpointTestStatus[endpoint.id].startsWith("pass") ? "ok" : endpointTestStatus[endpoint.id].startsWith("fail") ? "fail" : ""}`}>
+                              {endpointTestStatus[endpoint.id]}
+                            </div>
+                          ) : null}
+                        </div>
+                        <div className="endpoint-actions">
+                          <button type="button" className="ghost" onClick={() => editEndpoint(endpoint.id)}>Edit</button>
+                          <button type="button" className="ghost" onClick={() => deleteEndpoint(endpoint.id)}>Delete</button>
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="muted">No endpoints configured.</div>
+                  )}
+                </div>
+                <div className="endpoint-selectors">
+                  <label className="field">
+                    <span className="field-label">Chat endpoint</span>
+                    <div className="field-inline">
+                      <select
+                        value={selectedChatEndpoint || ""}
+                        onChange={(event) => setSelectedChatEndpoint(event.target.value || null)}
+                      >
+                        <option value="">None</option>
+                        {aiEndpoints.filter((endpoint) => endpoint.type === "chat").map((endpoint) => (
+                          <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        className="ghost"
+                        disabled={!selectedChatEndpoint}
+                        onClick={() => selectedChatEndpoint && testEndpoint(selectedChatEndpoint)}
+                      >
+                        Test
+                      </button>
+                    </div>
+                  </label>
+                </div>
+                <div className="endpoint-form">
+                  <div className="endpoint-form-title">{endpointDraft.id ? "Edit endpoint" : "Add endpoint"}</div>
+                  <label className="field">
+                    <span className="field-label">Name</span>
+                    <input value={endpointDraft.name} onChange={(e) => setEndpointDraft({ ...endpointDraft, name: e.target.value })} />
+                  </label>
+                  <label className="field">
+                    <span className="field-label">URL</span>
+                    <input
+                      value={endpointDraft.url}
+                      onChange={(e) => setEndpointDraft({ ...endpointDraft, url: e.target.value })}
+                      placeholder={endpointDraft.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com"}
+                    />
+                  </label>
+                  <label className="field">
+                    <span className="field-label">Type</span>
+                    <select value={endpointDraft.type} onChange={(e) => setEndpointDraft({ ...endpointDraft, type: e.target.value as "chat" | "embeddings" })}>
+                      <option value="chat">Chat</option>
+                    </select>
+                  </label>
+                  <label className="field">
+                    <span className="field-label">Provider</span>
+                    <select value={endpointDraft.provider} onChange={(e) => setEndpointDraft({ ...endpointDraft, provider: e.target.value as "openai" | "anthropic" })}>
+                      <option value="openai">OpenAI-compatible</option>
+                      <option value="anthropic">Anthropic</option>
+                    </select>
+                  </label>
+                  <label className="field">
+                    <span className="field-label">Model</span>
+                    <input value={endpointDraft.model} onChange={(e) => setEndpointDraft({ ...endpointDraft, model: e.target.value })} />
+                  </label>
+                  <label className="field">
+                    <span className="field-label">Token</span>
+                    <input type="password" value={endpointDraft.token} onChange={(e) => setEndpointDraft({ ...endpointDraft, token: e.target.value })} />
+                  </label>
+                  <div className="modal-actions">
+                    <button type="button" className="ghost" onClick={resetEndpointDraft}>Clear</button>
+                    <button type="button" onClick={saveEndpointDraft}>{endpointDraft.id ? "Update" : "Add"}</button>
+                  </div>
+                </div>
+              </div>
             </div>
             <div className="modal-actions">
               <button type="button" className="ghost" onClick={() => setShowSettings(false)}>Close</button>
@@ -2185,6 +3250,38 @@ export function App() {
           </div>
         </div>
       ) : null}
+        {aiFloatingSteps.length ? (
+          <div className="ai-floating" style={{ left: aiFloatingPos.x, top: aiFloatingPos.y }}>
+            <div
+              className="ai-floating-header"
+              onPointerDown={(event) => {
+                aiFloatingDragRef.current = {
+                  startX: event.clientX,
+                  startY: event.clientY,
+                  baseX: aiFloatingPos.x,
+                  baseY: aiFloatingPos.y,
+                };
+                (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+              }}
+            >
+              <span>Next steps</span>
+              <button type="button" className="ghost" onClick={() => setAiFloatingSteps([])}>x</button>
+            </div>
+            <div className="ai-floating-list">
+              {aiFloatingSteps.map((step) => (
+                <button
+                  key={step.id}
+                  type="button"
+                  className={`ai-floating-item ${step.recommended ? "recommended" : ""}`}
+                  onClick={() => runAiNextStep(step)}
+                >
+                  <span className="ai-floating-id">{step.id}.</span>
+                  <span className="ai-floating-label">{step.label}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
         <footer className="statusbar">
           <div className="status-left" />
           <div className="status-right">
@@ -2245,8 +3342,57 @@ export function App() {
                 <div className="compile-toast-errors-title">Parse errors</div>
                 {compileToast.parseErrors.map((file) => (
                   <div key={file.path} className="compile-toast-error-item">
-                    <div className="compile-toast-error-path">{file.path}</div>
+                    <button
+                      type="button"
+                      className="compile-toast-link"
+                      onClick={() => {
+                        const first = file.errors?.[0] || "";
+                        const loc = parseErrorLocation(first);
+                        void navigateTo({
+                          path: file.path,
+                          name: file.path.split(/[\\/]/).pop() || "Untitled",
+                          selection: loc
+                            ? {
+                                startLine: loc.line,
+                                startCol: loc.col,
+                                endLine: loc.line,
+                                endCol: loc.col + 1,
+                              }
+                            : undefined,
+                        });
+                      }}
+                    >
+                      {file.path}
+                    </button>
                     <div className="compile-toast-error-count">{file.errors.length} issues</div>
+                    {file.errors.length ? (
+                      <div className="compile-toast-error-lines">
+                        {file.errors.slice(0, 5).map((err, idx) => (
+                          <button
+                            key={`${file.path}-${idx}`}
+                            type="button"
+                            className="compile-toast-link subtle"
+                            onClick={() => {
+                              const loc = parseErrorLocation(err);
+                              void navigateTo({
+                                path: file.path,
+                                name: file.path.split(/[\\/]/).pop() || "Untitled",
+                                selection: loc
+                                  ? {
+                                      startLine: loc.line,
+                                      startCol: loc.col,
+                                      endLine: loc.line,
+                                      endCol: loc.col + 1,
+                                    }
+                                  : undefined,
+                              });
+                            }}
+                          >
+                            {err}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
                   </div>
                 ))}
               </div>

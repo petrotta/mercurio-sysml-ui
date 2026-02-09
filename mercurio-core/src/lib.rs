@@ -14,6 +14,8 @@ use syster::interchange::{detect_format, model_from_symbols, restore_ids_from_sy
 use syster::project::StdLibLoader;
 use syster::syntax::SyntaxFile;
 use syster::syntax::parser::parse_with_result;
+use syster::parser::ast::Usage;
+use syster::parser::AstNode;
 
 #[derive(Serialize, Clone)]
 pub struct CompileFileResult {
@@ -33,8 +35,9 @@ pub enum LibraryConfig {
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct ProjectConfig {
     pub library: Option<LibraryConfig>,
+    pub stdlib: Option<String>,
     pub src: Option<Vec<String>>,
-    #[serde(rename = "import")]
+    #[serde(rename = "import", alias = "import_entries")]
     pub import_entries: Option<Vec<String>>,
 }
 
@@ -55,6 +58,10 @@ pub struct ProjectDescriptorView {
     pub description: Option<String>,
     pub organization: Option<String>,
     pub default_library: bool,
+    pub stdlib: Option<String>,
+    pub library: Option<LibraryConfig>,
+    pub src: Vec<String>,
+    pub import_entries: Vec<String>,
     pub raw_json: String,
 }
 
@@ -141,20 +148,24 @@ pub struct UnresolvedRefView {
 
 #[derive(Serialize)]
 pub struct SymbolView {
-    pub file_path: String,
-    pub name: String,
-    pub short_name: Option<String>,
-    pub qualified_name: String,
-    pub kind: String,
-    pub file: u32,
-    pub start_line: u32,
-    pub start_col: u32,
-    pub end_line: u32,
-    pub end_col: u32,
-    pub short_name_start_line: Option<u32>,
-    pub short_name_start_col: Option<u32>,
-    pub short_name_end_line: Option<u32>,
-    pub short_name_end_col: Option<u32>,
+  pub file_path: String,
+  pub name: String,
+  pub short_name: Option<String>,
+  pub qualified_name: String,
+  pub kind: String,
+  pub file: u32,
+  pub start_line: u32,
+  pub start_col: u32,
+  pub end_line: u32,
+  pub end_col: u32,
+  pub expr_start_line: Option<u32>,
+  pub expr_start_col: Option<u32>,
+  pub expr_end_line: Option<u32>,
+  pub expr_end_col: Option<u32>,
+  pub short_name_start_line: Option<u32>,
+  pub short_name_start_col: Option<u32>,
+  pub short_name_end_line: Option<u32>,
+  pub short_name_end_col: Option<u32>,
     pub doc: Option<String>,
     pub supertypes: Vec<String>,
     pub relationships: Vec<RelationshipView>,
@@ -284,9 +295,12 @@ pub fn resolve_user_local_dir() -> PathBuf {
             .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
     }
 }
+pub fn resolve_mercurio_user_dir() -> PathBuf {
+    resolve_user_local_dir().join(".mercurio")
+}
 
 pub fn ensure_mercurio_paths() -> Result<MercurioPaths, String> {
-    let root = resolve_user_local_dir().join(".mercurio");
+    let root = resolve_mercurio_user_dir();
     let stdlib_root = root.join("stdlib");
     fs::create_dir_all(&stdlib_root).map_err(|e| e.to_string())?;
     let settings_path = root.join("settings.json");
@@ -656,7 +670,8 @@ pub fn compile_workspace_sync<F: Fn(CompileProgressPayload)>(
         .unwrap_or_default();
     let import_set: HashSet<PathBuf> = import_files.iter().cloned().collect();
 
-    let library_config = project_config.clone().and_then(|config| config.library);
+    let library_config = project_config.as_ref().and_then(|config| config.library.clone());
+    let stdlib_override = project_config.as_ref().and_then(|config| config.stdlib.clone());
     let (stdlib_loader, _stdlib_source, stdlib_path_for_log) = match library_config {
         Some(LibraryConfig::Path { path }) => {
             if path.trim().is_empty() {
@@ -696,12 +711,27 @@ pub fn compile_workspace_sync<F: Fn(CompileProgressPayload)>(
             }
         }
         None => {
-            let discovered = resolve_default_stdlib_path(
-                &root_path,
-                &state.stdlib_root,
-                default_stdlib.as_deref(),
-            );
-            (StdLibLoader::new(), "".to_string(), Some(discovered))
+            if let Some(stdlib_id) = stdlib_override {
+                let trimmed = stdlib_id.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+                    let discovered = resolve_default_stdlib_path(
+                        &root_path,
+                        &state.stdlib_root,
+                        default_stdlib.as_deref(),
+                    );
+                    (StdLibLoader::new(), "".to_string(), Some(discovered))
+                } else {
+                    let resolved = state.stdlib_root.join(trimmed);
+                    (StdLibLoader::new(), "".to_string(), Some(resolved))
+                }
+            } else {
+                let discovered = resolve_default_stdlib_path(
+                    &root_path,
+                    &state.stdlib_root,
+                    default_stdlib.as_deref(),
+                );
+                (StdLibLoader::new(), "".to_string(), Some(discovered))
+            }
         }
     };
     let project_set: HashSet<PathBuf> = files.iter().cloned().collect();
@@ -881,7 +911,7 @@ pub fn compile_workspace_sync<F: Fn(CompileProgressPayload)>(
                     .stack_size(64 * 1024 * 1024)
                     .spawn(move || {
                         let mut checker = SemanticChecker::new(&symbol_index);
-                        for (index, file_id) in project_file_ids.into_iter().enumerate() {
+                        for (_index, file_id) in project_file_ids.into_iter().enumerate() {
                             let canceled = canceled_compiles
                                 .lock()
                                 .map(|set| set.contains(&run_id))
@@ -914,6 +944,7 @@ pub fn compile_workspace_sync<F: Fn(CompileProgressPayload)>(
             }
 
             check_cancel()?;
+            let expr_spans_by_file = collect_expr_spans(analysis_host.files());
             let analysis_snapshot = analysis_host.analysis();
             let mut all_symbols: Vec<_> = analysis_snapshot
                 .symbol_index()
@@ -935,7 +966,8 @@ pub fn compile_workspace_sync<F: Fn(CompileProgressPayload)>(
                 .into_iter()
                 .map(|symbol| {
                     let file_path = analysis_snapshot.get_file_path(symbol.file).unwrap_or("");
-                    symbol_to_view(symbol, Path::new(file_path))
+                    let expr_spans = expr_spans_by_file.get(file_path);
+                    symbol_to_view(symbol, Path::new(file_path), expr_spans)
                 })
                 .collect();
             Ok::<(), String>(())
@@ -998,7 +1030,8 @@ pub fn export_model_to_path(
         }
     }
 
-    let library_config = project_config.clone().and_then(|config| config.library);
+    let library_config = project_config.as_ref().and_then(|config| config.library.clone());
+    let stdlib_override = project_config.as_ref().and_then(|config| config.stdlib.clone());
     let (stdlib_loader, stdlib_path_for_log) = match library_config {
         Some(LibraryConfig::Path { path }) => {
             if path.trim().is_empty() {
@@ -1038,12 +1071,27 @@ pub fn export_model_to_path(
             }
         }
         None => {
-            let discovered = resolve_default_stdlib_path(
-                &root_path,
-                &state.stdlib_root,
-                default_stdlib.as_deref(),
-            );
-            (StdLibLoader::new(), Some(discovered))
+            if let Some(stdlib_id) = stdlib_override {
+                let trimmed = stdlib_id.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
+                    let discovered = resolve_default_stdlib_path(
+                        &root_path,
+                        &state.stdlib_root,
+                        default_stdlib.as_deref(),
+                    );
+                    (StdLibLoader::new(), Some(discovered))
+                } else {
+                    let resolved = state.stdlib_root.join(trimmed);
+                    (StdLibLoader::new(), Some(resolved))
+                }
+            } else {
+                let discovered = resolve_default_stdlib_path(
+                    &root_path,
+                    &state.stdlib_root,
+                    default_stdlib.as_deref(),
+                );
+                (StdLibLoader::new(), Some(discovered))
+            }
         }
     };
     let stdlib_path_exists = stdlib_path_for_log
@@ -1114,11 +1162,16 @@ pub fn export_model_to_path(
 }
 
 pub fn load_project_descriptor(root: &Path) -> Result<Option<ProjectDescriptor>, String> {
-    let config_path = root.join(".project.json");
-    if !config_path.exists() {
+    let config_path = root.join(".project");
+    let legacy_path = root.join(".project.json");
+    let path = if config_path.exists() {
+        config_path
+    } else if legacy_path.exists() {
+        legacy_path
+    } else {
         return Ok(None);
-    }
-    let content = fs::read_to_string(config_path).map_err(|e| e.to_string())?;
+    };
+    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let parsed: ProjectDescriptor = serde_json::from_str(&content).map_err(|e| e.to_string())?;
     Ok(Some(parsed))
 }
@@ -1135,7 +1188,12 @@ pub fn get_project_descriptor_view(root: &Path) -> Result<Option<ProjectDescript
     let default_library = matches!(
         descriptor.config.library,
         Some(LibraryConfig::Default(ref value)) if value == "default"
+    ) || matches!(
+        descriptor.config.stdlib,
+        Some(ref value) if value.eq_ignore_ascii_case("default")
     );
+    let src = descriptor.config.src.clone().unwrap_or_default();
+    let import_entries = descriptor.config.import_entries.clone().unwrap_or_default();
     let raw_json = serde_json::to_string_pretty(&descriptor).map_err(|e| e.to_string())?;
     Ok(Some(ProjectDescriptorView {
         name: descriptor.name,
@@ -1143,6 +1201,10 @@ pub fn get_project_descriptor_view(root: &Path) -> Result<Option<ProjectDescript
         description: descriptor.description,
         organization: descriptor.organization,
         default_library,
+        stdlib: descriptor.config.stdlib,
+        library: descriptor.config.library,
+        src,
+        import_entries,
         raw_json,
     }))
 }
@@ -1323,9 +1385,66 @@ fn collect_model_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String
     Ok(())
 }
 
-fn symbol_to_view(symbol: HirSymbol, file_path: &Path) -> SymbolView {
+#[derive(Clone)]
+struct ExprSpan {
+    name: String,
+    name_start_line: u32,
+    name_start_col: u32,
+    expr_start_line: u32,
+    expr_start_col: u32,
+    expr_end_line: u32,
+    expr_end_col: u32,
+}
+
+fn collect_expr_spans(files: &HashMap<PathBuf, SyntaxFile>) -> HashMap<String, Vec<ExprSpan>> {
+    let mut result: HashMap<String, Vec<ExprSpan>> = HashMap::new();
+    for (path, syntax_file) in files {
+        let line_index = syntax_file.line_index();
+        let mut spans = Vec::new();
+        let root = syntax_file.parse().syntax();
+        for usage in root.descendants().filter_map(Usage::cast) {
+            let Some(name) = usage.name() else { continue };
+            let Some(name_text) = name.text() else { continue };
+            let Some(expr) = usage.value_expression() else { continue };
+            let name_range = name.syntax().text_range();
+            let expr_range = expr.syntax().text_range();
+            let name_start = line_index.line_col(name_range.start());
+            let expr_start = line_index.line_col(expr_range.start());
+            let expr_end = line_index.line_col(expr_range.end());
+            spans.push(ExprSpan {
+                name: name_text,
+                name_start_line: name_start.line,
+                name_start_col: name_start.col,
+                expr_start_line: expr_start.line,
+                expr_start_col: expr_start.col,
+                expr_end_line: expr_end.line,
+                expr_end_col: expr_end.col,
+            });
+        }
+        result.insert(path.to_string_lossy().to_string(), spans);
+    }
+    result
+}
+
+fn find_expr_span<'a>(symbol: &HirSymbol, spans: &'a [ExprSpan]) -> Option<&'a ExprSpan> {
+    spans
+        .iter()
+        .find(|span| {
+            span.name == symbol.name.as_ref()
+                && span.name_start_line == symbol.start_line
+                && span.name_start_col == symbol.start_col
+        })
+        .or_else(|| {
+            spans.iter().find(|span| {
+                span.name == symbol.name.as_ref() && span.name_start_line == symbol.start_line
+            })
+        })
+}
+
+fn symbol_to_view(symbol: HirSymbol, file_path: &Path, expr_spans: Option<&Vec<ExprSpan>>) -> SymbolView {
     let kind_label = symbol_kind_label(symbol.kind);
     let properties = build_properties(&symbol, file_path, &kind_label);
+    let expr_span = expr_spans.and_then(|spans| find_expr_span(&symbol, spans));
     SymbolView {
         file_path: file_path.to_string_lossy().to_string(),
         name: symbol.name.as_ref().to_string(),
@@ -1337,6 +1456,10 @@ fn symbol_to_view(symbol: HirSymbol, file_path: &Path) -> SymbolView {
         start_col: symbol.start_col,
         end_line: symbol.end_line,
         end_col: symbol.end_col,
+        expr_start_line: expr_span.map(|span| span.expr_start_line),
+        expr_start_col: expr_span.map(|span| span.expr_start_col),
+        expr_end_line: expr_span.map(|span| span.expr_end_line),
+        expr_end_col: expr_span.map(|span| span.expr_end_col),
         short_name_start_line: symbol.short_name_start_line,
         short_name_start_col: symbol.short_name_start_col,
         short_name_end_line: symbol.short_name_end_line,

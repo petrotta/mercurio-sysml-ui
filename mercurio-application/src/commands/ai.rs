@@ -7,6 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::command;
 
+use crate::agent::{AgentFinal, parse_agent_final};
 use crate::resolve_under_root;
 
 #[derive(Deserialize)]
@@ -35,6 +36,15 @@ pub struct AiChatPayload {
 }
 
 #[derive(Deserialize)]
+pub struct AiEmbeddingsPayload {
+    pub url: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub token: Option<String>,
+    pub input: Vec<String>,
+}
+
+#[derive(Deserialize)]
 pub struct AiAgentPayload {
     url: String,
     provider: Option<String>,
@@ -56,6 +66,8 @@ pub struct AiAgentStep {
 pub struct AiAgentResponse {
     message: String,
     steps: Vec<AiAgentStep>,
+    final_response: Option<AgentFinal>,
+    final_error: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -566,6 +578,43 @@ pub async fn ai_chat_completion(payload: AiChatPayload) -> Result<serde_json::Va
 }
 
 #[command]
+/// Sends embedding requests to the configured provider and returns vectors.
+pub async fn ai_embeddings(payload: AiEmbeddingsPayload) -> Result<Vec<Vec<f32>>, String> {
+    let provider = AiProvider::from_input(payload.provider.as_deref());
+    if provider == AiProvider::Anthropic {
+        return Err("Embeddings are not supported for Anthropic endpoints in this client yet.".to_string());
+    }
+    let adapter = adapter_for(provider);
+    let url = adapter.test_url(&payload.url, "embeddings")?;
+    let model = payload.model.unwrap_or_else(|| "text-embedding-3-small".to_string());
+    let body = serde_json::json!({
+        "model": model,
+        "input": payload.input,
+    });
+    let response = request_json(url, payload.token.as_deref(), body, adapter).await?;
+    let data = response
+        .get("data")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "Missing embeddings data".to_string())?;
+    let mut embeddings = Vec::new();
+    for entry in data {
+        let vector = entry
+            .get("embedding")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| "Missing embedding vector".to_string())?;
+        let mut out = Vec::with_capacity(vector.len());
+        for value in vector {
+            let num = value
+                .as_f64()
+                .ok_or_else(|| "Invalid embedding value".to_string())?;
+            out.push(num as f32);
+        }
+        embeddings.push(out);
+    }
+    Ok(embeddings)
+}
+
+#[command]
 /// Runs a lightweight multi-step agent loop with optional local tools.
 pub async fn ai_agent_run(payload: AiAgentPayload) -> Result<AiAgentResponse, String> {
     let provider = AiProvider::from_input(payload.provider.as_deref());
@@ -574,15 +623,49 @@ pub async fn ai_agent_run(payload: AiAgentPayload) -> Result<AiAgentResponse, St
     let root = root_path.as_deref();
 
     let mut steps = Vec::new();
+    let mut last_tool_result: Option<String> = None;
     let mut conversation = payload.messages.clone();
     let tools_enabled = payload.enable_tools.unwrap_or(true);
+    let clamp_tool_result = |value: &str| -> String {
+        const LIMIT: usize = 4000;
+        let mut out = String::new();
+        for (idx, ch) in value.chars().enumerate() {
+            if idx >= LIMIT {
+                out.push_str("\n... (truncated)");
+                break;
+            }
+            out.push(ch);
+        }
+        out
+    };
 
     if tools_enabled {
+        let root_note = root
+            .map(|path| {
+                format!(
+                    "\nWorkspace root: {}\nAll tool paths must be under this root. Prefer relative paths without a drive letter.",
+                    path.display()
+                )
+            })
+            .unwrap_or_else(|| "\nWorkspace root: (unknown)\nAll tool paths must be under the workspace root.".to_string());
         conversation.insert(
             0,
             AiMessagePayload {
                 role: "system".to_string(),
-                content: r#"You are a coding assistant with local tools. Respond ONLY with JSON using one of these actions: {"action":"final","content":"..."}, {"action":"read_file","path":"..."}, {"action":"list_dir","path":"..."}, {"action":"search_text","query":"...","limit":20}, {"action":"write_file","path":"...","content":"...","create_dirs":true}, or {"action":"apply_patch","path":"...","find":"...","replace":"...","replace_all":false,"apply":false}. Use apply_patch with apply=false first to preview; only set apply=true when confident."#.to_string(),
+                content: format!(
+                    r#"You are a coding assistant with local tools. Respond ONLY with JSON using one of these actions: {{"action":"final","content":"...json..."}}, {{"action":"read_file","path":"..."}}, {{"action":"list_dir","path":"..."}}, {{"action":"search_text","query":"...","limit":20}}, {{"action":"write_file","path":"...","content":"...","create_dirs":true}}, or {{"action":"apply_patch","path":"...","find":"...","replace":"...","replace_all":false,"apply":false}}. Use apply_patch with apply=false first to preview; only set apply=true when confident.
+All tool paths MUST be under the workspace root. Prefer relative paths like "src/foo.sysml". If a user gives an absolute path, ensure it is within the workspace root; otherwise refuse and ask for a path under the root.
+
+When you are done, respond with {{"action":"final","content":"..."}} where content is a JSON object encoded as a string in this exact shape:
+{{
+  "summary": "short summary for the user",
+  "next_steps": [
+    {{ "id": "1", "label": "step text", "recommended": true, "action": "message to the agent" }},
+    {{ "id": "2", "label": "step text", "recommended": false, "action": "message to the agent" }}
+  ]
+}}
+Mark 1-3 steps with recommended=true. Do not include any extra text outside the JSON."#
+                ) + &root_note,
             },
         );
     }
@@ -598,39 +681,68 @@ pub async fn ai_agent_run(payload: AiAgentPayload) -> Result<AiAgentResponse, St
 
         let text = adapter.extract_text(&response);
         if !tools_enabled {
-            return Ok(AiAgentResponse {
-                message: if text.is_empty() {
-                    "No response.".to_string()
+            let message = if text.is_empty() {
+                if let Some(result) = last_tool_result.as_deref() {
+                    format!("Tool result:\n{}", clamp_tool_result(result))
                 } else {
-                    text
-                },
+                    "No response.".to_string()
+                }
+            } else {
+                text
+            };
+            return Ok(AiAgentResponse {
+                message,
                 steps,
+                final_response: None,
+                final_error: None,
             });
         }
 
         let action = match parse_agent_action(&text) {
             Some(action) => action,
             None => {
-                return Ok(AiAgentResponse {
-                    message: if text.is_empty() {
-                        "No response.".to_string()
+                let message = if text.is_empty() {
+                    if let Some(result) = last_tool_result.as_deref() {
+                        format!("Tool result:\n{}", clamp_tool_result(result))
                     } else {
-                        text
-                    },
+                        "No response.".to_string()
+                    }
+                } else {
+                    text
+                };
+                return Ok(AiAgentResponse {
+                    message,
                     steps,
-                })
+                    final_response: None,
+                    final_error: Some("Invalid agent action".to_string()),
+                });
             }
         };
 
         if let AgentAction::Final { content } = action {
-            return Ok(AiAgentResponse {
-                message: content,
-                steps,
-            });
+            match parse_agent_final(&content) {
+                Ok(final_response) => {
+                    return Ok(AiAgentResponse {
+                        message: final_response.summary.clone(),
+                        steps,
+                        final_response: Some(final_response),
+                        final_error: None,
+                    });
+                }
+                Err(error) => {
+                    return Ok(AiAgentResponse {
+                        message: content,
+                        steps,
+                        final_response: None,
+                        final_error: Some(error),
+                    });
+                }
+            }
         }
 
         match run_agent_tool(action, root) {
             Ok(outcome) => {
+                last_tool_result = Some(outcome.result.clone());
                 steps.push(AiAgentStep {
                     kind: "tool".to_string(),
                     detail: outcome.detail.clone(),
@@ -661,8 +773,18 @@ pub async fn ai_agent_run(payload: AiAgentPayload) -> Result<AiAgentResponse, St
         }
     }
 
+    let message = if let Some(result) = last_tool_result.as_deref() {
+        format!(
+            "Agent stopped after max steps without a final answer.\n\nLast tool result:\n{}",
+            clamp_tool_result(result)
+        )
+    } else {
+        "Agent stopped after max steps without a final answer.".to_string()
+    };
     Ok(AiAgentResponse {
-        message: "Agent stopped after max steps without a final answer.".to_string(),
+        message,
         steps,
+        final_response: None,
+        final_error: Some("Agent stopped after max steps".to_string()),
     })
 }
