@@ -13,6 +13,8 @@ const extractSnippet = (
   startCol: number | null | undefined,
   endLine: number | null | undefined,
   endCol: number | null | undefined,
+  name?: string,
+  preferRhs = true,
 ) => {
   if (startLine == null || endLine == null) return null;
   const lines = content.split(/\r?\n/);
@@ -24,7 +26,24 @@ const extractSnippet = (
     const line = lines[start] ?? "";
     const startIdx = Math.max(0, startCol ?? 0);
     const endIdx = endCol == null ? line.length : Math.min(line.length, Math.max(startIdx, endCol));
-    return line.slice(startIdx, endIdx);
+    const slice = line.slice(startIdx, endIdx);
+    if (slice.trim().length && slice.trim().length > ((name?.length ?? 0) + 1)) {
+      if (preferRhs) {
+        const rhsIndex = slice.indexOf("=");
+        if (rhsIndex >= 0) {
+          return slice.slice(rhsIndex + 1).trim();
+        }
+      }
+      return slice;
+    }
+    const fallback = line.trim();
+    if (preferRhs) {
+      const rhsIndex = fallback.indexOf("=");
+      if (rhsIndex >= 0) {
+        return fallback.slice(rhsIndex + 1).trim();
+      }
+    }
+    return fallback;
   }
   const chunk = lines.slice(start, end + 1);
   if (chunk.length === 0) return null;
@@ -35,7 +54,24 @@ const extractSnippet = (
     const lastIndex = chunk.length - 1;
     chunk[lastIndex] = chunk[lastIndex].slice(0, Math.max(0, endCol));
   }
-  return chunk.join("\n");
+  const joined = chunk.join("\n").trim();
+  if (joined.length && joined.length > ((name?.length ?? 0) + 1)) {
+    if (preferRhs) {
+      const rhsIndex = joined.indexOf("=");
+      if (rhsIndex >= 0) {
+        return joined.slice(rhsIndex + 1).trim();
+      }
+    }
+    return joined;
+  }
+  const fallback = lines[start]?.trim() ?? joined;
+  if (preferRhs) {
+    const rhsIndex = fallback.indexOf("=");
+    if (rhsIndex >= 0) {
+      return fallback.slice(rhsIndex + 1).trim();
+    }
+  }
+  return fallback;
 };
 
 export function PropertiesPane({ selectedSymbol, getDoc, readFile }: PropertiesPaneProps) {
@@ -51,13 +87,24 @@ export function PropertiesPane({ selectedSymbol, getDoc, readFile }: PropertiesP
         return;
       }
       const cached = getDoc(selectedSymbol.file_path);
+      const hasExprRange =
+        selectedSymbol.expr_start_line != null &&
+        selectedSymbol.expr_start_col != null &&
+        selectedSymbol.expr_end_line != null &&
+        selectedSymbol.expr_end_col != null;
+      const rangeStartLine = hasExprRange ? selectedSymbol.expr_start_line : selectedSymbol.start_line;
+      const rangeStartCol = hasExprRange ? selectedSymbol.expr_start_col : selectedSymbol.start_col;
+      const rangeEndLine = hasExprRange ? selectedSymbol.expr_end_line : selectedSymbol.end_line;
+      const rangeEndCol = hasExprRange ? selectedSymbol.expr_end_col : selectedSymbol.end_col;
       if (cached) {
         const snippet = extractSnippet(
           cached.text,
-          selectedSymbol.start_line,
-          selectedSymbol.start_col,
-          selectedSymbol.end_line,
-          selectedSymbol.end_col,
+          rangeStartLine,
+          rangeStartCol,
+          rangeEndLine,
+          rangeEndCol,
+          selectedSymbol.name,
+          !hasExprRange,
         );
         setRawSnippet(snippet);
         setRawLoading(false);
@@ -69,10 +116,12 @@ export function PropertiesPane({ selectedSymbol, getDoc, readFile }: PropertiesP
         if (!active) return;
         const snippet = extractSnippet(
           content,
-          selectedSymbol.start_line,
-          selectedSymbol.start_col,
-          selectedSymbol.end_line,
-          selectedSymbol.end_col,
+          rangeStartLine,
+          rangeStartCol,
+          rangeEndLine,
+          rangeEndCol,
+          selectedSymbol.name,
+          !hasExprRange,
         );
         setRawSnippet(snippet);
       } catch {

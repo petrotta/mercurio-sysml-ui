@@ -14,6 +14,8 @@ use syster::interchange::{detect_format, model_from_symbols, restore_ids_from_sy
 use syster::project::StdLibLoader;
 use syster::syntax::SyntaxFile;
 use syster::syntax::parser::parse_with_result;
+use syster::parser::ast::Usage;
+use syster::parser::AstNode;
 
 #[derive(Serialize, Clone)]
 pub struct CompileFileResult {
@@ -146,20 +148,24 @@ pub struct UnresolvedRefView {
 
 #[derive(Serialize)]
 pub struct SymbolView {
-    pub file_path: String,
-    pub name: String,
-    pub short_name: Option<String>,
-    pub qualified_name: String,
-    pub kind: String,
-    pub file: u32,
-    pub start_line: u32,
-    pub start_col: u32,
-    pub end_line: u32,
-    pub end_col: u32,
-    pub short_name_start_line: Option<u32>,
-    pub short_name_start_col: Option<u32>,
-    pub short_name_end_line: Option<u32>,
-    pub short_name_end_col: Option<u32>,
+  pub file_path: String,
+  pub name: String,
+  pub short_name: Option<String>,
+  pub qualified_name: String,
+  pub kind: String,
+  pub file: u32,
+  pub start_line: u32,
+  pub start_col: u32,
+  pub end_line: u32,
+  pub end_col: u32,
+  pub expr_start_line: Option<u32>,
+  pub expr_start_col: Option<u32>,
+  pub expr_end_line: Option<u32>,
+  pub expr_end_col: Option<u32>,
+  pub short_name_start_line: Option<u32>,
+  pub short_name_start_col: Option<u32>,
+  pub short_name_end_line: Option<u32>,
+  pub short_name_end_col: Option<u32>,
     pub doc: Option<String>,
     pub supertypes: Vec<String>,
     pub relationships: Vec<RelationshipView>,
@@ -938,6 +944,7 @@ pub fn compile_workspace_sync<F: Fn(CompileProgressPayload)>(
             }
 
             check_cancel()?;
+            let expr_spans_by_file = collect_expr_spans(analysis_host.files());
             let analysis_snapshot = analysis_host.analysis();
             let mut all_symbols: Vec<_> = analysis_snapshot
                 .symbol_index()
@@ -959,7 +966,8 @@ pub fn compile_workspace_sync<F: Fn(CompileProgressPayload)>(
                 .into_iter()
                 .map(|symbol| {
                     let file_path = analysis_snapshot.get_file_path(symbol.file).unwrap_or("");
-                    symbol_to_view(symbol, Path::new(file_path))
+                    let expr_spans = expr_spans_by_file.get(file_path);
+                    symbol_to_view(symbol, Path::new(file_path), expr_spans)
                 })
                 .collect();
             Ok::<(), String>(())
@@ -1377,9 +1385,66 @@ fn collect_model_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String
     Ok(())
 }
 
-fn symbol_to_view(symbol: HirSymbol, file_path: &Path) -> SymbolView {
+#[derive(Clone)]
+struct ExprSpan {
+    name: String,
+    name_start_line: u32,
+    name_start_col: u32,
+    expr_start_line: u32,
+    expr_start_col: u32,
+    expr_end_line: u32,
+    expr_end_col: u32,
+}
+
+fn collect_expr_spans(files: &HashMap<PathBuf, SyntaxFile>) -> HashMap<String, Vec<ExprSpan>> {
+    let mut result: HashMap<String, Vec<ExprSpan>> = HashMap::new();
+    for (path, syntax_file) in files {
+        let line_index = syntax_file.line_index();
+        let mut spans = Vec::new();
+        let root = syntax_file.parse().syntax();
+        for usage in root.descendants().filter_map(Usage::cast) {
+            let Some(name) = usage.name() else { continue };
+            let Some(name_text) = name.text() else { continue };
+            let Some(expr) = usage.value_expression() else { continue };
+            let name_range = name.syntax().text_range();
+            let expr_range = expr.syntax().text_range();
+            let name_start = line_index.line_col(name_range.start());
+            let expr_start = line_index.line_col(expr_range.start());
+            let expr_end = line_index.line_col(expr_range.end());
+            spans.push(ExprSpan {
+                name: name_text,
+                name_start_line: name_start.line,
+                name_start_col: name_start.col,
+                expr_start_line: expr_start.line,
+                expr_start_col: expr_start.col,
+                expr_end_line: expr_end.line,
+                expr_end_col: expr_end.col,
+            });
+        }
+        result.insert(path.to_string_lossy().to_string(), spans);
+    }
+    result
+}
+
+fn find_expr_span<'a>(symbol: &HirSymbol, spans: &'a [ExprSpan]) -> Option<&'a ExprSpan> {
+    spans
+        .iter()
+        .find(|span| {
+            span.name == symbol.name.as_ref()
+                && span.name_start_line == symbol.start_line
+                && span.name_start_col == symbol.start_col
+        })
+        .or_else(|| {
+            spans.iter().find(|span| {
+                span.name == symbol.name.as_ref() && span.name_start_line == symbol.start_line
+            })
+        })
+}
+
+fn symbol_to_view(symbol: HirSymbol, file_path: &Path, expr_spans: Option<&Vec<ExprSpan>>) -> SymbolView {
     let kind_label = symbol_kind_label(symbol.kind);
     let properties = build_properties(&symbol, file_path, &kind_label);
+    let expr_span = expr_spans.and_then(|spans| find_expr_span(&symbol, spans));
     SymbolView {
         file_path: file_path.to_string_lossy().to_string(),
         name: symbol.name.as_ref().to_string(),
@@ -1391,6 +1456,10 @@ fn symbol_to_view(symbol: HirSymbol, file_path: &Path) -> SymbolView {
         start_col: symbol.start_col,
         end_line: symbol.end_line,
         end_col: symbol.end_col,
+        expr_start_line: expr_span.map(|span| span.expr_start_line),
+        expr_start_col: expr_span.map(|span| span.expr_start_col),
+        expr_end_line: expr_span.map(|span| span.expr_end_line),
+        expr_end_col: expr_span.map(|span| span.expr_end_col),
         short_name_start_line: symbol.short_name_start_line,
         short_name_start_col: symbol.short_name_start_col,
         short_name_end_line: symbol.short_name_end_line,

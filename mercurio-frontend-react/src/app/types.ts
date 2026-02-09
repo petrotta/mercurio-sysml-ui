@@ -50,6 +50,10 @@ export type SymbolView = {
   start_col: number;
   end_line: number;
   end_col: number;
+  expr_start_line?: number;
+  expr_start_col?: number;
+  expr_end_line?: number;
+  expr_end_col?: number;
   doc?: string | null;
   properties: SymbolProperty[];
 };
