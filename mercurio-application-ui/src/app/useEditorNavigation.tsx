@@ -1,6 +1,6 @@
 import { useEffect, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { PROJECT_DESCRIPTOR_TAB } from "./constants";
+import { readFileText } from "./fileOps";
 import type { OpenTab } from "./types";
 
 type EditorSelection = { startLine: number; startCol: number; endLine: number; endCol: number };
@@ -73,7 +73,7 @@ export function useEditorNavigation({
             editorRef.current.setValue(cached.text);
           }
         } else {
-          const content = await invoke<string>("read_file", { path: target.path });
+          const content = await readFileText(target.path);
           if (reqId !== navReqRef.current) return;
           suppressDirtyRef.current = true;
           setActiveEditorDoc(target.path, content || "", false);
@@ -83,7 +83,7 @@ export function useEditorNavigation({
           }
         }
       } else {
-        const content = await invoke<string>("read_file", { path: target.path });
+        const content = await readFileText(target.path);
         if (reqId !== navReqRef.current) return;
         suppressDirtyRef.current = true;
         setActiveEditorDoc(target.path, content || "", false);

@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.markpetrotta.mercurio",
   "build": {
-    "frontendDist": "../mercurio-frontend-react/dist",
+    "frontendDist": "../mercurio-application-ui/dist",
     "devUrl": "http://localhost:5173",
-    "beforeBuildCommand": "npm --prefix mercurio-frontend-react run build && cargo build -p mercurio-cli --release --manifest-path Cargo.toml && powershell -NoProfile -Command \"$root = Resolve-Path ..; Copy-Item (Join-Path $root 'target\\\\release\\\\mercurio-cli.exe') (Join-Path $root 'target\\\\release\\\\mercurio-cli-x86_64-pc-windows-msvc.exe') -Force\""
+    "beforeBuildCommand": "npm --prefix mercurio-application-ui run build && cargo build -p mercurio-cli --release --manifest-path Cargo.toml && powershell -NoProfile -Command \"$root = Resolve-Path ..; Copy-Item (Join-Path $root 'target\\\\release\\\\mercurio-cli.exe') (Join-Path $root 'target\\\\release\\\\mercurio-cli-x86_64-pc-windows-msvc.exe') -Force\""
   },
   "app": {
     "withGlobalTauri": true,

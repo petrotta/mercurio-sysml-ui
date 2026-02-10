@@ -25,6 +25,7 @@ type UseModelTreeOptions = {
   errorCounts: CountSummary;
   projectSymbolsLoaded: boolean;
   getKindKey: (kind: string) => string;
+  showUsages: boolean;
 };
 
 export function useModelTree({
@@ -39,6 +40,7 @@ export function useModelTree({
   errorCounts,
   projectSymbolsLoaded,
   getKindKey,
+  showUsages,
 }: UseModelTreeOptions) {
   const buildSymbolTree = (list: SymbolView[]) => {
     const root: SymbolNode = {
@@ -67,6 +69,10 @@ export function useModelTree({
       });
     });
     return root;
+  };
+
+  const isUsageSymbol = (symbol: SymbolView) => {
+    return (symbol.properties || []).some((prop) => prop.name.startsWith("usage_"));
   };
 
   const buildRowsForTree = (
@@ -128,11 +134,12 @@ export function useModelTree({
     const pushSymbolGroups = (groups: SymbolGroup[], sectionKey: string) => {
       groups.forEach((group) => {
         const rootLabel = group.path.split(/[\\/]/).pop() || group.path;
+        const filtered = showUsages ? group.list : group.list.filter((symbol) => !isUsageSymbol(symbol));
         const fileRow: SymbolNode = {
           name: rootLabel,
           fullName: `${sectionKey}::${group.path}`,
           symbols: [],
-          children: new Map([[rootLabel, buildSymbolTree(group.list)]]),
+          children: new Map([[rootLabel, buildSymbolTree(filtered)]]),
         };
         const builtRows = buildRowsForTree(fileRow, rootLabel, `${sectionKey}::${group.path}`, modelExpanded, collapseAllModel);
         builtRows.forEach((row) => {
@@ -218,6 +225,7 @@ export function useModelTree({
     errorCounts.symbolCount,
     projectSymbolsLoaded,
     getKindKey,
+    showUsages,
   ]);
 
   return { modelRows };

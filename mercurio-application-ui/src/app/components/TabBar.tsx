@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getTabIcon, getTabKindClass } from "../tabs";
 import type { OpenTab } from "../types";
 
@@ -15,10 +15,24 @@ type TabBarProps = {
 
 export function TabBar(props: TabBarProps) {
   const draggedTabPathRef = useRef<string | null>(null);
+  const tabsRef = useRef<HTMLDivElement | null>(null);
+  const [hasOverflow, setHasOverflow] = useState(false);
+
+  useEffect(() => {
+    const el = tabsRef.current;
+    if (!el) return;
+    const update = () => {
+      setHasOverflow(el.scrollWidth > el.clientWidth + 2);
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [props.openTabs.length]);
 
   return (
     <div className="panel-header editor-tabs">
-      <div className="tabs">
+      <div className="tabs" ref={tabsRef}>
         {props.openTabs.length ? (
           props.openTabs.map((tab) => (
             <button
@@ -73,7 +87,7 @@ export function TabBar(props: TabBarProps) {
           <div className="muted">No files open.</div>
         )}
       </div>
-      {props.openTabs.length ? (
+      {props.openTabs.length && hasOverflow ? (
         <div className="tab-overflow">
           <button
             type="button"

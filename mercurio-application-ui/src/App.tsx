@@ -1,6 +1,8 @@
-import "./style.css";
+﻿import "./style.css";
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import type { MouseEvent as ReactMouseEvent } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getName, getTauriVersion, getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import MonacoEditor, { loader, type OnMount } from "@monaco-editor/react";
@@ -12,6 +14,8 @@ import {
   PROJECT_LOCATION_KEY,
   ROOT_STORAGE_KEY,
   THEME_KEY,
+  TRACK_TEXT_KEY,
+  FILTER_MODEL_FILES_KEY,
 } from "./app/constants";
 import { loadRecents, saveRecents } from "./app/storage";
 import { useEditorState } from "./app/editorState";
@@ -23,6 +27,9 @@ import { ProjectTree } from "./app/components/ProjectTree";
 import { DataView } from "./app/components/DataView";
 import { DescriptorView } from "./app/components/DescriptorView";
 import { DiagramView } from "./app/components/DiagramView";
+import { AstStatus } from "./app/components/AstStatus";
+import { CompileToastPanel } from "./app/components/CompileToast";
+import { Modal } from "./app/components/Modal";
 import { getKindKey, renderTypeIcon } from "./app/diagramIcons";
 import { useModelTracking } from "./app/useModelTracking";
 import { useDiagramView } from "./app/useDiagramView";
@@ -33,7 +40,11 @@ import { useModelGroups } from "./app/useModelGroups";
 import { useTabs } from "./app/useTabs";
 import { useEditorNavigation } from "./app/useEditorNavigation";
 import { useCompileRunner } from "./app/useCompileRunner";
+import { useAstLoader } from "./app/useAstLoader";
+import { readFileText } from "./app/fileOps";
+import { useProjectTree } from "./app/useProjectTree";
 import { runAgent } from "./app/agentClient";
+import { parseErrorLocation } from "./app/parseErrors";
 import type { FileEntry, OpenTab, SymbolView } from "./app/types";
 
 loader.config({ paths: { vs: "/monaco/vs" } });
@@ -55,8 +66,7 @@ export function App() {
   const startRef = useRef({ x: 0, y: 0, left: 240, right: 320, model: 260 });
   const [rootPath, setRootPath] = useState<string>(() => window.localStorage?.getItem(ROOT_STORAGE_KEY) || "");
   const [recentProjects, setRecentProjects] = useState<string[]>(() => loadRecents());
-  const [treeEntries, setTreeEntries] = useState<FileEntry[]>([]);
-  const [expanded, setExpanded] = useState<Record<string, FileEntry[]>>({});
+  const { treeEntries, expanded, refreshRoot, toggleExpand } = useProjectTree();
   const {
     editorValueRef,
     editorChangeTick,
@@ -79,9 +89,26 @@ export function App() {
   const [descriptorViewMode, setDescriptorViewMode] = useState<"view" | "json">("view");
   const suppressDirtyRef = useRef(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; entry: FileEntry; scope: "root" | "node" } | null>(null);
+  const [modelContextMenu, setModelContextMenu] = useState<{ x: number; y: number; filePath: string | null; label: string } | null>(null);
+  const [astViewOpen, setAstViewOpen] = useState(false);
+  const [astViewTitle, setAstViewTitle] = useState("");
+  const { astState: astViewState, loadForPath: loadAstViewForPath } = useAstLoader();
   const [tabMenu, setTabMenu] = useState<{ x: number; y: number; path: string } | null>(null);
   const [tabOverflowOpen, setTabOverflowOpen] = useState(false);
-  const [showProjectInfo, setShowProjectInfo] = useState(false);
+  const [showUsageNodes, setShowUsageNodes] = useState(true);
+  const [showAstSplit, setShowAstSplit] = useState(false);
+  const {
+    astState: astSplitState,
+    setAstState: setAstSplitState,
+    loadForContent: loadAstSplitForContent,
+    clearTimer: clearAstSplitTimer,
+  } = useAstLoader();
+  const [showAbout, setShowAbout] = useState(false);
+  const [aboutVersion, setAboutVersion] = useState<string | null>(null);
+  const [aboutBuild, setAboutBuild] = useState<string | null>(null);
+  const astEditorRef = useRef<Parameters<OnMount>[0] | null>(null);
+  const astScrollSyncRef = useRef<{ dispose: () => void } | null>(null);
+  const astCursorSyncRef = useRef<{ dispose: () => void } | null>(null);
   const [hasProjectDescriptor, setHasProjectDescriptor] = useState(false);
   const [gitInfo, setGitInfo] = useState<{
     repo_root: string;
@@ -103,10 +130,6 @@ export function App() {
   const [gitCommitBusy, setGitCommitBusy] = useState(false);
   const [gitCommitError, setGitCommitError] = useState("");
   const [gitCommitSelection, setGitCommitSelection] = useState<Record<string, boolean>>({});
-  const [gitCommitSectionsOpen, setGitCommitSectionsOpen] = useState({
-    changes: true,
-    unversioned: false,
-  });
   const [gitPushBusy, setGitPushBusy] = useState(false);
   const [gitPushError, setGitPushError] = useState("");
   const [gitBranches, setGitBranches] = useState<string[]>([]);
@@ -155,6 +178,7 @@ export function App() {
   const [exportIncludeStdlib, setExportIncludeStdlib] = useState(true);
   const [exportPath, setExportPath] = useState("");
   const [exportBusy, setExportBusy] = useState(false);
+  const [exportAfterBuild, setExportAfterBuild] = useState(false);
   const [showNewProject, setShowNewProject] = useState(false);
   const [showOpenProject, setShowOpenProject] = useState(false);
   const [openProjectPath, setOpenProjectPath] = useState("");
@@ -240,15 +264,30 @@ export function App() {
     unresolved,
     libraryPath,
     projectSymbolsLoaded,
+    parseErrorPaths,
   } = useCompileRunner({ rootPath });
   const [dataExcludeStdlib, setDataExcludeStdlib] = useState(true);
   const [selectedSymbol, setSelectedSymbol] = useState<SymbolView | null>(null);
+  const [selectedNodeSymbols, setSelectedNodeSymbols] = useState<SymbolView[] | null>(null);
   const [modelTreeHeight, setModelTreeHeight] = useState(260);
   const [collapseAllModel, setCollapseAllModel] = useState(false);
   const [showPropertiesPane, setShowPropertiesPane] = useState(true);
-  const [trackText, setTrackText] = useState(false);
+  const [trackText, setTrackText] = useState(() => {
+    try {
+      return window.localStorage?.getItem(TRACK_TEXT_KEY) === "true";
+    } catch {
+      return false;
+    }
+  });
   const [modelExpanded, setModelExpanded] = useState<Record<string, boolean>>({});
   const [modelSectionOpen, setModelSectionOpen] = useState({ project: true, library: true, errors: true });
+  const [showOnlyModelFiles, setShowOnlyModelFiles] = useState(() => {
+    try {
+      return window.localStorage?.getItem(FILTER_MODEL_FILES_KEY) === "true";
+    } catch {
+      return false;
+    }
+  });
   const modelTreeRef = useRef<HTMLDivElement | null>(null);
   const modelPaneContainerRef = useRef<HTMLDivElement | null>(null);
   const [modelPaneHeight, setModelPaneHeight] = useState(0);
@@ -306,13 +345,92 @@ export function App() {
   }, [activeDoc, currentFilePathRef]);
 
   useEffect(() => {
-    const onDocClick = (event: MouseEvent) => {
+    if (!showAstSplit) return;
+    if (!activeEditorPath) {
+      setAstSplitState({ content: "", error: "No active file.", loading: false });
+      return;
+    }
+    const lower = activeEditorPath.toLowerCase();
+    if (!lower.endsWith(".sysml") && !lower.endsWith(".kerml")) {
+      setAstSplitState({ content: "", error: "AST is only available for .sysml and .kerml files.", loading: false });
+      return;
+    }
+    const content = editorValueRef.current;
+    loadAstSplitForContent(activeEditorPath, content);
+    return () => {
+      clearAstSplitTimer();
+    };
+  }, [showAstSplit, activeEditorPath, editorChangeTick, loadAstSplitForContent, setAstSplitState, clearAstSplitTimer]);
+
+  const attachAstSync = () => {
+    const editor = editorRef.current;
+    const astEditor = astEditorRef.current;
+    if (!showAstSplit || !editor || !astEditor) return;
+    if (astScrollSyncRef.current) {
+      astScrollSyncRef.current.dispose();
+      astScrollSyncRef.current = null;
+    }
+    if (astCursorSyncRef.current) {
+      astCursorSyncRef.current.dispose();
+      astCursorSyncRef.current = null;
+    }
+    const syncScroll = () => {
+      const scrollTop = editor.getScrollTop();
+      const scrollHeight = editor.getScrollHeight();
+      const layout = editor.getLayoutInfo();
+      const maxEditor = Math.max(1, scrollHeight - layout.height);
+      const ratio = scrollTop / maxEditor;
+      const astScrollHeight = astEditor.getScrollHeight();
+      const astLayout = astEditor.getLayoutInfo();
+      const maxAst = Math.max(1, astScrollHeight - astLayout.height);
+      astEditor.setScrollTop(ratio * maxAst);
+    };
+    astScrollSyncRef.current = editor.onDidScrollChange(syncScroll);
+    astCursorSyncRef.current = editor.onDidChangeCursorPosition((event) => {
+      const model = editor.getModel();
+      const astModel = astEditor.getModel();
+      if (!model || !astModel) return;
+      const lineCount = model.getLineCount();
+      const astLineCount = astModel.getLineCount();
+      if (lineCount <= 0 || astLineCount <= 0) return;
+      const ratio = event.position.lineNumber / lineCount;
+      const astLine = Math.max(1, Math.min(astLineCount, Math.round(ratio * astLineCount)));
+      astEditor.revealLineInCenter(astLine);
+    });
+    syncScroll();
+  };
+
+  useEffect(() => {
+    if (!showAstSplit) return;
+    attachAstSync();
+    return () => {
+      astScrollSyncRef.current?.dispose();
+      astScrollSyncRef.current = null;
+      astCursorSyncRef.current?.dispose();
+      astCursorSyncRef.current = null;
+    };
+  }, [showAstSplit]);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor) return;
+    const raf = window.requestAnimationFrame(() => {
+      editor.layout();
+      astEditorRef.current?.layout();
+      attachAstSync();
+    });
+    return () => window.cancelAnimationFrame(raf);
+  }, [showAstSplit]);
+
+  useEffect(() => {
+    const onDocClick = (event: globalThis.MouseEvent) => {
       const target = event.target as HTMLElement | null;
       if (!target || !target.closest(".menu-button") && !target.closest(".menu-dropdown")) {
         setOpenMenu(null);
       }
       if (!target || !target.closest(".context-menu")) {
         setContextMenu(null);
+        setModelContextMenu(null);
       }
       if (!target || !target.closest(".tab-menu")) {
         setTabMenu(null);
@@ -326,8 +444,55 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    const unlistenPromise = listen<string>("menu-action", (event) => {
+      if (event.payload === "about") {
+        setShowAbout(true);
+      } else if (event.payload === "compile-workspace") {
+        void runCompile();
+      } else if (event.payload === "build-options") {
+        openBuildOptions();
+      }
+    });
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const loadAbout = async () => {
+      try {
+        const [version, tauriVersion, appName] = await Promise.all([
+          getVersion(),
+          getTauriVersion(),
+          getName(),
+        ]);
+        if (!active) return;
+        setAboutVersion(`${appName} ${version}`);
+        setAboutBuild(`Tauri ${tauriVersion}`);
+      } catch {
+        if (!active) return;
+        setAboutVersion(null);
+        setAboutBuild(null);
+      }
+    };
+    void loadAbout();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
     window.localStorage?.setItem(AI_ENDPOINTS_KEY, JSON.stringify(aiEndpoints));
   }, [aiEndpoints]);
+
+  useEffect(() => {
+    window.localStorage?.setItem(TRACK_TEXT_KEY, trackText ? "true" : "false");
+  }, [trackText]);
+
+  useEffect(() => {
+    window.localStorage?.setItem(FILTER_MODEL_FILES_KEY, showOnlyModelFiles ? "true" : "false");
+  }, [showOnlyModelFiles]);
 
 
   useEffect(() => {
@@ -598,12 +763,6 @@ export function App() {
     document.body.classList.add("dragging");
   };
 
-  const refreshRoot = async (path: string) => {
-    const entries = await invoke<FileEntry[]>("list_dir", { path });
-    setTreeEntries(entries || []);
-    setExpanded({});
-  };
-
   const refreshGitInfo = async (path: string) => {
     if (!path) {
       setGitInfo(null);
@@ -666,19 +825,6 @@ export function App() {
     setShowOpenProject(false);
   };
 
-  const toggleExpand = async (entry: FileEntry) => {
-    if (!entry.is_dir) return;
-    if (expanded[entry.path]) {
-      setExpanded((prev) => {
-        const next = { ...prev };
-        delete next[entry.path];
-        return next;
-      });
-      return;
-    }
-    const children = await invoke<FileEntry[]>("list_dir", { path: entry.path });
-    setExpanded((prev) => ({ ...prev, [entry.path]: children || [] }));
-  };
   const { navigateTo, applyEditorSelection } = useEditorNavigation({
     centerView,
     setCenterView,
@@ -714,7 +860,6 @@ export function App() {
     setCenterView,
     setActiveEditorDoc,
     setDescriptorViewMode,
-    setShowProjectInfo,
     setProjectDescriptor,
     setHasProjectDescriptor,
     clearPendingEditorContent,
@@ -739,13 +884,14 @@ export function App() {
     await navigateTo({ path: entry.path, name: entry.name });
   };
 
-  const showContext = (event: React.MouseEvent, entry: FileEntry) => {
+  const showContext = (event: ReactMouseEvent, entry: FileEntry) => {
     event.preventDefault();
     event.stopPropagation();
     setContextMenu({ x: event.clientX, y: event.clientY, entry, scope: "node" });
+    setModelContextMenu(null);
   };
 
-  const showRootContext = (event: React.MouseEvent) => {
+  const showRootContext = (event: ReactMouseEvent) => {
     if (!rootPath) return;
     event.preventDefault();
     event.stopPropagation();
@@ -755,6 +901,20 @@ export function App() {
       scope: "root",
       entry: { name: rootPath.split(/[\\/]/).pop() || rootPath, path: rootPath, is_dir: true },
     });
+    setModelContextMenu(null);
+  };
+
+  const showModelContext = (event: ReactMouseEvent, payload: { filePath: string | null; label: string }) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setModelContextMenu({ x: event.clientX, y: event.clientY, filePath: payload.filePath, label: payload.label });
+    setContextMenu(null);
+  };
+
+  const openAstView = async (filePath: string, label: string) => {
+    setAstViewTitle(label);
+    setAstViewOpen(true);
+    await loadAstViewForPath(filePath);
   };
 
   const handleContextAction = async (action: string) => {
@@ -850,7 +1010,6 @@ export function App() {
     setGitPushError("");
     setGitCommitMessage("");
     setGitCommitSelection({});
-    setGitCommitSectionsOpen({ changes: true, unversioned: false });
     if (!gitInfo) {
       setGitStatus(null);
       setGitStatusBusy(false);
@@ -962,7 +1121,12 @@ export function App() {
     setGitCommitSelection((prev) => ({ ...prev, [path]: !prev[path] }));
   };
 
-  const toggleCommitSectionAll = (section: "changes" | "unversioned", checked: boolean) => {
+  const [gitCommitSectionsOpen, setGitCommitSectionsOpen] = useState({
+    changes: true,
+    unversioned: true,
+  });
+
+  const toggleCommitAll = (section: "changes" | "unversioned", checked: boolean) => {
     if (!gitStatus) return;
     const paths = section === "changes"
       ? [...gitStatus.staged, ...gitStatus.unstaged]
@@ -1172,10 +1336,18 @@ export function App() {
       await navigateTo({ path: createdPath, name: finalName });
     };
 
-  const openExportDialog = () => {
+  const getDefaultBuildPath = (format: "jsonld" | "kpar" | "xmi") => {
+    if (!rootPath) return "";
+    const folder = `${rootPath}\\build`;
+    const ext = format;
+    return `${folder}\\model.${ext}`;
+  };
+
+  const openBuildOptions = () => {
     setExportFormat("jsonld");
     setExportIncludeStdlib(true);
-    setExportPath("");
+    setExportAfterBuild(false);
+    setExportPath(getDefaultBuildPath("jsonld"));
     setShowExport(true);
   };
 
@@ -1183,6 +1355,12 @@ export function App() {
     if (!rootPath || !exportPath) {
       setCompileStatus("Export requires a project root and output path");
       return;
+    }
+    if (rootPath && exportPath.startsWith(rootPath)) {
+      const buildDir = `${rootPath}\\build`;
+      if (exportPath.toLowerCase().startsWith(buildDir.toLowerCase())) {
+        await invoke("create_dir", { root: rootPath, parent: rootPath, name: "build" }).catch(() => {});
+      }
     }
     try {
       setExportBusy(true);
@@ -1200,6 +1378,23 @@ export function App() {
       setCompileStatus(`Export failed: ${error}`);
     } finally {
       setExportBusy(false);
+    }
+  };
+
+  const runBuildWithOptions = async () => {
+    if (!rootPath) {
+      setCompileStatus("Build requires a project root");
+      return;
+    }
+    const ok = await runCompile();
+    if (exportAfterBuild) {
+      if (!exportPath) {
+        setCompileStatus("Export after build requires an output path");
+        return;
+      }
+      if (ok) {
+        await runExportModel();
+      }
     }
   };
 
@@ -1223,7 +1418,7 @@ export function App() {
         const cached = getDoc(changedPath);
         if (cached && !cached.dirty) {
           try {
-            const content = await invoke<string>("read_file", { path: changedPath });
+            const content = await readFileText(changedPath);
             updateDocContent(changedPath, content || "", false);
             if (currentFilePathRef.current === changedPath && editorRef.current && centerView === "file") {
               suppressDirtyRef.current = true;
@@ -1360,6 +1555,14 @@ export function App() {
         ],
       },
     });
+
+    // Ensure Ctrl+/ toggles line comments.
+    editorInstance.addAction({
+      id: "toggle-line-comment",
+      label: "Toggle Line Comment",
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Slash],
+      run: () => editorInstance.getAction("editor.action.commentLine")?.run(),
+    });
     monaco.editor.setTheme(appTheme === "light" ? "vs" : "vs-dark");
     editorInstance.focus();
   };
@@ -1411,7 +1614,6 @@ export function App() {
 
   const selectSymbolInEditor = async (symbol: SymbolView) => {
     if (!symbol) return;
-    if (symbol.name?.startsWith("<anon")) return;
     if (!symbol.file_path) return;
     const startLine = (symbol.start_line ?? 0) + 1;
     const startCol = (symbol.start_col ?? 0) + 1;
@@ -1474,7 +1676,7 @@ export function App() {
           setTabMenu(null);
           return;
         }
-        if (showProjectInfo && activeTabPath === PROJECT_DESCRIPTOR_TAB) {
+        if (activeTabPath === PROJECT_DESCRIPTOR_TAB) {
           closeTab(PROJECT_DESCRIPTOR_TAB);
           return;
         }
@@ -1851,7 +2053,7 @@ export function App() {
             await Promise.all(
               Array.from(touched).map(async (path) => {
                 try {
-                  const content = await invoke<string>("read_file", { path });
+                  const content = await readFileText(path);
                   updateDocContent(path, content || "", false);
                   if (currentFilePathRef.current === path && editorRef.current && centerView === "file") {
                     suppressDirtyRef.current = true;
@@ -1924,20 +2126,6 @@ export function App() {
       setAiHistoryIndex(null);
     };
 
-  const parseErrorLocation = (text: string) => {
-    if (!text) return null;
-    const colonMatch = text.match(/:(\d+):(\d+)/);
-    if (colonMatch) {
-      return { line: Number(colonMatch[1]) || 1, col: Number(colonMatch[2]) || 1 };
-    }
-    const lineMatch = text.match(/line\s+(\d+)/i);
-    const colMatch = text.match(/col(?:umn)?\s+(\d+)/i);
-    if (lineMatch) {
-      return { line: Number(lineMatch[1]) || 1, col: colMatch ? Number(colMatch[1]) || 1 : 1 };
-    }
-    return null;
-  };
-
   const deferredSymbols = useDeferredValue(symbols);
   const deferredUnresolved = useDeferredValue(unresolved);
 
@@ -1983,6 +2171,7 @@ export function App() {
     errorCounts,
     projectSymbolsLoaded,
     getKindKey,
+    showUsages: showUsageNodes,
   });
 
   const effectiveModelTreeHeight = showPropertiesPane
@@ -2006,6 +2195,7 @@ export function App() {
     setModelExpanded,
     selectedSymbol,
     setSelectedSymbol,
+    setSelectedNodeSymbols,
     selectSymbolInEditor,
     navigateTo,
     projectGroups,
@@ -2046,13 +2236,14 @@ export function App() {
     setCompileStatus,
   });
 
-  const { trackCandidate, trackNow } = useModelTracking({
+  const { trackCandidate } = useModelTracking({
     symbols,
     activeEditorPath,
     cursorPos,
     enabled: trackText,
     onTrack: (symbol) => {
       setSelectedSymbol(symbol);
+      setSelectedNodeSymbols([symbol]);
       syncModelTreeToSymbol(symbol);
     },
   });
@@ -2065,11 +2256,13 @@ export function App() {
         modelSectionIndent,
         modelTreeRef,
         handleModelTreeKeyDown,
+        onModelContextMenu: showModelContext,
         setModelCursorIndex,
         setModelSectionOpen,
         setModelExpanded,
         selectedSymbol,
         setSelectedSymbol,
+        setSelectedNodeSymbols,
         selectSymbolInEditor,
         navigateTo,
         renderTypeIcon,
@@ -2079,8 +2272,10 @@ export function App() {
       modelSectionOpen,
       modelSectionIndent,
       handleModelTreeKeyDown,
+      showModelContext,
       selectedSymbol,
       setSelectedSymbol,
+      setSelectedNodeSymbols,
       selectSymbolInEditor,
       navigateTo,
       renderTypeIcon,
@@ -2130,6 +2325,17 @@ export function App() {
             <div className="menu-dropdown" data-tauri-drag-region="false">
               <button type="button">Project Panel</button>
               <button type="button">Model Panel</button>
+              <div className="menu-divider" />
+              <div className="menu-header">Debug</div>
+              <button
+                type="button"
+                onClick={() => {
+                  setOpenMenu(null);
+                  setShowAstSplit((prev) => !prev);
+                }}
+              >
+                {showAstSplit ? "✓ " : ""}AST Split
+              </button>
               <div className="menu-divider" />
               <button type="button" onClick={() => { setOpenMenu(null); openAiViewTab(); }}>Agent</button>
               <button type="button" onClick={() => { setOpenMenu(null); openDataViewTab(); }}>Data Analysis View</button>
@@ -2184,8 +2390,8 @@ export function App() {
               <button type="button" className="menu-button" onClick={() => setOpenMenu(openMenu === "Build" ? null : "Build")}>Build</button>
               {openMenu === "Build" ? (
             <div className="menu-dropdown" data-tauri-drag-region="false">
-              <button type="button" onClick={() => { setOpenMenu(null); runCompile(); }}>Build Workspace</button>
-              <button type="button" onClick={() => { setOpenMenu(null); openExportDialog(); }}>Export Model</button>
+              <button type="button" onClick={() => { setOpenMenu(null); void runCompile(); }}>Build</button>
+              <button type="button" onClick={() => { setOpenMenu(null); openBuildOptions(); }}>Show Build Options</button>
             </div>
               ) : null}
             </div>
@@ -2193,7 +2399,7 @@ export function App() {
               <button type="button" className="menu-button" onClick={() => setOpenMenu(openMenu === "Help" ? null : "Help")}>Help</button>
               {openMenu === "Help" ? (
             <div className="menu-dropdown" data-tauri-drag-region="false">
-              <button type="button">About</button>
+              <button type="button" onClick={() => { setOpenMenu(null); setShowAbout(true); }}>About</button>
             </div>
               ) : null}
             </div>
@@ -2233,8 +2439,7 @@ export function App() {
       <main className="content">
           {leftCollapsed ? <div className="panel-spacer" /> : (
             <section className="panel sidebar">
-              <div className="panel-header">
-                <span>Project</span>
+              <div className="project-actions inline">
                 <button
                   type="button"
                   className="ghost collapse-btn"
@@ -2244,10 +2449,8 @@ export function App() {
                   }}
                   title="Collapse project"
                 >
-                  «
+                  {"<<"}
                 </button>
-              </div>
-            <div className="project-actions inline">
                 <button type="button" className="icon-button" onClick={chooseProject} aria-label="Open Project" title="Open Project" />
                 <select className="recent-select" value="" onChange={(e) => openProject(e.target.value)} aria-label="Open recent" title="Open recent">
                   <option value="">Recent</option>
@@ -2255,6 +2458,15 @@ export function App() {
                     <option key={path} value={path}>{path}</option>
                   ))}
                 </select>
+                <button
+                  type="button"
+                  className={`ghost ${showOnlyModelFiles ? "active" : ""}`}
+                  onClick={() => setShowOnlyModelFiles((prev) => !prev)}
+                  title={showOnlyModelFiles ? "Show all files" : "Filter to .sysml/.kerml"}
+                  aria-label="Filter SysML/KerML"
+                >
+                  <span className="icon-filter" aria-hidden="true" />
+                </button>
             </div>
           <div className="project-root">
             {rootPath ? (
@@ -2273,6 +2485,8 @@ export function App() {
               onOpenFile={openFile}
               onContextMenu={showContext}
               onRootContextMenu={showRootContext}
+              showOnlyModelFiles={showOnlyModelFiles}
+              parseErrorPaths={parseErrorPaths}
             />
             </section>
           )}
@@ -2290,7 +2504,7 @@ export function App() {
                 }}
                 title="Restore project"
               >
-                »
+                {">>"}
               </button>
             ) : null}
           </div>
@@ -2361,36 +2575,66 @@ export function App() {
                         aria-pressed={trackText}
                         aria-label="Track text"
                       />
-                      <span className="editor-toolbar-label">Track text</span>
                     </div>
-                    <div className="editor-toolbar-group">
-                      <button
-                        type="button"
-                        className="ghost"
-                        onClick={trackNow}
-                        disabled={!trackCandidate}
-                        title={trackCandidate ? "Select symbol near cursor" : "No symbol near cursor"}
-                      >
-                        Track now
-                      </button>
+                    {trackCandidate ? null : (
+                      <div className="editor-toolbar-group">
+                        <span className="muted">No symbol near cursor</span>
+                      </div>
+                    )}
+                </div>
+                  <div className={`editor-body ${showAstSplit ? "editor-split" : ""}`}>
+                    <div className="editor-pane">
+                      <MonacoEditor
+                        defaultValue=""
+                        onChange={(value) => {
+                          const next = value ?? "";
+                          if (suppressDirtyRef.current) {
+                            suppressDirtyRef.current = false;
+                            return;
+                          }
+                          onEditorChange(next);
+                        }}
+                        language="sysml"
+                        theme={appTheme === "light" ? "vs" : "vs-dark"}
+                        onMount={handleEditorMount}
+                        options={editorOptions}
+                      />
                     </div>
-                  </div>
-                  <div className="editor-body">
-                    <MonacoEditor
-                      defaultValue=""
-                      onChange={(value) => {
-                        const next = value ?? "";
-                        if (suppressDirtyRef.current) {
-                          suppressDirtyRef.current = false;
-                          return;
-                        }
-                        onEditorChange(next);
-                      }}
-                      language="sysml"
-                      theme={appTheme === "light" ? "vs" : "vs-dark"}
-                      onMount={handleEditorMount}
-                      options={editorOptions}
-                    />
+                    {showAstSplit ? (
+                      <div className="ast-pane">
+                        <div className="ast-pane-header">AST (read-only)</div>
+                        <AstStatus state={astSplitState}>
+                          <MonacoEditor
+                            value={astSplitState.content || ""}
+                            language="plaintext"
+                            theme={appTheme === "light" ? "vs" : "vs-dark"}
+                            onMount={(editorInstance) => {
+                              astEditorRef.current = editorInstance;
+                              editorInstance.updateOptions({
+                                readOnly: true,
+                                domReadOnly: true,
+                                minimap: { enabled: false },
+                                wordWrap: "off",
+                                scrollBeyondLastLine: false,
+                                renderLineHighlight: "none",
+                              });
+                              editorInstance.layout();
+                              attachAstSync();
+                            }}
+                            options={{
+                              readOnly: true,
+                              domReadOnly: true,
+                              minimap: { enabled: false },
+                              wordWrap: "off",
+                              scrollBeyondLastLine: false,
+                              renderLineHighlight: "none",
+                              fontSize: editorOptions?.fontSize,
+                              lineNumbers: "on",
+                            }}
+                          />
+                        </AstStatus>
+                      </div>
+                    ) : null}
                   </div>
                 </>
             ) : (
@@ -2455,7 +2699,7 @@ export function App() {
                 }}
                 title="Restore model pane"
               >
-                «
+                {"<<"}
               </button>
             ) : null}
           </div>
@@ -2468,6 +2712,8 @@ export function App() {
                 onExpandAll={() => setCollapseAllModel(false)}
                 onToggleProperties={() => setShowPropertiesPane((prev) => !prev)}
                 showProperties={showPropertiesPane}
+                showUsages={showUsageNodes}
+                onToggleUsages={() => setShowUsageNodes((prev) => !prev)}
               />
               <button
                 type="button"
@@ -2478,7 +2724,7 @@ export function App() {
                 }}
                 title="Collapse model pane"
               >
-                »
+                {">>"}
               </button>
             </div>
             <ModelPane
@@ -2498,9 +2744,10 @@ export function App() {
               }}
               startDrag={startDrag}
               selectedSymbol={selectedSymbol}
+              selectedSymbols={selectedNodeSymbols}
               getDoc={getDoc}
               readFile={async (path: string) => {
-                const content = await invoke<string>("read_file", { path });
+                const content = await readFileText(path);
                 return content || "";
               }}
             />
@@ -2563,6 +2810,21 @@ export function App() {
             )}
           </div>
         ) : null}
+        {modelContextMenu ? (
+          <div className="context-menu" style={{ left: modelContextMenu.x, top: modelContextMenu.y }}>
+            <button
+              type="button"
+              disabled={!modelContextMenu.filePath}
+              onClick={() => {
+                if (!modelContextMenu.filePath) return;
+                void openAstView(modelContextMenu.filePath, modelContextMenu.label);
+                setModelContextMenu(null);
+              }}
+            >
+              Show AST
+            </button>
+          </div>
+        ) : null}
           {showNewFile ? (
             <div className="modal">
               <div className="modal-card">
@@ -2585,7 +2847,7 @@ export function App() {
                 </label>
                 <div className="field">
                   <span>Parent</span>
-                  <div className="field-value">{newFileParent || rootPath || "—"}</div>
+                  <div className="field-value">{newFileParent || rootPath || "â€”"}</div>
                 </div>
               </div>
                 <div className="modal-actions">
@@ -2888,7 +3150,7 @@ export function App() {
                 <div className="field">
                   <div className="field-label">Repo</div>
                   <div className="field-inline">
-                    <span>{gitInfo.repo_root}</span>
+                    <span>{gitInfo.repo_root.replace(/^\\\\\\?\\/, "")}</span>
                   </div>
                   <div className="field-hint">
                     Branch: {gitInfo.branch} - Ahead {gitInfo.ahead} - Behind {gitInfo.behind} - {gitInfo.clean ? "Clean" : "Has changes"}
@@ -2909,31 +3171,34 @@ export function App() {
               {gitStatus ? (
                 <div className="project-properties-section">
                   <div className="project-properties-title">Select files</div>
-                  <div className="project-properties-list commit-section-scroll">
-                    <div className="project-properties-item section-toggle">
+                  <div className="commit-tree">
+                    <div className="commit-header">
                       <input
                         type="checkbox"
                         checked={
                           gitStatus.staged.length + gitStatus.unstaged.length > 0 &&
                           [...gitStatus.staged, ...gitStatus.unstaged].every((path) => gitCommitSelection[path])
                         }
-                        onChange={(event) => toggleCommitSectionAll("changes", event.target.checked)}
+                        onChange={(event) => toggleCommitAll("changes", event.target.checked)}
                       />
                       <button
                         type="button"
-                        className="ghost toggle-btn"
+                        className="commit-toggle"
                         onClick={() => setGitCommitSectionsOpen((prev) => ({ ...prev, changes: !prev.changes }))}
                         aria-expanded={gitCommitSectionsOpen.changes}
                       >
-                        {gitCommitSectionsOpen.changes ? "-" : "+"}
+                        {gitCommitSectionsOpen.changes ? "v" : ">"}
                       </button>
                       <span>Changes</span>
                       <span>{gitStatus.staged.length + gitStatus.unstaged.length}</span>
                     </div>
                     {gitCommitSectionsOpen.changes ? (
-                      <div className="commit-section-list">
-                        {[...gitStatus.staged.map((path) => ({ path, state: "staged" as const })), ...gitStatus.unstaged.map((path) => ({ path, state: "unstaged" as const }))].map(({ path, state }) => (
-                          <label key={`change-${path}`} className="project-properties-item commit-item">
+                      <div className="commit-list">
+                        {[
+                          ...gitStatus.staged.map((path) => ({ path, state: "staged" as const })),
+                          ...gitStatus.unstaged.map((path) => ({ path, state: "unstaged" as const })),
+                        ].map(({ path, state }) => (
+                          <label key={`change-${path}`} className="commit-row">
                             <input
                               type="checkbox"
                               checked={!!gitCommitSelection[path]}
@@ -2945,36 +3210,37 @@ export function App() {
                         ))}
                       </div>
                     ) : null}
-                    <div className="project-properties-item section-toggle">
+                    <div className="commit-header">
                       <input
                         type="checkbox"
                         checked={
                           gitStatus.untracked.length > 0 &&
                           gitStatus.untracked.every((path) => gitCommitSelection[path])
                         }
-                        onChange={(event) => toggleCommitSectionAll("unversioned", event.target.checked)}
+                        onChange={(event) => toggleCommitAll("unversioned", event.target.checked)}
                       />
                       <button
                         type="button"
-                        className="ghost toggle-btn"
+                        className="commit-toggle"
                         onClick={() => setGitCommitSectionsOpen((prev) => ({ ...prev, unversioned: !prev.unversioned }))}
                         aria-expanded={gitCommitSectionsOpen.unversioned}
                       >
-                        {gitCommitSectionsOpen.unversioned ? "-" : "+"}
+                        {gitCommitSectionsOpen.unversioned ? "v" : ">"}
                       </button>
-                      <span>Unversioned files</span>
+                      <span>Unversioned</span>
                       <span>{gitStatus.untracked.length}</span>
                     </div>
                     {gitCommitSectionsOpen.unversioned ? (
-                      <div className="commit-section-list">
+                      <div className="commit-list">
                         {gitStatus.untracked.map((path) => (
-                          <label key={`unversioned-${path}`} className="project-properties-item commit-item">
+                          <label key={`unversioned-${path}`} className="commit-row">
                             <input
                               type="checkbox"
                               checked={!!gitCommitSelection[path]}
                               onChange={() => toggleCommitSelection(path)}
                             />
                             <span>{path}</span>
+                            <span className="muted">untracked</span>
                           </label>
                         ))}
                       </div>
@@ -3068,15 +3334,41 @@ export function App() {
       ) : null}
         {showExport ? (
         <div className="modal">
-          <div className="modal-card">
+          <div
+            className="modal-card"
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                void runBuildWithOptions();
+              }
+            }}
+          >
             <div className="modal-header">
-              <span>Export Model</span>
+              <span>Build Options</span>
               <button type="button" onClick={() => setShowExport(false)}>Close</button>
             </div>
             <div className="modal-body">
+              <label className="field checkbox">
+                <input
+                  type="checkbox"
+                  checked={exportAfterBuild}
+                  onChange={(event) => setExportAfterBuild(event.target.checked)}
+                />
+                <span>Export model after build</span>
+              </label>
               <label className="field">
                 <span>Format</span>
-                <select value={exportFormat} onChange={(event) => setExportFormat(event.target.value as "jsonld" | "kpar" | "xmi")}>
+                <select
+                  value={exportFormat}
+                  onChange={(event) => {
+                    const next = event.target.value as "jsonld" | "kpar" | "xmi";
+                    setExportFormat(next);
+                    if (!exportPath || exportPath.includes("\\build\\")) {
+                      setExportPath(getDefaultBuildPath(next));
+                    }
+                  }}
+                  disabled={!exportAfterBuild}
+                >
                   <option value="jsonld">JSON-LD</option>
                   <option value="kpar">KPAR</option>
                   <option value="xmi">XMI</option>
@@ -3085,10 +3377,16 @@ export function App() {
               <label className="field">
                 <span>Output</span>
                 <div className="field-inline">
-                  <input value={exportPath} onChange={(event) => setExportPath(event.target.value)} placeholder="Select output file" />
+                  <input
+                    value={exportPath}
+                    onChange={(event) => setExportPath(event.target.value)}
+                    placeholder="Select output file"
+                    disabled={!exportAfterBuild}
+                  />
                   <button
                     type="button"
                     className="ghost"
+                    disabled={!exportAfterBuild}
                     onClick={async () => {
                       const selected = await save({
                         defaultPath: exportPath || undefined,
@@ -3114,21 +3412,22 @@ export function App() {
                   type="checkbox"
                   checked={exportIncludeStdlib}
                   onChange={(event) => setExportIncludeStdlib(event.target.checked)}
+                  disabled={!exportAfterBuild}
                 />
                 <span>Include standard library</span>
               </label>
             </div>
             <div className="modal-actions">
               <button type="button" className="ghost" onClick={() => setShowExport(false)}>Cancel</button>
-              <button type="button" onClick={runExportModel} disabled={exportBusy}>Export</button>
+              <button type="button" onClick={runBuildWithOptions} disabled={exportBusy}>Build</button>
             </div>
           </div>
         </div>
       ) : null}
-      {showSettings ? (
-        <div className="modal">
-          <div className="modal-backdrop" onClick={() => setShowSettings(false)} />
-          <div className="modal-card legacy-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        {showSettings ? (
+          <div className="modal">
+            <div className="modal-backdrop" onClick={() => setShowSettings(false)} />
+            <div className="modal-card legacy-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
             <div className="modal-header">
               <h3 id="settings-title">Settings</h3>
             </div>
@@ -3282,6 +3581,45 @@ export function App() {
             </div>
           </div>
         ) : null}
+        <Modal open={showAbout} onClose={() => setShowAbout(false)} cardClassName="legacy-modal" ariaLabelledBy="about-title">
+          <div className="modal-header">
+            <h3 id="about-title">About Mercurio</h3>
+          </div>
+          <div className="modal-body">
+            <p className="about-text">
+              Mercurio is a SysML/KerML workbench for editing, compiling, and exploring models with integrated analysis tools.
+            </p>
+            {aboutVersion ? <p className="about-text">Version: {aboutVersion}</p> : null}
+            {aboutBuild ? <p className="about-text">Build: {aboutBuild}</p> : null}
+            <p className="about-text">
+              GitHub:{" "}
+              <a className="about-link" href="https://github.com/petrotta/mercurio" target="_blank" rel="noreferrer">
+                https://github.com/petrotta/mercurio
+              </a>
+            </p>
+          </div>
+          <div className="modal-actions">
+            <button type="button" className="ghost" onClick={() => setShowAbout(false)}>
+              Close
+            </button>
+          </div>
+        </Modal>
+        <Modal open={astViewOpen} onClose={() => setAstViewOpen(false)} cardClassName="modal-wide ast-modal" ariaLabelledBy="ast-title">
+          <div className="modal-header">
+            <h3 id="ast-title">AST: {astViewTitle || "Untitled"}</h3>
+            <button type="button" className="icon-button" onClick={() => setAstViewOpen(false)} aria-label="Close AST view" />
+          </div>
+          <div className="modal-body">
+            <AstStatus state={astViewState} emptyFallback={<pre className="ast-content">(empty)</pre>}>
+              <pre className="ast-content">{astViewState.content}</pre>
+            </AstStatus>
+          </div>
+          <div className="modal-actions">
+            <button type="button" className="ghost" onClick={() => setAstViewOpen(false)}>
+              Close
+            </button>
+          </div>
+        </Modal>
         <footer className="statusbar">
           <div className="status-left" />
           <div className="status-right">
@@ -3307,99 +3645,28 @@ export function App() {
           </div>
       </footer>
       {compileToast.open ? (
-        <div className={`compile-toast ${compileToast.ok === false ? "error" : compileToast.ok ? "ok" : ""}`}>
-          <div className="compile-toast-header">
-            <span className={`compile-toast-title ${compileToast.ok === null ? "running" : ""}`}>
-              <span className="compile-spinner" aria-hidden="true" />
-              Compile
-            </span>
-            <button type="button" onClick={() => setCompileToast((prev) => ({ ...prev, open: false }))}>x</button>
-          </div>
-          <div className="compile-toast-body">
-            {compileToast.lines.map((line, index) => (
-              <div key={`${line}-${index}`}>{line}</div>
-            ))}
-            {compileToast.details.length ? (
-              <div className="compile-toast-details">
-                {compileToast.details.map((line, index) => (
-                  <div key={`${line}-${index}`}>{line}</div>
-                ))}
-              </div>
-            ) : null}
-            {compileToast.parsedFiles.length ? (
-              <div className="compile-toast-files">
-                <div className="compile-toast-files-title">Reparsed files</div>
-                {compileToast.parsedFiles.slice(0, 8).map((path) => (
-                  <div key={path} className="compile-toast-file-path">{path}</div>
-                ))}
-                {compileToast.parsedFiles.length > 8 ? (
-                  <div className="compile-toast-file-more">+{compileToast.parsedFiles.length - 8} more</div>
-                ) : null}
-              </div>
-            ) : null}
-            {compileToast.parseErrors.length ? (
-              <div className="compile-toast-errors">
-                <div className="compile-toast-errors-title">Parse errors</div>
-                {compileToast.parseErrors.map((file) => (
-                  <div key={file.path} className="compile-toast-error-item">
-                    <button
-                      type="button"
-                      className="compile-toast-link"
-                      onClick={() => {
-                        const first = file.errors?.[0] || "";
-                        const loc = parseErrorLocation(first);
-                        void navigateTo({
-                          path: file.path,
-                          name: file.path.split(/[\\/]/).pop() || "Untitled",
-                          selection: loc
-                            ? {
-                                startLine: loc.line,
-                                startCol: loc.col,
-                                endLine: loc.line,
-                                endCol: loc.col + 1,
-                              }
-                            : undefined,
-                        });
-                      }}
-                    >
-                      {file.path}
-                    </button>
-                    <div className="compile-toast-error-count">{file.errors.length} issues</div>
-                    {file.errors.length ? (
-                      <div className="compile-toast-error-lines">
-                        {file.errors.slice(0, 5).map((err, idx) => (
-                          <button
-                            key={`${file.path}-${idx}`}
-                            type="button"
-                            className="compile-toast-link subtle"
-                            onClick={() => {
-                              const loc = parseErrorLocation(err);
-                              void navigateTo({
-                                path: file.path,
-                                name: file.path.split(/[\\/]/).pop() || "Untitled",
-                                selection: loc
-                                  ? {
-                                      startLine: loc.line,
-                                      startCol: loc.col,
-                                      endLine: loc.line,
-                                      endCol: loc.col + 1,
-                                    }
-                                  : undefined,
-                              });
-                            }}
-                          >
-                            {err}
-                          </button>
-                        ))}
-                      </div>
-                    ) : null}
-                  </div>
-                ))}
-              </div>
-            ) : null}
-          </div>
-        </div>
+        <CompileToastPanel
+          compileToast={compileToast}
+          onClose={() => setCompileToast((prev) => ({ ...prev, open: false }))}
+          parseErrorLocation={parseErrorLocation}
+          onNavigate={(path, loc) => {
+            void navigateTo({
+              path,
+              name: path.split(/[\\/]/).pop() || "Untitled",
+              selection: loc
+                ? {
+                    startLine: loc.line,
+                    startCol: loc.col,
+                    endLine: loc.line,
+                    endCol: loc.col + 1,
+                  }
+                : undefined,
+            });
+          }}
+        />
       ) : null}
     </div>
   );
 }
+
+

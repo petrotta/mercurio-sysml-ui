@@ -1,4 +1,4 @@
-import type { KeyboardEvent, RefObject, ReactElement } from "react";
+import type { KeyboardEvent, MouseEvent, RefObject, ReactElement } from "react";
 import type { RowComponentProps } from "react-window";
 import type { ModelRow, SymbolNode, SymbolView } from "./types";
 
@@ -14,11 +14,13 @@ type ModelRowRendererOptions = {
   modelSectionIndent: number;
   modelTreeRef: RefObject<HTMLDivElement | null>;
   handleModelTreeKeyDown: (event: KeyboardEvent<HTMLDivElement>, indexOverride?: number) => void;
+  onModelContextMenu: (event: MouseEvent, payload: { filePath: string | null; label: string }) => void;
   setModelCursorIndex: (index: number | null) => void;
   setModelSectionOpen: (updater: (prev: { project: boolean; library: boolean; errors: boolean }) => { project: boolean; library: boolean; errors: boolean }) => void;
   setModelExpanded: (updater: (prev: Record<string, boolean>) => Record<string, boolean>) => void;
   selectedSymbol: SymbolView | null;
   setSelectedSymbol: (symbol: SymbolView | null) => void;
+  setSelectedNodeSymbols: (symbols: SymbolView[] | null) => void;
   selectSymbolInEditor: (symbol: SymbolView) => Promise<void> | void;
   navigateTo: (target: NavigateTarget) => Promise<void> | void;
   renderTypeIcon: (kind: string, variant: "model" | "diagram") => ReactElement;
@@ -31,11 +33,13 @@ export function createModelRowRenderer(options: ModelRowRendererOptions) {
     modelSectionIndent,
     modelTreeRef,
     handleModelTreeKeyDown,
+    onModelContextMenu,
     setModelCursorIndex,
     setModelSectionOpen,
     setModelExpanded,
     selectedSymbol,
     setSelectedSymbol,
+    setSelectedNodeSymbols,
     selectSymbolInEditor,
     navigateTo,
     renderTypeIcon,
@@ -155,6 +159,27 @@ export function createModelRowRenderer(options: ModelRowRendererOptions) {
           if (symbol) {
             setSelectedSymbol(symbol);
           }
+          if (row.node.symbols.length) {
+            setSelectedNodeSymbols(row.node.symbols);
+          } else {
+            setSelectedNodeSymbols(symbol ? [symbol] : null);
+          }
+        }}
+        onContextMenu={(event) => {
+          if (row.depth !== 0) return;
+          event.preventDefault();
+          event.stopPropagation();
+          setModelCursorIndex(index);
+          if (symbol) {
+            setSelectedSymbol(symbol);
+          }
+          if (row.node.symbols.length) {
+            setSelectedNodeSymbols(row.node.symbols);
+          } else {
+            setSelectedNodeSymbols(symbol ? [symbol] : null);
+          }
+          const filePath = symbol?.file_path ?? null;
+          onModelContextMenu(event, { filePath, label: row.name });
         }}
         onDoubleClick={(event) => {
           event.stopPropagation();
