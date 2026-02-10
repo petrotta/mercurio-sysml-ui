@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { SymbolView, UnresolvedIssue } from "./types";
 
-type CompileToast = {
+export type CompileToast = {
   open: boolean;
   ok: boolean | null;
   lines: string[];
@@ -41,7 +41,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
     details: [],
     parsedFiles: [],
   });
-  const compileToastTimerRef = useRef<number | null>(null);
+  const compileToastTimerRef = useRef<number | undefined>(undefined);
   const backgroundCompileRef = useRef<number | null>(null);
   const backgroundCompileTokenRef = useRef(0);
   const [backgroundCompileEnabled, setBackgroundCompileEnabled] = useState(true);
@@ -50,6 +50,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
   const [libraryPath, setLibraryPath] = useState<string | null>(null);
   const [projectSymbolsLoaded, setProjectSymbolsLoaded] = useState(false);
   const [parsedFiles, setParsedFiles] = useState<string[]>([]);
+  const [parseErrorPaths, setParseErrorPaths] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     setProjectSymbolsLoaded(false);
@@ -81,8 +82,8 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
     };
   }, [compileRunId]);
 
-  const runCompile = useCallback(async () => {
-    if (!rootPath) return;
+  const runCompile = useCallback(async (): Promise<boolean> => {
+    if (!rootPath) return false;
     if (backgroundCompileRef.current) {
       void invoke("cancel_compile", { run_id: backgroundCompileRef.current }).catch(() => {});
       backgroundCompileRef.current = null;
@@ -109,6 +110,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
       const parseErrors = (response?.files || [])
         .filter((file) => !file.ok && file.errors && file.errors.length)
         .map((file) => ({ path: file.path, errors: file.errors }));
+      setParseErrorPaths(new Set(parseErrors.map((file) => file.path)));
       const details: string[] = [];
       if (typeof response?.stdlib_cache_hit === "boolean") {
         details.push(`Stdlib: ${response.stdlib_cache_hit ? "cache hit" : "reloaded"}`);
@@ -138,14 +140,15 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
       setCompileStatus(ok ? "Compile: complete" : "Compile: finished with errors");
       setCompileToast((prev) => ({ ...prev, ok, open: true, parseErrors, details, parsedFiles }));
       if (ok) {
-        if (compileToastTimerRef.current) {
+        if (compileToastTimerRef.current !== undefined) {
           window.clearTimeout(compileToastTimerRef.current);
         }
         compileToastTimerRef.current = window.setTimeout(() => {
           setCompileToast((prev) => ({ ...prev, open: false }));
-          compileToastTimerRef.current = null;
+          compileToastTimerRef.current = undefined;
         }, 2000);
       }
+      return ok;
     } catch (error) {
       setCompileStatus(`Compile: failed: ${error}`);
       setCompileToast((prev) => ({
@@ -154,6 +157,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
         open: true,
         lines: [...prev.lines, `failed: ${String(error)}`].slice(-8),
       }));
+      return false;
     } finally {
       setCompileRunId(null);
     }
@@ -188,6 +192,10 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
       setLibraryPath(response?.library_path ?? null);
       setProjectSymbolsLoaded(true);
       setParsedFiles(response?.parsed_files || []);
+      const parseErrors = (response?.files || [])
+        .filter((file) => !file.ok && file.errors && file.errors.length)
+        .map((file) => file.path);
+      setParseErrorPaths(new Set(parseErrors));
       setCompileStatus(response?.ok ? "Background compile: complete" : "Background compile: finished with errors");
     } catch (error) {
       if (token === backgroundCompileTokenRef.current) {
@@ -223,6 +231,10 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
       setLibraryPath(response?.library_path ?? null);
       setProjectSymbolsLoaded(true);
       setParsedFiles(response?.parsed_files || []);
+      const parseErrors = (response?.files || [])
+        .filter((file) => !file.ok && file.errors && file.errors.length)
+        .map((file) => file.path);
+      setParseErrorPaths(new Set(parseErrors));
       setCompileStatus(response?.ok ? "Background compile: complete" : "Background compile: finished with errors");
     } catch (error) {
       if (token === backgroundCompileTokenRef.current) {
@@ -264,5 +276,6 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
     libraryPath,
     projectSymbolsLoaded,
     parsedFiles,
+    parseErrorPaths,
   };
 }

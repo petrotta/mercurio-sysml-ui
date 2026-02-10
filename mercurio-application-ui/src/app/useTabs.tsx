@@ -32,7 +32,6 @@ type UseTabsOptions = {
   setCenterView: (value: "file" | "diagram" | "ai" | "data") => void;
   setActiveEditorDoc: (path: string | null, text: string, dirty: boolean) => void;
   setDescriptorViewMode: (mode: "view" | "json") => void;
-  setShowProjectInfo: (value: boolean) => void;
   setProjectDescriptor: (descriptor: DescriptorPayload | null) => void;
   setHasProjectDescriptor: (value: boolean) => void;
   clearPendingEditorContent: () => void;
@@ -58,7 +57,6 @@ export function useTabs({
   setCenterView,
   setActiveEditorDoc,
   setDescriptorViewMode,
-  setShowProjectInfo,
   setProjectDescriptor,
   setHasProjectDescriptor,
   clearPendingEditorContent,
@@ -73,13 +71,12 @@ export function useTabs({
   const openProjectDescriptorTab = useCallback(
     (descriptor?: DescriptorPayload | null) => {
       if (descriptor) {
-        setProjectDescriptor(descriptor);
-        setHasProjectDescriptor(true);
-      }
-      setCenterView("file");
-      setShowProjectInfo(true);
-      setDescriptorViewMode("view");
-      setActiveEditorDoc(null, "", false);
+      setProjectDescriptor(descriptor);
+      setHasProjectDescriptor(true);
+    }
+    setCenterView("file");
+    setDescriptorViewMode("view");
+    setActiveEditorDoc(null, "", false);
       setOpenTabs((prev) => {
         if (prev.some((tab) => tab.path === PROJECT_DESCRIPTOR_TAB)) return prev;
         return [...prev, { path: PROJECT_DESCRIPTOR_TAB, name: "Project Descriptor", dirty: false, kind: "descriptor" }];
@@ -90,7 +87,6 @@ export function useTabs({
       setProjectDescriptor,
       setHasProjectDescriptor,
       setCenterView,
-      setShowProjectInfo,
       setDescriptorViewMode,
       setActiveEditorDoc,
       setOpenTabs,
@@ -190,9 +186,6 @@ export function useTabs({
       navReqRef.current += 1;
       pendingNavRef.current = null;
       setOpenTabs((prev) => prev.filter((tab) => tab.path !== path));
-      if (path === PROJECT_DESCRIPTOR_TAB) {
-        setShowProjectInfo(false);
-      }
       if (activeTabPath === path) {
         const remaining = openTabs.filter((tab) => tab.path !== path);
         const next = remaining[remaining.length - 1];
@@ -219,7 +212,6 @@ export function useTabs({
       navReqRef,
       pendingNavRef,
       setOpenTabs,
-      setShowProjectInfo,
       activeTabPath,
       openTabs,
       selectTab,
@@ -269,7 +261,6 @@ export function useTabs({
       setOpenTabs([kept]);
       setActiveTabPath(path);
       if (path === PROJECT_DESCRIPTOR_TAB) {
-        setShowProjectInfo(true);
         setCenterView("file");
         setDescriptorViewMode("view");
         setActiveEditorDoc(null, "", false);
@@ -293,7 +284,6 @@ export function useTabs({
       openTabs,
       setOpenTabs,
       setActiveTabPath,
-      setShowProjectInfo,
       setCenterView,
       setDescriptorViewMode,
       setActiveEditorDoc,

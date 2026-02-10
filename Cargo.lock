@@ -2592,8 +2592,18 @@ dependencies = [
 name = "mercurio-core"
 version = "0.1.0"
 dependencies = [
+ "mercurio-model",
  "serde",
  "serde_json",
+ "syster-base",
+]
+
+[[package]]
+name = "mercurio-model"
+version = "0.1.0"
+dependencies = [
+ "salsa",
+ "serde",
  "syster-base",
 ]
 

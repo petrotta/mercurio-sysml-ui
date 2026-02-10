@@ -5,11 +5,11 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "dev:ui": "npm --prefix mercurio-frontend-react run dev",
+    "dev:ui": "npm --prefix mercurio-application-ui run dev",
     "dev:tauri": "cargo run --manifest-path mercurio-application/Cargo.toml",
     "dev": "concurrently -n ui,tauri -c cyan,magenta \"npm run dev:ui\" \"npm run dev:tauri\"",
     "tauri": "cd mercurio-application && cargo tauri",
-    "build": "npm --prefix mercurio-frontend-react run build && cd mercurio-application && cargo tauri build"
+    "build": "npm --prefix mercurio-application-ui run build && cd mercurio-application && cargo tauri build"
   },
   "dependencies": {
     "concurrently": "^9.2.1",
