@@ -12,7 +12,7 @@ node_modules
 dist
 dist-ssr
 *.local
-mercurio-frontend-react/public/monaco
+mercurio-application-ui/public/monaco
 
 # Editor directories and files
 .vscode/*

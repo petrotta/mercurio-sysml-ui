@@ -4,6 +4,8 @@ type ModelHeaderProps = {
   onExpandAll: () => void;
   onToggleProperties: () => void;
   showProperties: boolean;
+  showUsages: boolean;
+  onToggleUsages: () => void;
 };
 
 export function ModelHeader({
@@ -12,6 +14,8 @@ export function ModelHeader({
   onExpandAll,
   onToggleProperties,
   showProperties,
+  showUsages,
+  onToggleUsages,
 }: ModelHeaderProps) {
   return (
     <>
@@ -41,6 +45,13 @@ export function ModelHeader({
         onClick={onToggleProperties}
         aria-label="Toggle properties"
         title={showProperties ? "Hide properties" : "Show properties"}
+      />
+      <button
+        type="button"
+        className={`ghost icon-usage ${showUsages ? "active" : ""}`}
+        onClick={onToggleUsages}
+        aria-label="Toggle usages"
+        title={showUsages ? "Hide usages" : "Show usages"}
       />
     </>
   );

@@ -15,6 +15,7 @@ type UseModelTreeSelectionOptions = {
   setModelExpanded: (updater: (prev: Record<string, boolean>) => Record<string, boolean>) => void;
   selectedSymbol: SymbolView | null;
   setSelectedSymbol: (symbol: SymbolView | null) => void;
+  setSelectedNodeSymbols: (symbols: SymbolView[] | null) => void;
   selectSymbolInEditor: (symbol: SymbolView) => Promise<void> | void;
   navigateTo: (target: NavigateTarget) => Promise<void> | void;
   projectGroups: Array<{ path: string; list: SymbolView[] }>;
@@ -28,6 +29,7 @@ export function useModelTreeSelection({
   setModelExpanded,
   selectedSymbol,
   setSelectedSymbol,
+  setSelectedNodeSymbols,
   selectSymbolInEditor,
   navigateTo,
   projectGroups,
@@ -108,6 +110,7 @@ export function useModelTreeSelection({
       const symbol = row.node.symbols[0];
       if (symbol) {
         setSelectedSymbol(symbol);
+        setSelectedNodeSymbols(row.node.symbols.length ? row.node.symbols : [symbol]);
         void selectSymbolInEditor(symbol);
       }
       return;

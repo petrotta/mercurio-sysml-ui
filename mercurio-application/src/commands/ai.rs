@@ -26,25 +26,6 @@ pub struct AiMessagePayload {
 }
 
 #[derive(Deserialize)]
-pub struct AiChatPayload {
-    url: String,
-    provider: Option<String>,
-    model: Option<String>,
-    token: Option<String>,
-    messages: Vec<AiMessagePayload>,
-    max_tokens: Option<u32>,
-}
-
-#[derive(Deserialize)]
-pub struct AiEmbeddingsPayload {
-    pub url: String,
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub token: Option<String>,
-    pub input: Vec<String>,
-}
-
-#[derive(Deserialize)]
 pub struct AiAgentPayload {
     url: String,
     provider: Option<String>,
@@ -561,57 +542,6 @@ pub async fn ai_test_endpoint(payload: AiEndpointPayload) -> Result<serde_json::
             }))
         }
     }
-}
-
-#[command]
-/// Sends chat messages to the configured provider and returns the raw JSON response.
-pub async fn ai_chat_completion(payload: AiChatPayload) -> Result<serde_json::Value, String> {
-    let provider = AiProvider::from_input(payload.provider.as_deref());
-    let adapter = adapter_for(provider);
-    let url = adapter.chat_url(&payload.url);
-    let body = adapter.chat_body(
-        payload.model.as_deref(),
-        &payload.messages,
-        payload.max_tokens.unwrap_or(512),
-    );
-    request_json(url, payload.token.as_deref(), body, adapter).await
-}
-
-#[command]
-/// Sends embedding requests to the configured provider and returns vectors.
-pub async fn ai_embeddings(payload: AiEmbeddingsPayload) -> Result<Vec<Vec<f32>>, String> {
-    let provider = AiProvider::from_input(payload.provider.as_deref());
-    if provider == AiProvider::Anthropic {
-        return Err("Embeddings are not supported for Anthropic endpoints in this client yet.".to_string());
-    }
-    let adapter = adapter_for(provider);
-    let url = adapter.test_url(&payload.url, "embeddings")?;
-    let model = payload.model.unwrap_or_else(|| "text-embedding-3-small".to_string());
-    let body = serde_json::json!({
-        "model": model,
-        "input": payload.input,
-    });
-    let response = request_json(url, payload.token.as_deref(), body, adapter).await?;
-    let data = response
-        .get("data")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| "Missing embeddings data".to_string())?;
-    let mut embeddings = Vec::new();
-    for entry in data {
-        let vector = entry
-            .get("embedding")
-            .and_then(|value| value.as_array())
-            .ok_or_else(|| "Missing embedding vector".to_string())?;
-        let mut out = Vec::with_capacity(vector.len());
-        for value in vector {
-            let num = value
-                .as_f64()
-                .ok_or_else(|| "Invalid embedding value".to_string())?;
-            out.push(num as f32);
-        }
-        embeddings.push(out);
-    }
-    Ok(embeddings)
 }
 
 #[command]

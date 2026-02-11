@@ -16,12 +16,11 @@ mod agent;
 
 // Re-exported Tauri commands from focused modules.
 use commands::{
-    ai_agent_run, ai_chat_completion, ai_embeddings, ai_test_endpoint, create_dir, create_file, create_package, delete_path,
-    detect_git_repo, git_checkout_branch, git_commit, git_create_branch, git_list_branches, git_push,
-    git_stage_paths, git_status, git_unstage_paths,
-    get_default_root, get_default_stdlib, get_startup_path, list_dir, list_stdlib_versions,
-    open_in_explorer, path_exists, read_diagram, read_file, rename_path, set_default_stdlib,
-    window_close, window_minimize, window_toggle_maximize, write_diagram, write_file,
+    ai_agent_run, ai_test_endpoint, create_dir, create_file, detect_git_repo, get_user_projects_root,
+    git_checkout_branch, git_commit, git_create_branch, git_list_branches, git_push, git_stage_paths,
+    git_status, git_unstage_paths, list_dir, list_stdlib_versions, open_in_explorer, path_exists,
+    read_diagram, read_file, rename_path, window_close, window_minimize, window_toggle_maximize,
+    write_diagram, write_file,
 };
 
 
@@ -30,7 +29,8 @@ use mercurio_core::{
     compile_workspace_sync as core_compile_workspace_sync,
     ensure_mercurio_paths,
     export_model_to_path as core_export_model_to_path,
-    get_parse_errors as core_get_parse_errors,
+    get_ast_for_content as core_get_ast_for_content,
+    get_ast_for_path as core_get_ast_for_path,
     get_parse_errors_for_content as core_get_parse_errors_for_content,
     get_project_descriptor_view,
     list_stdlib_versions_from_root,
@@ -78,12 +78,6 @@ struct UpdateProjectDescriptorPayload {
     import_entries: Option<Vec<String>>,
     stdlib: Option<String>,
     library: Option<LibraryConfig>,
-}
-
-#[derive(Serialize)]
-pub(crate) struct StartupOpen {
-    path: String,
-    kind: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -303,15 +297,21 @@ fn set_watch_root(app: tauri::AppHandle, state: tauri::State<AppState>, root: St
 }
 
 #[tauri::command]
-fn get_parse_errors(path: String) -> Result<ParseErrorsPayload, String> {
-    let file_path = PathBuf::from(&path);
-    core_get_parse_errors(&file_path)
-}
-
-#[tauri::command]
 fn get_parse_errors_for_content(path: String, content: String) -> Result<ParseErrorsPayload, String> {
     let file_path = PathBuf::from(&path);
     core_get_parse_errors_for_content(&file_path, &content)
+}
+
+#[tauri::command]
+fn get_ast_for_path(path: String) -> Result<String, String> {
+    let file_path = PathBuf::from(&path);
+    core_get_ast_for_path(&file_path)
+}
+
+#[tauri::command]
+fn get_ast_for_content(path: String, content: String) -> Result<String, String> {
+    let file_path = PathBuf::from(&path);
+    core_get_ast_for_content(&file_path, &content)
 }
 
 #[tauri::command]
@@ -546,9 +546,10 @@ pub fn run() {
                 .build(app)?;
             let project_properties = MenuItemBuilder::with_id("file.project_properties", "Project Properties...")
                 .build(app)?;
-            let export_model = MenuItemBuilder::with_id("file.export_model", "Export Model...")
+            let compile = MenuItemBuilder::with_id("build.compile", "Build")
+                .accelerator("Ctrl+B")
                 .build(app)?;
-            let compile = MenuItemBuilder::with_id("build.compile", "Compile Workspace")
+            let build_options = MenuItemBuilder::with_id("build.options", "Show Build Options")
                 .accelerator("Ctrl+Shift+B")
                 .build(app)?;
             let toggle_project = MenuItemBuilder::with_id("view.toggle_project", "Toggle Project")
@@ -561,12 +562,11 @@ pub fn run() {
                 .item(&open_file)
                 .item(&project_properties)
                 .separator()
-                .item(&export_model)
-                .separator()
                 .item(&PredefinedMenuItem::close_window(app, None)?)
                 .build()?;
             let build_menu = SubmenuBuilder::new(app, "Build")
                 .item(&compile)
+                .item(&build_options)
                 .build()?;
             let view_menu = SubmenuBuilder::new(app, "View")
                 .item(&toggle_project)
@@ -589,8 +589,8 @@ pub fn run() {
                 "file.open_folder" => Some("open-folder"),
                 "file.open_file" => Some("open-file"),
                 "file.project_properties" => Some("project-properties"),
-                "file.export_model" => Some("export-model"),
                 "build.compile" => Some("compile-workspace"),
+                "build.options" => Some("build-options"),
                 "view.toggle_project" => Some("toggle-project"),
                 "help.about" => Some("about"),
                 _ => None,
@@ -600,11 +600,8 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            get_default_root,
-            get_startup_path,
+            get_user_projects_root,
             list_stdlib_versions,
-            get_default_stdlib,
-            set_default_stdlib,
             list_dir,
             read_file,
             path_exists,
@@ -613,13 +610,12 @@ pub fn run() {
             write_diagram,
             create_file,
             create_dir,
-            create_package,
             rename_path,
-            delete_path,
             set_watch_root,
             open_in_explorer,
-            get_parse_errors,
             get_parse_errors_for_content,
+            get_ast_for_path,
+            get_ast_for_content,
             get_project_descriptor,
             create_project_descriptor,
             ensure_project_descriptor,
@@ -640,8 +636,6 @@ pub fn run() {
             cancel_compile,
             export_compiled_model,
             ai_test_endpoint,
-            ai_chat_completion,
-            ai_embeddings,
             ai_agent_run
             ,
         ])
