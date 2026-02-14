@@ -7,6 +7,9 @@ use std::time::SystemTime;
 use syster::ide::AnalysisHost;
 use syster::syntax::SyntaxFile;
 
+use crate::metamodel::StdlibMetamodelView;
+use crate::project_model::ProjectModelView;
+
 #[derive(Serialize, Clone)]
 pub struct CompileFileResult {
     pub path: String,
@@ -37,6 +40,8 @@ pub struct CoreState {
     pub(crate) canceled_compiles: Arc<Mutex<HashSet<u64>>>,
     pub(crate) analysis_host: Arc<Mutex<AnalysisHost>>,
     pub(crate) workspace: Arc<Mutex<WorkspaceState>>,
+    pub(crate) metamodel_cache: Arc<Mutex<HashMap<String, StdlibMetamodelView>>>,
+    pub(crate) project_model_cache: Arc<Mutex<HashMap<String, ProjectModelView>>>,
     pub stdlib_root: PathBuf,
     pub settings: Arc<Mutex<AppSettings>>,
 }
@@ -48,6 +53,8 @@ impl CoreState {
             canceled_compiles: Arc::new(Mutex::new(HashSet::new())),
             analysis_host: Arc::new(Mutex::new(AnalysisHost::new())),
             workspace: Arc::new(Mutex::new(WorkspaceState::default())),
+            metamodel_cache: Arc::new(Mutex::new(HashMap::new())),
+            project_model_cache: Arc::new(Mutex::new(HashMap::new())),
             stdlib_root,
             settings: Arc::new(Mutex::new(settings)),
         }

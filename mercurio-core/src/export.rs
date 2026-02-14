@@ -2,13 +2,17 @@ use std::fs;
 use std::path::PathBuf;
 
 use syster::ide::AnalysisHost;
-use syster::interchange::{model_from_symbols, restore_ids_from_symbols, JsonLd, Kpar, ModelFormat, Xmi};
+use syster::interchange::{
+    model_from_symbols, restore_ids_from_symbols, JsonLd, Kpar, ModelFormat, Xmi,
+};
 use syster::syntax::parser::parse_with_result;
 
 use crate::files::is_path_under_root;
 use crate::project::load_project_config;
 use crate::stdlib::{load_stdlib_into_host, resolve_stdlib_path};
-use crate::workspace::{collect_model_files, collect_project_files, collect_project_imports, load_imports_into_host};
+use crate::workspace::{
+    collect_model_files, collect_project_files, collect_project_imports, load_imports_into_host,
+};
 use crate::CoreState;
 
 pub fn export_model_to_path(
@@ -41,8 +45,12 @@ pub fn export_model_to_path(
         }
     }
 
-    let library_config = project_config.as_ref().and_then(|config| config.library.as_ref());
-    let stdlib_override = project_config.as_ref().and_then(|config| config.stdlib.as_ref());
+    let library_config = project_config
+        .as_ref()
+        .and_then(|config| config.library.as_ref());
+    let stdlib_override = project_config
+        .as_ref()
+        .and_then(|config| config.stdlib.as_ref());
     let (_stdlib_loader, stdlib_path_for_log) = resolve_stdlib_path(
         &state.stdlib_root,
         default_stdlib.as_deref(),

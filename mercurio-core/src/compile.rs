@@ -12,7 +12,9 @@ use syster::syntax::parser::parse_with_result;
 use crate::project::load_project_config;
 use crate::stdlib::{load_stdlib_into_host, resolve_stdlib_path};
 use crate::symbols::{build_symbols_from_walk, build_usage_views, collect_expr_spans};
-use crate::workspace::{collect_model_files, collect_project_files, collect_project_imports, load_imports_into_host};
+use crate::workspace::{
+    collect_model_files, collect_project_files, collect_project_imports, load_imports_into_host,
+};
 use crate::CoreState;
 
 // Compile types + functions follow.
@@ -184,15 +186,16 @@ pub fn compile_workspace_sync<F: Fn(CompileProgressPayload)>(
         }
         Ok(())
     };
-    let emit_progress = |stage: &str, file: Option<String>, index: Option<usize>, total: Option<usize>| {
-        emit_progress(CompileProgressPayload {
-            run_id,
-            stage: stage.to_string(),
-            file,
-            index,
-            total,
-        });
-    };
+    let emit_progress =
+        |stage: &str, file: Option<String>, index: Option<usize>, total: Option<usize>| {
+            emit_progress(CompileProgressPayload {
+                run_id,
+                stage: stage.to_string(),
+                file,
+                index,
+                total,
+            });
+        };
 
     let mut files = Vec::new();
     let mut used_project_src = false;
@@ -229,8 +232,12 @@ pub fn compile_workspace_sync<F: Fn(CompileProgressPayload)>(
         .unwrap_or_default();
     let import_set: HashSet<PathBuf> = import_files.iter().cloned().collect();
 
-    let library_config = project_config.as_ref().and_then(|config| config.library.as_ref());
-    let stdlib_override = project_config.as_ref().and_then(|config| config.stdlib.as_ref());
+    let library_config = project_config
+        .as_ref()
+        .and_then(|config| config.library.as_ref());
+    let stdlib_override = project_config
+        .as_ref()
+        .and_then(|config| config.stdlib.as_ref());
     let (_stdlib_loader, stdlib_path_for_log) = resolve_stdlib_path(
         &state.stdlib_root,
         default_stdlib.as_deref(),

@@ -138,6 +138,8 @@ export function createModelRowRenderer(options: ModelRowRendererOptions) {
       );
     }
     const symbol = row.node.symbols[0] || findFirstSymbol(row.node);
+    const displayName = row.name && row.name.trim() ? row.name : "(unnamed)";
+    const isUnnamed = displayName === "(unnamed)";
     const isSelected =
       !!symbol &&
       (selectedSymbol?.qualified_name
@@ -200,7 +202,7 @@ export function createModelRowRenderer(options: ModelRowRendererOptions) {
           {row.hasChildren ? (row.expanded ? "-" : "+") : ""}
         </span>
         {renderTypeIcon(row.kindKey, "model")}
-        <span className="model-name">{row.name}</span>
+        <span className={`model-name ${isUnnamed ? "model-name-unnamed" : ""}`}>{displayName}</span>
         {row.kindLabel ? <span className="model-kind">{row.kindLabel}</span> : null}
       </div>
     );

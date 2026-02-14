@@ -7,7 +7,10 @@ use syster::interchange::{detect_format, JsonLd, Kpar, ModelFormat, Xmi};
 
 use crate::files::{is_import_file, resolve_under_root};
 
-pub(crate) fn load_imports_into_host(host: &mut AnalysisHost, imports: &[PathBuf]) -> Result<(), String> {
+pub(crate) fn load_imports_into_host(
+    host: &mut AnalysisHost,
+    imports: &[PathBuf],
+) -> Result<(), String> {
     for import in imports {
         if import.is_dir() {
             collect_model_files(import, &mut Vec::new())?;
@@ -73,7 +76,10 @@ pub(crate) fn collect_project_files(root: &Path, src: &[String]) -> Result<Vec<P
     Ok(out)
 }
 
-pub(crate) fn collect_project_imports(root: &Path, imports: &[String]) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn collect_project_imports(
+    root: &Path,
+    imports: &[String],
+) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
 

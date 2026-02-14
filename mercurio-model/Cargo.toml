@@ -6,4 +6,4 @@ edition = "2021"
 [dependencies]
 salsa = "0.18"
 serde = { version = "1", features = ["derive"] }
-syster = { package = "syster-base", path = "C:\\dev\\git\\sysml\\syster-base" }
+syster = { package = "syster-base", version = "0.3.5-alpha" }

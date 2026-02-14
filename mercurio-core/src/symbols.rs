@@ -4,12 +4,12 @@ use std::path::PathBuf;
 use mercurio_model as walk;
 use syster::base::{LineCol, LineIndex, TextSize};
 use syster::hir::SymbolKind;
-use syster::parser::Direction;
-use syster::syntax::normalized::Multiplicity;
 use syster::parser::ast::Usage;
 use syster::parser::AstNode;
-use syster::syntax::SyntaxFile;
+use syster::parser::Direction;
 use syster::parser::{SyntaxKind, SyntaxNode};
+use syster::syntax::normalized::Multiplicity;
+use syster::syntax::SyntaxFile;
 
 use crate::compile::{PropertyItemView, PropertyValueView, SymbolView};
 
@@ -24,7 +24,9 @@ pub(crate) struct ExprSpan {
     expr_end_col: u32,
 }
 
-pub(crate) fn collect_expr_spans(files: &HashMap<PathBuf, SyntaxFile>) -> HashMap<String, Vec<ExprSpan>> {
+pub(crate) fn collect_expr_spans(
+    files: &HashMap<PathBuf, SyntaxFile>,
+) -> HashMap<String, Vec<ExprSpan>> {
     let mut result: HashMap<String, Vec<ExprSpan>> = HashMap::new();
     for (path, syntax_file) in files {
         let line_index = syntax_file.line_index();
@@ -32,8 +34,12 @@ pub(crate) fn collect_expr_spans(files: &HashMap<PathBuf, SyntaxFile>) -> HashMa
         let root = syntax_file.parse().syntax();
         for usage in root.descendants().filter_map(Usage::cast) {
             let Some(name) = usage.name() else { continue };
-            let Some(name_text) = name.text() else { continue };
-            let Some(expr) = usage.value_expression() else { continue };
+            let Some(name_text) = name.text() else {
+                continue;
+            };
+            let Some(expr) = usage.value_expression() else {
+                continue;
+            };
             let name_range = name.syntax().text_range();
             let expr_range = expr.syntax().text_range();
             let name_start = line_index.line_col(name_range.start());
@@ -71,7 +77,9 @@ pub(crate) fn build_symbols_from_walk(
     let mut next_id: u32 = 1;
 
     for path in &file_paths {
-        let Some(syntax) = files.get(path) else { continue };
+        let Some(syntax) = files.get(path) else {
+            continue;
+        };
         let file_id = walk::FileId(next_id);
         next_id += 1;
         let text = syntax.source_text();
@@ -83,7 +91,12 @@ pub(crate) fn build_symbols_from_walk(
         file_inputs.push((path.clone(), file_id, file_text, file_path));
     }
 
-    let ws_files = walk::WorkspaceFiles::new(&mut walk_db, walk::WorkspaceId(1), file_texts, file_paths_input);
+    let ws_files = walk::WorkspaceFiles::new(
+        &mut walk_db,
+        walk::WorkspaceId(1),
+        file_texts,
+        file_paths_input,
+    );
     let _workspace_index = walk::workspace_index(&walk_db, ws_files);
 
     let mut symbols: Vec<SymbolView> = Vec::new();
@@ -107,12 +120,19 @@ pub(crate) fn build_symbols_from_walk(
         let path_str = path.to_string_lossy().to_string();
         let expr_spans = expr_spans_by_file.get(&path_str);
         for element in &file_index.elements {
-            let type_info = file_index.types.iter().find(|info| info.element == element.id);
-            let owned_attrs = owned_attr_infos.get(&element.id).cloned().unwrap_or_default();
+            let type_info = file_index
+                .types
+                .iter()
+                .find(|info| info.element == element.id);
+            let owned_attrs = owned_attr_infos
+                .get(&element.id)
+                .cloned()
+                .unwrap_or_default();
             symbols.push(symbol_to_view_walk(
                 element,
                 file_id,
                 &path_str,
+                text,
                 &line_index,
                 expr_spans,
                 type_info,
@@ -151,7 +171,10 @@ pub(crate) fn build_usage_views(files: &HashMap<PathBuf, SyntaxFile>) -> Vec<Sym
             let kind_label = if kind_raw.starts_with("SyntaxKind(") {
                 "usage".to_string()
             } else {
-                kind_raw.replace("_USAGE", "").replace('_', " ").to_lowercase()
+                kind_raw
+                    .replace("_USAGE", "")
+                    .replace('_', " ")
+                    .to_lowercase()
             };
             let name_text = usage
                 .name()
@@ -220,9 +243,7 @@ pub(crate) fn build_usage_views(files: &HashMap<PathBuf, SyntaxFile>) -> Vec<Sym
                 usage_properties.push(PropertyItemView {
                     name: "usage_modifiers".to_string(),
                     label: "Modifiers".to_string(),
-                    value: PropertyValueView::List {
-                        items: modifiers,
-                    },
+                    value: PropertyValueView::List { items: modifiers },
                     hint: Some("usage".to_string()),
                     group: None,
                 });
@@ -356,6 +377,7 @@ fn symbol_to_view_walk(
     element: &walk::ElementInfo,
     file_id: walk::FileId,
     file_path: &str,
+    source_text: &str,
     line_index: &LineIndex,
     expr_spans: Option<&Vec<ExprSpan>>,
     type_info: Option<&walk::TypeInfo>,
@@ -365,8 +387,11 @@ fn symbol_to_view_walk(
     let start = line_col_from_offset(line_index, element.span.start);
     let end = line_col_from_offset(line_index, element.span.end);
     let name_start = line_col_from_offset(line_index, element.name_span.start);
-    let expr_span = expr_spans.and_then(|spans| find_expr_span_for_element(element, &name_start, spans));
-    let properties = build_properties_from_walk(element, file_path, type_info, owned_attrs, &kind_label);
+    let expr_span =
+        expr_spans.and_then(|spans| find_expr_span_for_element(element, &name_start, spans));
+    let properties =
+        build_properties_from_walk(element, file_path, type_info, owned_attrs, &kind_label);
+    let doc = extract_doc_comment(source_text, element.span.start as usize);
     SymbolView {
         file_path: file_path.to_string(),
         name: element.name.clone(),
@@ -386,7 +411,7 @@ fn symbol_to_view_walk(
         short_name_start_col: None,
         short_name_end_line: None,
         short_name_end_col: None,
-        doc: None,
+        doc,
         supertypes: type_info
             .map(|info| info.supertypes.clone())
             .unwrap_or_default(),
@@ -395,6 +420,105 @@ fn symbol_to_view_walk(
         is_public: false,
         properties,
     }
+}
+
+fn extract_doc_comment(text: &str, start_offset: usize) -> Option<String> {
+    let safe_start = start_offset.min(text.len());
+    let before = &text[..safe_start];
+    let mut lines: Vec<&str> = before.lines().collect();
+    if lines.is_empty() {
+        return None;
+    }
+
+    while let Some(last) = lines.last() {
+        if last.trim().is_empty() {
+            lines.pop();
+            continue;
+        }
+        break;
+    }
+    if lines.is_empty() {
+        return None;
+    }
+
+    let mut doc_lines = Vec::new();
+    let mut index = lines.len();
+    while index > 0 {
+        let line = lines[index - 1].trim_start();
+        if let Some(rest) = line.strip_prefix("///") {
+            doc_lines.push(rest.trim_start().to_string());
+            index -= 1;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("//!") {
+            doc_lines.push(rest.trim_start().to_string());
+            index -= 1;
+            continue;
+        }
+        break;
+    }
+    if !doc_lines.is_empty() {
+        doc_lines.reverse();
+        return Some(doc_lines.join("\n"));
+    }
+
+    let mut index = lines.len();
+    while index > 0 {
+        let line = lines[index - 1].trim_start();
+        if let Some(rest) = line.strip_prefix("//") {
+            doc_lines.push(rest.trim_start().to_string());
+            index -= 1;
+            continue;
+        }
+        break;
+    }
+    if !doc_lines.is_empty() {
+        doc_lines.reverse();
+        return Some(doc_lines.join("\n"));
+    }
+
+    let mut end = lines.len();
+    while end > 0 && lines[end - 1].trim().is_empty() {
+        end -= 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    if !lines[end - 1].trim_end().ends_with("*/") {
+        return None;
+    }
+
+    let mut block = Vec::new();
+    let mut idx = end;
+    while idx > 0 {
+        let current = lines[idx - 1].trim();
+        block.push(current.to_string());
+        if current.starts_with("/*") {
+            block.reverse();
+            let cleaned = block
+                .into_iter()
+                .map(clean_block_line)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
+            if cleaned.is_empty() {
+                return None;
+            }
+            return Some(cleaned);
+        }
+        idx -= 1;
+    }
+
+    None
+}
+
+fn clean_block_line(line: String) -> String {
+    let trimmed = line.trim();
+    let without_open = trimmed.strip_prefix("/*").unwrap_or(trimmed);
+    let without_close = without_open.strip_suffix("*/").unwrap_or(without_open);
+    let without_star = without_close.strip_prefix('*').unwrap_or(without_close);
+    without_star.trim().to_string()
 }
 
 fn build_properties_from_walk(
@@ -436,7 +560,12 @@ fn build_properties_from_walk(
         name: "visibility".to_string(),
         label: "Visibility".to_string(),
         value: PropertyValueView::Text {
-            value: if element.is_public { "public" } else { "private" }.to_string(),
+            value: if element.is_public {
+                "public"
+            } else {
+                "private"
+            }
+            .to_string(),
         },
         hint: None,
         group: Some("modifiers".to_string()),
@@ -592,8 +721,12 @@ fn format_multiplicity(mult: Multiplicity) -> Option<String> {
             return Some(format!("[{}]", lo));
         }
     }
-    let lo = lower.map(|v| v.to_string()).unwrap_or_else(|| "*".to_string());
-    let hi = upper.map(|v| v.to_string()).unwrap_or_else(|| "*".to_string());
+    let lo = lower
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "*".to_string());
+    let hi = upper
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "*".to_string());
     Some(format!("[{}..{}]", lo, hi))
 }
 
@@ -613,7 +746,11 @@ fn find_expr_span_for_element<'a>(
                 && span.name_start_line == name_start.line
                 && span.name_start_col == name_start.col
         })
-        .or_else(|| spans.iter().find(|span| span.name == element.name && span.name_start_line == name_start.line))
+        .or_else(|| {
+            spans
+                .iter()
+                .find(|span| span.name == element.name && span.name_start_line == name_start.line)
+        })
 }
 
 fn symbol_kind_label(kind: SymbolKind) -> String {

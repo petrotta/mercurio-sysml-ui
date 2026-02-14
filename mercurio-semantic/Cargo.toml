@@ -1,0 +1,9 @@
+[package]
+name = "mercurio-semantic"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+mercurio-model = { path = "..\\mercurio-model" }
+syster = { package = "syster-base", version = "0.3.5-alpha", features = ["interchange"] }

@@ -1,0 +1,64 @@
+Mercurio Software Design (High-Level)
+
+Purpose
+Mercurio is a SysML/KerML authoring and analysis application. It provides parsing, semantic indexing,
+metamodel binding, and UI tooling for exploring and querying models.
+
+Software Stack (Top to Bottom)
+
+1) UI (mercurio-application-ui)
+Purpose: Web-based frontend (React/Vite) that drives user interaction.
+Responsibilities:
+- Editor UI (Monaco), project tree, model/semantic views.
+- Calls into the Tauri backend for filesystem and model/semantic operations.
+
+2) Desktop Shell / App (mercurio-application)
+Purpose: Tauri host for desktop distribution.
+Responsibilities:
+- Exposes commands to UI (compile, project model, semantic query, file ops).
+- Manages app lifecycle, menus, windowing, and local storage.
+- Bridges UI to core services (mercurio-core).
+
+3) Core Services (mercurio-core)
+Purpose: Application logic and orchestration.
+Responsibilities:
+- Parse/compile workspace (AST/HIR via syster).
+- Build symbol views and project model view.
+- Bind project elements to stdlib metamodel types and attributes.
+- Provide semantic query API (delegates to mercurio-semantic).
+- Export compiled models.
+
+4) Semantic Layer (mercurio-semantic)
+Purpose: Semantic indexing and mapping, with explicit rules for implied attributes.
+Responsibilities:
+- Build semantic index from AST/HIR + metamodel.
+- Provide query API for attributes such as short_name and comment body.
+- Centralize metatype resolution and metamodel attribute collection utilities.
+
+5) Model Layer (mercurio-model)
+Purpose: Workspace indexing and model graph utilities.
+Responsibilities:
+- Build FileIndex/WorkspaceIndex from parsed symbols.
+- Provide element/type/attribute reference and traversal helpers.
+- Maintain indexes for types, subtypes, and owned attributes.
+
+6) Language Infrastructure (syster-base)
+Purpose: Parser + HIR + analysis foundation for SysML/KerML.
+Responsibilities:
+- Parse source files into syntax trees and HIR symbols.
+- Provide diagnostics and semantic resolution primitives.
+
+7) External Runtime/Tooling
+Purpose: Build and runtime environment.
+Responsibilities:
+- Rust toolchain for core, semantic, and model crates.
+- Node/Vite for frontend dev and build.
+- Tauri toolchain for desktop packaging.
+
+Data Flow (Typical Path)
+- UI action -> Tauri command -> mercurio-core -> mercurio-semantic/mercurio-model -> syster parser.
+- Results return to UI for rendering (project model view, semantic query results, diagnostics).
+
+Notes
+- Metamodel binding uses stdlib definitions; project types resolve their metatype via supertypes.
+- Semantic mappings are explicitly encoded for explainability and maintainability.

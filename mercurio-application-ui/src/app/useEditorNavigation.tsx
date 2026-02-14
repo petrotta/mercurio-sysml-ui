@@ -12,8 +12,8 @@ type NavigateTarget = {
 };
 
 type UseEditorNavigationOptions = {
-  centerView: "file" | "diagram" | "ai" | "data";
-  setCenterView: (value: "file" | "diagram" | "ai" | "data") => void;
+  centerView: "file" | "diagram" | "ai" | "data" | "project-model";
+  setCenterView: (value: "file" | "diagram" | "ai" | "data" | "project-model") => void;
   activeDocPath: string | null;
   getDoc: (path: string) => { text: string; dirty: boolean } | null;
   setActiveEditorDoc: (path: string | null, text: string, dirty: boolean) => void;
@@ -65,22 +65,11 @@ export function useEditorNavigation({
     if (currentPath !== target.path) {
       const cached = getDoc(target.path);
       if (cached) {
-        if (cached.dirty) {
-          suppressDirtyRef.current = true;
-          setActiveEditorDoc(target.path, cached.text, cached.dirty);
-          queuePendingEditorContent(target.path, cached.text);
-          if (editorRef.current && centerView === "file" && activeTabPathRef.current !== PROJECT_DESCRIPTOR_TAB) {
-            editorRef.current.setValue(cached.text);
-          }
-        } else {
-          const content = await readFileText(target.path);
-          if (reqId !== navReqRef.current) return;
-          suppressDirtyRef.current = true;
-          setActiveEditorDoc(target.path, content || "", false);
-          queuePendingEditorContent(target.path, content || "");
-          if (editorRef.current && centerView === "file" && activeTabPathRef.current !== PROJECT_DESCRIPTOR_TAB) {
-            editorRef.current.setValue(content || "");
-          }
+        suppressDirtyRef.current = true;
+        setActiveEditorDoc(target.path, cached.text, cached.dirty);
+        queuePendingEditorContent(target.path, cached.text);
+        if (editorRef.current && centerView === "file" && activeTabPathRef.current !== PROJECT_DESCRIPTOR_TAB) {
+          editorRef.current.setValue(cached.text);
         }
       } else {
         const content = await readFileText(target.path);

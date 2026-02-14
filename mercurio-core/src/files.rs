@@ -90,7 +90,10 @@ pub fn get_parse_errors(path: &Path) -> Result<ParseErrorsPayload, String> {
     get_parse_errors_for_content(path, &content)
 }
 
-pub fn get_parse_errors_for_content(path: &Path, content: &str) -> Result<ParseErrorsPayload, String> {
+pub fn get_parse_errors_for_content(
+    path: &Path,
+    content: &str,
+) -> Result<ParseErrorsPayload, String> {
     if !is_model_file(path) {
         return Ok(ParseErrorsPayload {
             path: path.to_string_lossy().to_string(),

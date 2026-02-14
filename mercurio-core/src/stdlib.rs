@@ -82,7 +82,8 @@ pub(crate) fn resolve_stdlib_path(
     match config {
         Some(crate::LibraryConfig::Path { path }) => {
             if path.trim().is_empty() {
-                let discovered = resolve_default_stdlib_path(project_root, stdlib_root, default_stdlib);
+                let discovered =
+                    resolve_default_stdlib_path(project_root, stdlib_root, default_stdlib);
                 (StdLibLoader::new(), Some(discovered))
             } else {
                 let raw_path = PathBuf::from(path);
@@ -97,7 +98,8 @@ pub(crate) fn resolve_stdlib_path(
         Some(crate::LibraryConfig::Default(value)) => {
             let trimmed = value.trim();
             if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
-                let discovered = resolve_default_stdlib_path(project_root, stdlib_root, default_stdlib);
+                let discovered =
+                    resolve_default_stdlib_path(project_root, stdlib_root, default_stdlib);
                 (StdLibLoader::new(), Some(discovered))
             } else {
                 let raw_path = PathBuf::from(trimmed);
@@ -113,14 +115,16 @@ pub(crate) fn resolve_stdlib_path(
             if let Some(stdlib_id) = override_id {
                 let trimmed = stdlib_id.trim();
                 if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
-                    let discovered = resolve_default_stdlib_path(project_root, stdlib_root, default_stdlib);
+                    let discovered =
+                        resolve_default_stdlib_path(project_root, stdlib_root, default_stdlib);
                     (StdLibLoader::new(), Some(discovered))
                 } else {
                     let resolved = stdlib_root.join(trimmed);
                     (StdLibLoader::new(), Some(resolved))
                 }
             } else {
-                let discovered = resolve_default_stdlib_path(project_root, stdlib_root, default_stdlib);
+                let discovered =
+                    resolve_default_stdlib_path(project_root, stdlib_root, default_stdlib);
                 (StdLibLoader::new(), Some(discovered))
             }
         }

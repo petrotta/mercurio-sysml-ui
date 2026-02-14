@@ -17,6 +17,8 @@ mod agent;
 // Re-exported Tauri commands from focused modules.
 use commands::{
     ai_agent_run, ai_test_endpoint, create_dir, create_file, detect_git_repo, get_user_projects_root,
+    get_project_element_attributes, get_project_model, query_semantic,
+    get_stdlib_metamodel,
     git_checkout_branch, git_commit, git_create_branch, git_list_branches, git_push, git_stage_paths,
     git_status, git_unstage_paths, list_dir, list_stdlib_versions, open_in_explorer, path_exists,
     read_diagram, read_file, rename_path, window_close, window_minimize, window_toggle_maximize,
@@ -602,6 +604,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_user_projects_root,
             list_stdlib_versions,
+            get_stdlib_metamodel,
+            get_project_model,
+            get_project_element_attributes,
+            query_semantic,
             list_dir,
             read_file,
             path_exists,

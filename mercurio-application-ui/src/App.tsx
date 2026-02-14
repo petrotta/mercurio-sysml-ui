@@ -16,6 +16,9 @@ import {
   THEME_KEY,
   TRACK_TEXT_KEY,
   FILTER_MODEL_FILES_KEY,
+  MODEL_SORT_KEY,
+  MODEL_SHOW_FILES_KEY,
+  MODEL_PROPERTIES_DOCK_KEY,
 } from "./app/constants";
 import { loadRecents, saveRecents } from "./app/storage";
 import { useEditorState } from "./app/editorState";
@@ -25,6 +28,7 @@ import { ModelHeader } from "./app/components/ModelHeader";
 import { EditorPane } from "./app/components/EditorPane";
 import { ProjectTree } from "./app/components/ProjectTree";
 import { DataView } from "./app/components/DataView";
+import { ProjectModelPaneView } from "./app/components/ProjectModelView";
 import { DescriptorView } from "./app/components/DescriptorView";
 import { DiagramView } from "./app/components/DiagramView";
 import { AstStatus } from "./app/components/AstStatus";
@@ -45,7 +49,14 @@ import { readFileText } from "./app/fileOps";
 import { useProjectTree } from "./app/useProjectTree";
 import { runAgent } from "./app/agentClient";
 import { parseErrorLocation } from "./app/parseErrors";
-import type { FileEntry, OpenTab, SymbolView } from "./app/types";
+import type {
+  FileEntry,
+  OpenTab,
+  ProjectElementAttributesView,
+  ProjectModelView,
+  StdlibMetamodelView,
+  SymbolView,
+} from "./app/types";
 
 loader.config({ paths: { vs: "/monaco/vs" } });
 
@@ -62,8 +73,8 @@ export function App() {
   const [rightCollapsed, setRightCollapsed] = useState(false);
   const leftStoredWidthRef = useRef(240);
   const rightStoredWidthRef = useRef(320);
-  const draggingRef = useRef<null | "left" | "right" | "model">(null);
-  const startRef = useRef({ x: 0, y: 0, left: 240, right: 320, model: 260 });
+  const draggingRef = useRef<null | "left" | "right" | "model" | "modelProps">(null);
+  const startRef = useRef({ x: 0, y: 0, left: 240, right: 320, model: 260, modelProps: 320 });
   const [rootPath, setRootPath] = useState<string>(() => window.localStorage?.getItem(ROOT_STORAGE_KEY) || "");
   const [recentProjects, setRecentProjects] = useState<string[]>(() => loadRecents());
   const { treeEntries, expanded, refreshRoot, toggleExpand } = useProjectTree();
@@ -90,6 +101,7 @@ export function App() {
   const suppressDirtyRef = useRef(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; entry: FileEntry; scope: "root" | "node" } | null>(null);
   const [modelContextMenu, setModelContextMenu] = useState<{ x: number; y: number; filePath: string | null; label: string } | null>(null);
+  const [modelOptionsMenu, setModelOptionsMenu] = useState<{ x: number; y: number } | null>(null);
   const [astViewOpen, setAstViewOpen] = useState(false);
   const [astViewTitle, setAstViewTitle] = useState("");
   const { astState: astViewState, loadForPath: loadAstViewForPath } = useAstLoader();
@@ -104,6 +116,13 @@ export function App() {
     clearTimer: clearAstSplitTimer,
   } = useAstLoader();
   const [showAbout, setShowAbout] = useState(false);
+  const [metamodelDebugLoading, setMetamodelDebugLoading] = useState(false);
+  const [metamodelDebugError, setMetamodelDebugError] = useState("");
+  const [stdlibMetamodel, setStdlibMetamodel] = useState<StdlibMetamodelView | null>(null);
+  const [projectModelView, setProjectModelView] = useState<ProjectModelView | null>(null);
+  const [projectModelLoading, setProjectModelLoading] = useState(false);
+  const [projectModelError, setProjectModelError] = useState("");
+  const [projectModelFocusQuery, setProjectModelFocusQuery] = useState("");
   const [aboutVersion, setAboutVersion] = useState<string | null>(null);
   const [aboutBuild, setAboutBuild] = useState<string | null>(null);
   const astEditorRef = useRef<Parameters<OnMount>[0] | null>(null);
@@ -193,7 +212,7 @@ export function App() {
   const [newProjectDefaultLib, setNewProjectDefaultLib] = useState(true);
   const [newProjectBusy, setNewProjectBusy] = useState(false);
   const [newProjectError, setNewProjectError] = useState("");
-  const [centerView, setCenterView] = useState<"file" | "diagram" | "ai" | "data">("file");
+  const [centerView, setCenterView] = useState<"file" | "diagram" | "ai" | "data" | "project-model">("file");
   // cursorPos is managed by useEditorState
   const [aiInput, setAiInput] = useState("");
   const [aiHistoryIndex, setAiHistoryIndex] = useState<number | null>(null);
@@ -272,6 +291,15 @@ export function App() {
   const [modelTreeHeight, setModelTreeHeight] = useState(260);
   const [collapseAllModel, setCollapseAllModel] = useState(false);
   const [showPropertiesPane, setShowPropertiesPane] = useState(true);
+  const [propertiesDock, setPropertiesDock] = useState<"bottom" | "right">(() => {
+    try {
+      const stored = window.localStorage?.getItem(MODEL_PROPERTIES_DOCK_KEY);
+      return stored === "right" ? "right" : "bottom";
+    } catch {
+      return "bottom";
+    }
+  });
+  const [modelPropertiesWidth, setModelPropertiesWidth] = useState(320);
   const [trackText, setTrackText] = useState(() => {
     try {
       return window.localStorage?.getItem(TRACK_TEXT_KEY) === "true";
@@ -288,6 +316,22 @@ export function App() {
       return false;
     }
   });
+  const [modelSortBy, setModelSortBy] = useState<"name" | "qualified_name">(() => {
+    try {
+      const stored = window.localStorage?.getItem(MODEL_SORT_KEY);
+      return stored === "qualified_name" ? "qualified_name" : "name";
+    } catch {
+      return "name";
+    }
+  });
+  const [modelShowFiles, setModelShowFiles] = useState(() => {
+    try {
+      const stored = window.localStorage?.getItem(MODEL_SHOW_FILES_KEY);
+      return stored !== "false";
+    } catch {
+      return true;
+    }
+  });
   const modelTreeRef = useRef<HTMLDivElement | null>(null);
   const modelPaneContainerRef = useRef<HTMLDivElement | null>(null);
   const [modelPaneHeight, setModelPaneHeight] = useState(0);
@@ -298,6 +342,8 @@ export function App() {
     selection?: { startLine: number; startCol: number; endLine: number; endCol: number };
   } | null>(null);
   const lastCompiledContentRef = useRef<Record<string, string>>({});
+  const elementAttrsCacheRef = useRef<Record<string, ProjectElementAttributesView | null>>({});
+  const elementAttrsInflightRef = useRef<Record<string, Promise<ProjectElementAttributesView | null>>>({});
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
   const cursorListenerRef = useRef<null | { dispose: () => void }>(null);
@@ -319,7 +365,14 @@ export function App() {
   const activeEditorPath = useMemo(() => {
     if (!activeTabMeta) return null;
     if (activeTabMeta.path === PROJECT_DESCRIPTOR_TAB) return null;
-    if (activeTabMeta.kind === "ai" || activeTabMeta.kind === "data" || activeTabMeta.kind === "diagram") return null;
+    if (
+      activeTabMeta.kind === "ai" ||
+      activeTabMeta.kind === "data" ||
+      activeTabMeta.kind === "diagram" ||
+      activeTabMeta.kind === "project-model"
+    ) {
+      return null;
+    }
     return activeTabMeta.path;
   }, [activeTabMeta]);
   const activeDiagramPath = useMemo(() => {
@@ -431,6 +484,7 @@ export function App() {
       if (!target || !target.closest(".context-menu")) {
         setContextMenu(null);
         setModelContextMenu(null);
+        setModelOptionsMenu(null);
       }
       if (!target || !target.closest(".tab-menu")) {
         setTabMenu(null);
@@ -493,6 +547,23 @@ export function App() {
   useEffect(() => {
     window.localStorage?.setItem(FILTER_MODEL_FILES_KEY, showOnlyModelFiles ? "true" : "false");
   }, [showOnlyModelFiles]);
+
+  useEffect(() => {
+    window.localStorage?.setItem(MODEL_SORT_KEY, modelSortBy);
+  }, [modelSortBy]);
+
+  useEffect(() => {
+    window.localStorage?.setItem(MODEL_SHOW_FILES_KEY, modelShowFiles ? "true" : "false");
+  }, [modelShowFiles]);
+
+  useEffect(() => {
+    window.localStorage?.setItem(MODEL_PROPERTIES_DOCK_KEY, propertiesDock);
+  }, [propertiesDock]);
+
+  useEffect(() => {
+    elementAttrsCacheRef.current = {};
+    elementAttrsInflightRef.current = {};
+  }, [rootPath, symbols]);
 
 
   useEffect(() => {
@@ -647,6 +718,48 @@ export function App() {
     }
   };
 
+  const loadStdlibMetamodel = async () => {
+    if (!rootPath) {
+      setMetamodelDebugError("Select a project root first.");
+      setStdlibMetamodel(null);
+      return;
+    }
+    setMetamodelDebugLoading(true);
+    setMetamodelDebugError("");
+    try {
+      const payload = await invoke<StdlibMetamodelView>("get_stdlib_metamodel", { root: rootPath });
+      setStdlibMetamodel(payload);
+    } catch (error) {
+      setMetamodelDebugError(`Failed to load metamodel: ${String(error)}`);
+      setStdlibMetamodel(null);
+    } finally {
+      setMetamodelDebugLoading(false);
+    }
+  };
+
+  const loadProjectModel = async () => {
+    if (!rootPath) {
+      setProjectModelError("Select a project root first.");
+      setProjectModelView(null);
+      return;
+    }
+    setProjectModelLoading(true);
+    setProjectModelError("");
+    try {
+      const payload = await invoke<ProjectModelView>("get_project_model", { root: rootPath });
+      setProjectModelView(payload);
+    } catch (error) {
+      setProjectModelError(`Failed to load project model: ${String(error)}`);
+      setProjectModelView(null);
+    } finally {
+      setProjectModelLoading(false);
+    }
+  };
+
+  const loadProjectAndLibraryModel = async () => {
+    await Promise.all([loadProjectModel(), loadStdlibMetamodel()]);
+  };
+
   useEffect(() => {
     const onMove = (event: PointerEvent) => {
       if (!draggingRef.current) return;
@@ -659,6 +772,9 @@ export function App() {
       } else if (draggingRef.current === "model") {
         const deltaY = event.clientY - startRef.current.y;
         setModelTreeHeight(Math.max(140, Math.min(520, startRef.current.model + deltaY)));
+      } else if (draggingRef.current === "modelProps") {
+        const deltaX = event.clientX - startRef.current.x;
+        setModelPropertiesWidth(Math.max(220, Math.min(720, startRef.current.modelProps - deltaX)));
       }
     };
     const onUp = () => {
@@ -734,6 +850,12 @@ export function App() {
   }, [rootPath, backgroundCompileEnabled]);
 
   useEffect(() => {
+    if (activeTabMeta?.kind !== "project-model") return;
+    if (!rootPath) return;
+    void loadProjectAndLibraryModel();
+  }, [activeTabMeta?.kind, rootPath]);
+
+  useEffect(() => {
     if (!modelPaneContainerRef.current) return;
     const observer = new ResizeObserver((entries) => {
       const entry = entries[0];
@@ -742,10 +864,10 @@ export function App() {
     });
     observer.observe(modelPaneContainerRef.current);
     return () => observer.disconnect();
-  }, []);
+  }, [rightCollapsed]);
 
 
-  const startDrag = (side: "left" | "right" | "model", event: React.PointerEvent) => {
+  const startDrag = (side: "left" | "right" | "model" | "modelProps", event: React.PointerEvent) => {
     event.preventDefault();
     if (event.currentTarget && "setPointerCapture" in event.currentTarget) {
       (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
@@ -759,7 +881,14 @@ export function App() {
       setRightWidth(rightStoredWidthRef.current || 320);
     }
     draggingRef.current = side;
-    startRef.current = { x: event.clientX, y: event.clientY, left: leftWidth, right: rightWidth, model: modelTreeHeight };
+    startRef.current = {
+      x: event.clientX,
+      y: event.clientY,
+      left: leftWidth,
+      right: rightWidth,
+      model: modelTreeHeight,
+      modelProps: modelPropertiesWidth,
+    };
     document.body.classList.add("dragging");
   };
 
@@ -795,6 +924,9 @@ export function App() {
     setDescriptorViewMode("view");
     setProjectDescriptor(null);
     setHasProjectDescriptor(false);
+    setProjectModelView(null);
+    setProjectModelError("");
+    setProjectModelFocusQuery("");
     setGitInfo(null);
     setGitStatus(null);
     setRootPath(path);
@@ -846,6 +978,7 @@ export function App() {
     selectTab,
     openAiViewTab,
     openDataViewTab,
+    openProjectModelViewTab,
     openDiagramViewTab,
     reorderTabs,
     closeTab,
@@ -889,6 +1022,7 @@ export function App() {
     event.stopPropagation();
     setContextMenu({ x: event.clientX, y: event.clientY, entry, scope: "node" });
     setModelContextMenu(null);
+    setModelOptionsMenu(null);
   };
 
   const showRootContext = (event: ReactMouseEvent) => {
@@ -902,12 +1036,23 @@ export function App() {
       entry: { name: rootPath.split(/[\\/]/).pop() || rootPath, path: rootPath, is_dir: true },
     });
     setModelContextMenu(null);
+    setModelOptionsMenu(null);
   };
 
   const showModelContext = (event: ReactMouseEvent, payload: { filePath: string | null; label: string }) => {
     event.preventDefault();
     event.stopPropagation();
     setModelContextMenu({ x: event.clientX, y: event.clientY, filePath: payload.filePath, label: payload.label });
+    setModelOptionsMenu(null);
+    setContextMenu(null);
+  };
+
+  const showModelOptions = (event: ReactMouseEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = event.currentTarget.getBoundingClientRect();
+    setModelOptionsMenu({ x: Math.round(rect.left), y: Math.round(rect.bottom + 4) });
+    setModelContextMenu(null);
     setContextMenu(null);
   };
 
@@ -915,6 +1060,110 @@ export function App() {
     setAstViewTitle(label);
     setAstViewOpen(true);
     await loadAstViewForPath(filePath);
+  };
+
+  const loadElementAttributes = async (symbol: SymbolView): Promise<ProjectElementAttributesView | null> => {
+    if (!rootPath || !symbol.qualified_name) return null;
+    const cacheKey = `${rootPath}::${symbol.qualified_name}::${symbol.kind || ""}`;
+    if (cacheKey in elementAttrsCacheRef.current) {
+      return elementAttrsCacheRef.current[cacheKey];
+    }
+    const inflight = elementAttrsInflightRef.current[cacheKey];
+    if (inflight) {
+      return inflight;
+    }
+    const request = (async () => {
+      try {
+        const data = await invoke<ProjectElementAttributesView>("get_project_element_attributes", {
+          root: rootPath,
+          elementQualifiedName: symbol.qualified_name,
+          symbolKind: symbol.kind || null,
+        });
+        elementAttrsCacheRef.current[cacheKey] = data;
+        return data;
+      } catch {
+        return null;
+      } finally {
+        delete elementAttrsInflightRef.current[cacheKey];
+      }
+    })();
+    elementAttrsInflightRef.current[cacheKey] = request;
+    try {
+      return await request;
+    } catch {
+      return null;
+    }
+  };
+
+  const openAttributeInProjectModel = (
+    symbol: SymbolView,
+    attrQualifiedName: string,
+    attrName: string,
+  ) => {
+    setProjectModelFocusQuery(attrQualifiedName || `${symbol.qualified_name}::${attrName}`);
+    openProjectModelViewTab();
+  };
+
+  const openAttributeSourceText = async (
+    symbol: SymbolView,
+    attrQualifiedName: string,
+    attrName: string,
+  ) => {
+    if (!rootPath) return;
+    type SemanticQueryPayload = {
+      metatype?: string | null;
+      metatype_is_a?: string | null;
+      predicates: Array<{ name: string; equals: string }>;
+    };
+    type SemanticElementResult = {
+      file_path: string;
+      start_line: number;
+      start_col: number;
+      end_line: number;
+      end_col: number;
+    };
+    try {
+      const query: SemanticQueryPayload = {
+        metatype: null,
+        metatype_is_a: null,
+        predicates: [
+          {
+            name: "qualified_name",
+            equals: attrQualifiedName,
+          },
+        ],
+      };
+      const matches = await invoke<SemanticElementResult[]>("query_semantic", {
+        root: rootPath,
+        query,
+      });
+      const first = Array.isArray(matches) && matches.length ? matches[0] : null;
+      if (first?.file_path) {
+        await navigateTo({
+          path: first.file_path,
+          name: first.file_path.split(/[\\/]/).pop() || attrName || "Attribute",
+          selection: {
+            startLine: first.start_line,
+            startCol: first.start_col,
+            endLine: first.end_line,
+            endCol: first.end_col,
+          },
+        });
+        return;
+      }
+    } catch {
+      // Fall back to opening the owning symbol when attribute lookup fails.
+    }
+    await navigateTo({
+      path: symbol.file_path,
+      name: symbol.file_path.split(/[\\/]/).pop() || symbol.name || "Source",
+      selection: {
+        startLine: symbol.start_line,
+        startCol: symbol.start_col,
+        endLine: symbol.end_line,
+        endCol: symbol.end_col,
+      },
+    });
   };
 
   const handleContextAction = async (action: string) => {
@@ -2172,11 +2421,16 @@ export function App() {
     projectSymbolsLoaded,
     getKindKey,
     showUsages: showUsageNodes,
+    modelSortBy,
+    modelShowFiles,
   });
 
-  const effectiveModelTreeHeight = showPropertiesPane
-    ? modelTreeHeight
-    : Math.max(modelTreeHeight, modelPaneHeight || modelTreeHeight);
+  const undockedTreeHeight = Math.max(
+    modelTreeHeight,
+    modelPaneHeight > 0 ? modelPaneHeight - 44 : modelTreeHeight,
+  );
+  const effectiveModelTreeHeight =
+    showPropertiesPane && propertiesDock === "bottom" ? modelTreeHeight : undockedTreeHeight;
 
   const {
     modelListRef,
@@ -2339,6 +2593,7 @@ export function App() {
               <div className="menu-divider" />
               <button type="button" onClick={() => { setOpenMenu(null); openAiViewTab(); }}>Agent</button>
               <button type="button" onClick={() => { setOpenMenu(null); openDataViewTab(); }}>Data Analysis View</button>
+              <button type="button" onClick={() => { setOpenMenu(null); openProjectModelViewTab(); }}>Project Model View</button>
               <button
                 type="button"
                 onClick={() => {
@@ -2546,6 +2801,20 @@ export function App() {
                   errorCounts={errorCounts}
                   dataViewSymbolKindCounts={dataViewSymbolKindCounts}
                 />
+              ) : activeTabMeta?.kind === "project-model" ? (
+                <ProjectModelPaneView
+                  rootPath={rootPath}
+                  model={projectModelView}
+                  library={stdlibMetamodel}
+                  loading={projectModelLoading}
+                  libraryLoading={metamodelDebugLoading}
+                  error={projectModelError}
+                  libraryError={metamodelDebugError}
+                  focusQuery={projectModelFocusQuery}
+                  onRefresh={() => {
+                    void loadProjectAndLibraryModel();
+                  }}
+                />
               ) : !activeTabPath ? (
                 <div className="editor-placeholder">
                   <div className="welcome-screen">
@@ -2710,10 +2979,7 @@ export function App() {
                 collapseAll={collapseAllModel}
                 onCollapseAll={() => setCollapseAllModel(true)}
                 onExpandAll={() => setCollapseAllModel(false)}
-                onToggleProperties={() => setShowPropertiesPane((prev) => !prev)}
-                showProperties={showPropertiesPane}
-                showUsages={showUsageNodes}
-                onToggleUsages={() => setShowUsageNodes((prev) => !prev)}
+                onOpenOptions={showModelOptions}
               />
               <button
                 type="button"
@@ -2730,6 +2996,8 @@ export function App() {
             <ModelPane
               modelTreeHeight={effectiveModelTreeHeight}
               showPropertiesPane={showPropertiesPane}
+              propertiesDock={propertiesDock}
+              modelPropertiesWidth={modelPropertiesWidth}
               modelTreeRef={modelTreeRef}
               modelListRef={modelListRef}
               modelRows={modelRows}
@@ -2750,6 +3018,13 @@ export function App() {
                 const content = await readFileText(path);
                 return content || "";
               }}
+              onOpenInProjectModel={(symbol) => {
+                setProjectModelFocusQuery(symbol.qualified_name || symbol.name || symbol.kind);
+                openProjectModelViewTab();
+              }}
+              onOpenAttributeInProjectModel={openAttributeInProjectModel}
+              onOpenAttributeSourceText={openAttributeSourceText}
+              loadElementAttributes={loadElementAttributes}
             />
             </section>
           )}
@@ -2808,6 +3083,75 @@ export function App() {
                 <button type="button" onClick={() => handleContextAction("rename")}>Rename</button>
               </>
             )}
+          </div>
+        ) : null}
+        {modelOptionsMenu ? (
+          <div className="context-menu" style={{ left: modelOptionsMenu.x, top: modelOptionsMenu.y }}>
+            <button
+              type="button"
+              onClick={() => {
+                setModelSortBy("name");
+                setModelOptionsMenu(null);
+              }}
+            >
+              Sort by: Name{modelSortBy === "name" ? " (current)" : ""}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setModelSortBy("qualified_name");
+                setModelOptionsMenu(null);
+              }}
+            >
+              Sort by: Qualified Name{modelSortBy === "qualified_name" ? " (current)" : ""}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setModelShowFiles((prev) => !prev);
+                setModelOptionsMenu(null);
+              }}
+            >
+              {modelShowFiles ? "Hide File Groups" : "Show File Groups"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setShowPropertiesPane((prev) => !prev);
+                setModelOptionsMenu(null);
+              }}
+            >
+              {showPropertiesPane ? "Undock Properties Panel" : "Dock Properties Panel"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setPropertiesDock("bottom");
+                setShowPropertiesPane(true);
+                setModelOptionsMenu(null);
+              }}
+            >
+              Dock Properties: Bottom{propertiesDock === "bottom" ? " (current)" : ""}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setPropertiesDock("right");
+                setShowPropertiesPane(true);
+                setModelOptionsMenu(null);
+              }}
+            >
+              Dock Properties: Right{propertiesDock === "right" ? " (current)" : ""}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setShowUsageNodes((prev) => !prev);
+                setModelOptionsMenu(null);
+              }}
+            >
+              {showUsageNodes ? "Hide Usages" : "Show Usages"}
+            </button>
           </div>
         ) : null}
         {modelContextMenu ? (

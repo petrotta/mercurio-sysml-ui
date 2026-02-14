@@ -1,21 +1,17 @@
+import type { MouseEvent } from "react";
+
 type ModelHeaderProps = {
   collapseAll: boolean;
   onCollapseAll: () => void;
   onExpandAll: () => void;
-  onToggleProperties: () => void;
-  showProperties: boolean;
-  showUsages: boolean;
-  onToggleUsages: () => void;
+  onOpenOptions: (event: MouseEvent<HTMLButtonElement>) => void;
 };
 
 export function ModelHeader({
   collapseAll,
   onCollapseAll,
   onExpandAll,
-  onToggleProperties,
-  showProperties,
-  showUsages,
-  onToggleUsages,
+  onOpenOptions,
 }: ModelHeaderProps) {
   return (
     <>
@@ -41,17 +37,10 @@ export function ModelHeader({
       </button>
       <button
         type="button"
-        className={`ghost icon-properties ${showProperties ? "active" : ""}`}
-        onClick={onToggleProperties}
-        aria-label="Toggle properties"
-        title={showProperties ? "Hide properties" : "Show properties"}
-      />
-      <button
-        type="button"
-        className={`ghost icon-usage ${showUsages ? "active" : ""}`}
-        onClick={onToggleUsages}
-        aria-label="Toggle usages"
-        title={showUsages ? "Hide usages" : "Show usages"}
+        className="ghost icon-gear"
+        onClick={onOpenOptions}
+        aria-label="Model options"
+        title="Model options"
       />
     </>
   );

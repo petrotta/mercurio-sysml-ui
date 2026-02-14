@@ -37,6 +37,7 @@ export function useModelTreeSelection({
 }: UseModelTreeSelectionOptions) {
   const modelListRef = useRef<ListImperativeAPI | null>(null);
   const pendingScrollSymbolRef = useRef<string | null>(null);
+  const modelCursorRowKeyRef = useRef<string | null>(null);
   const [modelCursorIndex, setModelCursorIndex] = useState<number | null>(null);
   const modelSectionIndent = 12;
   const modelListHeight = Math.max(120, modelTreeHeight - 16);
@@ -98,8 +99,26 @@ export function useModelTreeSelection({
       setModelCursorIndex(modelRows.length ? 0 : null);
       return;
     }
+    const row = modelRows[modelCursorIndex];
+    modelCursorRowKeyRef.current = row?.key ?? null;
     modelListRef.current?.scrollToRow({ index: modelCursorIndex, align: "smart" });
   }, [modelCursorIndex, modelRows.length]);
+
+  useEffect(() => {
+    if (!modelRows.length) {
+      modelCursorRowKeyRef.current = null;
+      if (modelCursorIndex != null) {
+        setModelCursorIndex(null);
+      }
+      return;
+    }
+    const key = modelCursorRowKeyRef.current;
+    if (!key) return;
+    const index = modelRows.findIndex((row) => row.key === key);
+    if (index >= 0 && index !== modelCursorIndex) {
+      setModelCursorIndex(index);
+    }
+  }, [modelRows, modelCursorIndex]);
 
   const activateModelRow = (row: ModelRow, index: number) => {
     if (row.type === "section") {

@@ -26,6 +26,8 @@ type UseModelTreeOptions = {
   projectSymbolsLoaded: boolean;
   getKindKey: (kind: string) => string;
   showUsages: boolean;
+  modelSortBy: "name" | "qualified_name";
+  modelShowFiles: boolean;
 };
 
 export function useModelTree({
@@ -41,6 +43,8 @@ export function useModelTree({
   projectSymbolsLoaded,
   getKindKey,
   showUsages,
+  modelSortBy,
+  modelShowFiles,
 }: UseModelTreeOptions) {
   const buildSymbolTree = (list: SymbolView[]) => {
     const root: SymbolNode = {
@@ -95,7 +99,7 @@ export function useModelTree({
     const walk = (node: SymbolNode, depth: number, isTop: boolean, pathKey: string) => {
       const displayName = isTop && node.name === "root" && rootLabel ? rootLabel : node.name;
       const nodeId = `${rootKey}::${node.fullName || pathKey}`;
-      const kindLabel = node.symbols.map((symbol) => symbol.kind).filter(Boolean).join(", ");
+      const kindLabel = Array.from(new Set(node.symbols.map((symbol) => symbol.kind).filter(Boolean))).join(" ");
       const kindKey = getKindKey(node.symbols[0]?.kind || "");
       const hasChildren = node.children.size > 0;
       const expandedState = collapseAll ? false : expanded[nodeId] ?? false;
@@ -115,7 +119,12 @@ export function useModelTree({
       if (hasChildren && (expandedState || isVirtualRoot)) {
         const byNameCount = new Map<string, number>();
         Array.from(node.children.values())
-          .sort((a, b) => a.name.localeCompare(b.name))
+          .sort((a, b) => {
+            if (modelSortBy === "qualified_name") {
+              return a.fullName.localeCompare(b.fullName);
+            }
+            return a.name.localeCompare(b.name);
+          })
           .forEach((child) => {
             const keyBase = child.name || "node";
             const count = (byNameCount.get(keyBase) || 0) + 1;
@@ -132,6 +141,27 @@ export function useModelTree({
   const modelRows = useMemo<ModelRow[]>(() => {
     const rows: ModelRow[] = [];
     const pushSymbolGroups = (groups: SymbolGroup[], sectionKey: string) => {
+      if (!modelShowFiles) {
+        const merged = groups.flatMap((group) =>
+          showUsages ? group.list : group.list.filter((symbol) => !isUsageSymbol(symbol)),
+        );
+        const tree = buildSymbolTree(merged);
+        const builtRows = buildRowsForTree(tree, undefined, `${sectionKey}::all`, modelExpanded, collapseAllModel);
+        builtRows.forEach((row) => {
+          rows.push({
+            type: "symbol",
+            key: row.id,
+            name: row.name,
+            kindLabel: row.kindLabel,
+            kindKey: row.kindKey,
+            depth: row.depth,
+            node: row.node,
+            hasChildren: row.hasChildren,
+            expanded: row.expanded,
+          });
+        });
+        return;
+      }
       groups.forEach((group) => {
         const rootLabel = group.path.split(/[\\/]/).pop() || group.path;
         const filtered = showUsages ? group.list : group.list.filter((symbol) => !isUsageSymbol(symbol));
@@ -226,6 +256,8 @@ export function useModelTree({
     projectSymbolsLoaded,
     getKindKey,
     showUsages,
+    modelSortBy,
+    modelShowFiles,
   ]);
 
   return { modelRows };

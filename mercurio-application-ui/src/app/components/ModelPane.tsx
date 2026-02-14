@@ -1,11 +1,13 @@
 import type { KeyboardEvent, PointerEvent, RefObject, ReactElement } from "react";
 import { List, type ListImperativeAPI, type RowComponentProps } from "react-window";
-import type { ModelRow, SymbolView } from "../types";
+import type { ModelRow, ProjectElementAttributesView, SymbolView } from "../types";
 import { PropertiesPane } from "./PropertiesPane";
 
 type ModelPaneProps = {
   modelTreeHeight: number;
   showPropertiesPane: boolean;
+  propertiesDock: "bottom" | "right";
+  modelPropertiesWidth: number;
   modelTreeRef: RefObject<HTMLDivElement | null>;
   modelListRef: RefObject<ListImperativeAPI | null>;
   modelRows: ModelRow[];
@@ -14,16 +16,22 @@ type ModelPaneProps = {
   renderModelRow: (props: RowComponentProps<{ rows: ModelRow[] }>) => ReactElement | null;
   handleModelTreeKeyDown: (event: KeyboardEvent<HTMLDivElement>) => void;
   onModelTreeFocus: () => void;
-  startDrag: (side: "left" | "right" | "model", event: PointerEvent) => void;
+  startDrag: (side: "left" | "right" | "model" | "modelProps", event: PointerEvent) => void;
   selectedSymbol: SymbolView | null;
   selectedSymbols: SymbolView[] | null;
   getDoc: (path: string) => { path: string; text: string; dirty: boolean } | null;
   readFile: (path: string) => Promise<string>;
+  onOpenInProjectModel: (symbol: SymbolView) => void;
+  onOpenAttributeInProjectModel: (symbol: SymbolView, attrQualifiedName: string, attrName: string) => void;
+  onOpenAttributeSourceText: (symbol: SymbolView, attrQualifiedName: string, attrName: string) => void;
+  loadElementAttributes: (symbol: SymbolView) => Promise<ProjectElementAttributesView | null>;
 };
 
 export function ModelPane({
   modelTreeHeight,
   showPropertiesPane,
+  propertiesDock,
+  modelPropertiesWidth,
   modelTreeRef,
   modelListRef,
   modelRows,
@@ -37,11 +45,19 @@ export function ModelPane({
   selectedSymbols,
   getDoc,
   readFile,
+  onOpenInProjectModel,
+  onOpenAttributeInProjectModel,
+  onOpenAttributeSourceText,
+  loadElementAttributes,
 }: ModelPaneProps) {
+  const dockRight = showPropertiesPane && propertiesDock === "right";
   return (
     <div
-      className={`model-pane ${showPropertiesPane ? "" : "no-properties"}`}
-      style={{ ["--model-tree-height" as string]: `${modelTreeHeight}px` }}
+      className={`model-pane ${showPropertiesPane ? "" : "no-properties"} ${dockRight ? "dock-right" : "dock-bottom"}`}
+      style={{
+        ["--model-tree-height" as string]: `${modelTreeHeight}px`,
+        ["--model-props-width" as string]: `${modelPropertiesWidth}px`,
+      }}
     >
       <div
         className="model-tree"
@@ -67,8 +83,19 @@ export function ModelPane({
       </div>
       {showPropertiesPane ? (
         <>
-          <div className="h-splitter" onPointerDown={(event) => startDrag("model", event)} />
-          <PropertiesPane selectedSymbols={selectedSymbols ?? (selectedSymbol ? [selectedSymbol] : null)} getDoc={getDoc} readFile={readFile} />
+          <div
+            className={dockRight ? "v-splitter" : "h-splitter"}
+            onPointerDown={(event) => startDrag(dockRight ? "modelProps" : "model", event)}
+          />
+          <PropertiesPane
+            selectedSymbols={selectedSymbols ?? (selectedSymbol ? [selectedSymbol] : null)}
+            getDoc={getDoc}
+            readFile={readFile}
+            onOpenInProjectModel={onOpenInProjectModel}
+            onOpenAttributeInProjectModel={onOpenAttributeInProjectModel}
+            onOpenAttributeSourceText={onOpenAttributeSourceText}
+            loadElementAttributes={loadElementAttributes}
+          />
         </>
       ) : null}
     </div>
