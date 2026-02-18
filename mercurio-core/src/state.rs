@@ -1,14 +1,14 @@
+use mercurio_symbol_index::{InMemorySymbolIndex, SqliteSymbolIndexStore, SymbolIndex};
+use mercurio_sysml_semantics::stdlib::MetatypeIndex;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use syster::ide::AnalysisHost;
-use syster::syntax::SyntaxFile;
-
-use crate::metamodel::StdlibMetamodelView;
 use crate::project_model::ProjectModelView;
+use crate::settings::AppSettings;
+use crate::stdlib::StdlibMetamodelView;
 
 #[derive(Serialize, Clone)]
 pub struct CompileFileResult {
@@ -17,44 +17,61 @@ pub struct CompileFileResult {
     pub errors: Vec<String>,
     pub symbol_count: usize,
 }
-use crate::settings::AppSettings;
+
+#[derive(Clone)]
+pub(crate) struct StdlibSymbol {
+    pub(crate) file_path: String,
+    pub(crate) name: String,
+    pub(crate) qualified_name: String,
+    pub(crate) kind: String,
+    pub(crate) start_line: u32,
+    pub(crate) start_col: u32,
+    pub(crate) end_line: u32,
+    pub(crate) end_col: u32,
+}
 
 pub(crate) struct StdlibCache {
     pub(crate) path: PathBuf,
-    pub(crate) files: Vec<(PathBuf, SyntaxFile)>,
+    pub(crate) signature: String,
+    pub(crate) files: Vec<(PathBuf, String)>,
+    pub(crate) metatype_index: Arc<MetatypeIndex>,
+    pub(crate) symbols: Arc<Vec<StdlibSymbol>>,
 }
 
 #[derive(Default)]
 pub(crate) struct WorkspaceState {
-    pub(crate) root: Option<PathBuf>,
-    pub(crate) project_files: HashSet<PathBuf>,
-    pub(crate) import_files: HashSet<PathBuf>,
-    pub(crate) stdlib_path: Option<PathBuf>,
     pub(crate) file_mtimes: HashMap<PathBuf, SystemTime>,
     pub(crate) file_cache: HashMap<PathBuf, CompileFileResult>,
 }
 
 #[derive(Clone)]
 pub struct CoreState {
-    pub(crate) stdlib_cache: Arc<Mutex<Option<StdlibCache>>>,
+    pub(crate) stdlib_cache: Arc<Mutex<HashMap<String, StdlibCache>>>,
     pub(crate) canceled_compiles: Arc<Mutex<HashSet<u64>>>,
-    pub(crate) analysis_host: Arc<Mutex<AnalysisHost>>,
     pub(crate) workspace: Arc<Mutex<WorkspaceState>>,
     pub(crate) metamodel_cache: Arc<Mutex<HashMap<String, StdlibMetamodelView>>>,
     pub(crate) project_model_cache: Arc<Mutex<HashMap<String, ProjectModelView>>>,
+    pub(crate) symbol_index: Arc<Mutex<SymbolIndex>>,
     pub stdlib_root: PathBuf,
     pub settings: Arc<Mutex<AppSettings>>,
 }
 
 impl CoreState {
     pub fn new(stdlib_root: PathBuf, settings: AppSettings) -> Self {
+        let index_path = stdlib_root
+            .parent()
+            .map(|parent| parent.join("symbol-index.db"))
+            .unwrap_or_else(|| stdlib_root.join("symbol-index.db"));
+        let symbol_index = SqliteSymbolIndexStore::open(&index_path)
+            .map(SymbolIndex::Sqlite)
+            .unwrap_or_else(|_| SymbolIndex::InMemory(InMemorySymbolIndex::default()));
         Self {
-            stdlib_cache: Arc::new(Mutex::new(None)),
+            stdlib_cache: Arc::new(Mutex::new(HashMap::new())),
             canceled_compiles: Arc::new(Mutex::new(HashSet::new())),
-            analysis_host: Arc::new(Mutex::new(AnalysisHost::new())),
             workspace: Arc::new(Mutex::new(WorkspaceState::default())),
             metamodel_cache: Arc::new(Mutex::new(HashMap::new())),
             project_model_cache: Arc::new(Mutex::new(HashMap::new())),
+            symbol_index: Arc::new(Mutex::new(symbol_index)),
             stdlib_root,
             settings: Arc::new(Mutex::new(settings)),
         }

@@ -20,6 +20,8 @@ export function ProjectTree({
   showOnlyModelFiles,
   parseErrorPaths,
 }: ProjectTreeProps) {
+  const normalizePathKey = (path: string) => (path || "").replace(/\//g, "\\").toLowerCase();
+
   const isModelFile = (entry: FileEntry) => {
     const ext = entry.name.toLowerCase().split(".").pop() || "";
     return ext === "sysml" || ext === "kerml";
@@ -46,11 +48,12 @@ export function ProjectTree({
                 ? "{}"
                 : "";
       const iconClass = entry.is_dir ? "folder" : isDiagram ? "file diagram" : "file";
-      const hasParseError = !entry.is_dir && parseErrorPaths.has(entry.path);
+      const hasParseError = !entry.is_dir && parseErrorPaths.has(normalizePathKey(entry.path));
       return (
         <div key={`${entry.path}-${depth}`} className="tree-node">
           <div
             className={`tree-row ${entry.is_dir ? "dir" : "file"} ${hasParseError ? "tree-row-error" : ""}`}
+            style={{ paddingLeft: `${8 + depth * 14}px` }}
             onClick={() => onOpenFile(entry)}
             onContextMenu={(event) => onContextMenu(event, entry)}
           >

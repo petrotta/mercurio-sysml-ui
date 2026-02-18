@@ -18,16 +18,17 @@ mod agent;
 use commands::{
     ai_agent_run, ai_test_endpoint, create_dir, create_file, detect_git_repo, get_user_projects_root,
     get_project_element_attributes, get_project_model, query_semantic,
-    get_stdlib_metamodel,
+    get_default_stdlib, get_stdlib_metamodel,
     git_checkout_branch, git_commit, git_create_branch, git_list_branches, git_push, git_stage_paths,
     git_status, git_unstage_paths, list_dir, list_stdlib_versions, open_in_explorer, path_exists,
     read_diagram, read_file, rename_path, window_close, window_minimize, window_toggle_maximize,
-    write_diagram, write_file,
+    write_diagram, write_file, set_default_stdlib,
 };
 
 
 use mercurio_core::{
     cancel_compile as core_cancel_compile,
+    compile_project_delta_sync as core_compile_project_delta_sync,
     compile_workspace_sync as core_compile_workspace_sync,
     ensure_mercurio_paths,
     export_model_to_path as core_export_model_to_path,
@@ -35,12 +36,19 @@ use mercurio_core::{
     get_ast_for_path as core_get_ast_for_path,
     get_parse_errors_for_content as core_get_parse_errors_for_content,
     get_project_descriptor_view,
+    query_library_symbols as core_query_library_symbols,
+    query_library_summary as core_query_library_summary,
+    query_stdlib_documentation_symbols as core_query_stdlib_documentation_symbols,
+    query_symbols_by_metatype as core_query_symbols_by_metatype,
     list_stdlib_versions_from_root,
     load_app_settings,
     save_app_settings,
     AppSettings,
     CompileResponse,
     CoreState,
+    IndexedSymbolView,
+    LibraryIndexSummaryView,
+    LibrarySymbolsResponse,
     LibraryConfig,
     MercurioPaths,
     ParseErrorsPayload,
@@ -48,6 +56,7 @@ use mercurio_core::{
     ProjectDescriptor,
     ProjectDescriptorView,
     UnsavedFile,
+    load_library_symbols_sync as core_load_library_symbols_sync,
     load_project_descriptor,
 };
 
@@ -354,19 +363,262 @@ async fn compile_workspace(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let target_path = payload
+        .get("file")
+        .or_else(|| payload.get("path"))
+        .or_else(|| payload.get("target_path"))
+        .or_else(|| payload.get("targetPath"))
+        .and_then(|value| value.as_str())
+        .map(PathBuf::from);
     let core = state.core.clone();
     let app_handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        core_compile_workspace_sync(&core, root, run_id, allow_parse_errors, unsaved, |progress| {
-            let _ = app_handle.emit_to(
-                EventTarget::webview_window("main"),
-                "compile-progress",
-                progress,
-            );
-        })
+        core_compile_workspace_sync(
+            &core,
+            root,
+            run_id,
+            allow_parse_errors,
+            target_path,
+            unsaved,
+            |progress| {
+                let _ = app_handle.emit_to(
+                    EventTarget::webview_window("main"),
+                    "compile-progress",
+                    progress,
+                );
+            },
+        )
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+fn collect_model_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let read_dir = fs::read_dir(root).map_err(|e| e.to_string())?;
+    for entry in read_dir {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_model_files_recursive(&path, out)?;
+            continue;
+        }
+        let Some(ext) = path.extension().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if ext.eq_ignore_ascii_case("sysml") || ext.eq_ignore_ascii_case("kerml") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn eval_expression(root: String, expression: String) -> Result<String, String> {
+    let root_path = PathBuf::from(&root);
+    if !root_path.exists() {
+        return Err("Root path does not exist".to_string());
+    }
+    let mut files = Vec::<PathBuf>::new();
+    collect_model_files_recursive(&root_path, &mut files)?;
+    files.sort();
+    files.dedup();
+    let mut sources = Vec::<String>::new();
+    for file in files {
+        if let Ok(text) = fs::read_to_string(&file) {
+            sources.push(text);
+        }
+    }
+    if sources.is_empty() {
+        return Err("No model files found under root".to_string());
+    }
+    mercurio_sysml::expression_eval::eval_expression_in_sources(&sources, &expression)
+}
+
+#[tauri::command]
+async fn compile_project_delta(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    payload: serde_json::Value,
+) -> Result<CompileResponse, String> {
+    let root = payload
+        .get("root")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'root' argument".to_string())?
+        .to_string();
+    let run_id = payload
+        .get("run_id")
+        .or_else(|| payload.get("runId"))
+        .or_else(|| payload.get("runld"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let allow_parse_errors = payload
+        .get("allow_parse_errors")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let unsaved = payload
+        .get("unsaved")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|entry| {
+                    let path = entry.get("path").and_then(|v| v.as_str())?;
+                    let content = entry.get("content").and_then(|v| v.as_str())?;
+                    Some(UnsavedFile {
+                        path: PathBuf::from(path),
+                        content: content.to_string(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let target_path = payload
+        .get("file")
+        .or_else(|| payload.get("path"))
+        .or_else(|| payload.get("target_path"))
+        .or_else(|| payload.get("targetPath"))
+        .and_then(|value| value.as_str())
+        .map(PathBuf::from);
+    let core = state.core.clone();
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        core_compile_project_delta_sync(
+            &core,
+            root,
+            run_id,
+            allow_parse_errors,
+            target_path,
+            unsaved,
+            |progress| {
+                let _ = app_handle.emit_to(
+                    EventTarget::webview_window("main"),
+                    "compile-progress",
+                    progress,
+                );
+            },
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn load_library_symbols(
+    state: tauri::State<'_, AppState>,
+    payload: serde_json::Value,
+) -> Result<LibrarySymbolsResponse, String> {
+    let root = payload
+        .get("root")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'root' argument".to_string())?
+        .to_string();
+    let target_path = payload
+        .get("file")
+        .or_else(|| payload.get("path"))
+        .and_then(|value| value.as_str())
+        .map(PathBuf::from);
+    let include_symbols = payload
+        .get("include_symbols")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        core_load_library_symbols_sync(&core, root, target_path, include_symbols)
+    })
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn query_index_symbols_by_metatype(
+    state: tauri::State<'_, AppState>,
+    payload: serde_json::Value,
+) -> Result<Vec<IndexedSymbolView>, String> {
+    let root = payload
+        .get("root")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'root' argument".to_string())?
+        .to_string();
+    let metatype_qname = payload
+        .get("metatype_qname")
+        .or_else(|| payload.get("metatypeQname"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'metatype_qname' argument".to_string())?
+        .to_string();
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        core_query_symbols_by_metatype(&core, root, metatype_qname)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn query_index_stdlib_documentation_symbols(
+    state: tauri::State<'_, AppState>,
+    payload: serde_json::Value,
+) -> Result<Vec<IndexedSymbolView>, String> {
+    let library_key = payload
+        .get("library_key")
+        .or_else(|| payload.get("libraryKey"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'library_key' argument".to_string())?
+        .to_string();
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        core_query_stdlib_documentation_symbols(&core, library_key)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn query_index_library_symbols(
+    state: tauri::State<'_, AppState>,
+    payload: serde_json::Value,
+) -> Result<Vec<IndexedSymbolView>, String> {
+    let root = payload
+        .get("root")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'root' argument".to_string())?
+        .to_string();
+    let file = payload
+        .get("file")
+        .or_else(|| payload.get("path"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let offset = payload
+        .get("offset")
+        .or_else(|| payload.get("skip"))
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize);
+    let limit = payload
+        .get("limit")
+        .or_else(|| payload.get("take"))
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize);
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        core_query_library_symbols(&core, root, file, offset, limit)
+    })
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn query_index_library_summary(
+    state: tauri::State<'_, AppState>,
+    payload: serde_json::Value,
+) -> Result<LibraryIndexSummaryView, String> {
+    let root = payload
+        .get("root")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'root' argument".to_string())?
+        .to_string();
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || core_query_library_summary(&core, root))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -557,6 +809,9 @@ pub fn run() {
             let toggle_project = MenuItemBuilder::with_id("view.toggle_project", "Toggle Project")
                 .accelerator("Ctrl+Shift+P")
                 .build(app)?;
+            let toggle_terminal = MenuItemBuilder::with_id("view.toggle_terminal", "View Terminal")
+                .accelerator("Ctrl+`")
+                .build(app)?;
             let about = MenuItemBuilder::with_id("help.about", "About").build(app)?;
 
             let file_menu = SubmenuBuilder::new(app, "File")
@@ -572,6 +827,7 @@ pub fn run() {
                 .build()?;
             let view_menu = SubmenuBuilder::new(app, "View")
                 .item(&toggle_project)
+                .item(&toggle_terminal)
                 .separator()
                 .item(&PredefinedMenuItem::fullscreen(app, None)?)
                 .build()?;
@@ -594,6 +850,7 @@ pub fn run() {
                 "build.compile" => Some("compile-workspace"),
                 "build.options" => Some("build-options"),
                 "view.toggle_project" => Some("toggle-project"),
+                "view.toggle_terminal" => Some("toggle-terminal"),
                 "help.about" => Some("about"),
                 _ => None,
             };
@@ -604,6 +861,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_user_projects_root,
             list_stdlib_versions,
+            get_default_stdlib,
+            set_default_stdlib,
             get_stdlib_metamodel,
             get_project_model,
             get_project_element_attributes,
@@ -622,6 +881,7 @@ pub fn run() {
             get_parse_errors_for_content,
             get_ast_for_path,
             get_ast_for_content,
+            eval_expression,
             get_project_descriptor,
             create_project_descriptor,
             ensure_project_descriptor,
@@ -639,6 +899,12 @@ pub fn run() {
             window_toggle_maximize,
             window_close,
             compile_workspace,
+            compile_project_delta,
+            load_library_symbols,
+            query_index_symbols_by_metatype,
+            query_index_stdlib_documentation_symbols,
+            query_index_library_symbols,
+            query_index_library_summary,
             cancel_compile,
             export_compiled_model,
             ai_test_endpoint,

@@ -1,3 +1,4 @@
+﻿use mercurio_sysml_core::parser::Parser;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -100,15 +101,19 @@ pub fn get_parse_errors_for_content(
             errors: Vec::new(),
         });
     }
-    let parse = syster::syntax::parser::parse_with_result(content, path);
-    let errors = parse
-        .errors
+    let mut parser = Parser::new(content);
+    let _ = parser.parse_root();
+    let errors = parser
+        .errors()
         .iter()
-        .map(|err| ParseErrorView {
-            message: err.message.clone(),
-            line: err.position.line,
-            column: err.position.column,
-            kind: "parse".to_string(),
+        .map(|err| {
+            let (line, col) = offset_to_line_col(content, err.span.start as usize);
+            ParseErrorView {
+                message: err.message.clone(),
+                line,
+                column: col,
+                kind: "parse".to_string(),
+            }
         })
         .collect::<Vec<_>>();
     Ok(ParseErrorsPayload {
@@ -129,35 +134,34 @@ pub fn get_ast_for_content(path: &Path, content: &str) -> Result<String, String>
     if !is_model_file(path) {
         return Err("AST is only available for .sysml or .kerml files".to_string());
     }
-    let parse = syster::syntax::parser::parse_with_result(content, path);
-    if let Some(syntax) = parse.content {
-        let mut out = String::new();
-        out.push_str("AST (full debug):\n");
-        let root = syntax.parse().syntax();
-        out.push_str(&format!("{:#?}", root));
-        if !parse.errors.is_empty() {
-            out.push_str("\n\nErrors:\n");
-            for err in parse.errors.iter() {
-                out.push_str(&format!(
-                    "- {} (line {}, col {})\n",
-                    err.message, err.position.line, err.position.column
-                ));
-            }
+    let mut parser = Parser::new(content);
+    let root = parser.parse_root();
+    let mut out = String::new();
+    out.push_str("AST (full debug):\n");
+    out.push_str(&format!("{:#?}", root));
+    if !parser.errors().is_empty() {
+        out.push_str("\n\nErrors:\n");
+        for err in parser.errors() {
+            let (line, col) = offset_to_line_col(content, err.span.start as usize);
+            out.push_str(&format!("- {} (line {}, col {})\n", err.message, line, col));
         }
-        return Ok(out);
     }
-    let mut error_lines = Vec::new();
-    for err in parse.errors.iter() {
-        error_lines.push(format!(
-            "{} (line {}, col {})",
-            err.message, err.position.line, err.position.column
-        ));
+    Ok(out)
+}
+
+fn offset_to_line_col(text: &str, offset: usize) -> (usize, usize) {
+    let safe = offset.min(text.len());
+    let mut line = 1usize;
+    let mut col = 1usize;
+    for ch in text[..safe].chars() {
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
     }
-    if error_lines.is_empty() {
-        Err("Parse failed with no error details".to_string())
-    } else {
-        Err(format!("Parse failed:\n{}", error_lines.join("\n")))
-    }
+    (line, col)
 }
 
 pub(crate) fn normalize_path(path: &Path) -> PathBuf {
@@ -200,38 +204,10 @@ pub(crate) fn resolve_under_root(root: &Path, target: &Path) -> Result<PathBuf, 
     Ok(normalized)
 }
 
-pub(crate) fn is_path_under_root(root: &Path, path: &str) -> bool {
-    let root_norm = root.canonicalize().ok();
-    let path_norm = PathBuf::from(path).canonicalize().ok();
-    if let (Some(root_norm), Some(path_norm)) = (root_norm, path_norm) {
-        return path_norm.starts_with(&root_norm);
-    }
-    let root_str = root.to_string_lossy().to_lowercase();
-    let path_str = path.to_lowercase();
-    if root_str.is_empty() || path_str.is_empty() {
-        return false;
-    }
-    path_str.starts_with(&root_str)
-}
-
-pub(crate) fn is_import_extension(ext: &str) -> bool {
-    matches!(
-        ext.to_lowercase().as_str(),
-        "xmi" | "sysmlx" | "kermlx" | "kpar" | "jsonld" | "json"
-    )
-}
-
 pub(crate) fn is_model_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| matches!(ext.to_lowercase().as_str(), "sysml" | "kerml"))
-        .unwrap_or(false)
-}
-
-pub(crate) fn is_import_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| is_import_extension(ext))
         .unwrap_or(false)
 }
 

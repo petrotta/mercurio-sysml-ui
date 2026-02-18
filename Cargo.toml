@@ -3,7 +3,6 @@ members = [
     "mercurio-application",
     "mercurio-core",
     "mercurio-cli",
-    "mercurio-model",
-    "mercurio-semantic",
+    "mercurio-symbol-index",
 ]
 resolver = "2"

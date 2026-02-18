@@ -16,7 +16,6 @@ import {
   THEME_KEY,
   TRACK_TEXT_KEY,
   FILTER_MODEL_FILES_KEY,
-  MODEL_SORT_KEY,
   MODEL_SHOW_FILES_KEY,
   MODEL_PROPERTIES_DOCK_KEY,
 } from "./app/constants";
@@ -30,7 +29,9 @@ import { ProjectTree } from "./app/components/ProjectTree";
 import { DataView } from "./app/components/DataView";
 import { ProjectModelPaneView } from "./app/components/ProjectModelView";
 import { DescriptorView } from "./app/components/DescriptorView";
+import { SettingsDialog } from "./app/components/SettingsDialog";
 import { DiagramView } from "./app/components/DiagramView";
+import { TerminalPane } from "./app/components/TerminalPane";
 import { AstStatus } from "./app/components/AstStatus";
 import { CompileToastPanel } from "./app/components/CompileToast";
 import { Modal } from "./app/components/Modal";
@@ -49,6 +50,7 @@ import { readFileText } from "./app/fileOps";
 import { useProjectTree } from "./app/useProjectTree";
 import { runAgent } from "./app/agentClient";
 import { parseErrorLocation } from "./app/parseErrors";
+import { isPathWithin } from "./app/pathUtils";
 import type {
   FileEntry,
   OpenTab,
@@ -60,10 +62,24 @@ import type {
 
 loader.config({ paths: { vs: "/monaco/vs" } });
 
+type TerminalTabState = {
+  id: string;
+  title: string;
+  input: string;
+  lines: string[];
+  history: string[];
+  historyIndex: number | null;
+};
+
 export function App() {
   void getCurrentWindow();
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<"theme" | "ai" | "stdlib">("theme");
+  const [settingsStdlibVersions, setSettingsStdlibVersions] = useState<string[]>([]);
+  const [settingsDefaultStdlib, setSettingsDefaultStdlib] = useState("");
+  const [settingsStdlibBusy, setSettingsStdlibBusy] = useState(false);
+  const [settingsStdlibStatus, setSettingsStdlibStatus] = useState("");
   const [appTheme, setAppTheme] = useState<"dark" | "light">(
     (window.localStorage?.getItem(THEME_KEY) as "dark" | "light") || "dark",
   );
@@ -100,7 +116,14 @@ export function App() {
   const [descriptorViewMode, setDescriptorViewMode] = useState<"view" | "json">("view");
   const suppressDirtyRef = useRef(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; entry: FileEntry; scope: "root" | "node" } | null>(null);
-  const [modelContextMenu, setModelContextMenu] = useState<{ x: number; y: number; filePath: string | null; label: string } | null>(null);
+  const [modelContextMenu, setModelContextMenu] = useState<{
+    x: number;
+    y: number;
+    filePath: string | null;
+    label: string;
+    section: "project" | "library";
+    loadError?: string;
+  } | null>(null);
   const [modelOptionsMenu, setModelOptionsMenu] = useState<{ x: number; y: number } | null>(null);
   const [astViewOpen, setAstViewOpen] = useState(false);
   const [astViewTitle, setAstViewTitle] = useState("");
@@ -108,6 +131,7 @@ export function App() {
   const [tabMenu, setTabMenu] = useState<{ x: number; y: number; path: string } | null>(null);
   const [tabOverflowOpen, setTabOverflowOpen] = useState(false);
   const [showUsageNodes, setShowUsageNodes] = useState(true);
+  const [libraryKindFilter, setLibraryKindFilter] = useState<string | null>(null);
   const [showAstSplit, setShowAstSplit] = useState(false);
   const {
     astState: astSplitState,
@@ -282,10 +306,35 @@ export function App() {
     symbols,
     unresolved,
     libraryPath,
+    libraryFiles,
+    libraryLoadingFiles,
+    libraryLoadErrors,
+    libraryBulkLoading,
+    loadedLibraryFileCount,
+    libraryBulkTotal,
+    libraryBulkCompleted,
+    libraryBulkFailed,
+    libraryImportCount,
+    libraryKindCounts,
+    libraryIndexedSymbolCount,
+    loadLibrarySymbolsForFile,
+    loadAllLibrarySymbols,
+    retryFailedLibraryLoads,
+    cancelLibrarySymbolLoading,
+    stdlibFileCount,
     projectSymbolsLoaded,
     parseErrorPaths,
+    setEditorParseError,
   } = useCompileRunner({ rootPath });
   const [dataExcludeStdlib, setDataExcludeStdlib] = useState(true);
+  const [showTerminal, setShowTerminal] = useState(false);
+  const [terminalHeight, setTerminalHeight] = useState(180);
+  const [terminalTabs, setTerminalTabs] = useState<TerminalTabState[]>([
+    { id: "term-1", title: "Terminal 1", input: "", lines: [], history: [], historyIndex: null },
+  ]);
+  const [activeTerminalTabId, setActiveTerminalTabId] = useState<string | null>("term-1");
+  const terminalTabCounterRef = useRef(1);
+  const terminalResizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
   const [selectedSymbol, setSelectedSymbol] = useState<SymbolView | null>(null);
   const [selectedNodeSymbols, setSelectedNodeSymbols] = useState<SymbolView[] | null>(null);
   const [modelTreeHeight, setModelTreeHeight] = useState(260);
@@ -314,14 +363,6 @@ export function App() {
       return window.localStorage?.getItem(FILTER_MODEL_FILES_KEY) === "true";
     } catch {
       return false;
-    }
-  });
-  const [modelSortBy, setModelSortBy] = useState<"name" | "qualified_name">(() => {
-    try {
-      const stored = window.localStorage?.getItem(MODEL_SORT_KEY);
-      return stored === "qualified_name" ? "qualified_name" : "name";
-    } catch {
-      return "name";
     }
   });
   const [modelShowFiles, setModelShowFiles] = useState(() => {
@@ -379,6 +420,26 @@ export function App() {
     if (activeTabMeta?.kind === "diagram") return activeTabMeta.sourcePath || null;
     return null;
   }, [activeTabMeta]);
+  const activeTerminalTab = useMemo(
+    () => terminalTabs.find((tab) => tab.id === activeTerminalTabId) || null,
+    [terminalTabs, activeTerminalTabId],
+  );
+
+  const updateActiveTerminalTab = (updater: (tab: TerminalTabState) => TerminalTabState) => {
+    if (!activeTerminalTabId) return;
+    setTerminalTabs((prev) =>
+      prev.map((tab) => (tab.id === activeTerminalTabId ? updater(tab) : tab)),
+    );
+  };
+
+  const ensureTerminalTab = () => {
+    setTerminalTabs((prev) => {
+      if (prev.length) return prev;
+      terminalTabCounterRef.current = 1;
+      return [{ id: "term-1", title: "Terminal 1", input: "", lines: [], history: [], historyIndex: null }];
+    });
+    setActiveTerminalTabId((prev) => prev || "term-1");
+  };
 
   useEffect(() => {
     document.body.classList.toggle("theme-light", appTheme === "light");
@@ -498,6 +559,30 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (!showTerminal) return;
+    ensureTerminalTab();
+  }, [showTerminal]);
+
+  useEffect(() => {
+    const onPointerMove = (event: PointerEvent) => {
+      const drag = terminalResizeRef.current;
+      if (!drag) return;
+      const delta = drag.startY - event.clientY;
+      const next = Math.max(120, Math.min(520, drag.startHeight + delta));
+      setTerminalHeight(next);
+    };
+    const onPointerUp = () => {
+      terminalResizeRef.current = null;
+    };
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+    };
+  }, []);
+
+  useEffect(() => {
     const unlistenPromise = listen<string>("menu-action", (event) => {
       if (event.payload === "about") {
         setShowAbout(true);
@@ -505,12 +590,23 @@ export function App() {
         void runCompile();
       } else if (event.payload === "build-options") {
         openBuildOptions();
+      } else if (event.payload === "toggle-project") {
+        setLeftCollapsed((prev) => {
+          if (!prev) {
+            leftStoredWidthRef.current = leftWidth;
+          } else {
+            setLeftWidth(leftStoredWidthRef.current || 240);
+          }
+          return !prev;
+        });
+      } else if (event.payload === "toggle-terminal") {
+        toggleTerminal();
       }
     });
     return () => {
       unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
     };
-  }, []);
+  }, [leftWidth, runCompile]);
 
   useEffect(() => {
     let active = true;
@@ -541,16 +637,33 @@ export function App() {
   }, [aiEndpoints]);
 
   useEffect(() => {
+    if (!showSettings) return;
+    setSettingsTab("theme");
+    setSettingsStdlibStatus("");
+    void (async () => {
+      try {
+        const [versions, selected] = await Promise.all([
+          invoke<string[]>("list_stdlib_versions"),
+          invoke<string | null>("get_default_stdlib"),
+        ]);
+        const nextVersions = Array.isArray(versions) ? versions : [];
+        setSettingsStdlibVersions(nextVersions);
+        setSettingsDefaultStdlib(selected || "");
+      } catch (error) {
+        setSettingsStdlibStatus(`Failed to load stdlib settings: ${String(error)}`);
+        setSettingsStdlibVersions([]);
+        setSettingsDefaultStdlib("");
+      }
+    })();
+  }, [showSettings]);
+
+  useEffect(() => {
     window.localStorage?.setItem(TRACK_TEXT_KEY, trackText ? "true" : "false");
   }, [trackText]);
 
   useEffect(() => {
     window.localStorage?.setItem(FILTER_MODEL_FILES_KEY, showOnlyModelFiles ? "true" : "false");
   }, [showOnlyModelFiles]);
-
-  useEffect(() => {
-    window.localStorage?.setItem(MODEL_SORT_KEY, modelSortBy);
-  }, [modelSortBy]);
 
   useEffect(() => {
     window.localStorage?.setItem(MODEL_SHOW_FILES_KEY, modelShowFiles ? "true" : "false");
@@ -847,7 +960,7 @@ export function App() {
   useEffect(() => {
     if (!rootPath) return;
     void runBackgroundCompile(rootPath);
-  }, [rootPath, backgroundCompileEnabled]);
+  }, [rootPath, backgroundCompileEnabled, activeEditorPath]);
 
   useEffect(() => {
     if (activeTabMeta?.kind !== "project-model") return;
@@ -1039,10 +1152,20 @@ export function App() {
     setModelOptionsMenu(null);
   };
 
-  const showModelContext = (event: ReactMouseEvent, payload: { filePath: string | null; label: string }) => {
+  const showModelContext = (
+    event: ReactMouseEvent,
+    payload: { filePath: string | null; label: string; section: "project" | "library"; loadError?: string },
+  ) => {
     event.preventDefault();
     event.stopPropagation();
-    setModelContextMenu({ x: event.clientX, y: event.clientY, filePath: payload.filePath, label: payload.label });
+    setModelContextMenu({
+      x: event.clientX,
+      y: event.clientY,
+      filePath: payload.filePath,
+      label: payload.label,
+      section: payload.section,
+      loadError: payload.loadError,
+    });
     setModelOptionsMenu(null);
     setContextMenu(null);
   };
@@ -1840,14 +1963,16 @@ export function App() {
             endColumn: (err.column || 1) + 1,
           }));
           monaco.editor.setModelMarkers(model, "sysml-parse", markers);
+          setEditorParseError(activeEditorPath, markers.length > 0);
         })
         .catch(() => {
           if (reqId !== parseReqRef.current) return;
           monaco.editor.setModelMarkers(model, "sysml-parse", []);
+          setEditorParseError(activeEditorPath, false);
         });
     }, 450);
     return () => window.clearTimeout(timer);
-  }, [editorChangeTick, activeEditorPath]);
+  }, [editorChangeTick, activeEditorPath, setEditorParseError]);
 
   useEffect(() => {
     if (!rootPath || !activeEditorPath) return;
@@ -1864,10 +1989,16 @@ export function App() {
   const selectSymbolInEditor = async (symbol: SymbolView) => {
     if (!symbol) return;
     if (!symbol.file_path) return;
-    const startLine = (symbol.start_line ?? 0) + 1;
-    const startCol = (symbol.start_col ?? 0) + 1;
-    const endLine = (symbol.end_line ?? symbol.start_line ?? 0) + 1;
-    const endCol = (symbol.end_col ?? symbol.start_col ?? 0) + 1;
+    const startLine = Math.max(1, symbol.start_line || 1);
+    const startCol = Math.max(1, symbol.start_col || 1);
+    let endLine = Math.max(startLine, symbol.end_line || symbol.start_line || 1);
+    let endCol = Math.max(1, symbol.end_col || symbol.start_col || 1);
+    if (endLine === startLine && endCol < startCol) {
+      endCol = startCol;
+    }
+    if (endLine === startLine && endCol === startCol) {
+      endCol = startCol + 1;
+    }
     await navigateTo({
       path: symbol.file_path,
       name: symbol.file_path.split(/[\\/]/).pop() || "Untitled",
@@ -1877,6 +2008,206 @@ export function App() {
         endLine,
         endCol,
       },
+    });
+  };
+
+  const evaluateTerminalExpression = async (rawExpr: string): Promise<string> => {
+    if (!rawExpr.trim()) return "Error = missing expression";
+    if (!rootPath) return "Error = no project root selected";
+    try {
+      const value = await invoke<string>("eval_expression", { root: rootPath, expression: rawExpr });
+      return `Result = ${value}`;
+    } catch (error) {
+      return `Error = ${String(error)}`;
+    }
+  };
+
+  const normalizeTerminalRef = (value: string) => value.trim().replace(/\./g, "::");
+
+  const appendTerminalLines = (next: string[]) => {
+    updateActiveTerminalTab((tab) => ({ ...tab, lines: [...tab.lines, ...next].slice(-300) }));
+  };
+
+  const toggleTerminal = () => {
+    setShowTerminal((prev) => {
+      const next = !prev;
+      if (next) ensureTerminalTab();
+      return next;
+    });
+  };
+
+  const inspectByType = (raw: string): string[] => {
+    const needle = raw.trim().toLowerCase();
+    if (!needle) return ["Error = missing type query"];
+    const projectSymbols = symbols.filter((symbol) => !isPathWithin(symbol.file_path, libraryPath));
+    const matches = projectSymbols.filter((symbol) => {
+      const kind = (symbol.kind || "").toLowerCase();
+      if (kind === needle) return true;
+      const metatype = (symbol.properties || []).find(
+        (prop) => prop.name === "metatype_qname" && prop.value?.type === "text",
+      );
+      if (metatype && metatype.value.type === "text") {
+        const value = (metatype.value.value || "").toLowerCase();
+        return value.endsWith(needle) || value.includes(needle);
+      }
+      return false;
+    });
+    if (!matches.length) return [`Result = no symbols for type '${raw.trim()}'`];
+    const lines = [`Result = ${matches.length} symbols`];
+    matches.slice(0, 20).forEach((symbol) => {
+      lines.push(
+        `- ${symbol.kind} ${symbol.qualified_name} @ ${symbol.file_path}:${symbol.start_line || 0}`,
+      );
+    });
+    if (matches.length > 20) {
+      lines.push(`... ${matches.length - 20} more`);
+    }
+    return lines;
+  };
+
+  const inspectSymbol = (raw: string): string[] => {
+    const query = normalizeTerminalRef(raw);
+    if (!query) return ["Error = missing symbol query"];
+    const projectSymbols = symbols.filter((symbol) => !isPathWithin(symbol.file_path, libraryPath));
+    let symbol = projectSymbols.find((item) => (item.qualified_name || "").trim() === query);
+    if (!symbol) {
+      symbol = projectSymbols.find((item) => (item.name || "").trim() === query);
+    }
+    if (!symbol) {
+      const partial = projectSymbols.filter((item) => {
+        const qn = (item.qualified_name || "").trim();
+        return qn.endsWith(`::${query}`) || qn.includes(query);
+      });
+      if (!partial.length) return [`Result = symbol '${raw.trim()}' not found`];
+      const lines = [`Result = ${partial.length} matches`];
+      partial.slice(0, 20).forEach((item) => {
+        lines.push(`- ${item.kind} ${item.qualified_name} @ ${item.file_path}:${item.start_line || 0}`);
+      });
+      if (partial.length > 20) lines.push(`... ${partial.length - 20} more`);
+      return lines;
+    }
+    const lines = [
+      `Result = ${symbol.kind} ${symbol.qualified_name}`,
+      `file = ${symbol.file_path}`,
+      `span = ${symbol.start_line || 0}:${symbol.start_col || 0} - ${symbol.end_line || 0}:${symbol.end_col || 0}`,
+    ];
+    const properties = symbol.properties || [];
+    if (properties.length) {
+      lines.push("properties:");
+      properties.slice(0, 16).forEach((prop) => {
+        const value =
+          prop.value.type === "text"
+            ? prop.value.value
+            : prop.value.type === "number"
+              ? String(prop.value.value)
+              : prop.value.type === "bool"
+                ? String(prop.value.value)
+                : `[${prop.value.items.join(", ")}]`;
+        lines.push(`- ${prop.name} = ${value}`);
+      });
+      if (properties.length > 16) lines.push(`... ${properties.length - 16} more properties`);
+    }
+    const rels = symbol.relationships || [];
+    if (rels.length) {
+      lines.push("relationships:");
+      rels.slice(0, 12).forEach((rel) => {
+        lines.push(`- ${rel.kind} -> ${rel.resolved_target || rel.target}`);
+      });
+      if (rels.length > 12) lines.push(`... ${rels.length - 12} more relationships`);
+    }
+    return lines;
+  };
+
+  const runTerminalCommand = async () => {
+    const command = (activeTerminalTab?.input || "").trim();
+    if (!command) return;
+    updateActiveTerminalTab((tab) => ({
+      ...tab,
+      history: [...tab.history, command].slice(-200),
+      historyIndex: null,
+      input: "",
+    }));
+    appendTerminalLines([`> ${command}`]);
+    if (command.toLowerCase().startsWith("eval ")) {
+      const expr = command.slice(5);
+      const result = await evaluateTerminalExpression(expr);
+      appendTerminalLines([result]);
+      return;
+    }
+    if (command.toLowerCase().startsWith("inspect ")) {
+      const rest = command.slice(8).trim();
+      if (rest.toLowerCase().startsWith("type ")) {
+        appendTerminalLines(inspectByType(rest.slice(5)));
+      } else {
+        appendTerminalLines(inspectSymbol(rest));
+      }
+      return;
+    }
+    appendTerminalLines(["Error = unknown command (try: eval A.x or inspect A.x or inspect type Usage)"]);
+  };
+
+  const autocompleteTerminalEval = () => {
+    const trimmed = (activeTerminalTab?.input || "").trim().toLowerCase();
+    if (trimmed === "e" || trimmed === "ev" || trimmed === "eva" || trimmed === "eval") {
+      updateActiveTerminalTab((tab) => ({ ...tab, input: "eval " }));
+    }
+  };
+
+  const terminalHistoryUp = () => {
+    updateActiveTerminalTab((tab) => {
+      if (!tab.history.length) return tab;
+      if (tab.historyIndex == null) {
+        const nextIndex = tab.history.length - 1;
+        return { ...tab, historyIndex: nextIndex, input: tab.history[nextIndex] || "" };
+      }
+      const nextIndex = Math.max(0, tab.historyIndex - 1);
+      return { ...tab, historyIndex: nextIndex, input: tab.history[nextIndex] || "" };
+    });
+  };
+
+  const terminalHistoryDown = () => {
+    updateActiveTerminalTab((tab) => {
+      if (!tab.history.length || tab.historyIndex == null) return tab;
+      const lastIndex = tab.history.length - 1;
+      if (tab.historyIndex >= lastIndex) {
+        return { ...tab, historyIndex: null, input: "" };
+      }
+      const nextIndex = tab.historyIndex + 1;
+      return { ...tab, historyIndex: nextIndex, input: tab.history[nextIndex] || "" };
+    });
+  };
+
+  const createTerminalTab = () => {
+    terminalTabCounterRef.current += 1;
+    const id = `term-${terminalTabCounterRef.current}`;
+    const next: TerminalTabState = {
+      id,
+      title: `Terminal ${terminalTabCounterRef.current}`,
+      input: "",
+      lines: [],
+      history: [],
+      historyIndex: null,
+    };
+    setTerminalTabs((prev) => [...prev, next]);
+    setActiveTerminalTabId(id);
+    setShowTerminal(true);
+  };
+
+  const closeTerminalTab = (id: string) => {
+    setTerminalTabs((prev) => {
+      const idx = prev.findIndex((tab) => tab.id === id);
+      if (idx < 0) return prev;
+      const next = prev.filter((tab) => tab.id !== id);
+      if (!next.length) {
+        setShowTerminal(false);
+        setActiveTerminalTabId(null);
+        return next;
+      }
+      if (activeTerminalTabId === id) {
+        const fallback = next[Math.max(0, idx - 1)]?.id || next[0].id;
+        setActiveTerminalTabId(fallback);
+      }
+      return next;
     });
   };
 
@@ -1912,6 +2243,7 @@ export function App() {
       const key = event.key.toLowerCase();
       const isBuild = (event.ctrlKey || event.metaKey) && key === "b";
       const isSave = (event.ctrlKey || event.metaKey) && key === "s";
+      const isTerminalToggle = (event.ctrlKey || event.metaKey) && key === "t";
       if (event.key === "Escape") {
         if (openMenu) {
           setOpenMenu(null);
@@ -1963,6 +2295,11 @@ export function App() {
       if (isSave) {
         event.preventDefault();
         void saveActiveTab();
+        return;
+      }
+      if (isTerminalToggle) {
+        event.preventDefault();
+        toggleTerminal();
         return;
       }
       if (event.key === "F10") {
@@ -2076,6 +2413,23 @@ export function App() {
     }
   };
 
+  const saveDefaultStdlibSelection = async () => {
+    setSettingsStdlibBusy(true);
+    setSettingsStdlibStatus("Saving...");
+    try {
+      const selected = settingsDefaultStdlib.trim();
+      const saved = await invoke<string | null>("set_default_stdlib", {
+        stdlib: selected ? selected : null,
+      });
+      setSettingsDefaultStdlib(saved || "");
+      setSettingsStdlibStatus("Saved default stdlib.");
+    } catch (error) {
+      setSettingsStdlibStatus(`Failed to save stdlib setting: ${String(error)}`);
+    } finally {
+      setSettingsStdlibBusy(false);
+    }
+  };
+
   const sendAiMessage = async (text: string) => {
     const endpoint = selectedChatEndpoint ? aiEndpoints.find((item) => item.id === selectedChatEndpoint) : null;
     const requestId = ++aiRequestRef.current;
@@ -2104,7 +2458,7 @@ export function App() {
     }
     const buildModelContext = () => {
       const activePath = activeEditorPath || activeDoc.path || "";
-      const projectSymbols = symbols.filter((symbol) => !(libraryPath && symbol.file_path.startsWith(libraryPath)));
+      const projectSymbols = symbols.filter((symbol) => !isPathWithin(symbol.file_path, libraryPath));
       const activeSymbols = activePath
         ? projectSymbols.filter((symbol) => symbol.file_path === activePath).slice(0, 40)
         : [];
@@ -2115,10 +2469,10 @@ export function App() {
           : "";
       const symbolLines = activeSymbols.map(
         (symbol) =>
-          `- ${symbol.kind} ${symbol.qualified_name} @ ${symbol.file_path}:${(symbol.start_line ?? 0) + 1}`,
+          `- ${symbol.kind} ${symbol.qualified_name} @ ${symbol.file_path}:${symbol.start_line ?? 0}`,
       );
       const unresolvedLines = unresolvedTop.map(
-        (item) => `- ${item.file_path}:${(item.line ?? 0) + 1}:${(item.column ?? 0) + 1} ${item.message}`,
+        (item) => `- ${item.file_path}:${item.line ?? 0}:${item.column ?? 0} ${item.message}`,
       );
       return [
         `root: ${rootPath || "unknown"}`,
@@ -2399,12 +2753,16 @@ export function App() {
     projectCounts,
     libraryCounts,
     errorCounts,
+    dataViewSymbols,
     dataViewSymbolKindCounts,
   } = useModelGroups({
     deferredSymbols,
     deferredUnresolved,
     rootPath,
     libraryPath,
+    libraryFilePaths: libraryFiles,
+    stdlibFileCount,
+    librarySymbolCount: libraryIndexedSymbolCount,
     dataExcludeStdlib,
   });
 
@@ -2421,9 +2779,16 @@ export function App() {
     projectSymbolsLoaded,
     getKindKey,
     showUsages: showUsageNodes,
-    modelSortBy,
     modelShowFiles,
+    libraryLoadingFilePaths: libraryLoadingFiles,
+    libraryLoadErrors,
+    libraryKindFilter,
   });
+  const pendingLibraryFiles = Math.max(0, libraryFiles.length - loadedLibraryFileCount);
+  const failedLibraryFiles = Object.keys(libraryLoadErrors).length;
+  const libraryStatusLabel = libraryBulkLoading
+    ? `Library ${libraryBulkCompleted}/${libraryBulkTotal || pendingLibraryFiles} loading${libraryBulkFailed ? ` (${libraryBulkFailed} failed)` : ""}`
+    : `Library ${loadedLibraryFileCount}/${libraryFiles.length} loaded | ${libraryIndexedSymbolCount} symbols${failedLibraryFiles ? ` (${failedLibraryFiles} failed)` : ""}${libraryImportCount ? ` | imports ${libraryImportCount}` : ""}${libraryKindFilter ? ` | filter ${libraryKindFilter}` : ""}`;
 
   const undockedTreeHeight = Math.max(
     modelTreeHeight,
@@ -2452,6 +2817,9 @@ export function App() {
     setSelectedNodeSymbols,
     selectSymbolInEditor,
     navigateTo,
+    onRequestLibraryFileSymbols: (filePath) => {
+      void loadLibrarySymbolsForFile(filePath);
+    },
     projectGroups,
     libraryGroups,
   });
@@ -2520,6 +2888,12 @@ export function App() {
         selectSymbolInEditor,
         navigateTo,
         renderTypeIcon,
+        onRequestLibraryFileSymbols: (filePath) => {
+          void loadLibrarySymbolsForFile(filePath);
+        },
+        onRetryLibraryFileSymbols: (filePath) => {
+          void loadLibrarySymbolsForFile(filePath);
+        },
       }),
     [
       modelCursorIndex,
@@ -2533,6 +2907,7 @@ export function App() {
       selectSymbolInEditor,
       navigateTo,
       renderTypeIcon,
+      loadLibrarySymbolsForFile,
     ],
   );
 
@@ -2589,6 +2964,15 @@ export function App() {
                 }}
               >
                 {showAstSplit ? "✓ " : ""}AST Split
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setOpenMenu(null);
+                  toggleTerminal();
+                }}
+              >
+                {showTerminal ? "✓ " : ""}View Terminal
               </button>
               <div className="menu-divider" />
               <button type="button" onClick={() => { setOpenMenu(null); openAiViewTab(); }}>Agent</button>
@@ -2796,9 +3180,12 @@ export function App() {
                 <DataView
                   dataExcludeStdlib={dataExcludeStdlib}
                   onToggleExcludeStdlib={setDataExcludeStdlib}
+                  rootPath={rootPath}
+                  libraryPath={libraryPath}
                   projectCounts={projectCounts}
                   libraryCounts={libraryCounts}
                   errorCounts={errorCounts}
+                  dataViewSymbols={dataViewSymbols}
                   dataViewSymbolKindCounts={dataViewSymbolKindCounts}
                 />
               ) : activeTabMeta?.kind === "project-model" ? (
@@ -2952,6 +3339,33 @@ export function App() {
                 renderTypeIcon={renderTypeIcon}
               />
             )}
+            <TerminalPane
+              open={showTerminal}
+              height={terminalHeight}
+              tabs={terminalTabs.map((tab) => ({ id: tab.id, title: tab.title }))}
+              activeTabId={activeTerminalTabId}
+              onSelectTab={setActiveTerminalTabId}
+              onNewTab={createTerminalTab}
+              onCloseTab={closeTerminalTab}
+              onResizeStart={(event) => {
+                terminalResizeRef.current = { startY: event.clientY, startHeight: terminalHeight };
+              }}
+              lines={activeTerminalTab?.lines || []}
+              input={activeTerminalTab?.input || ""}
+              onInputChange={(value) => {
+                updateActiveTerminalTab((tab) => ({ ...tab, input: value, historyIndex: null }));
+              }}
+              onSubmit={() => {
+                void runTerminalCommand();
+              }}
+              onClose={() => setShowTerminal(false)}
+              onAutocompleteEval={autocompleteTerminalEval}
+              onHistoryUp={terminalHistoryUp}
+              onHistoryDown={terminalHistoryDown}
+              onClear={() => {
+                updateActiveTerminalTab((tab) => ({ ...tab, lines: [] }));
+              }}
+            />
           </EditorPane>
           <>
           <div
@@ -2977,6 +3391,7 @@ export function App() {
               <div className="panel-header">
               <ModelHeader
                 collapseAll={collapseAllModel}
+                libraryStatus={libraryStatusLabel}
                 onCollapseAll={() => setCollapseAllModel(true)}
                 onExpandAll={() => setCollapseAllModel(false)}
                 onOpenOptions={showModelOptions}
@@ -3090,29 +3505,43 @@ export function App() {
             <button
               type="button"
               onClick={() => {
-                setModelSortBy("name");
-                setModelOptionsMenu(null);
-              }}
-            >
-              Sort by: Name{modelSortBy === "name" ? " (current)" : ""}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setModelSortBy("qualified_name");
-                setModelOptionsMenu(null);
-              }}
-            >
-              Sort by: Qualified Name{modelSortBy === "qualified_name" ? " (current)" : ""}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
                 setModelShowFiles((prev) => !prev);
                 setModelOptionsMenu(null);
               }}
             >
               {modelShowFiles ? "Hide File Groups" : "Show File Groups"}
+            </button>
+            <button
+              type="button"
+              disabled={!pendingLibraryFiles || libraryBulkLoading}
+              onClick={() => {
+                void loadAllLibrarySymbols();
+                setModelOptionsMenu(null);
+              }}
+            >
+              {libraryBulkLoading
+                ? "Loading Library Symbols..."
+                : `Load All Library Symbols (${loadedLibraryFileCount}/${libraryFiles.length})`}
+            </button>
+            <button
+              type="button"
+              disabled={!libraryBulkLoading}
+              onClick={() => {
+                cancelLibrarySymbolLoading();
+                setModelOptionsMenu(null);
+              }}
+            >
+              Cancel Library Load
+            </button>
+            <button
+              type="button"
+              disabled={!failedLibraryFiles || libraryBulkLoading}
+              onClick={() => {
+                void retryFailedLibraryLoads();
+                setModelOptionsMenu(null);
+              }}
+            >
+              Retry Failed Library Loads{failedLibraryFiles ? ` (${failedLibraryFiles})` : ""}
             </button>
             <button
               type="button"
@@ -3152,6 +3581,26 @@ export function App() {
             >
               {showUsageNodes ? "Hide Usages" : "Show Usages"}
             </button>
+            <div className="context-meta">
+              Library kinds ({libraryKindCounts.reduce((sum, [, count]) => sum + count, 0)}):
+            </div>
+            {libraryKindCounts.slice(0, 8).map(([kind, count]) => (
+              <button
+                key={`library-kind-${kind}`}
+                type="button"
+                className={libraryKindFilter === kind ? "context-kind-filter active" : "context-kind-filter"}
+                onClick={() => setLibraryKindFilter((prev) => (prev === kind ? null : kind))}
+              >
+                {kind}: {count}
+              </button>
+            ))}
+            <button
+              type="button"
+              disabled={!libraryKindFilter}
+              onClick={() => setLibraryKindFilter(null)}
+            >
+              Clear Library Kind Filter
+            </button>
           </div>
         ) : null}
         {modelContextMenu ? (
@@ -3167,6 +3616,20 @@ export function App() {
             >
               Show AST
             </button>
+            <button
+              type="button"
+              disabled={modelContextMenu.section !== "library" || !modelContextMenu.filePath}
+              onClick={() => {
+                if (!modelContextMenu.filePath || modelContextMenu.section !== "library") return;
+                void loadLibrarySymbolsForFile(modelContextMenu.filePath);
+                setModelContextMenu(null);
+              }}
+            >
+              Retry Library File Load
+            </button>
+            {modelContextMenu.section === "library" && modelContextMenu.loadError ? (
+              <div className="context-meta">Last load error: {modelContextMenu.loadError}</div>
+            ) : null}
           </div>
         ) : null}
           {showNewFile ? (
@@ -3768,131 +4231,35 @@ export function App() {
           </div>
         </div>
       ) : null}
-        {showSettings ? (
-          <div className="modal">
-            <div className="modal-backdrop" onClick={() => setShowSettings(false)} />
-            <div className="modal-card legacy-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
-            <div className="modal-header">
-              <h3 id="settings-title">Settings</h3>
-            </div>
-            <div className="modal-body">
-              <div className="field">
-                <span className="field-label">Theme</span>
-                <div className="theme-toggle">
-                  <button
-                    type="button"
-                    className={`theme-option ${appTheme === "dark" ? "active" : ""}`}
-                    onClick={() => setAppTheme("dark")}
-                  >
-                    Dark
-                  </button>
-                  <button
-                    type="button"
-                    className={`theme-option ${appTheme === "light" ? "active" : ""}`}
-                    onClick={() => setAppTheme("light")}
-                  >
-                    Light
-                  </button>
-                </div>
-              </div>
-              <div className="project-properties-section">
-                <div className="project-properties-title">AI Settings</div>
-                <div className="endpoint-list">
-                  {aiEndpoints.length ? (
-                    aiEndpoints.map((endpoint) => (
-                      <div key={endpoint.id} className="endpoint-row">
-                        <div className="endpoint-main">
-                          <div className="endpoint-title">{endpoint.name}</div>
-                          <div className="endpoint-meta">{endpoint.provider.toUpperCase()} / {endpoint.type.toUpperCase()} / {endpoint.url}</div>
-                          {endpoint.model ? <div className="endpoint-meta">Model: {endpoint.model}</div> : null}
-                          {endpointTestStatus[endpoint.id] ? (
-                            <div className={`endpoint-status ${endpointTestStatus[endpoint.id].startsWith("pass") ? "ok" : endpointTestStatus[endpoint.id].startsWith("fail") ? "fail" : ""}`}>
-                              {endpointTestStatus[endpoint.id]}
-                            </div>
-                          ) : null}
-                        </div>
-                        <div className="endpoint-actions">
-                          <button type="button" className="ghost" onClick={() => editEndpoint(endpoint.id)}>Edit</button>
-                          <button type="button" className="ghost" onClick={() => deleteEndpoint(endpoint.id)}>Delete</button>
-                        </div>
-                      </div>
-                    ))
-                  ) : (
-                    <div className="muted">No endpoints configured.</div>
-                  )}
-                </div>
-                <div className="endpoint-selectors">
-                  <label className="field">
-                    <span className="field-label">Chat endpoint</span>
-                    <div className="field-inline">
-                      <select
-                        value={selectedChatEndpoint || ""}
-                        onChange={(event) => setSelectedChatEndpoint(event.target.value || null)}
-                      >
-                        <option value="">None</option>
-                        {aiEndpoints.filter((endpoint) => endpoint.type === "chat").map((endpoint) => (
-                          <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>
-                        ))}
-                      </select>
-                      <button
-                        type="button"
-                        className="ghost"
-                        disabled={!selectedChatEndpoint}
-                        onClick={() => selectedChatEndpoint && testEndpoint(selectedChatEndpoint)}
-                      >
-                        Test
-                      </button>
-                    </div>
-                  </label>
-                </div>
-                <div className="endpoint-form">
-                  <div className="endpoint-form-title">{endpointDraft.id ? "Edit endpoint" : "Add endpoint"}</div>
-                  <label className="field">
-                    <span className="field-label">Name</span>
-                    <input value={endpointDraft.name} onChange={(e) => setEndpointDraft({ ...endpointDraft, name: e.target.value })} />
-                  </label>
-                  <label className="field">
-                    <span className="field-label">URL</span>
-                    <input
-                      value={endpointDraft.url}
-                      onChange={(e) => setEndpointDraft({ ...endpointDraft, url: e.target.value })}
-                      placeholder={endpointDraft.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com"}
-                    />
-                  </label>
-                  <label className="field">
-                    <span className="field-label">Type</span>
-                    <select value={endpointDraft.type} onChange={(e) => setEndpointDraft({ ...endpointDraft, type: e.target.value as "chat" | "embeddings" })}>
-                      <option value="chat">Chat</option>
-                    </select>
-                  </label>
-                  <label className="field">
-                    <span className="field-label">Provider</span>
-                    <select value={endpointDraft.provider} onChange={(e) => setEndpointDraft({ ...endpointDraft, provider: e.target.value as "openai" | "anthropic" })}>
-                      <option value="openai">OpenAI-compatible</option>
-                      <option value="anthropic">Anthropic</option>
-                    </select>
-                  </label>
-                  <label className="field">
-                    <span className="field-label">Model</span>
-                    <input value={endpointDraft.model} onChange={(e) => setEndpointDraft({ ...endpointDraft, model: e.target.value })} />
-                  </label>
-                  <label className="field">
-                    <span className="field-label">Token</span>
-                    <input type="password" value={endpointDraft.token} onChange={(e) => setEndpointDraft({ ...endpointDraft, token: e.target.value })} />
-                  </label>
-                  <div className="modal-actions">
-                    <button type="button" className="ghost" onClick={resetEndpointDraft}>Clear</button>
-                    <button type="button" onClick={saveEndpointDraft}>{endpointDraft.id ? "Update" : "Add"}</button>
-                  </div>
-                </div>
-              </div>
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="ghost" onClick={() => setShowSettings(false)}>Close</button>
-            </div>
-          </div>
-        </div>
-      ) : null}
+        <SettingsDialog
+          open={showSettings}
+          onClose={() => setShowSettings(false)}
+          appTheme={appTheme}
+          onThemeChange={setAppTheme}
+          settingsTab={settingsTab}
+          onSettingsTabChange={setSettingsTab}
+          aiEndpoints={aiEndpoints}
+          endpointTestStatus={endpointTestStatus}
+          onEditEndpoint={editEndpoint}
+          onDeleteEndpoint={deleteEndpoint}
+          selectedChatEndpoint={selectedChatEndpoint}
+          onSelectedChatEndpointChange={setSelectedChatEndpoint}
+          onTestEndpoint={(endpointId) => {
+            void testEndpoint(endpointId);
+          }}
+          endpointDraft={endpointDraft}
+          onEndpointDraftChange={setEndpointDraft}
+          onResetEndpointDraft={resetEndpointDraft}
+          onSaveEndpointDraft={saveEndpointDraft}
+          settingsDefaultStdlib={settingsDefaultStdlib}
+          onSettingsDefaultStdlibChange={setSettingsDefaultStdlib}
+          settingsStdlibVersions={settingsStdlibVersions}
+          settingsStdlibStatus={settingsStdlibStatus}
+          settingsStdlibBusy={settingsStdlibBusy}
+          onSaveDefaultStdlibSelection={() => {
+            void saveDefaultStdlibSelection();
+          }}
+        />
         {aiFloatingSteps.length ? (
           <div className="ai-floating" style={{ left: aiFloatingPos.x, top: aiFloatingPos.y }}>
             <div

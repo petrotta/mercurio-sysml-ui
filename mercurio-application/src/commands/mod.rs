@@ -24,5 +24,5 @@ pub use git::{
     detect_git_repo, git_checkout_branch, git_commit, git_create_branch, git_list_branches, git_push,
     git_stage_paths, git_status, git_unstage_paths,
 };
-pub use stdlib::{get_stdlib_metamodel, list_stdlib_versions};
+pub use stdlib::{get_default_stdlib, get_stdlib_metamodel, list_stdlib_versions, set_default_stdlib};
 pub use window::{window_close, window_minimize, window_toggle_maximize};

@@ -6,7 +6,6 @@ export const PROJECT_LOCATION_KEY = "mercurio.projectLocation";
 export const THEME_KEY = "mercurio.theme";
 export const TRACK_TEXT_KEY = "mercurio.trackText";
 export const FILTER_MODEL_FILES_KEY = "mercurio.filterModelFiles";
-export const MODEL_SORT_KEY = "mercurio.modelSortBy";
 export const MODEL_SHOW_FILES_KEY = "mercurio.modelShowFiles";
 export const MODEL_PROPERTIES_DOCK_KEY = "mercurio.modelPropertiesDock";
 export const PROJECT_DESCRIPTOR_TAB = "__project_descriptor__";

@@ -40,6 +40,16 @@ export type SymbolProperty = {
   group?: string | null;
 };
 
+export type SymbolRelationship = {
+  kind: string;
+  target: string;
+  resolved_target?: string | null;
+  start_line: number;
+  start_col: number;
+  end_line: number;
+  end_col: number;
+};
+
 export type SymbolView = {
   name: string;
   kind: string;
@@ -56,6 +66,7 @@ export type SymbolView = {
   expr_end_col?: number;
   doc?: string | null;
   properties: SymbolProperty[];
+  relationships?: SymbolRelationship[];
 };
 
 export type UnresolvedIssue = {
@@ -77,6 +88,11 @@ export type ModelRow =
   | {
       type: "symbol";
       key: string;
+      section: "project" | "library";
+      filePath: string | null;
+      isFileRoot: boolean;
+      isLoading: boolean;
+      loadError?: string;
       name: string;
       kindLabel: string;
       kindKey: string;
