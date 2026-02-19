@@ -38,6 +38,8 @@ use mercurio_core::{
     get_project_descriptor_view,
     query_library_symbols as core_query_library_symbols,
     query_library_summary as core_query_library_summary,
+    query_project_symbols as core_query_project_symbols,
+    query_symbol_metatype_mapping as core_query_symbol_metatype_mapping,
     query_stdlib_documentation_symbols as core_query_stdlib_documentation_symbols,
     query_symbols_by_metatype as core_query_symbols_by_metatype,
     list_stdlib_versions_from_root,
@@ -49,6 +51,7 @@ use mercurio_core::{
     IndexedSymbolView,
     LibraryIndexSummaryView,
     LibrarySymbolsResponse,
+    SymbolMetatypeMappingView,
     LibraryConfig,
     MercurioPaths,
     ParseErrorsPayload,
@@ -606,6 +609,39 @@ async fn query_index_library_symbols(
 }
 
 #[tauri::command]
+async fn query_index_project_symbols(
+    state: tauri::State<'_, AppState>,
+    payload: serde_json::Value,
+) -> Result<Vec<IndexedSymbolView>, String> {
+    let root = payload
+        .get("root")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'root' argument".to_string())?
+        .to_string();
+    let file = payload
+        .get("file")
+        .or_else(|| payload.get("path"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let offset = payload
+        .get("offset")
+        .or_else(|| payload.get("skip"))
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize);
+    let limit = payload
+        .get("limit")
+        .or_else(|| payload.get("take"))
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize);
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        core_query_project_symbols(&core, root, file, offset, limit)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn query_index_library_summary(
     state: tauri::State<'_, AppState>,
     payload: serde_json::Value,
@@ -619,6 +655,35 @@ async fn query_index_library_summary(
     tauri::async_runtime::spawn_blocking(move || core_query_library_summary(&core, root))
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn query_index_symbol_metatype_mapping(
+    state: tauri::State<'_, AppState>,
+    payload: serde_json::Value,
+) -> Result<Option<SymbolMetatypeMappingView>, String> {
+    let root = payload
+        .get("root")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'root' argument".to_string())?
+        .to_string();
+    let symbol_qualified_name = payload
+        .get("symbol_qualified_name")
+        .or_else(|| payload.get("symbolQualifiedName"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'symbol_qualified_name' argument".to_string())?
+        .to_string();
+    let file_path = payload
+        .get("file_path")
+        .or_else(|| payload.get("filePath"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        core_query_symbol_metatype_mapping(&core, root, symbol_qualified_name, file_path)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -904,7 +969,9 @@ pub fn run() {
             query_index_symbols_by_metatype,
             query_index_stdlib_documentation_symbols,
             query_index_library_symbols,
+            query_index_project_symbols,
             query_index_library_summary,
+            query_index_symbol_metatype_mapping,
             cancel_compile,
             export_compiled_model,
             ai_test_endpoint,

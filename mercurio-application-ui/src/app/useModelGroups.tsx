@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import type { SymbolView, UnresolvedIssue } from "./types";
-import { isPathWithin } from "./pathUtils";
+import { isPathWithin, normalizeFsPath } from "./pathUtils";
 
 type CountSummary = {
   fileCount: number;
@@ -39,39 +39,86 @@ export function useModelGroups({
   };
 
   const groupedSymbols = useMemo(() => {
-    const groups = new Map<string, SymbolView[]>();
+    const groups = new Map<string, { path: string; list: SymbolView[] }>();
     deferredSymbols.forEach((symbol) => {
-      const key = symbol.file_path || "unknown";
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key)?.push(symbol);
+      const rawPath = symbol.file_path || "unknown";
+      const key = normalizeFsPath(rawPath) || rawPath;
+      if (!groups.has(key)) groups.set(key, { path: rawPath, list: [] });
+      groups.get(key)?.list.push(symbol);
     });
-    return Array.from(groups.entries()).map(([path, list]) => ({
-      path,
-      list: list.sort(compareByParseOrder),
+    return Array.from(groups.values()).map((group) => ({
+      path: group.path,
+      list: group.list.sort(compareByParseOrder),
     }));
   }, [deferredSymbols]);
 
+  const libraryFilePathSet = useMemo(() => {
+    const set = new Set<string>();
+    (libraryFilePaths || []).forEach((path) => {
+      const normalized = normalizeFsPath(path);
+      if (normalized) set.add(normalized);
+    });
+    return set;
+  }, [libraryFilePaths]);
+
+  const shouldTreatAsLibrary = (path: string) => {
+    const normalized = normalizeFsPath(path);
+    if (!normalized) return false;
+    if (libraryFilePathSet.size > 0) {
+      return libraryFilePathSet.has(normalized);
+    }
+    return !!libraryPath && isPathWithin(path, libraryPath);
+  };
+
+  const groupScope = (group: { path: string; list: SymbolView[] }): "project" | "library" | null => {
+    if (!group.list.length) return null;
+    let projectCount = 0;
+    let libraryCount = 0;
+    for (const symbol of group.list) {
+      if (symbol.source_scope === "project") projectCount += 1;
+      if (symbol.source_scope === "library") libraryCount += 1;
+    }
+    if (projectCount > 0 || libraryCount > 0) {
+      return projectCount >= libraryCount ? "project" : "library";
+    }
+    return null;
+  };
+
   const projectGroups = useMemo(() => {
     return groupedSymbols.filter((group) => {
-      if (isPathWithin(group.path, libraryPath)) return false;
+      const scope = groupScope(group);
+      if (scope === "project") return true;
+      if (scope === "library") return false;
+      if (shouldTreatAsLibrary(group.path)) return false;
       return rootPath ? isPathWithin(group.path, rootPath) : true;
     }).sort((a, b) => a.path.localeCompare(b.path));
-  }, [groupedSymbols, rootPath, libraryPath]);
+  }, [groupedSymbols, rootPath, libraryPath, libraryFilePathSet]);
 
   const libraryGroups = useMemo(() => {
-    const grouped = libraryPath ? groupedSymbols.filter((group) => isPathWithin(group.path, libraryPath)) : [];
-    const groupedMap = new Map(grouped.map((group) => [group.path, group.list]));
+    const grouped = groupedSymbols.filter((group) => {
+      const scope = groupScope(group);
+      if (scope === "library") return true;
+      if (scope === "project") return false;
+      return shouldTreatAsLibrary(group.path);
+    });
+    const groupedMap = new Map(grouped.map((group) => [normalizeFsPath(group.path), group]));
+    const mergedKeys = new Set<string>();
     const merged = (libraryFilePaths || []).map((path) => ({
       path,
-      list: groupedMap.get(path) || [],
+      list: (() => {
+        const norm = normalizeFsPath(path);
+        mergedKeys.add(norm);
+        return groupedMap.get(norm)?.list || [];
+      })(),
     }));
     grouped.forEach((group) => {
-      if (!merged.some((entry) => entry.path === group.path)) {
+      const norm = normalizeFsPath(group.path);
+      if (!mergedKeys.has(norm)) {
         merged.push(group);
       }
     });
     return merged.sort((a, b) => a.path.localeCompare(b.path));
-  }, [groupedSymbols, libraryPath, libraryFilePaths]);
+  }, [groupedSymbols, libraryPath, libraryFilePaths, libraryFilePathSet]);
 
   const projectCounts = useMemo<CountSummary>(() => {
     const fileCount = projectGroups.length;

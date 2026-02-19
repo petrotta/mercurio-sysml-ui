@@ -1,6 +1,6 @@
 use mercurio_sysml_core::parser::Parser;
 use mercurio_sysml_semantics::defmap::{DefKind, build_defmap, DefInfo};
-use mercurio_sysml_semantics::hir::{lower_defmap, lower_defmap_with_cst};
+use mercurio_sysml_semantics::hir::lower_defmap_with_cst;
 use mercurio_sysml_semantics::model_rel::{
     ModelFileAnalysis, build_model_stdlib_relations_from_analyses,
 };
@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use crate::project::load_project_config;
+use crate::index_contract::{canonical_symbol_record, CanonicalSymbolRecordArgs};
 use crate::state::{StdlibCache, StdlibSymbol};
 use crate::stdlib::resolve_stdlib_path;
 use crate::workspace::{collect_model_files, collect_project_files};
@@ -73,7 +74,7 @@ pub struct UnresolvedRefView {
     pub code: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct SymbolView {
     pub file_path: String,
     pub name: String,
@@ -101,7 +102,7 @@ pub struct SymbolView {
     pub properties: Vec<PropertyItemView>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct PropertyItemView {
     pub name: String,
     pub label: String,
@@ -110,7 +111,7 @@ pub struct PropertyItemView {
     pub group: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum PropertyValueView {
     Text { value: String },
@@ -130,7 +131,7 @@ pub struct RelationshipView {
     pub end_col: u32,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct TypeRefPartView {
     pub kind: String,
     pub target: String,
@@ -141,7 +142,7 @@ pub struct TypeRefPartView {
     pub end_col: u32,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum TypeRefView {
     Simple { part: TypeRefPartView },
@@ -257,16 +258,6 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
         };
 
     let project_config = load_project_config(&root_path).ok().flatten();
-    let mut files = Vec::new();
-    if let Some(config) = project_config.as_ref() {
-        if let Some(src) = config.src.as_ref() {
-            files = collect_project_files(&root_path, src)?;
-        }
-    }
-    if files.is_empty() {
-        collect_model_files(&root_path, &mut files)?;
-    }
-
     let library_config = project_config
         .as_ref()
         .and_then(|config| config.library.as_ref());
@@ -280,6 +271,35 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
         stdlib_override,
         &root_path,
     );
+    let mut files = Vec::new();
+    if let Some(config) = project_config.as_ref() {
+        if let Some(src) = config.src.as_ref() {
+            files = collect_project_files(&root_path, src)?;
+        }
+    }
+    if files.is_empty() {
+        collect_model_files(&root_path, &mut files)?;
+    }
+    files = filter_out_stdlib_files(files, stdlib_path_for_log.as_deref());
+    if files.is_empty() {
+        let mut fallback = Vec::new();
+        collect_model_files(&root_path, &mut fallback)?;
+        files = filter_out_stdlib_files(fallback, stdlib_path_for_log.as_deref());
+    }
+    if let Some(target) = target_path.as_ref() {
+        let should_include_target = target.exists()
+            && target
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("sysml") || ext.eq_ignore_ascii_case("kerml"))
+                .unwrap_or(false)
+            && !is_library_symbol_path(&target.to_string_lossy(), stdlib_path_for_log.as_deref());
+        if should_include_target && !files.iter().any(|candidate| same_path(candidate, target)) {
+            files.push(target.clone());
+        }
+    }
+    files.sort();
+    files.dedup();
 
     let mut workspace = state
         .workspace
@@ -397,12 +417,29 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
     }
 
     let stdlib_start = Instant::now();
-    let (stdlib_entries, stdlib_metatype_index, stdlib_symbols, stdlib_cache_hit, _stdlib_signature) =
-        load_stdlib_snapshot(state, stdlib_path_for_log.as_deref())?;
-    let stdlib_files = stdlib_entries
-        .iter()
-        .map(|(path, _)| path.clone())
-        .collect::<Vec<_>>();
+    let (stdlib_files, stdlib_metatype_index, stdlib_symbols, stdlib_cache_hit) =
+        if include_library_symbols {
+            let (
+                stdlib_entries,
+                stdlib_metatype_index,
+                stdlib_symbols,
+                stdlib_cache_hit,
+                _stdlib_signature,
+            ) = load_stdlib_snapshot(state, stdlib_path_for_log.as_deref())?;
+            let files = stdlib_entries
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>();
+            (files, stdlib_metatype_index, stdlib_symbols, stdlib_cache_hit)
+        } else {
+            let files = collect_stdlib_files(stdlib_path_for_log.as_deref())?;
+            (
+                files,
+                Arc::new(MetatypeIndex::default()),
+                Arc::new(Vec::new()),
+                false,
+            )
+        };
     let stdlib_duration_ms = stdlib_start.elapsed().as_millis();
 
     let analysis_start = Instant::now();
@@ -417,6 +454,13 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
 
     let mut project_symbol_count = 0usize;
     let mut library_symbol_count = 0usize;
+    for symbol in project_decl_symbols(&project_symbol_files, &unsaved_map) {
+        let key = format!("{}|{}|{}", symbol.file_path, symbol.qualified_name, symbol.name);
+        if seen.insert(key) {
+            symbols.push(symbol);
+            project_symbol_count += 1;
+        }
+    }
     for symbol in project_connection_end_symbols(&project_symbol_files, &unsaved_map) {
         let key = format!("{}|{}|{}", symbol.file_path, symbol.qualified_name, symbol.name);
         if seen.insert(key) {
@@ -431,19 +475,23 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
             project_symbol_count += 1;
         }
     }
-    for element in semantic_elements_for_project(
-        &project_symbol_files,
-        &unsaved_map,
-        stdlib_metatype_index.as_ref(),
-        stdlib_files.len(),
-    ) {
-        let key = format!(
-            "{}|{}|{}",
-            element.file_path, element.qualified_name, element.name
-        );
-        if seen.insert(key) {
-            symbols.push(map_semantic_element_to_symbol(element, &symbol_spans));
-            project_symbol_count += 1;
+    // Delta compiles prioritize responsiveness for UI symbol tree updates.
+    // Skip the expensive semantic projection pass here and rely on defmap-backed symbols.
+    if include_library_symbols {
+        for element in semantic_elements_for_project(
+            &project_symbol_files,
+            &unsaved_map,
+            stdlib_metatype_index.as_ref(),
+            stdlib_files.len(),
+        ) {
+            let key = format!(
+                "{}|{}|{}",
+                element.file_path, element.qualified_name, element.name
+            );
+            if seen.insert(key) {
+                symbols.push(map_semantic_element_to_symbol(element, &symbol_spans));
+                project_symbol_count += 1;
+            }
         }
     }
     if include_library_symbols {
@@ -489,13 +537,36 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
         stdlib_file_count: stdlib_files.len(),
         total_duration_ms: compile_start.elapsed().as_millis(),
     };
-    let _ = index_symbols_for_project(
-        state,
-        &root,
-        stdlib_path_for_log.as_deref(),
-        &response.symbols,
-    );
+    if include_library_symbols {
+        let _ = index_symbols_for_project(
+            state,
+            &root,
+            stdlib_path_for_log.as_deref(),
+            &response.symbols,
+            true,
+            false,
+        );
+    } else {
+        let _ = index_symbols_for_project(
+            state,
+            &root,
+            stdlib_path_for_log.as_deref(),
+            &response.symbols,
+            false,
+            false,
+        );
+    }
     Ok(response)
+}
+
+fn filter_out_stdlib_files(files: Vec<PathBuf>, stdlib_path: Option<&Path>) -> Vec<PathBuf> {
+    match stdlib_path {
+        None => files,
+        Some(stdlib_root) => files
+            .into_iter()
+            .filter(|file| !is_library_symbol_path(&file.to_string_lossy(), Some(stdlib_root)))
+            .collect(),
+    }
 }
 
 pub fn load_library_symbols_sync(
@@ -532,37 +603,52 @@ pub fn load_library_symbols_sync(
     );
 
     let stdlib_start = Instant::now();
-    let (stdlib_entries, _stdlib_metatype_index, stdlib_symbols, stdlib_cache_hit, stdlib_signature) =
-        load_stdlib_snapshot(state, stdlib_path_for_log.as_deref())?;
-    let stdlib_duration_ms = stdlib_start.elapsed().as_millis();
-
-    let library_files = stdlib_entries
+    let stdlib_files = collect_stdlib_files(stdlib_path_for_log.as_deref())?;
+    let library_files = stdlib_files
         .iter()
-        .map(|(path, _)| path.to_string_lossy().to_string())
+        .map(|path| path.to_string_lossy().to_string())
         .collect::<Vec<_>>();
+    let stdlib_signature = if stdlib_files.is_empty() {
+        String::new()
+    } else {
+        stdlib_signature_key(&stdlib_files)?
+    };
     let symbols = if include_symbols {
-        let selected_files = select_symbol_files(
-            &stdlib_entries
-                .iter()
-                .map(|(path, _)| path.clone())
-                .collect::<Vec<_>>(),
-            target_path.as_deref(),
-        );
+        let selected_files = select_symbol_files(&stdlib_files, target_path.as_deref());
         let selected = selected_files
             .iter()
             .map(|path| normalized_compare_key(path))
             .collect::<HashSet<_>>();
-        stdlib_symbols
-            .iter()
+        let mut loaded = Vec::new();
+        for file in &stdlib_files {
+            if let Ok(text) = fs::read_to_string(file) {
+                loaded.push((file.clone(), text));
+            }
+        }
+        let fast_symbols = build_stdlib_symbols_only(&loaded);
+        fast_symbols
+            .into_iter()
             .filter(|symbol| {
                 target_path.is_none()
                     || selected.contains(&normalized_compare_key(Path::new(&symbol.file_path)))
             })
-            .map(map_stdlib_symbol_to_symbol_view)
+            .map(|symbol| map_stdlib_symbol_to_symbol_view(&symbol))
             .collect::<Vec<_>>()
     } else {
         Vec::new()
     };
+    let stdlib_cache_hit = !stdlib_signature.is_empty()
+        && stdlib_path_for_log.as_ref().is_some_and(|path| {
+            let key = normalized_compare_key(path);
+            state
+                .symbol_index
+                .lock()
+                .ok()
+                .map(|store| store.is_stdlib_index_fresh(&root, &key, &stdlib_signature))
+                .unwrap_or(false)
+        });
+    let stdlib_file_count = stdlib_files.len();
+    let stdlib_duration_ms = stdlib_start.elapsed().as_millis();
 
     let library_path_text = stdlib_path_for_log
         .as_ref()
@@ -572,7 +658,9 @@ pub fn load_library_symbols_sync(
         .map(|path| normalized_compare_key(path));
     let can_mark_freshness = target_path.is_none() && !stdlib_signature.is_empty();
     let should_index_stdlib = if let Some(key) = library_key.as_ref() {
-        if can_mark_freshness {
+        if !include_symbols {
+            false
+        } else if can_mark_freshness {
             let store = state
                 .symbol_index
                 .lock()
@@ -591,16 +679,18 @@ pub fn load_library_symbols_sync(
         library_path: library_path_text,
         stdlib_cache_hit,
         stdlib_duration_ms,
-        stdlib_file_count: stdlib_entries.len(),
+        stdlib_file_count,
         total_duration_ms: start.elapsed().as_millis(),
     };
     if should_index_stdlib {
-        let symbols_for_index = response_symbols_from_stdlib(&stdlib_symbols, None);
+        let symbols_for_index = response.symbols.clone();
         let _ = index_symbols_for_project(
             state,
             &root,
             stdlib_path_for_log.as_deref(),
             &symbols_for_index,
+            true,
+            false,
         );
         if let (Some(key), true) = (library_key.as_ref(), can_mark_freshness) {
             if let Ok(mut store) = state.symbol_index.lock() {
@@ -611,19 +701,34 @@ pub fn load_library_symbols_sync(
     Ok(response)
 }
 
-fn response_symbols_from_stdlib(
-    stdlib_symbols: &[StdlibSymbol],
-    target_path: Option<&Path>,
-) -> Vec<SymbolView> {
-    let selected = target_path.map(|target| normalized_compare_key(target));
-    stdlib_symbols
-        .iter()
-        .filter(|symbol| match selected.as_ref() {
-            None => true,
-            Some(target) => normalized_compare_key(Path::new(&symbol.file_path)) == *target,
-        })
-        .map(map_stdlib_symbol_to_symbol_view)
-        .collect()
+fn build_stdlib_symbols_only(entries: &[(PathBuf, String)]) -> Vec<StdlibSymbol> {
+    let mut symbols = Vec::new();
+    for (path, source) in entries {
+        let mut parser = Parser::new(source);
+        let root = parser.parse_root();
+        let defmap = build_defmap(&root, source);
+        if let Some(package) = defmap.package.as_ref() {
+            if let Some(symbol) = stdlib_symbol_from_def(path, package, source) {
+                symbols.push(symbol);
+            }
+        }
+        for import in &defmap.imports {
+            if let Some(symbol) = stdlib_symbol_from_def(path, import, source) {
+                symbols.push(symbol);
+            }
+        }
+        for def in &defmap.defs {
+            if let Some(symbol) = stdlib_symbol_from_def(path, def, source) {
+                symbols.push(symbol);
+            }
+        }
+        for dependency in &defmap.dependencies {
+            if let Some(symbol) = stdlib_symbol_from_def(path, dependency, source) {
+                symbols.push(symbol);
+            }
+        }
+    }
+    symbols
 }
 
 fn collect_stdlib_files(stdlib_path: Option<&Path>) -> Result<Vec<PathBuf>, String> {
@@ -737,7 +842,7 @@ fn build_stdlib_snapshot(entries: &[(PathBuf, String)]) -> (MetatypeIndex, Vec<S
         let mut parser = Parser::new(source);
         let root = parser.parse_root();
         let defmap = build_defmap(&root, source);
-        hirs.push(lower_defmap(&defmap));
+        hirs.push(lower_defmap_with_cst(&defmap, &root, source));
         if let Some(package) = defmap.package.as_ref() {
             if let Some(symbol) = stdlib_symbol_from_def(path, package, source) {
                 symbols.push(symbol);
@@ -853,6 +958,41 @@ fn project_import_symbols(
         let defmap = build_defmap(&root, &source);
         for import in &defmap.imports {
             if let Some(symbol) = project_symbol_from_def(file, import, &source) {
+                out.push(symbol);
+            }
+        }
+    }
+    out
+}
+
+fn project_decl_symbols(
+    project_files: &[PathBuf],
+    unsaved_map: &HashMap<PathBuf, String>,
+) -> Vec<SymbolView> {
+    let mut out = Vec::new();
+    for file in project_files {
+        let source = unsaved_map
+            .get(file)
+            .cloned()
+            .or_else(|| fs::read_to_string(file).ok());
+        let Some(source) = source else {
+            continue;
+        };
+        let mut parser = Parser::new(&source);
+        let root = parser.parse_root();
+        let defmap = build_defmap(&root, &source);
+        if let Some(package) = defmap.package.as_ref() {
+            if let Some(symbol) = project_symbol_from_def(file, package, &source) {
+                out.push(symbol);
+            }
+        }
+        for def in &defmap.defs {
+            if let Some(symbol) = project_symbol_from_def(file, def, &source) {
+                out.push(symbol);
+            }
+        }
+        for dependency in &defmap.dependencies {
+            if let Some(symbol) = project_symbol_from_def(file, dependency, &source) {
                 out.push(symbol);
             }
         }
@@ -1370,6 +1510,8 @@ fn index_symbols_for_project(
     project_root: &str,
     library_path: Option<&Path>,
     symbols: &[SymbolView],
+    rebuild_mappings: bool,
+    non_blocking_lock: bool,
 ) -> Result<(), String> {
     let mut grouped = HashMap::<String, Vec<SymbolRecord>>::new();
     let library_key = library_path.map(|path| normalized_compare_key(path));
@@ -1379,38 +1521,52 @@ fn index_symbols_for_project(
         } else {
             Scope::Project
         };
-        let id = format!(
-            "{}|{}|{}|{}",
-            project_root, symbol.file_path, symbol.qualified_name, symbol.name
-        );
-        let record = SymbolRecord {
-            id,
-            project_root: project_root.to_string(),
-            library_key: if scope == Scope::Stdlib {
-                library_key.clone()
-            } else {
-                None
+        let normalized_file_key = normalized_compare_key(Path::new(&symbol.file_path));
+        let metatype_qname = symbol_metatype_qname(symbol);
+        let properties_json = serde_json::to_string(&serde_json::json!({
+            "schema": 1,
+            "properties": symbol.properties
+        })).ok();
+        let record = canonical_symbol_record(
+            project_root,
+            &normalized_file_key,
+            library_key.as_deref(),
+            CanonicalSymbolRecordArgs {
+                scope,
+                name: &symbol.name,
+                qualified_name: &symbol.qualified_name,
+                kind: &symbol.kind,
+                metatype_qname: metatype_qname.as_deref(),
+                file_path: &symbol.file_path,
+                start_line: symbol.start_line,
+                start_col: symbol.start_col,
+                end_line: symbol.end_line,
+                end_col: symbol.end_col,
+                doc_text: symbol.doc.as_deref(),
+                properties_json: properties_json.as_deref(),
             },
-            scope,
-            name: symbol.name.clone(),
-            qualified_name: symbol.qualified_name.clone(),
-            kind: symbol.kind.clone(),
-            metatype_qname: symbol_metatype_qname(symbol),
-            file_path: symbol.file_path.clone(),
-            start_line: symbol.start_line,
-            start_col: symbol.start_col,
-            end_line: symbol.end_line,
-            end_col: symbol.end_col,
-            doc_text: symbol.doc.clone(),
-        };
+        );
         grouped.entry(symbol.file_path.clone()).or_default().push(record);
     }
-    let mut store = state
-        .symbol_index
-        .lock()
-        .map_err(|_| "Symbol index lock poisoned".to_string())?;
-    for (file_path, entries) in grouped {
+    let mut store = if non_blocking_lock {
+        state
+            .symbol_index
+            .try_lock()
+            .map_err(|_| "Symbol index busy".to_string())?
+    } else {
+        state
+            .symbol_index
+            .lock()
+            .map_err(|_| "Symbol index lock poisoned".to_string())?
+    };
+    let mut file_paths = grouped.keys().cloned().collect::<Vec<_>>();
+    file_paths.sort();
+    for file_path in file_paths {
+        let entries = grouped.remove(&file_path).unwrap_or_default();
         store.upsert_symbols_for_file(project_root, &file_path, entries);
+    }
+    if rebuild_mappings {
+        store.rebuild_symbol_mappings(project_root);
     }
     Ok(())
 }
@@ -2348,5 +2504,85 @@ standard library package KerML {
         assert!(a2.stdlib_cache_hit);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn canonical_symbol_record_id_is_stable_and_scope_aware() {
+        let symbol = SymbolView {
+            name: "P".to_string(),
+            short_name: None,
+            kind: "Package".to_string(),
+            file_path: "C:/tmp/project/main.sysml".to_string(),
+            qualified_name: "P".to_string(),
+            file: 0,
+            start_line: 1,
+            start_col: 2,
+            end_line: 3,
+            end_col: 4,
+            expr_start_line: None,
+            expr_start_col: None,
+            expr_end_line: None,
+            expr_end_col: None,
+            short_name_start_line: None,
+            short_name_start_col: None,
+            short_name_end_line: None,
+            short_name_end_col: None,
+            doc: None,
+            supertypes: Vec::new(),
+            relationships: Vec::new(),
+            type_refs: Vec::new(),
+            is_public: true,
+            properties: Vec::new(),
+        };
+        let file_key = normalized_compare_key(Path::new(&symbol.file_path));
+        let project_id_a = crate::index_contract::canonical_symbol_id(
+            "rootA",
+            Scope::Project,
+            &file_key,
+            &symbol.qualified_name,
+            &symbol.kind,
+            symbol.start_line,
+            symbol.start_col,
+            symbol.end_line,
+            symbol.end_col,
+        );
+        let project_id_b = crate::index_contract::canonical_symbol_id(
+            "rootA",
+            Scope::Project,
+            &file_key,
+            &symbol.qualified_name,
+            &symbol.kind,
+            symbol.start_line,
+            symbol.start_col,
+            symbol.end_line,
+            symbol.end_col,
+        );
+        let stdlib_id = crate::index_contract::canonical_symbol_id(
+            "rootA",
+            Scope::Stdlib,
+            &file_key,
+            &symbol.qualified_name,
+            &symbol.kind,
+            symbol.start_line,
+            symbol.start_col,
+            symbol.end_line,
+            symbol.end_col,
+        );
+        let other_root_id = crate::index_contract::canonical_symbol_id(
+            "rootB",
+            Scope::Project,
+            &file_key,
+            &symbol.qualified_name,
+            &symbol.kind,
+            symbol.start_line,
+            symbol.start_col,
+            symbol.end_line,
+            symbol.end_col,
+        );
+
+        assert_eq!(project_id_a, project_id_b);
+        assert_ne!(project_id_a, stdlib_id);
+        assert_ne!(project_id_a, other_root_id);
+        assert!(project_id_a.starts_with("v2|rootA|project|"));
     }
 }

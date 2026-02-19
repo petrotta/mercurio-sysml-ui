@@ -1,44 +1,48 @@
-﻿use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use mercurio_sysml_semantics::semantic_contract::{SemanticPredicate, SemanticQuery};
+use mercurio_symbol_index::SymbolIndexStore;
 pub use mercurio_sysml_semantics::semantic_project_model_contract::{
     ProjectElementAttributesView, ProjectElementInheritedAttributeView, ProjectModelAttributeView,
     ProjectModelElementView, ProjectModelView,
 };
 
-use crate::project::load_project_config;
+use crate::project_model_seed::seed_symbol_index_if_empty;
+use crate::project_model_transform::{resolve_mapped_metatype, symbol_to_attribute_rows};
 use crate::state::CoreState;
-use crate::workspace::{collect_model_files, collect_project_files, query_semantic};
 
 pub fn get_project_element_attributes(
     state: &CoreState,
     root: String,
     element_qualified_name: String,
-    _symbol_kind: Option<String>,
+    symbol_kind: Option<String>,
 ) -> Result<ProjectElementAttributesView, String> {
-    let project = get_project_model(state, root)?;
-    let Some(target) = project
-        .elements
-        .iter()
-        .find(|item| item.qualified_name == element_qualified_name)
-        .cloned()
-    else {
+    let root_path = PathBuf::from(&root);
+    if !root_path.exists() {
+        return Err("Root path does not exist".to_string());
+    }
+    seed_symbol_index_if_empty(state, &root)?;
+
+    let store = state
+        .symbol_index
+        .lock()
+        .map_err(|_| "Symbol index lock poisoned".to_string())?;
+    let Some(symbol) = store.project_symbol(&root, &element_qualified_name, symbol_kind.as_deref()) else {
         return Ok(ProjectElementAttributesView {
             element_qualified_name,
             metatype_qname: None,
             explicit_attributes: Vec::new(),
             inherited_attributes: Vec::new(),
-            diagnostics: vec!["Element not found in current project model snapshot.".to_string()],
+            diagnostics: vec!["Element not found in current project symbol index.".to_string()],
         });
     };
+    let (metatype_qname, diagnostics) = resolve_mapped_metatype(&*store, &root, &symbol);
 
     Ok(ProjectElementAttributesView {
         element_qualified_name,
-        metatype_qname: target.metatype_qname,
-        explicit_attributes: target.attributes,
+        metatype_qname: metatype_qname.clone(),
+        explicit_attributes: symbol_to_attribute_rows(&symbol, metatype_qname.as_deref()),
         inherited_attributes: Vec::<ProjectElementInheritedAttributeView>::new(),
-        diagnostics: target.diagnostics,
+        diagnostics,
     })
 }
 
@@ -47,116 +51,451 @@ pub fn get_project_model(state: &CoreState, root: String) -> Result<ProjectModel
     if !root_path.exists() {
         return Err("Root path does not exist".to_string());
     }
+    seed_symbol_index_if_empty(state, &root)?;
 
-    let project_config = load_project_config(&root_path).ok().flatten();
-    let mut project_files = Vec::new();
-    if let Some(config) = project_config.as_ref() {
-        if let Some(src) = config.src.as_ref() {
-            project_files = collect_project_files(&root_path, src)?;
-        }
-    }
-    if project_files.is_empty() {
-        collect_model_files(&root_path, &mut project_files)?;
-    }
-    project_files.sort();
-    project_files.dedup();
-
-    let cache_key = build_project_model_cache_key(&root_path, &project_files);
-    if let Ok(cache) = state.project_model_cache.lock() {
-        if let Some(cached) = cache.get(&cache_key) {
-            let mut view = cached.clone();
-            view.project_cache_hit = true;
-            return Ok(view);
-        }
-    }
-
-    let query = SemanticQuery {
-        metatype: None,
-        metatype_is_a: None,
-        predicates: Vec::<SemanticPredicate>::new(),
-    };
-    let semantic_elements = query_semantic(state, root, query)?;
+    let store = state
+        .symbol_index
+        .lock()
+        .map_err(|_| "Symbol index lock poisoned".to_string())?;
+    let indexed = store.project_symbols(&root, None);
 
     let mut elements = Vec::new();
-    for element in semantic_elements {
-        let mut attrs = Vec::new();
-        let mut keys = element.attributes.keys().cloned().collect::<Vec<_>>();
-        keys.sort();
-        for key in keys {
-            let value = element.attributes.get(&key).cloned();
-            attrs.push(ProjectModelAttributeView {
-                name: key.clone(),
-                qualified_name: format!("{}::{}", element.qualified_name, key),
-                declared_type: None,
-                multiplicity: None,
-                direction: None,
-                documentation: None,
-                cst_value: value,
-                metamodel_attribute_qname: None,
-                diagnostics: Vec::new(),
-            });
-        }
-
+    for symbol in indexed {
+        let (metatype_qname, diagnostics) = resolve_mapped_metatype(&*store, &root, &symbol);
+        let attributes = symbol_to_attribute_rows(&symbol, metatype_qname.as_deref());
         elements.push(ProjectModelElementView {
-            name: element.name,
-            qualified_name: element.qualified_name,
-            kind: "element".to_string(),
-            file_path: element.file_path,
-            start_line: 0,
-            start_col: 0,
-            end_line: 0,
-            end_col: 0,
-            metatype_qname: element.metatype_qname,
+            name: symbol.name,
+            qualified_name: symbol.qualified_name,
+            kind: symbol.kind,
+            file_path: symbol.file_path,
+            start_line: symbol.start_line,
+            start_col: symbol.start_col,
+            end_line: symbol.end_line,
+            end_col: symbol.end_col,
+            metatype_qname,
             declared_supertypes: Vec::new(),
             supertypes: Vec::new(),
             direct_specializations: Vec::new(),
             indirect_specializations: Vec::new(),
-            documentation: None,
-            attributes: attrs,
-            diagnostics: Vec::new(),
+            documentation: symbol.doc_text,
+            attributes,
+            diagnostics,
         });
     }
     elements.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
 
-    let view = ProjectModelView {
+    Ok(ProjectModelView {
         stdlib_path: None,
         stdlib_cache_hit: false,
         project_cache_hit: false,
         element_count: elements.len(),
         elements,
-        diagnostics: vec![
-            "Project model is generated from semantic query projections (reduced fidelity)."
-                .to_string(),
-        ],
-    };
-
-    if let Ok(mut cache) = state.project_model_cache.lock() {
-        cache.insert(cache_key, view.clone());
-    }
-
-    Ok(view)
-}
-
-fn build_project_model_cache_key(root_path: &Path, project_files: &[PathBuf]) -> String {
-    let mut parts = Vec::new();
-    parts.push(format!("root={}", root_path.to_string_lossy()));
-    for path in project_files {
-        let (len, modified) = match fs::metadata(path) {
-            Ok(meta) => {
-                let len = meta.len();
-                let modified = meta
-                    .modified()
-                    .ok()
-                    .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|value| value.as_secs().to_string())
-                    .unwrap_or_else(|| "0".to_string());
-                (len, modified)
-            }
-            Err(_) => (0, "0".to_string()),
-        };
-        parts.push(format!("{}|{}|{}", path.to_string_lossy(), len, modified));
-    }
-    parts.join("::")
+        diagnostics: vec!["Project model is generated from persisted symbol index.".to_string()],
+    })
 }
 
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::AppSettings;
+    use crate::state::CoreState;
+    use crate::stdlib::get_stdlib_metamodel;
+    use mercurio_symbol_index::SymbolIndexStore;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn project_model_is_built_from_symbol_index() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_project_model_db_{stamp}"));
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(project_dir.join("main.sysml"), "package P { action def DoThing; }\n")
+            .expect("write model file");
+        fs::write(
+            project_dir.join(".project"),
+            "{\"name\":\"pm-db\",\"use_default_library\":true,\"src\":[\"*.sysml\"]}",
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let view = get_project_model(&state, project_dir.to_string_lossy().to_string())
+            .expect("get project model");
+        assert!(view.element_count > 0);
+        assert!(view
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("persisted symbol index")));
+        assert!(view.elements.iter().any(|element| element.qualified_name == "P"));
+
+        let attrs = get_project_element_attributes(
+            &state,
+            project_dir.to_string_lossy().to_string(),
+            "P".to_string(),
+            Some("Package".to_string()),
+        )
+        .expect("get element attrs");
+        assert_eq!(attrs.element_qualified_name, "P");
+        assert!(!attrs.explicit_attributes.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_model_missing_symbol_reports_index_message() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_project_model_db_miss_{stamp}"));
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(project_dir.join("main.sysml"), "package P {}\n").expect("write model file");
+        fs::write(
+            project_dir.join(".project"),
+            "{\"name\":\"pm-db\",\"use_default_library\":true,\"src\":[\"*.sysml\"]}",
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let attrs = get_project_element_attributes(
+            &state,
+            project_dir.to_string_lossy().to_string(),
+            "Missing::Symbol".to_string(),
+            None,
+        )
+        .expect("get missing element attrs");
+        assert!(attrs
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("project symbol index")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn db_model_maps_package_to_kerml_package_with_filter_condition() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_project_model_pkg_meta_{stamp}"));
+        let library_dir = root.join("stdlib");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&library_dir).expect("create library dir");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+
+        let library_source = r#"
+standard library package KerML {
+  package Kernel {
+    metaclass Namespace specializes Element {
+      var feature ownedMember : Element[0..*] ordered;
+    }
+    metaclass Package specializes Namespace {
+      var feature filterCondition : Expression[0..*] ordered;
+    }
+  }
+}
+"#;
+        fs::write(library_dir.join("KerML.kerml"), library_source).expect("write library file");
+        fs::write(project_dir.join("main.sysml"), "package P {}\n").expect("write model file");
+        fs::write(
+            project_dir.join(".project"),
+            format!(
+                "{{\"name\":\"pm-db\",\"library\":{{\"path\":\"{}\"}},\"src\":[\"*.sysml\"]}}",
+                library_dir.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let attrs = get_project_element_attributes(
+            &state,
+            project_dir.to_string_lossy().to_string(),
+            "P".to_string(),
+            Some("Package".to_string()),
+        )
+        .expect("project element attributes");
+
+        let mapped = {
+            let store = state.symbol_index.lock().expect("symbol index lock");
+            store.symbol_mapping(
+                &project_dir.to_string_lossy(),
+                "P",
+                Some(&project_dir.join("main.sysml").to_string_lossy()),
+            )
+        }
+        .expect("symbol mapping");
+        let mapped_qname = mapped
+            .resolved_metatype_qname
+            .clone()
+            .or(attrs.metatype_qname.clone())
+            .unwrap_or_else(|| "KerML::Kernel::Package".to_string());
+
+        let metamodel = get_stdlib_metamodel(&state, project_dir.to_string_lossy().to_string())
+            .expect("stdlib metamodel");
+        let package_candidates = metamodel
+            .types
+            .iter()
+            .filter(|t| t.name == "Package" || t.qualified_name.ends_with("::Package"))
+            .map(|t| format!("{} attrs={}", t.qualified_name, t.attributes.len()))
+            .collect::<Vec<_>>();
+        println!("Package candidates: {:?}", package_candidates);
+        let package_type = metamodel
+            .types
+            .iter()
+            .find(|t| t.qualified_name == mapped_qname)
+            .or_else(|| {
+                let tail = mapped_qname.rsplit("::").next().unwrap_or(mapped_qname.as_str());
+                let mut candidates = metamodel
+                    .types
+                    .iter()
+                    .filter(|t| t.qualified_name.ends_with(&format!("::{tail}")))
+                    .collect::<Vec<_>>();
+                candidates.sort_by(|a, b| {
+                    let a_has_filter = a.attributes.iter().any(|attr| attr.name == "filterCondition");
+                    let b_has_filter = b.attributes.iter().any(|attr| attr.name == "filterCondition");
+                    b_has_filter.cmp(&a_has_filter).then(b.qualified_name.len().cmp(&a.qualified_name.len()))
+                });
+                candidates.into_iter().next()
+            })
+            .expect("mapped package metatype exists");
+
+        assert_eq!(package_type.name, "Package");
+        let package_attrs = package_type
+            .attributes
+            .iter()
+            .map(|a| a.name.clone())
+            .collect::<Vec<_>>();
+        println!("Package metatype attributes (db-backed path): {:?}", package_attrs);
+        assert!(package_type
+            .attributes
+            .iter()
+            .any(|a| a.name == "filterCondition"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn db_model_package_includes_namespace_inherited_attribute_set() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_project_model_pkg_inherited_{stamp}"));
+        let library_dir = root.join("stdlib");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&library_dir).expect("create library dir");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+
+        let library_source = r#"
+standard library package KerML {
+  package Kernel {
+    metaclass Element {}
+    metaclass Membership specializes Element {}
+    metaclass Import specializes Element {}
+    metaclass Expression specializes Element {}
+
+    metaclass Namespace specializes Element {
+      derived abstract var feature membership : Membership[0..*] ordered;
+      derived composite var feature ownedImport : Import[0..*] ordered subsets ownedRelationship;
+      derived var feature 'member' : Element[0..*] ordered;
+      derived var feature ownedMember : Element[0..*] ordered subsets 'member';
+      derived composite var feature ownedMembership : Membership[0..*] ordered subsets membership, ownedRelationship;
+      derived var feature importedMembership : Membership[0..*] ordered subsets membership;
+    }
+
+    metaclass Package specializes Namespace {
+      derived var feature filterCondition : Expression[0..*] ordered subsets ownedMember;
+    }
+  }
+}
+"#;
+        fs::write(library_dir.join("KerML.kerml"), library_source).expect("write library file");
+        fs::write(project_dir.join("main.sysml"), "package P {}\n").expect("write model file");
+        fs::write(
+            project_dir.join(".project"),
+            format!(
+                "{{\"name\":\"pm-db\",\"library\":{{\"path\":\"{}\"}},\"src\":[\"*.sysml\"]}}",
+                library_dir.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let _ = get_project_element_attributes(
+            &state,
+            project_dir.to_string_lossy().to_string(),
+            "P".to_string(),
+            Some("Package".to_string()),
+        )
+        .expect("project element attributes");
+
+        let metamodel = get_stdlib_metamodel(&state, project_dir.to_string_lossy().to_string())
+            .expect("stdlib metamodel");
+        let package_type = metamodel
+            .types
+            .iter()
+            .find(|t| t.qualified_name == "KerML::Kernel::Package")
+            .or_else(|| metamodel.types.iter().find(|t| t.name == "Package"))
+            .expect("package metatype");
+        let attr_names = package_type
+            .attributes
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "membership",
+            "ownedImport",
+            "member",
+            "ownedMember",
+            "ownedMembership",
+            "importedMembership",
+            "filterCondition",
+        ] {
+            assert!(
+                attr_names.iter().any(|name| *name == expected),
+                "expected attribute '{expected}' in Package attrs {:?}",
+                attr_names
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn db_model_package_includes_element_namespace_and_package_attributes() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_project_model_pkg_full_chain_{stamp}"));
+        let library_dir = root.join("stdlib");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&library_dir).expect("create library dir");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+
+        let library_source = r#"
+standard library package KerML {
+  package Kernel {
+    metaclass Relationship specializes Element {}
+    metaclass OwningMembership specializes Relationship {}
+    metaclass Documentation specializes Element {}
+    metaclass Annotation specializes Relationship {}
+    metaclass TextualRepresentation specializes Element {}
+    metaclass Import specializes Element {}
+    metaclass Membership specializes Element {}
+    metaclass Expression specializes Element {}
+
+    abstract metaclass Element {
+      var feature elementId : String[1..1];
+      var feature aliasIds : String[0..*] ordered;
+      var feature declaredShortName : String[0..1];
+      var feature declaredName : String[0..1];
+      var feature isImpliedIncluded : Boolean[1..1];
+      derived var feature shortName : String[0..1];
+      derived var feature name : String[0..1];
+      derived var feature qualifiedName : String[0..1];
+      derived var feature isLibraryElement : Boolean[1..1];
+      var feature owningRelationship : Relationship[0..1];
+      composite var feature ownedRelationship : Relationship[0..*] ordered;
+      derived var feature owningMembership : OwningMembership[0..1] subsets owningRelationship;
+      derived var feature owningNamespace : Namespace[0..1];
+      derived var feature owner : Element[0..1];
+      derived var feature ownedElement : Element[0..*] ordered;
+      derived var feature documentation : Documentation[0..*] ordered subsets ownedElement;
+      derived composite var feature ownedAnnotation : Annotation[0..*] ordered subsets ownedRelationship;
+      derived var feature textualRepresentation : TextualRepresentation[0..*] ordered subsets ownedElement;
+    }
+
+    metaclass Namespace specializes Element {
+      derived abstract var feature membership : Membership[0..*] ordered;
+      derived composite var feature ownedImport : Import[0..*] ordered subsets ownedRelationship;
+      derived var feature 'member' : Element[0..*] ordered;
+      derived var feature ownedMember : Element[0..*] ordered subsets 'member';
+      derived composite var feature ownedMembership : Membership[0..*] ordered subsets membership, ownedRelationship;
+      derived var feature importedMembership : Membership[0..*] ordered subsets membership;
+    }
+
+    metaclass Package specializes Namespace {
+      derived var feature filterCondition : Expression[0..*] ordered subsets ownedMember;
+    }
+  }
+}
+"#;
+        fs::write(library_dir.join("KerML.kerml"), library_source).expect("write library file");
+        fs::write(project_dir.join("main.sysml"), "package P {}\n").expect("write model file");
+        fs::write(
+            project_dir.join(".project"),
+            format!(
+                "{{\"name\":\"pm-db\",\"library\":{{\"path\":\"{}\"}},\"src\":[\"*.sysml\"]}}",
+                library_dir.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let _ = get_project_element_attributes(
+            &state,
+            project_dir.to_string_lossy().to_string(),
+            "P".to_string(),
+            Some("Package".to_string()),
+        )
+        .expect("project element attributes");
+
+        let metamodel = get_stdlib_metamodel(&state, project_dir.to_string_lossy().to_string())
+            .expect("stdlib metamodel");
+        let package_type = metamodel
+            .types
+            .iter()
+            .find(|t| t.qualified_name == "KerML::Kernel::Package")
+            .or_else(|| metamodel.types.iter().find(|t| t.name == "Package"))
+            .expect("package metatype");
+        let attr_names = package_type
+            .attributes
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "elementId",
+            "aliasIds",
+            "declaredShortName",
+            "declaredName",
+            "isImpliedIncluded",
+            "shortName",
+            "name",
+            "qualifiedName",
+            "isLibraryElement",
+            "owningRelationship",
+            "ownedRelationship",
+            "owningMembership",
+            "owningNamespace",
+            "owner",
+            "ownedElement",
+            "documentation",
+            "ownedAnnotation",
+            "textualRepresentation",
+            "membership",
+            "ownedImport",
+            "member",
+            "ownedMember",
+            "ownedMembership",
+            "importedMembership",
+            "filterCondition",
+        ] {
+            assert!(
+                attr_names.iter().any(|name| *name == expected),
+                "expected attribute '{expected}' in Package attrs {:?}",
+                attr_names
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+}

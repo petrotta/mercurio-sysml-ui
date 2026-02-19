@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use crate::project_model::ProjectModelView;
 use crate::settings::AppSettings;
 use crate::stdlib::StdlibMetamodelView;
 
@@ -50,7 +49,6 @@ pub struct CoreState {
     pub(crate) canceled_compiles: Arc<Mutex<HashSet<u64>>>,
     pub(crate) workspace: Arc<Mutex<WorkspaceState>>,
     pub(crate) metamodel_cache: Arc<Mutex<HashMap<String, StdlibMetamodelView>>>,
-    pub(crate) project_model_cache: Arc<Mutex<HashMap<String, ProjectModelView>>>,
     pub(crate) symbol_index: Arc<Mutex<SymbolIndex>>,
     pub stdlib_root: PathBuf,
     pub settings: Arc<Mutex<AppSettings>>,
@@ -70,7 +68,6 @@ impl CoreState {
             canceled_compiles: Arc::new(Mutex::new(HashSet::new())),
             workspace: Arc::new(Mutex::new(WorkspaceState::default())),
             metamodel_cache: Arc::new(Mutex::new(HashMap::new())),
-            project_model_cache: Arc::new(Mutex::new(HashMap::new())),
             symbol_index: Arc::new(Mutex::new(symbol_index)),
             stdlib_root,
             settings: Arc::new(Mutex::new(settings)),

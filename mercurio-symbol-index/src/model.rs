@@ -22,4 +22,19 @@ pub struct SymbolRecord {
     pub end_line: u32,
     pub end_col: u32,
     pub doc_text: Option<String>,
+    pub properties_json: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SymbolMetatypeMappingRecord {
+    pub project_root: String,
+    pub symbol_id: String,
+    pub symbol_file_path: String,
+    pub symbol_qualified_name: String,
+    pub symbol_kind: String,
+    pub resolved_metatype_qname: Option<String>,
+    pub target_symbol_id: Option<String>,
+    pub mapping_source: String,
+    pub confidence: f32,
+    pub diagnostic: Option<String>,
 }

@@ -54,6 +54,7 @@ export type SymbolView = {
   name: string;
   kind: string;
   file_path: string;
+  source_scope?: "project" | "library";
   qualified_name: string;
   file: number;
   start_line: number;
@@ -223,4 +224,17 @@ export type ProjectElementAttributesView = {
   explicit_attributes: ProjectModelAttributeView[];
   inherited_attributes: ProjectElementInheritedAttributeView[];
   diagnostics: string[];
+};
+
+export type SymbolMetatypeMappingView = {
+  project_root: string;
+  symbol_id: string;
+  symbol_file_path: string;
+  symbol_qualified_name: string;
+  symbol_kind: string;
+  resolved_metatype_qname?: string | null;
+  target_symbol_id?: string | null;
+  mapping_source: string;
+  confidence: number;
+  diagnostic?: string | null;
 };

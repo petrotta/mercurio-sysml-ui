@@ -36,7 +36,36 @@ CREATE TABLE IF NOT EXISTS stdlib_index_meta (
 );
 "#;
 
+pub const MIGRATION_0003_SYMBOL_MAPPINGS: &str = r#"
+CREATE TABLE IF NOT EXISTS symbol_mappings (
+  project_root TEXT NOT NULL,
+  symbol_id TEXT NOT NULL,
+  symbol_file_path TEXT NOT NULL,
+  symbol_qualified_name TEXT NOT NULL,
+  symbol_kind TEXT NOT NULL,
+  resolved_metatype_qname TEXT,
+  target_symbol_id TEXT,
+  mapping_source TEXT NOT NULL,
+  confidence REAL NOT NULL,
+  diagnostic TEXT,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (project_root, symbol_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_symbol_mappings_lookup
+  ON symbol_mappings(project_root, symbol_qualified_name, symbol_file_path);
+
+CREATE INDEX IF NOT EXISTS idx_symbol_mappings_metatype
+  ON symbol_mappings(project_root, resolved_metatype_qname);
+"#;
+
+pub const MIGRATION_0004_SYMBOL_PROPERTIES: &str = r#"
+ALTER TABLE symbols ADD COLUMN properties_json TEXT;
+"#;
+
 pub const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_init", MIGRATION_0001_INIT),
     ("0002_stdlib_meta", MIGRATION_0002_STDLIB_META),
+    ("0003_symbol_mappings", MIGRATION_0003_SYMBOL_MAPPINGS),
+    ("0004_symbol_properties", MIGRATION_0004_SYMBOL_PROPERTIES),
 ];

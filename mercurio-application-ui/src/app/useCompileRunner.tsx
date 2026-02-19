@@ -5,6 +5,7 @@ import type { SymbolView, UnresolvedIssue } from "./types";
 
 const LIBRARY_BULK_CONCURRENCY = 4;
 const LIBRARY_INDEX_PAGE_SIZE = 2000;
+const BACKGROUND_COMPILE_TIMEOUT_MS = 30000;
 
 export type CompileToast = {
   open: boolean;
@@ -82,16 +83,23 @@ function mergeProjectSymbolsByFile(
   incoming: SymbolView[],
   scopedFilePath?: string,
 ): SymbolView[] {
+  if (!incoming.length) {
+    return previous;
+  }
   if (!scopedFilePath) return incoming;
   const kept = previous.filter((symbol) => symbol.file_path !== scopedFilePath);
   return mergeSymbols(kept, incoming);
 }
 
-function mapIndexedToSymbolView(input: IndexedSymbolView): SymbolView {
+function mapIndexedToSymbolView(
+  input: IndexedSymbolView,
+  sourceScope: "project" | "library",
+): SymbolView {
   return {
     file_path: input.file_path,
     name: input.name,
     kind: input.kind,
+    source_scope: sourceScope,
     qualified_name: input.qualified_name,
     file: 0,
     start_line: input.start_line || 0,
@@ -101,6 +109,13 @@ function mapIndexedToSymbolView(input: IndexedSymbolView): SymbolView {
     doc: input.doc_text ?? null,
     properties: [],
   };
+}
+
+function withScope(
+  symbols: SymbolView[] | undefined,
+  sourceScope: "project" | "library",
+): SymbolView[] {
+  return (symbols || []).map((symbol) => ({ ...symbol, source_scope: sourceScope }));
 }
 
 function categorizeParseError(message: string): string {
@@ -131,6 +146,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
   const libraryLoadTokenRef = useRef(0);
   const backgroundCompileRef = useRef<number | null>(null);
   const backgroundCompileTokenRef = useRef(0);
+  const [backgroundCompileActive, setBackgroundCompileActive] = useState(false);
   const loadedLibraryFilesRef = useRef<Set<string>>(new Set());
   const [backgroundCompileEnabled, setBackgroundCompileEnabled] = useState(true);
   const [projectSymbols, setProjectSymbols] = useState<SymbolView[]>([]);
@@ -153,6 +169,15 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
   const [stdlibFileCount, setStdlibFileCount] = useState(0);
   const [parsedFiles, setParsedFiles] = useState<string[]>([]);
   const [parseErrorPaths, setParseErrorPaths] = useState<Set<string>>(new Set());
+  const backgroundCompileTimeoutRef = useRef<number | null>(null);
+  const libraryBootstrapRef = useRef<string | null>(null);
+
+  const clearBackgroundCompileTimeout = useCallback(() => {
+    if (backgroundCompileTimeoutRef.current != null) {
+      window.clearTimeout(backgroundCompileTimeoutRef.current);
+      backgroundCompileTimeoutRef.current = null;
+    }
+  }, []);
 
   useEffect(() => {
       setProjectSymbolsLoaded(false);
@@ -173,7 +198,11 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
       setSymbols([]);
       loadedLibraryFilesRef.current = new Set();
       libraryLoadTokenRef.current += 1;
-  }, [rootPath]);
+      backgroundCompileRef.current = null;
+      clearBackgroundCompileTimeout();
+      setBackgroundCompileActive(false);
+      libraryBootstrapRef.current = null;
+  }, [rootPath, clearBackgroundCompileTimeout]);
 
   useEffect(() => {
     setSymbols(mergeSymbols(projectSymbols, librarySymbols));
@@ -221,6 +250,19 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
     }
   }, []);
 
+  const loadProjectSymbolsFromIndex = useCallback(async (path: string) => {
+    if (!path) return;
+    try {
+      const indexed = await invoke<IndexedSymbolView[]>("query_index_project_symbols", {
+        payload: { root: path },
+      });
+      const mapped = (indexed || []).map((symbol) => mapIndexedToSymbolView(symbol, "project"));
+      setProjectSymbols(mapped);
+      setProjectSymbolsLoaded(true);
+    } catch {
+    }
+  }, []);
+
   const loadLibrarySymbols = useCallback(async (path: string, filePath?: string, includeSymbols: boolean = true): Promise<boolean> => {
     if (!path) return false;
     try {
@@ -235,7 +277,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
         setLibraryFiles(response.library_files);
       }
       if (includeSymbols) {
-        const incoming = response?.symbols || [];
+        const incoming = withScope(response?.symbols, "library");
         if (filePath) {
           setLibrarySymbols((prev) => mergeSymbols(prev, incoming));
           loadedLibraryFilesRef.current.add(filePath);
@@ -277,7 +319,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
         const indexed = await invoke<IndexedSymbolView[]>("query_index_library_symbols", {
           payload: { root: rootPath, file: filePath },
         });
-        const mapped = (indexed || []).map(mapIndexedToSymbolView);
+        const mapped = (indexed || []).map((symbol) => mapIndexedToSymbolView(symbol, "library"));
         setLibrarySymbols((prev) => mergeSymbols(prev, mapped));
         loadedLibraryFilesRef.current.add(filePath);
         setLoadedLibraryFileCount(loadedLibraryFilesRef.current.size);
@@ -325,7 +367,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
               limit: LIBRARY_INDEX_PAGE_SIZE,
             },
           });
-          const page = (indexed || []).map(mapIndexedToSymbolView);
+          const page = (indexed || []).map((symbol) => mapIndexedToSymbolView(symbol, "library"));
           if (!page.length) break;
           mapped.push(...page);
           if (page.length < LIBRARY_INDEX_PAGE_SIZE) break;
@@ -442,14 +484,33 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
 
   useEffect(() => {
     if (!rootPath) return;
+    void loadProjectSymbolsFromIndex(rootPath);
     void loadLibrarySymbols(rootPath, undefined, false);
-  }, [rootPath, loadLibrarySymbols]);
+  }, [rootPath, loadLibrarySymbols, loadProjectSymbolsFromIndex]);
+
+  useEffect(() => {
+    if (!rootPath) return;
+    if (!libraryFiles.length) return;
+    if (libraryIndexedSymbolCount > 0) return;
+    if (libraryBulkLoading) return;
+    if (libraryBootstrapRef.current === rootPath) return;
+    libraryBootstrapRef.current = rootPath;
+    void loadLibrarySymbols(rootPath, undefined, true);
+  }, [
+    rootPath,
+    libraryFiles.length,
+    libraryIndexedSymbolCount,
+    libraryBulkLoading,
+    loadLibrarySymbols,
+  ]);
 
   const runCompile = useCallback(async (filePath?: string): Promise<boolean> => {
     if (!rootPath) return false;
     if (backgroundCompileRef.current) {
       void invoke("cancel_compile", { run_id: backgroundCompileRef.current }).catch(() => {});
       backgroundCompileRef.current = null;
+      clearBackgroundCompileTimeout();
+      setBackgroundCompileActive(false);
     }
     const runId = Date.now();
     setCompileRunId(runId);
@@ -465,7 +526,8 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
           unsaved: [],
         },
       });
-      setProjectSymbols(response?.symbols || []);
+      const incomingProject = withScope(response?.symbols, "project");
+      setProjectSymbols((prev) => (incomingProject.length ? incomingProject : prev));
       setUnresolved(response?.unresolved || []);
       setProjectSymbolsLoaded(true);
       setParsedFiles(response?.parsed_files || []);
@@ -569,6 +631,15 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
     const runId = Date.now();
     const token = backgroundCompileTokenRef.current;
     backgroundCompileRef.current = runId;
+    setBackgroundCompileActive(true);
+    clearBackgroundCompileTimeout();
+    backgroundCompileTimeoutRef.current = window.setTimeout(() => {
+      if (backgroundCompileRef.current !== runId) return;
+      backgroundCompileRef.current = null;
+      setBackgroundCompileActive(false);
+      setCompileStatus(`Background compile: timed out after ${Math.round(BACKGROUND_COMPILE_TIMEOUT_MS / 1000)}s`);
+      void invoke("cancel_compile", { run_id: runId }).catch(() => {});
+    }, BACKGROUND_COMPILE_TIMEOUT_MS);
     setCompileStatus("Background compile: starting...");
     try {
       const response = await invoke<CompileResponse>("compile_project_delta", {
@@ -583,7 +654,13 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
       if (token !== backgroundCompileTokenRef.current || path !== rootPath) {
         return;
       }
-      setProjectSymbols((prev) => mergeProjectSymbolsByFile(prev, response?.symbols || [], filePath));
+      setProjectSymbols((prev) => {
+        const incomingProject = withScope(response?.symbols, "project");
+        return mergeProjectSymbolsByFile(prev, incomingProject, filePath);
+      });
+      if (!filePath && (!response?.symbols || response.symbols.length === 0)) {
+        await loadProjectSymbolsFromIndex(path);
+      }
       setUnresolved(response?.unresolved || []);
       setProjectSymbolsLoaded(true);
       setParsedFiles(response?.parsed_files || []);
@@ -591,23 +668,42 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
         .filter((file) => !file.ok && file.errors && file.errors.length)
         .map((file) => file.path);
       setParseErrorPaths(new Set(parseErrors.map((path) => normalizePathKey(path))));
-      setCompileStatus(response?.ok ? "Background compile: complete" : "Background compile: finished with errors");
+      const symbolCount = response?.symbols?.length || 0;
+      setCompileStatus(
+        response?.ok
+          ? `Background compile: complete (${symbolCount} symbols)`
+          : `Background compile: finished with errors (${symbolCount} symbols)`,
+      );
     } catch (error) {
       if (token === backgroundCompileTokenRef.current) {
         setCompileStatus(`Background compile: failed: ${error}`);
       }
     } finally {
+      clearBackgroundCompileTimeout();
       if (token === backgroundCompileTokenRef.current) {
         backgroundCompileRef.current = null;
+        setBackgroundCompileActive(false);
+      } else if (backgroundCompileRef.current === runId) {
+        backgroundCompileRef.current = null;
+        setBackgroundCompileActive(false);
       }
     }
-  }, [backgroundCompileEnabled, compileRunId, rootPath]);
+  }, [backgroundCompileEnabled, compileRunId, rootPath, clearBackgroundCompileTimeout, loadProjectSymbolsFromIndex]);
 
   const runBackgroundCompileWithUnsaved = useCallback(async (path: string, filePath: string, content: string) => {
     if (!backgroundCompileEnabled || !path || compileRunId || backgroundCompileRef.current) return;
     const runId = Date.now();
     const token = backgroundCompileTokenRef.current;
     backgroundCompileRef.current = runId;
+    setBackgroundCompileActive(true);
+    clearBackgroundCompileTimeout();
+    backgroundCompileTimeoutRef.current = window.setTimeout(() => {
+      if (backgroundCompileRef.current !== runId) return;
+      backgroundCompileRef.current = null;
+      setBackgroundCompileActive(false);
+      setCompileStatus(`Background compile: timed out after ${Math.round(BACKGROUND_COMPILE_TIMEOUT_MS / 1000)}s`);
+      void invoke("cancel_compile", { run_id: runId }).catch(() => {});
+    }, BACKGROUND_COMPILE_TIMEOUT_MS);
     setCompileStatus("Background compile: starting...");
     try {
       const response = await invoke<CompileResponse>("compile_project_delta", {
@@ -622,7 +718,13 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
       if (token !== backgroundCompileTokenRef.current || path !== rootPath) {
         return;
       }
-      setProjectSymbols((prev) => mergeProjectSymbolsByFile(prev, response?.symbols || [], filePath));
+      setProjectSymbols((prev) => {
+        const incomingProject = withScope(response?.symbols, "project");
+        return mergeProjectSymbolsByFile(prev, incomingProject, filePath);
+      });
+      if (!response?.symbols || response.symbols.length === 0) {
+        await loadProjectSymbolsFromIndex(path);
+      }
       setUnresolved(response?.unresolved || []);
       setProjectSymbolsLoaded(true);
       setParsedFiles(response?.parsed_files || []);
@@ -630,27 +732,37 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
         .filter((file) => !file.ok && file.errors && file.errors.length)
         .map((file) => file.path);
       setParseErrorPaths(new Set(parseErrors.map((path) => normalizePathKey(path))));
-      setCompileStatus(response?.ok ? "Background compile: complete" : "Background compile: finished with errors");
+      const symbolCount = response?.symbols?.length || 0;
+      setCompileStatus(
+        response?.ok
+          ? `Background compile: complete (${symbolCount} symbols)`
+          : `Background compile: finished with errors (${symbolCount} symbols)`,
+      );
     } catch (error) {
       if (token === backgroundCompileTokenRef.current) {
         setCompileStatus(`Background compile: failed: ${error}`);
       }
     } finally {
+      clearBackgroundCompileTimeout();
       if (token === backgroundCompileTokenRef.current) {
         backgroundCompileRef.current = null;
+        setBackgroundCompileActive(false);
+      } else if (backgroundCompileRef.current === runId) {
+        backgroundCompileRef.current = null;
+        setBackgroundCompileActive(false);
       }
     }
-  }, [backgroundCompileEnabled, compileRunId, rootPath]);
+  }, [backgroundCompileEnabled, compileRunId, rootPath, clearBackgroundCompileTimeout, loadProjectSymbolsFromIndex]);
 
   const cancelBackgroundCompile = useCallback(async () => {
     if (!backgroundCompileRef.current) return;
     const runId = backgroundCompileRef.current;
     backgroundCompileRef.current = null;
+    setBackgroundCompileActive(false);
+    clearBackgroundCompileTimeout();
     backgroundCompileTokenRef.current += 1;
     await invoke("cancel_compile", { run_id: runId }).catch(() => {});
-  }, []);
-
-  const backgroundCompileActive = backgroundCompileRef.current != null;
+  }, [clearBackgroundCompileTimeout]);
 
   const setEditorParseError = useCallback((path: string, hasError: boolean) => {
     const key = normalizePathKey(path);

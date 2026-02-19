@@ -1,14 +1,19 @@
 import { useEffect, useMemo, useState } from "react";
-import type { ProjectElementAttributesView, SymbolView } from "../types";
+import type { MetamodelAttributeView, ProjectElementAttributesView, StdlibMetamodelView, SymbolView } from "../types";
 
 type PropertiesPaneProps = {
   selectedSymbols: SymbolView[] | null;
   getDoc: (path: string) => { path: string; text: string; dirty: boolean } | null;
   readFile: (path: string) => Promise<string>;
   onOpenInProjectModel: (symbol: SymbolView) => void;
+  onOpenMetatypeInProjectModel: (metatypeQname: string) => void;
   onOpenAttributeInProjectModel: (symbol: SymbolView, attrQualifiedName: string, attrName: string) => void;
   onOpenAttributeSourceText: (symbol: SymbolView, attrQualifiedName: string, attrName: string) => void;
   loadElementAttributes: (symbol: SymbolView) => Promise<ProjectElementAttributesView | null>;
+  stdlibMetamodel: StdlibMetamodelView | null;
+  stdlibMetamodelLoading: boolean;
+  stdlibMetamodelError: string;
+  onReloadStdlibMetamodel: () => void;
 };
 
 type SnippetState = {
@@ -23,6 +28,30 @@ type AttributeContextMenuState = {
   symbol: SymbolView;
   attrQualifiedName: string;
   attrName: string;
+};
+
+type DisplayAttributeRow = {
+  source: "explicit" | "inherited";
+  name: string;
+  qualifiedName: string;
+  declaredOn?: string;
+  declaredType?: string | null;
+  multiplicity?: string | null;
+  direction?: string | null;
+  documentation?: string | null;
+  value: string | null;
+  valueSource: "cst" | "symbol" | "none";
+};
+
+type MetatypeDisplayAttributeRow = {
+  source: "explicit" | "inherited";
+  name: string;
+  qualifiedName: string;
+  declaredOn: string;
+  declaredType?: string | null;
+  multiplicity?: string | null;
+  direction?: string | null;
+  documentation?: string | null;
 };
 
 const symbolKey = (symbol: SymbolView) =>
@@ -53,15 +82,135 @@ const resolveFallbackAttrValue = (symbol: SymbolView, attrName: string): string 
   return propertyValueToText(prop.value);
 };
 
-const resolveAttributeValue = (
+const resolveAttributeValueDetailed = (
   symbol: SymbolView,
   attrName: string,
   cstValue: string | null | undefined,
+): { value: string | null; source: "cst" | "symbol" | "none" } => {
+  const cstRaw = cstValue != null ? cstValue.trim() : "";
+  if (cstRaw.length) return { value: cstRaw, source: "cst" };
+  const fallback = resolveFallbackAttrValue(symbol, attrName);
+  const normalized = fallback?.trim() || "";
+  if (normalized.length) return { value: normalized, source: "symbol" };
+  return { value: null, source: "none" };
+};
+
+const buildDisplayAttributes = (
+  symbol: SymbolView,
+  metaData: ProjectElementAttributesView,
+): DisplayAttributeRow[] => {
+  const explicit = metaData.explicit_attributes.map((attr) => {
+    const resolved = resolveAttributeValueDetailed(symbol, attr.name, attr.cst_value);
+    return {
+      source: "explicit" as const,
+      name: attr.name,
+      qualifiedName: attr.qualified_name,
+      declaredType: attr.declared_type,
+      multiplicity: attr.multiplicity,
+      direction: attr.direction,
+      documentation: attr.documentation,
+      value: resolved.value,
+      valueSource: resolved.source,
+    };
+  });
+  const inherited = metaData.inherited_attributes.map((attr) => {
+    const resolved = resolveAttributeValueDetailed(symbol, attr.name, attr.cst_value);
+    return {
+      source: "inherited" as const,
+      name: attr.name,
+      qualifiedName: attr.qualified_name,
+      declaredOn: attr.declared_on,
+      declaredType: attr.declared_type,
+      multiplicity: attr.multiplicity,
+      direction: attr.direction,
+      documentation: attr.documentation,
+      value: resolved.value,
+      valueSource: resolved.source,
+    };
+  });
+  return [...explicit, ...inherited].sort((a, b) => a.name.localeCompare(b.name));
+};
+
+const canonicalMetatypeKey = (qname: string | null | undefined): string =>
+  (qname || "").trim().toLowerCase();
+
+const tailName = (qname: string | null | undefined): string => {
+  const raw = (qname || "").trim();
+  if (!raw) return "";
+  const ix = raw.lastIndexOf("::");
+  return ix >= 0 ? raw.slice(ix + 2) : raw;
+};
+
+const normalizeMetatype = (
+  qname: string | null | undefined,
+  byQname: Map<string, string>,
+  byTail: Map<string, string[]>,
 ): string | null => {
-  const raw = cstValue != null && cstValue.trim() ? cstValue : resolveFallbackAttrValue(symbol, attrName);
+  const raw = (qname || "").trim();
   if (!raw) return null;
-  const value = raw.trim();
-  return value.length ? value : null;
+  const direct = byQname.get(canonicalMetatypeKey(raw));
+  if (direct) return direct;
+  const parts = raw.split("::").filter(Boolean);
+  if (parts.length >= 2) {
+    const collapsed = `${parts[0]}::${parts[parts.length - 1]}`;
+    const collapsedDirect = byQname.get(canonicalMetatypeKey(collapsed));
+    if (collapsedDirect) return collapsedDirect;
+  }
+  const candidates = byTail.get(canonicalMetatypeKey(tailName(raw))) || [];
+  if (!candidates.length) return null;
+  if (candidates.length === 1) return candidates[0];
+  const rawParts = raw.split("::").filter(Boolean).map((part) => part.toLowerCase());
+  const rawSet = new Set(rawParts);
+  const hasNamespace = rawParts.length > 1;
+  const ranked = candidates
+    .map((candidate) => {
+      const cParts = candidate.split("::").filter(Boolean).map((part) => part.toLowerCase());
+      const overlap = cParts.filter((part) => rawSet.has(part)).length;
+      const namespaceBonus = hasNamespace && cParts.length > 1 ? 2 : 0;
+      const depthBonus = cParts.length;
+      return { candidate, score: overlap * 10 + namespaceBonus + depthBonus };
+    })
+    .sort((a, b) => b.score - a.score || b.candidate.length - a.candidate.length);
+  return ranked[0]?.candidate || null;
+};
+
+const collectInheritedMetatypeAttrs = (
+  metatypeQname: string,
+  typeByQname: Map<string, { qualified_name: string; declared_supertypes: string[]; attributes: MetamodelAttributeView[] }>,
+  byQname: Map<string, string>,
+  byTail: Map<string, string[]>,
+): MetatypeDisplayAttributeRow[] => {
+  const out: MetatypeDisplayAttributeRow[] = [];
+  const visited = new Set<string>();
+  const stack: string[] = [metatypeQname];
+  visited.add(metatypeQname);
+
+  while (stack.length) {
+    const current = stack.pop()!;
+    const typeItem = typeByQname.get(canonicalMetatypeKey(current));
+    if (!typeItem) continue;
+    for (const superRaw of typeItem.declared_supertypes || []) {
+      const resolvedSuper = normalizeMetatype(superRaw, byQname, byTail);
+      if (!resolvedSuper || visited.has(resolvedSuper)) continue;
+      visited.add(resolvedSuper);
+      stack.push(resolvedSuper);
+      const superType = typeByQname.get(canonicalMetatypeKey(resolvedSuper));
+      if (!superType) continue;
+      for (const attr of superType.attributes || []) {
+        out.push({
+          source: "inherited",
+          name: attr.name,
+          qualifiedName: attr.qualified_name,
+          declaredOn: resolvedSuper,
+          declaredType: attr.declared_type,
+          multiplicity: attr.multiplicity,
+          direction: attr.direction,
+          documentation: attr.documentation,
+        });
+      }
+    }
+  }
+  return out;
 };
 
 const resolveTopDocumentation = (symbol: SymbolView): string | null => {
@@ -114,19 +263,61 @@ export function PropertiesPane({
   getDoc,
   readFile,
   onOpenInProjectModel,
+  onOpenMetatypeInProjectModel,
   onOpenAttributeInProjectModel,
   onOpenAttributeSourceText,
   loadElementAttributes,
+  stdlibMetamodel,
+  stdlibMetamodelLoading,
+  stdlibMetamodelError,
+  onReloadStdlibMetamodel,
 }: PropertiesPaneProps) {
   const [snippets, setSnippets] = useState<Record<string, SnippetState>>({});
   const [metatypeAttrs, setMetatypeAttrs] = useState<
     Record<string, { loading: boolean; error: string; data: ProjectElementAttributesView | null }>
   >({});
   const [attributeContextMenu, setAttributeContextMenu] = useState<AttributeContextMenuState | null>(null);
+  const linkButtonStyle = {
+    border: "none",
+    background: "transparent",
+    color: "inherit",
+    cursor: "pointer",
+    textDecoration: "underline",
+    padding: 0,
+    font: "inherit",
+  } as const;
   const normalizedSymbols = useMemo(
     () => (selectedSymbols && selectedSymbols.length ? selectedSymbols : null),
     [selectedSymbols],
   );
+  const metamodelTypeByQname = useMemo(() => {
+    const map = new Map<string, { qualified_name: string; declared_supertypes: string[]; attributes: MetamodelAttributeView[] }>();
+    for (const t of stdlibMetamodel?.types || []) {
+      map.set(canonicalMetatypeKey(t.qualified_name), {
+        qualified_name: t.qualified_name,
+        declared_supertypes: t.declared_supertypes || [],
+        attributes: t.attributes || [],
+      });
+    }
+    return map;
+  }, [stdlibMetamodel]);
+  const metamodelQnameByCanonical = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const t of stdlibMetamodel?.types || []) {
+      map.set(canonicalMetatypeKey(t.qualified_name), t.qualified_name);
+    }
+    return map;
+  }, [stdlibMetamodel]);
+  const metamodelQnameByTail = useMemo(() => {
+    const map = new Map<string, string[]>();
+    for (const t of stdlibMetamodel?.types || []) {
+      const key = canonicalMetatypeKey(tailName(t.qualified_name));
+      const existing = map.get(key) || [];
+      existing.push(t.qualified_name);
+      map.set(key, existing);
+    }
+    return map;
+  }, [stdlibMetamodel]);
 
   useEffect(() => {
     const onDocClick = (event: MouseEvent) => {
@@ -138,6 +329,18 @@ export function PropertiesPane({
     document.addEventListener("click", onDocClick);
     return () => document.removeEventListener("click", onDocClick);
   }, []);
+
+  useEffect(() => {
+    if (!normalizedSymbols?.length) return;
+    if (stdlibMetamodel || stdlibMetamodelLoading || stdlibMetamodelError) return;
+    onReloadStdlibMetamodel();
+  }, [
+    normalizedSymbols,
+    stdlibMetamodel,
+    stdlibMetamodelLoading,
+    stdlibMetamodelError,
+    onReloadStdlibMetamodel,
+  ]);
 
   useEffect(() => {
     let active = true;
@@ -269,6 +472,35 @@ export function PropertiesPane({
             const snippet = snippets[key];
             const topDocumentation = resolveTopDocumentation(symbol);
             const meta = metatypeAttrs[key];
+            const displayAttrs = meta?.data ? buildDisplayAttributes(symbol, meta.data) : [];
+            const rawMetatypeQname = (meta?.data?.metatype_qname || "").trim();
+            const resolvedMetatypeQname = normalizeMetatype(
+              rawMetatypeQname || null,
+              metamodelQnameByCanonical,
+              metamodelQnameByTail,
+            );
+            const metatypeDisplayQname = resolvedMetatypeQname || rawMetatypeQname;
+            const metatypeType = resolvedMetatypeQname
+              ? metamodelTypeByQname.get(canonicalMetatypeKey(resolvedMetatypeQname))
+              : null;
+            const metatypeExplicitAttrs: MetatypeDisplayAttributeRow[] = (metatypeType?.attributes || []).map((attr) => ({
+              source: "explicit",
+              name: attr.name,
+              qualifiedName: attr.qualified_name,
+              declaredOn: metatypeType?.qualified_name || "",
+              declaredType: attr.declared_type,
+              multiplicity: attr.multiplicity,
+              direction: attr.direction,
+              documentation: attr.documentation,
+            }));
+            const metatypeInheritedAttrs = resolvedMetatypeQname
+              ? collectInheritedMetatypeAttrs(
+                  resolvedMetatypeQname,
+                  metamodelTypeByQname,
+                  metamodelQnameByCanonical,
+                  metamodelQnameByTail,
+                )
+              : [];
             const baseProperties = [
               { label: "Kind", value: symbol.kind || "n/a" },
               { label: "Qualified name", value: symbol.qualified_name || "n/a" },
@@ -288,49 +520,12 @@ export function PropertiesPane({
                     className="model-kind"
                     onClick={() => onOpenInProjectModel(symbol)}
                     title="Open in Project Model"
-                    style={{
-                      border: "none",
-                      background: "transparent",
-                      color: "inherit",
-                      cursor: "pointer",
-                      textDecoration: "underline",
-                      padding: 0,
-                      font: "inherit",
-                    }}
+                    style={linkButtonStyle}
                   >
                     {symbol.kind}
                   </button>
                 </div>
                 {topDocumentation ? <div className="properties-doc">{topDocumentation}</div> : null}
-                <div className="properties-list">
-                  {baseProperties.map((prop, index) => (
-                    <div key={`core-${prop.label}-${index}`} className="properties-row">
-                      <div className="properties-key">{prop.label}</div>
-                      <div className="properties-value">{prop.value}</div>
-                    </div>
-                  ))}
-                  {dynamicProperties.length ? (
-                    dynamicProperties.map((prop, index) => (
-                      <div key={`${prop.name}-${index}`} className="properties-row">
-                        <div className="properties-key">{prop.label}</div>
-                        <div className="properties-value">
-                          {"type" in prop.value && prop.value.type === "text" ? prop.value.value : null}
-                          {"type" in prop.value && prop.value.type === "bool" ? (prop.value.value ? "true" : "false") : null}
-                          {"type" in prop.value && prop.value.type === "number" ? String(prop.value.value) : null}
-                          {"type" in prop.value && prop.value.type === "list" ? prop.value.items.join(", ") : null}
-                        </div>
-                      </div>
-                    ))
-                  ) : (
-                    <div className="muted">No additional properties.</div>
-                  )}
-                  {snippet?.expr ? (
-                    <div className="properties-row">
-                      <div className="properties-key">Expression</div>
-                      <div className="properties-value">{snippet.expr}</div>
-                    </div>
-                  ) : null}
-                </div>
                 <details className="properties-section" key={`meta-${symbol.qualified_name}`} open>
                   <summary>Metatype attributes</summary>
                   <div className="properties-parse">
@@ -343,7 +538,21 @@ export function PropertiesPane({
                       <>
                         <div className="properties-row">
                           <div className="properties-key">Metatype</div>
-                          <div className="properties-value">{meta.data.metatype_qname || "unresolved"}</div>
+                          <div className="properties-value">
+                            {metatypeDisplayQname ? (
+                              <button
+                                type="button"
+                                className="model-kind"
+                                onClick={() => onOpenMetatypeInProjectModel(metatypeDisplayQname)}
+                                title="Open metatype in Project Model"
+                                style={linkButtonStyle}
+                              >
+                                {metatypeDisplayQname}
+                              </button>
+                            ) : (
+                              "unresolved"
+                            )}
+                          </div>
                         </div>
                         <div className="properties-row">
                           <div className="properties-key">Explicit attrs</div>
@@ -353,70 +562,235 @@ export function PropertiesPane({
                           <div className="properties-key">Inherited attrs</div>
                           <div className="properties-value">{meta.data.inherited_attributes.length}</div>
                         </div>
-                        {meta.data.explicit_attributes.map((attr) => {
-                          const value = resolveAttributeValue(symbol, attr.name, attr.cst_value);
-                          return (
-                            <div
-                              key={`explicit-${attr.qualified_name}`}
-                              className={`properties-row ${value ? "" : "properties-row-empty"}`}
-                              onContextMenu={(event) => {
-                                event.preventDefault();
-                                event.stopPropagation();
-                                setAttributeContextMenu({
-                                  x: event.clientX,
-                                  y: event.clientY,
-                                  symbol,
-                                  attrQualifiedName: attr.qualified_name,
-                                  attrName: attr.name,
-                                });
-                              }}
-                            >
-                              <div className="properties-key" />
-                              <div className="properties-value">
-                                {attr.name}
-                                {value ? ` = ${value}` : ""}
-                                {attr.declared_type ? `: ${attr.declared_type}` : ""}
-                                {attr.multiplicity ? ` ${attr.multiplicity}` : ""}
+                        <div className="properties-row">
+                          <div className="properties-key">Total attrs</div>
+                          <div className="properties-value">{displayAttrs.length}</div>
+                        </div>
+                        <details className="properties-section" open>
+                          <summary>Metatype definition attributes</summary>
+                          <div className="properties-parse">
+                            {stdlibMetamodelLoading ? <div className="muted">Loading stdlib metamodel...</div> : null}
+                            {!stdlibMetamodelLoading && stdlibMetamodelError ? (
+                              <div className="muted">
+                                {stdlibMetamodelError}
+                                {" "}
+                                <button type="button" className="ghost" onClick={onReloadStdlibMetamodel}>
+                                  Retry
+                                </button>
                               </div>
-                            </div>
-                          );
-                        })}
-                        {meta.data.inherited_attributes.map((attr) => {
-                          const value = resolveAttributeValue(symbol, attr.name, attr.cst_value);
-                          return (
-                            <div
-                              key={`inherited-${attr.qualified_name}`}
-                              className={`properties-row ${value ? "" : "properties-row-empty"}`}
-                              onContextMenu={(event) => {
-                                event.preventDefault();
-                                event.stopPropagation();
-                                setAttributeContextMenu({
-                                  x: event.clientX,
-                                  y: event.clientY,
-                                  symbol,
-                                  attrQualifiedName: attr.qualified_name,
-                                  attrName: attr.name,
-                                });
-                              }}
-                            >
-                              <div className="properties-key" />
-                              <div className="properties-value">
-                                ^{attr.name}
-                                {value ? ` = ${value}` : ""}
-                                {attr.declared_type ? `: ${attr.declared_type}` : ""}
-                                {attr.multiplicity ? ` ${attr.multiplicity}` : ""}
-                                {` (from ${attr.declared_on})`}
+                            ) : null}
+                            {!stdlibMetamodelLoading && !stdlibMetamodelError && !stdlibMetamodel ? (
+                              <div className="muted">
+                                Stdlib metamodel is not loaded.
+                                {" "}
+                                <button type="button" className="ghost" onClick={onReloadStdlibMetamodel}>
+                                  Load
+                                </button>
                               </div>
+                            ) : null}
+                            <div className="properties-row">
+                              <div className="properties-key">Explicit attrs</div>
+                              <div className="properties-value">{metatypeExplicitAttrs.length}</div>
                             </div>
-                          );
-                        })}
-                        {meta.data.diagnostics.map((line, i) => (
+                            <div className="properties-row">
+                              <div className="properties-key">Inherited attrs</div>
+                              <div className="properties-value">{metatypeInheritedAttrs.length}</div>
+                            </div>
+                            {!stdlibMetamodelLoading &&
+                            !stdlibMetamodelError &&
+                            !!stdlibMetamodel &&
+                            !metatypeExplicitAttrs.length &&
+                            !metatypeInheritedAttrs.length ? (
+                              <div className="muted">No metatype attribute data available.</div>
+                            ) : null}
+                            {[...metatypeExplicitAttrs, ...metatypeInheritedAttrs]
+                              .sort((a, b) => a.name.localeCompare(b.name))
+                              .map((attr) => (
+                                <div key={`meta-def-${attr.source}-${attr.qualifiedName}`} className="properties-row">
+                                  <div className="properties-key">{attr.source === "inherited" ? "Inherited" : "Explicit"}</div>
+                                  <div className="properties-value">
+                                    <div className="properties-attr-main">
+                                      <button
+                                        type="button"
+                                        className="model-kind"
+                                        style={linkButtonStyle}
+                                        title="Open attribute in Project Model"
+                                        onClick={() => onOpenMetatypeInProjectModel(attr.qualifiedName)}
+                                      >
+                                        <strong>{attr.source === "inherited" ? "^" : ""}{attr.name}</strong>
+                                      </button>
+                                    </div>
+                                    <div className="properties-attr-meta">
+                                      {attr.declaredOn ? (
+                                        <>
+                                          declared on{" "}
+                                          <button
+                                            type="button"
+                                            className="model-kind"
+                                            style={linkButtonStyle}
+                                            onClick={() => onOpenMetatypeInProjectModel(attr.declaredOn)}
+                                          >
+                                            {attr.declaredOn}
+                                          </button>
+                                        </>
+                                      ) : null}
+                                      {attr.declaredType ? (
+                                        <>
+                                          {" | type "}
+                                          <button
+                                            type="button"
+                                            className="model-kind"
+                                            style={linkButtonStyle}
+                                            onClick={() => onOpenMetatypeInProjectModel(attr.declaredType || "")}
+                                          >
+                                            {attr.declaredType}
+                                          </button>
+                                        </>
+                                      ) : null}
+                                      {attr.multiplicity ? ` | mult ${attr.multiplicity}` : ""}
+                                      {attr.direction ? ` | dir ${attr.direction}` : ""}
+                                    </div>
+                                    <div className="properties-attr-meta">
+                                      <button
+                                        type="button"
+                                        className="model-kind"
+                                        style={linkButtonStyle}
+                                        onClick={() => onOpenMetatypeInProjectModel(attr.qualifiedName)}
+                                      >
+                                        {attr.qualifiedName}
+                                      </button>
+                                    </div>
+                                  </div>
+                                </div>
+                              ))}
+                          </div>
+                        </details>
+                        {displayAttrs.map((attr) => (
+                          <div
+                            key={`${attr.source}-${attr.qualifiedName}`}
+                            className={`properties-row ${attr.value ? "" : "properties-row-empty"}`}
+                            onContextMenu={(event) => {
+                              event.preventDefault();
+                              event.stopPropagation();
+                              setAttributeContextMenu({
+                                x: event.clientX,
+                                y: event.clientY,
+                                symbol,
+                                attrQualifiedName: attr.qualifiedName,
+                                attrName: attr.name,
+                              });
+                            }}
+                          >
+                            <div className="properties-key">{attr.source === "inherited" ? "Inherited" : "Explicit"}</div>
+                            <div className="properties-value">
+                              <div className="properties-attr-main">
+                                <button
+                                  type="button"
+                                  className="model-kind"
+                                  style={linkButtonStyle}
+                                  title="Open attribute in Project Model"
+                                  onClick={() => onOpenAttributeInProjectModel(symbol, attr.qualifiedName, attr.name)}
+                                >
+                                  <strong>{attr.source === "inherited" ? "^" : ""}{attr.name}</strong>
+                                </button>
+                                {attr.value ? ` = ${attr.value}` : " = <unresolved>"}
+                              </div>
+                              <div className="properties-attr-meta">
+                                {attr.declaredOn ? (
+                                  <>
+                                    declared on{" "}
+                                    <button
+                                      type="button"
+                                      className="model-kind"
+                                      style={linkButtonStyle}
+                                      onClick={() => onOpenMetatypeInProjectModel(attr.declaredOn || "")}
+                                    >
+                                      {attr.declaredOn}
+                                    </button>
+                                  </>
+                                ) : (
+                                  "declared on element"
+                                )}
+                                {attr.declaredType ? (
+                                  <>
+                                    {" | type "}
+                                    <button
+                                      type="button"
+                                      className="model-kind"
+                                      style={linkButtonStyle}
+                                      onClick={() => onOpenMetatypeInProjectModel(attr.declaredType || "")}
+                                    >
+                                      {attr.declaredType}
+                                    </button>
+                                  </>
+                                ) : null}
+                                {attr.multiplicity ? ` | mult ${attr.multiplicity}` : ""}
+                                {attr.direction ? ` | dir ${attr.direction}` : ""}
+                                {attr.valueSource !== "none" ? ` | value source ${attr.valueSource}` : ""}
+                              </div>
+                              <div className="properties-attr-meta">
+                                <button
+                                  type="button"
+                                  className="model-kind"
+                                  style={linkButtonStyle}
+                                  onClick={() => onOpenAttributeInProjectModel(symbol, attr.qualifiedName, attr.name)}
+                                >
+                                  {attr.qualifiedName}
+                                </button>
+                              </div>
+                              {attr.documentation ? <div className="properties-attr-doc">{attr.documentation}</div> : null}
+                            </div>
+                          </div>
+                        ))}
+                        {meta.data.diagnostics
+                          .filter((line) => line.startsWith("Metatype mapping source="))
+                          .map((line, i) => (
+                            <div key={`meta-map-${i}`} className="properties-row">
+                              <div className="properties-key">Mapping</div>
+                              <div className="properties-value">{line}</div>
+                            </div>
+                          ))}
+                        {meta.data.diagnostics
+                          .filter((line) => !line.startsWith("Metatype mapping source="))
+                          .map((line, i) => (
                           <div key={`meta-diag-${i}`} className="properties-row">
                             <div className="properties-key">Diagnostic</div>
                             <div className="properties-value">{line}</div>
                           </div>
                         ))}
                       </>
+                    ) : null}
+                  </div>
+                </details>
+                <details className="properties-section" key={`element-${symbol.qualified_name}`} open>
+                  <summary>Element details</summary>
+                  <div className="properties-parse">
+                    {baseProperties.map((prop, index) => (
+                      <div key={`core-${prop.label}-${index}`} className="properties-row">
+                        <div className="properties-key">{prop.label}</div>
+                        <div className="properties-value">{prop.value}</div>
+                      </div>
+                    ))}
+                    {dynamicProperties.length ? (
+                      dynamicProperties.map((prop, index) => (
+                        <div key={`${prop.name}-${index}`} className="properties-row">
+                          <div className="properties-key">{prop.label}</div>
+                          <div className="properties-value">
+                            {"type" in prop.value && prop.value.type === "text" ? prop.value.value : null}
+                            {"type" in prop.value && prop.value.type === "bool" ? (prop.value.value ? "true" : "false") : null}
+                            {"type" in prop.value && prop.value.type === "number" ? String(prop.value.value) : null}
+                            {"type" in prop.value && prop.value.type === "list" ? prop.value.items.join(", ") : null}
+                          </div>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="muted">No additional properties.</div>
+                    )}
+                    {snippet?.expr ? (
+                      <div className="properties-row">
+                        <div className="properties-key">Expression</div>
+                        <div className="properties-value">{snippet.expr}</div>
+                      </div>
                     ) : null}
                   </div>
                 </details>
@@ -434,28 +808,28 @@ export function PropertiesPane({
                         <div className="properties-row">
                           <div className="properties-key">File id</div>
                           <div className="properties-value">
-                            {symbol.file == null ? "—" : String(symbol.file)}
+                            {symbol.file == null ? "-" : String(symbol.file)}
                           </div>
                         </div>
                         <div className="properties-row">
                           <div className="properties-key">File path</div>
-                          <div className="properties-value">{symbol.file_path ?? "—"}</div>
+                          <div className="properties-value">{symbol.file_path ?? "-"}</div>
                         </div>
                         <div className="properties-row">
                           <div className="properties-key">Start line</div>
-                          <div className="properties-value">{symbol.start_line ?? "—"}</div>
+                          <div className="properties-value">{symbol.start_line == null ? "-" : `${symbol.start_line + 1} (raw ${symbol.start_line})`}</div>
                         </div>
                         <div className="properties-row">
                           <div className="properties-key">Start column</div>
-                          <div className="properties-value">{symbol.start_col ?? "—"}</div>
+                          <div className="properties-value">{symbol.start_col == null ? "-" : `${symbol.start_col + 1} (raw ${symbol.start_col})`}</div>
                         </div>
                         <div className="properties-row">
                           <div className="properties-key">End line</div>
-                          <div className="properties-value">{symbol.end_line ?? "—"}</div>
+                          <div className="properties-value">{symbol.end_line == null ? "-" : `${symbol.end_line + 1} (raw ${symbol.end_line})`}</div>
                         </div>
                         <div className="properties-row">
                           <div className="properties-key">End column</div>
-                          <div className="properties-value">{symbol.end_col ?? "—"}</div>
+                          <div className="properties-value">{symbol.end_col == null ? "-" : `${symbol.end_col + 1} (raw ${symbol.end_col})`}</div>
                         </div>
                       </>
                     )}
@@ -515,3 +889,4 @@ export function PropertiesPane({
     </div>
   );
 }
+

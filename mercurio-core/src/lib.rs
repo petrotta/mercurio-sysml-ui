@@ -12,6 +12,8 @@ pub use project::{
 };
 
 mod workspace;
+mod index_contract;
+mod symbol_properties;
 
 mod compile;
 pub use compile::{
@@ -37,6 +39,8 @@ pub use stdlib::{
 };
 
 mod project_model;
+mod project_model_seed;
+mod project_model_transform;
 pub use project_model::{
     get_project_element_attributes, get_project_model, ProjectElementAttributesView,
     ProjectElementInheritedAttributeView, ProjectModelAttributeView, ProjectModelElementView,
@@ -45,8 +49,9 @@ pub use project_model::{
 
 mod symbol_index;
 pub use symbol_index::{
-    query_library_summary, query_library_symbols, query_stdlib_documentation_symbols,
-    query_symbols_by_metatype, IndexedSymbolView, LibraryIndexSummaryView,
+    query_library_summary, query_library_symbols, query_project_symbols, query_stdlib_documentation_symbols,
+    query_symbol_metatype_mapping, query_symbols_by_metatype, IndexedSymbolView,
+    LibraryIndexSummaryView, SymbolMetatypeMappingView,
 };
 
 pub use workspace::query_semantic;

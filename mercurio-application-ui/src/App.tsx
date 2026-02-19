@@ -1,5 +1,5 @@
 ﻿import "./style.css";
-import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getName, getTauriVersion, getVersion } from "@tauri-apps/api/app";
@@ -56,6 +56,7 @@ import type {
   OpenTab,
   ProjectElementAttributesView,
   ProjectModelView,
+  SymbolMetatypeMappingView,
   StdlibMetamodelView,
   SymbolView,
 } from "./app/types";
@@ -140,8 +141,8 @@ export function App() {
     clearTimer: clearAstSplitTimer,
   } = useAstLoader();
   const [showAbout, setShowAbout] = useState(false);
-  const [metamodelDebugLoading, setMetamodelDebugLoading] = useState(false);
-  const [metamodelDebugError, setMetamodelDebugError] = useState("");
+  const [stdlibMetamodelLoadingState, setStdlibMetamodelLoadingState] = useState(false);
+  const [stdlibMetamodelErrorState, setStdlibMetamodelErrorState] = useState("");
   const [stdlibMetamodel, setStdlibMetamodel] = useState<StdlibMetamodelView | null>(null);
   const [projectModelView, setProjectModelView] = useState<ProjectModelView | null>(null);
   const [projectModelLoading, setProjectModelLoading] = useState(false);
@@ -831,24 +832,24 @@ export function App() {
     }
   };
 
-  const loadStdlibMetamodel = async () => {
+  const loadStdlibMetamodel = useCallback(async () => {
     if (!rootPath) {
-      setMetamodelDebugError("Select a project root first.");
+      setStdlibMetamodelErrorState("Select a project root first.");
       setStdlibMetamodel(null);
       return;
     }
-    setMetamodelDebugLoading(true);
-    setMetamodelDebugError("");
+    setStdlibMetamodelLoadingState(true);
+    setStdlibMetamodelErrorState("");
     try {
       const payload = await invoke<StdlibMetamodelView>("get_stdlib_metamodel", { root: rootPath });
       setStdlibMetamodel(payload);
     } catch (error) {
-      setMetamodelDebugError(`Failed to load metamodel: ${String(error)}`);
+      setStdlibMetamodelErrorState(`Failed to load metamodel: ${String(error)}`);
       setStdlibMetamodel(null);
     } finally {
-      setMetamodelDebugLoading(false);
+      setStdlibMetamodelLoadingState(false);
     }
-  };
+  }, [rootPath]);
 
   const loadProjectModel = async () => {
     if (!rootPath) {
@@ -869,9 +870,17 @@ export function App() {
     }
   };
 
-  const loadProjectAndLibraryModel = async () => {
-    await Promise.all([loadProjectModel(), loadStdlibMetamodel()]);
+  const loadProjectModelAndMaybeStdlib = async (includeLibrary = true) => {
+    if (includeLibrary) {
+      await Promise.all([loadProjectModel(), loadStdlibMetamodel()]);
+      return;
+    }
+    await loadProjectModel();
   };
+
+  const reloadStdlibMetamodel = useCallback(() => {
+    void loadStdlibMetamodel();
+  }, [loadStdlibMetamodel]);
 
   useEffect(() => {
     const onMove = (event: PointerEvent) => {
@@ -963,9 +972,17 @@ export function App() {
   }, [rootPath, backgroundCompileEnabled, activeEditorPath]);
 
   useEffect(() => {
+    if (!rootPath) {
+      setStdlibMetamodel(null);
+      return;
+    }
+    void loadStdlibMetamodel();
+  }, [rootPath, loadStdlibMetamodel]);
+
+  useEffect(() => {
     if (activeTabMeta?.kind !== "project-model") return;
     if (!rootPath) return;
-    void loadProjectAndLibraryModel();
+    void loadProjectModelAndMaybeStdlib(false);
   }, [activeTabMeta?.kind, rootPath]);
 
   useEffect(() => {
@@ -1202,6 +1219,34 @@ export function App() {
           elementQualifiedName: symbol.qualified_name,
           symbolKind: symbol.kind || null,
         });
+        if (data.metatype_qname && data.metatype_qname.trim()) {
+          elementAttrsCacheRef.current[cacheKey] = data;
+          return data;
+        }
+        try {
+          const mapping = await invoke<SymbolMetatypeMappingView | null>(
+            "query_index_symbol_metatype_mapping",
+            {
+              root: rootPath,
+              symbolQualifiedName: symbol.qualified_name,
+              filePath: symbol.file_path || null,
+            },
+          );
+          if (mapping?.resolved_metatype_qname && mapping.resolved_metatype_qname.trim()) {
+            const enriched: ProjectElementAttributesView = {
+              ...data,
+              metatype_qname: mapping.resolved_metatype_qname,
+              diagnostics: [
+                ...data.diagnostics,
+                `Metatype resolved via symbol index mapping (${mapping.mapping_source}, confidence=${mapping.confidence.toFixed(2)}).`,
+              ],
+            };
+            elementAttrsCacheRef.current[cacheKey] = enriched;
+            return enriched;
+          }
+        } catch {
+          // Ignore mapping lookup failure and fall through to original payload.
+        }
         elementAttrsCacheRef.current[cacheKey] = data;
         return data;
       } catch {
@@ -3194,12 +3239,12 @@ export function App() {
                   model={projectModelView}
                   library={stdlibMetamodel}
                   loading={projectModelLoading}
-                  libraryLoading={metamodelDebugLoading}
+                  libraryLoading={stdlibMetamodelLoadingState}
                   error={projectModelError}
-                  libraryError={metamodelDebugError}
+                  libraryError={stdlibMetamodelErrorState}
                   focusQuery={projectModelFocusQuery}
                   onRefresh={() => {
-                    void loadProjectAndLibraryModel();
+                    void loadProjectModelAndMaybeStdlib();
                   }}
                 />
               ) : !activeTabPath ? (
@@ -3437,9 +3482,18 @@ export function App() {
                 setProjectModelFocusQuery(symbol.qualified_name || symbol.name || symbol.kind);
                 openProjectModelViewTab();
               }}
+              onOpenMetatypeInProjectModel={(metatypeQname) => {
+                if (!metatypeQname) return;
+                setProjectModelFocusQuery(metatypeQname);
+                openProjectModelViewTab();
+              }}
               onOpenAttributeInProjectModel={openAttributeInProjectModel}
               onOpenAttributeSourceText={openAttributeSourceText}
               loadElementAttributes={loadElementAttributes}
+              stdlibMetamodel={stdlibMetamodel}
+              stdlibMetamodelLoading={stdlibMetamodelLoadingState}
+              stdlibMetamodelError={stdlibMetamodelErrorState}
+              onReloadStdlibMetamodel={reloadStdlibMetamodel}
             />
             </section>
           )}

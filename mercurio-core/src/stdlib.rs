@@ -215,17 +215,22 @@ pub fn get_stdlib_metamodel(
 
     let mut types = Vec::new();
     if let Some(path) = stdlib_path.as_ref() {
-        let mut vfs = Vfs::new();
-        let files = load_stdlib_from_path(&mut vfs, path);
-        let index = build_metatype_index(&vfs, &files);
-        let qname_by_id = index
-            .infos
-            .iter()
-            .map(|info| (info.id, info.qualified_name.clone()))
-            .collect::<HashMap<_, _>>();
-
-        for info in &index.infos {
-            types.push(metamodel_type_from_info(info, &index, &qname_by_id));
+        let normalized = normalized_compare_key(path);
+        let mut from_snapshot = false;
+        if let Ok(cache) = state.stdlib_cache.lock() {
+            for entry in cache.values() {
+                if normalized_compare_key(&entry.path) == normalized {
+                    types = metamodel_types_from_index(entry.metatype_index.as_ref());
+                    from_snapshot = true;
+                    break;
+                }
+            }
+        }
+        if !from_snapshot {
+            let mut vfs = Vfs::new();
+            let files = load_stdlib_from_path(&mut vfs, path);
+            let index = build_metatype_index(&vfs, &files);
+            types = metamodel_types_from_index(&index);
         }
     }
     types.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
@@ -242,6 +247,27 @@ pub fn get_stdlib_metamodel(
     }
 
     Ok(view)
+}
+
+fn normalized_compare_key(path: &Path) -> String {
+    let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    normalized
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
+fn metamodel_types_from_index(index: &MetatypeIndex) -> Vec<MetamodelTypeView> {
+    let qname_by_id = index
+        .infos
+        .iter()
+        .map(|info| (info.id, info.qualified_name.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut types = Vec::with_capacity(index.infos.len());
+    for info in &index.infos {
+        types.push(metamodel_type_from_info(info, index, &qname_by_id));
+    }
+    types
 }
 
 fn metamodel_type_from_info(
