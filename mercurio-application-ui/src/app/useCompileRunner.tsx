@@ -2,9 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { SymbolView, UnresolvedIssue } from "./types";
+import { callTool } from "./agentClient";
 
-const LIBRARY_BULK_CONCURRENCY = 4;
-const LIBRARY_INDEX_PAGE_SIZE = 2000;
 const BACKGROUND_COMPILE_TIMEOUT_MS = 30000;
 
 export type CompileToast = {
@@ -19,6 +18,8 @@ export type CompileToast = {
 type CompileResponse = {
   ok: boolean;
   files?: Array<{ path: string; ok: boolean; errors: string[]; symbol_count: number }>;
+  parse_error_categories?: Array<{ category: string; count: number }>;
+  performance_warnings?: string[];
   project_symbol_count?: number;
   library_symbol_count?: number;
   parsed_files?: string[];
@@ -68,51 +69,6 @@ type UseCompileRunnerOptions = {
 
 type ActiveFileSymbolMode = "fast" | "semantic";
 
-type SemanticElementView = {
-  name: string;
-  qualified_name: string;
-  metatype_qname?: string | null;
-  file_path: string;
-  attributes?: Record<string, string>;
-};
-
-function semanticAttr(
-  attributes: Record<string, string> | undefined,
-  ...keys: string[]
-): string | undefined {
-  if (!attributes) return undefined;
-  const normalize = (value: string) => value.replace(/:+/g, "::").toLowerCase();
-  const wanted = new Set(keys.map((key) => normalize(key)));
-  for (const [rawKey, rawValue] of Object.entries(attributes)) {
-    if (!wanted.has(normalize(rawKey))) continue;
-    const text = String(rawValue ?? "").trim();
-    if (text.length) return text;
-  }
-  for (const key of keys) {
-    const value = attributes[key];
-    if (value != null && String(value).trim().length > 0) {
-      return value;
-    }
-  }
-  return undefined;
-}
-
-function semanticAttrBySuffix(
-  attributes: Record<string, string> | undefined,
-  ...suffixes: string[]
-): string | undefined {
-  if (!attributes) return undefined;
-  for (const [key, value] of Object.entries(attributes)) {
-    for (const suffix of suffixes) {
-      if (key === suffix || key.endsWith(`::${suffix}`)) {
-        const text = String(value || "").trim();
-        if (text.length) return text;
-      }
-    }
-  }
-  return undefined;
-}
-
 function mergeSymbols(project: SymbolView[], library: SymbolView[]): SymbolView[] {
   const out: SymbolView[] = [];
   const seen = new Set<string>();
@@ -130,11 +86,23 @@ function mergeProjectSymbolsByFile(
   incoming: SymbolView[],
   scopedFilePath?: string,
 ): SymbolView[] {
-  if (!incoming.length) {
-    return previous;
+  if (!scopedFilePath) {
+    return incoming.length ? incoming : previous;
   }
-  if (!scopedFilePath) return incoming;
   const kept = previous.filter((symbol) => symbol.file_path !== scopedFilePath);
+  return mergeSymbols(kept, incoming);
+}
+
+function mergeProjectSymbolsByParsedFiles(
+  previous: SymbolView[],
+  incoming: SymbolView[],
+  parsedFiles: string[] | undefined,
+): SymbolView[] {
+  const parsed = new Set((parsedFiles || []).map((path) => normalizePathKey(path)));
+  if (!parsed.size) {
+    return incoming.length ? incoming : previous;
+  }
+  const kept = previous.filter((symbol) => !parsed.has(normalizePathKey(symbol.file_path)));
   return mergeSymbols(kept, incoming);
 }
 
@@ -158,106 +126,12 @@ function mapIndexedToSymbolView(
   };
 }
 
-function semanticSymbolKey(symbol: Pick<SymbolView, "file_path" | "qualified_name" | "name" | "kind">): string {
-  return `${normalizePathKey(symbol.file_path)}|${symbol.qualified_name}|${symbol.name}|${symbol.kind}`;
-}
-
-function mapSemanticToSymbolView(
-  input: SemanticElementView,
-  sourceScope: "project" | "library",
-  spanSeed?: Map<string, SymbolView>,
-): SymbolView {
-  const attributes = input.attributes || {};
-  const qualifiedName =
-    semanticAttr(attributes, "emf::qualifiedName", "Element::qualifiedName") || input.qualified_name;
-  const name =
-    semanticAttr(attributes, "emf::name", "NamedElement::name") ||
-    input.name ||
-    qualifiedName.split("::").pop() ||
-    "Unnamed";
-  const metatypeQname = semanticAttr(attributes, "emf::metatype", "Element::metatype") || input.metatype_qname || null;
-  const multiplicityText =
-    semanticAttr(attributes, "emf::multiplicityText", "multiplicityText", "multiplicity") ||
-    semanticAttrBySuffix(attributes, "multiplicityText", "multiplicity");
-  const kind =
-    semanticAttr(attributes, "emf::kind", "Element::kind", "kind") ||
-    metatypeQname?.split("::").pop() ||
-    "Unknown";
-  const seedKey = semanticSymbolKey({
-    file_path: input.file_path,
-    qualified_name: qualifiedName,
-    name,
-    kind,
-  });
-  const seed = spanSeed?.get(seedKey);
-  const ownerQname = semanticAttr(attributes, "emf::owner", "Element::owner");
-  return {
-    file_path: input.file_path,
-    name,
-    kind,
-    source_scope: sourceScope,
-    qualified_name: qualifiedName,
-    file: seed?.file ?? 0,
-    start_line: seed?.start_line ?? 0,
-    start_col: seed?.start_col ?? 0,
-    end_line: seed?.end_line ?? 0,
-    end_col: seed?.end_col ?? 0,
-    doc: seed?.doc ?? null,
-    properties: [
-      ...Object.entries(attributes).map(([key, value]) => ({
-        name: key,
-        label: key,
-        value: { type: "text" as const, value: String(value) },
-      })),
-      ...(metatypeQname
-        ? [
-            {
-              name: "metatype_qname",
-              label: "metatype_qname",
-              value: { type: "text" as const, value: metatypeQname },
-            },
-          ]
-        : []),
-      ...(multiplicityText
-        ? [
-            {
-              name: "multiplicity",
-              label: "multiplicity",
-              value: { type: "text" as const, value: multiplicityText },
-            },
-          ]
-        : []),
-    ],
-    relationships: ownerQname
-      ? [
-          {
-            kind: "owningNamespace",
-            target: ownerQname,
-            resolved_target: ownerQname,
-            start_line: seed?.start_line ?? 0,
-            start_col: seed?.start_col ?? 0,
-            end_line: seed?.end_line ?? 0,
-            end_col: seed?.end_col ?? 0,
-          },
-        ]
-      : seed?.relationships || [],
-  };
-}
 
 function withScope(
   symbols: SymbolView[] | undefined,
   sourceScope: "project" | "library",
 ): SymbolView[] {
   return (symbols || []).map((symbol) => ({ ...symbol, source_scope: sourceScope }));
-}
-
-function categorizeParseError(message: string): string {
-  const text = (message || "").toLowerCase();
-  if (text.includes("expected")) return "expected-token";
-  if (text.includes("unexpected")) return "unexpected-token";
-  if (text.includes("unterminated")) return "unterminated";
-  if (text.includes("invalid")) return "invalid-syntax";
-  return "other";
 }
 
 function normalizePathKey(path: string): string {
@@ -285,7 +159,6 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
   const [projectFastSymbols, setProjectFastSymbols] = useState<SymbolView[]>([]);
   const [projectSemanticSymbols, setProjectSemanticSymbols] = useState<SymbolView[]>([]);
   const [activeFileSymbolMode, setActiveFileSymbolMode] = useState<ActiveFileSymbolMode>("semantic");
-  const projectFastSymbolsRef = useRef<SymbolView[]>([]);
   const [librarySymbols, setLibrarySymbols] = useState<SymbolView[]>([]);
   const [libraryFiles, setLibraryFiles] = useState<string[]>([]);
   const [libraryLoadingFiles, setLibraryLoadingFiles] = useState<string[]>([]);
@@ -316,7 +189,6 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
   }, []);
 
   useEffect(() => {
-      projectFastSymbolsRef.current = [];
       setProjectSymbolsLoaded(false);
       setStdlibFileCount(0);
       setProjectFastSymbols([]);
@@ -342,10 +214,6 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
       setActiveFileSymbolMode("semantic");
       libraryBootstrapRef.current = null;
   }, [rootPath, clearBackgroundCompileTimeout]);
-
-  useEffect(() => {
-    projectFastSymbolsRef.current = projectFastSymbols;
-  }, [projectFastSymbols]);
 
   const composeProjectSymbols = useCallback((semantic: SymbolView[]) => semantic, []);
 
@@ -416,19 +284,10 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
   const refreshSemanticProjectSymbols = useCallback(async (path: string) => {
     if (!path) return;
     try {
-      const semantic = await invoke<SemanticElementView[]>("query_semantic", {
+      const semantic = await callTool<SymbolView[]>("core.query_semantic_symbols@v1", {
         root: path,
-        query: {
-          metatype: null,
-          metatype_is_a: null,
-          predicates: [],
-        },
       });
-      const spanSeed = new Map<string, SymbolView>();
-      for (const symbol of projectFastSymbolsRef.current) {
-        spanSeed.set(semanticSymbolKey(symbol), symbol);
-      }
-      const mapped = (semantic || []).map((item) => mapSemanticToSymbolView(item, "project", spanSeed));
+      const mapped = withScope(semantic || [], "project");
       setProjectSemanticSymbols(mapped);
       setProjectSymbolsLoaded(true);
     } catch {
@@ -527,37 +386,6 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
         setCompileStatus("Library symbols: all files already loaded");
         return;
       }
-      // Fast path: query all stdlib symbols from persistent index.
-      try {
-        const mapped: SymbolView[] = [];
-        let offset = 0;
-        while (token === libraryLoadTokenRef.current) {
-          const indexed = await invoke<IndexedSymbolView[]>("query_index_library_symbols", {
-            payload: {
-              root: rootPath,
-              offset,
-              limit: LIBRARY_INDEX_PAGE_SIZE,
-            },
-          });
-          const page = (indexed || []).map((symbol) => mapIndexedToSymbolView(symbol, "library"));
-          if (!page.length) break;
-          mapped.push(...page);
-          if (page.length < LIBRARY_INDEX_PAGE_SIZE) break;
-          offset += page.length;
-        }
-        if (token === libraryLoadTokenRef.current) {
-          setLibrarySymbols(mapped);
-          loadedLibraryFilesRef.current = new Set(libraryFiles);
-          setLoadedLibraryFileCount(libraryFiles.length);
-          setLibraryLoadErrors({});
-          setLibraryBulkCompleted(pending.length);
-          setLibraryBulkFailed(0);
-          setCompileStatus("Library symbols: all files loaded");
-          return;
-        }
-      } catch {
-      }
-      // Fallback: one round-trip for entire stdlib symbol set.
       const fullLoadOk = await loadLibrarySymbols(rootPath, undefined, true);
       if (fullLoadOk && token === libraryLoadTokenRef.current) {
         setLibraryBulkCompleted(pending.length);
@@ -565,32 +393,10 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
         setCompileStatus("Library symbols: all files loaded");
         return;
       }
-      let cursor = 0;
-      const worker = async () => {
-        while (token === libraryLoadTokenRef.current) {
-          if (cursor >= pending.length) return;
-          const filePath = pending[cursor];
-          cursor += 1;
-          const ok = await loadLibrarySymbolsForFile(filePath);
-          if (token !== libraryLoadTokenRef.current) return;
-          setLibraryBulkCompleted((prev) => prev + 1);
-          if (!ok) {
-            setLibraryBulkFailed((prev) => prev + 1);
-          }
-        }
-      };
-      const workers = Array.from(
-        { length: Math.min(LIBRARY_BULK_CONCURRENCY, pending.length) },
-        () => worker(),
-      );
-      await Promise.all(workers);
       if (token === libraryLoadTokenRef.current) {
-        const failed = pending.filter((path) => !loadedLibraryFilesRef.current.has(path)).length;
-        setCompileStatus(
-          failed
-            ? `Library symbols: completed with ${failed} file load failures`
-            : "Library symbols: all files loaded",
-        );
+        setLibraryBulkCompleted(0);
+        setLibraryBulkFailed(pending.length);
+        setCompileStatus("Library symbols: load failed");
       }
       await refreshLibrarySummary(rootPath);
     } finally {
@@ -598,7 +404,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
         setLibraryBulkLoading(false);
       }
     }
-  }, [rootPath, libraryFiles, loadLibrarySymbolsForFile, loadLibrarySymbols, refreshLibrarySummary]);
+  }, [rootPath, libraryFiles, loadLibrarySymbols, refreshLibrarySummary]);
 
   const retryFailedLibraryLoads = useCallback(async () => {
     if (!rootPath) return;
@@ -610,34 +416,13 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
     setLibraryBulkFailed(0);
     setLibraryBulkTotal(failed.length);
     setLibraryBulkCompleted(0);
-    setCompileStatus(`Library symbols: retrying ${failed.length} failed file loads...`);
+    setCompileStatus(`Library symbols: retrying ${failed.length} failed loads...`);
     try {
-      let cursor = 0;
-      const worker = async () => {
-        while (token === libraryLoadTokenRef.current) {
-          if (cursor >= failed.length) return;
-          const filePath = failed[cursor];
-          cursor += 1;
-          const ok = await loadLibrarySymbolsForFile(filePath);
-          if (token !== libraryLoadTokenRef.current) return;
-          setLibraryBulkCompleted((prev) => prev + 1);
-          if (!ok) {
-            setLibraryBulkFailed((prev) => prev + 1);
-          }
-        }
-      };
-      const workers = Array.from(
-        { length: Math.min(LIBRARY_BULK_CONCURRENCY, failed.length) },
-        () => worker(),
-      );
-      await Promise.all(workers);
+      const ok = await loadLibrarySymbols(rootPath, undefined, true);
       if (token === libraryLoadTokenRef.current) {
-        const remaining = failed.filter((path) => !loadedLibraryFilesRef.current.has(path)).length;
-        setCompileStatus(
-          remaining
-            ? `Library symbols: retry completed with ${remaining} remaining failures`
-            : "Library symbols: retry completed successfully",
-        );
+        setLibraryBulkCompleted(ok ? failed.length : 0);
+        setLibraryBulkFailed(ok ? 0 : failed.length);
+        setCompileStatus(ok ? "Library symbols: retry completed successfully" : "Library symbols: retry failed");
       }
       await refreshLibrarySummary(rootPath);
     } finally {
@@ -645,7 +430,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
         setLibraryBulkLoading(false);
       }
     }
-  }, [rootPath, libraryLoadErrors, loadLibrarySymbolsForFile, refreshLibrarySummary]);
+  }, [rootPath, libraryLoadErrors, loadLibrarySymbols, refreshLibrarySummary]);
 
   const cancelLibrarySymbolLoading = useCallback(() => {
     libraryLoadTokenRef.current += 1;
@@ -700,7 +485,11 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
         },
       });
       const incomingProject = withScope(response?.symbols, "project");
-      setProjectFastSymbols((prev) => (incomingProject.length ? incomingProject : prev));
+      setProjectFastSymbols((prev) =>
+        filePath
+          ? mergeProjectSymbolsByFile(prev, incomingProject, filePath)
+          : mergeProjectSymbolsByParsedFiles(prev, incomingProject, response?.parsed_files),
+      );
       setUnresolved(response?.unresolved || []);
       setProjectSymbolsLoaded(true);
       setParsedFiles(response?.parsed_files || []);
@@ -724,36 +513,19 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
       }
       if (typeof response?.total_duration_ms === "number") {
         details.push(`Total: ${response.total_duration_ms} ms`);
-        if (response.total_duration_ms > 2000) {
-          details.push("Warning: compile exceeded 2000 ms performance budget");
-        }
-      }
-      if (typeof response?.parse_duration_ms === "number" && response.parse_duration_ms > 750) {
-        details.push("Warning: parse stage exceeded 750 ms");
-      }
-      if (typeof response?.analysis_duration_ms === "number" && response.analysis_duration_ms > 750) {
-        details.push("Warning: analysis stage exceeded 750 ms");
-      }
-      if (typeof response?.stdlib_duration_ms === "number" && response.stdlib_duration_ms > 500) {
-        details.push("Warning: stdlib load exceeded 500 ms");
       }
       const parsedFiles = response?.parsed_files || [];
       if (parsedFiles.length) {
         details.push(`Files parsed: ${parsedFiles.length}`);
       }
-      if (parseErrors.length) {
-        const categories = new Map<string, number>();
-        parseErrors.forEach((entry) => {
-          entry.errors.forEach((message) => {
-            const category = categorizeParseError(message);
-            categories.set(category, (categories.get(category) || 0) + 1);
-          });
-        });
-        const summary = Array.from(categories.entries())
-          .sort((a, b) => b[1] - a[1])
-          .map(([name, count]) => `${name}:${count}`)
+      if (response?.parse_error_categories?.length) {
+        const summary = response.parse_error_categories
+          .map((entry) => `${entry.category}:${entry.count}`)
           .join(", ");
         details.push(`Parse error categories: ${summary}`);
+      }
+      for (const warning of response?.performance_warnings || []) {
+        details.push(`Warning: ${warning}`);
       }
       if (response?.symbols?.length != null) {
         details.push(`Symbols: ${response.symbols.length}`);
@@ -830,7 +602,9 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
       }
       setProjectFastSymbols((prev) => {
         const incomingProject = withScope(response?.symbols, "project");
-        return mergeProjectSymbolsByFile(prev, incomingProject, filePath);
+        return filePath
+          ? mergeProjectSymbolsByFile(prev, incomingProject, filePath)
+          : mergeProjectSymbolsByParsedFiles(prev, incomingProject, response?.parsed_files);
       });
       if (!filePath && (!response?.symbols || response.symbols.length === 0)) {
         await loadProjectSymbolsFromIndex(path);

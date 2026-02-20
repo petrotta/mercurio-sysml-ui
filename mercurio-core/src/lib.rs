@@ -2,14 +2,17 @@
 pub use files::{
     get_ast_for_content, get_ast_for_path, get_parse_errors, get_parse_errors_for_content,
     get_parse_tree_for_content,
+    resolve_under_root,
     read_diagram, write_diagram, DiagramFile, DiagramNode, DiagramOffset, DiagramSize,
     ParseErrorView, ParseErrorsPayload, ParseTreeNodeView,
 };
 
 mod project;
 pub use project::{
+    create_project_descriptor, ensure_project_descriptor,
     get_project_descriptor_view, load_project_config, load_project_descriptor, LibraryConfig,
-    ProjectConfig, ProjectDescriptor, ProjectDescriptorView,
+    ProjectConfig, ProjectDescriptor, ProjectDescriptorUpdate, ProjectDescriptorView,
+    update_project_descriptor, write_project_descriptor,
 };
 
 mod workspace;
@@ -19,9 +22,12 @@ mod symbol_properties;
 mod compile;
 pub use compile::{
     cancel_compile, compile_project_delta_sync, compile_workspace_sync, load_library_symbols_sync,
-    CompileFileResult, CompileProgressPayload, CompileResponse, LibrarySymbolsResponse,
+    query_semantic_symbols,
+    CompileFileResult, CompileProgressPayload, CompileRequest, CompileResponse,
+    LibrarySymbolsRequest, LibrarySymbolsResponse,
+    ParseErrorCategoryView,
     PropertyItemView, PropertyValueView, RelationshipView, SymbolView, TypeRefPartView,
-    TypeRefView, UnresolvedRefView, UnsavedFile,
+    TypeRefView, UnresolvedRefView, UnsavedFile, UnsavedFileInput,
 };
 
 mod settings;

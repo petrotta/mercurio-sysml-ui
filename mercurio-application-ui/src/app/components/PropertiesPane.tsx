@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import type { SymbolView } from "../types";
 
 type PropertiesPaneProps = {
@@ -81,6 +81,8 @@ export function PropertiesPane({
 }: PropertiesPaneProps) {
   const [snippets, setSnippets] = useState<Record<string, SnippetState>>({});
   const [keyColumnPercent, setKeyColumnPercent] = useState(32);
+  const paneRef = useRef<HTMLDivElement | null>(null);
+  const splitDragActiveRef = useRef(false);
   const linkButtonStyle = {
     border: "none",
     background: "transparent",
@@ -93,6 +95,20 @@ export function PropertiesPane({
   const normalizedSymbols = useMemo(
     () => (selectedSymbols && selectedSymbols.length ? selectedSymbols : null),
     [selectedSymbols],
+  );
+  const updateKeySplitFromClientX = useCallback((clientX: number) => {
+    const rect = paneRef.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0) return;
+    const nextPercent = Math.round(((clientX - rect.left) / rect.width) * 100);
+    setKeyColumnPercent(Math.max(20, Math.min(60, nextPercent)));
+  }, []);
+  const startKeySplitDrag = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      splitDragActiveRef.current = true;
+      updateKeySplitFromClientX(event.clientX);
+    },
+    [updateKeySplitFromClientX],
   );
   const renderPropertyValue = (value: string | null): ReactNode => {
     const text = value?.trim() || "";
@@ -178,22 +194,24 @@ export function PropertiesPane({
     };
   }, [getDoc, readFile, normalizedSymbols]);
 
+  useEffect(() => {
+    const onPointerMove = (event: PointerEvent) => {
+      if (!splitDragActiveRef.current) return;
+      updateKeySplitFromClientX(event.clientX);
+    };
+    const onPointerUp = () => {
+      splitDragActiveRef.current = false;
+    };
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+    };
+  }, [updateKeySplitFromClientX]);
+
   return (
-    <div className="properties-pane" style={{ ["--properties-key-col" as string]: `${keyColumnPercent}%` }}>
-      <div className="properties-header">
-        <label className="properties-split-control">
-          Split
-          <input
-            type="range"
-            min={20}
-            max={50}
-            step={1}
-            value={keyColumnPercent}
-            onChange={(event) => setKeyColumnPercent(Number(event.target.value))}
-            aria-label="Adjust properties key/value split"
-          />
-        </label>
-      </div>
+    <div ref={paneRef} className="properties-pane" style={{ ["--properties-key-col" as string]: `${keyColumnPercent}%` }}>
       {normalizedSymbols ? (
         <div className="properties-body">
           {normalizedSymbols.map((symbol, idx) => {
@@ -229,7 +247,14 @@ export function PropertiesPane({
                   <summary>Element details</summary>
                   <div className="properties-parse">
                     <div className="properties-row properties-row-header">
-                      <div className="properties-key properties-key-header">Key</div>
+                      <div className="properties-key properties-key-header">
+                        Key
+                        <div
+                          className="properties-header-divider"
+                          onPointerDown={startKeySplitDrag}
+                          title="Drag to resize key/value split"
+                        />
+                      </div>
                       <div className="properties-value properties-value-header">Value</div>
                     </div>
                     {baseProperties.map((prop, index) => (

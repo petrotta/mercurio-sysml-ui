@@ -9,7 +9,7 @@ use mercurio_sysml_semantics::semantic_contract::{
     SemanticElementView, SemanticIndexInput, SemanticPredicate, SemanticQuery, build_semantic_index,
 };
 use mercurio_symbol_index::{Scope, SymbolIndexStore, SymbolRecord};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,9 +18,10 @@ use std::time::{Instant, SystemTime};
 
 use crate::project::load_project_config;
 use crate::index_contract::{canonical_symbol_record, CanonicalSymbolRecordArgs};
+use crate::symbol_index::query_project_symbols;
 use crate::state::{StdlibCache, StdlibSymbol};
 use crate::stdlib::resolve_stdlib_path;
-use crate::workspace::{collect_model_files, collect_project_files};
+use crate::workspace::{collect_model_files, collect_project_files, query_semantic};
 use crate::CoreState;
 
 pub use crate::state::CompileFileResult;
@@ -29,6 +30,8 @@ pub use crate::state::CompileFileResult;
 pub struct CompileResponse {
     pub ok: bool,
     pub files: Vec<CompileFileResult>,
+    pub parse_error_categories: Vec<ParseErrorCategoryView>,
+    pub performance_warnings: Vec<String>,
     pub symbols: Vec<SymbolView>,
     pub project_symbol_count: usize,
     pub library_symbol_count: usize,
@@ -54,6 +57,12 @@ pub struct LibrarySymbolsResponse {
     pub stdlib_duration_ms: u128,
     pub stdlib_file_count: usize,
     pub total_duration_ms: u128,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ParseErrorCategoryView {
+    pub category: String,
+    pub count: usize,
 }
 
 #[derive(Serialize, Clone)]
@@ -155,6 +164,69 @@ pub struct UnsavedFile {
     pub content: String,
 }
 
+#[derive(Deserialize, Clone)]
+pub struct UnsavedFileInput {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct CompileRequest {
+    pub root: String,
+    #[serde(default)]
+    pub run_id: u64,
+    #[serde(default)]
+    pub allow_parse_errors: bool,
+    #[serde(default)]
+    pub unsaved: Vec<UnsavedFileInput>,
+    #[serde(default, alias = "file", alias = "path")]
+    pub target_path: Option<String>,
+}
+
+impl CompileRequest {
+    pub fn into_parts(self) -> (String, u64, bool, Option<PathBuf>, Vec<UnsavedFile>) {
+        let unsaved = self
+            .unsaved
+            .into_iter()
+            .map(|entry| UnsavedFile {
+                path: PathBuf::from(entry.path),
+                content: entry.content,
+            })
+            .collect::<Vec<_>>();
+        let target_path = self.target_path.map(PathBuf::from);
+        (
+            self.root,
+            self.run_id,
+            self.allow_parse_errors,
+            target_path,
+            unsaved,
+        )
+    }
+}
+
+#[derive(Deserialize, Clone)]
+pub struct LibrarySymbolsRequest {
+    pub root: String,
+    #[serde(default, alias = "file", alias = "path")]
+    pub target_path: Option<String>,
+    #[serde(default = "default_include_symbols")]
+    pub include_symbols: bool,
+}
+
+impl LibrarySymbolsRequest {
+    pub fn into_parts(self) -> (String, Option<PathBuf>, bool) {
+        (
+            self.root,
+            self.target_path.map(PathBuf::from),
+            self.include_symbols,
+        )
+    }
+}
+
+fn default_include_symbols() -> bool {
+    true
+}
+
 pub fn cancel_compile(state: &CoreState, run_id: u64) -> Result<(), String> {
     let mut set = state
         .canceled_compiles
@@ -162,6 +234,92 @@ pub fn cancel_compile(state: &CoreState, run_id: u64) -> Result<(), String> {
         .map_err(|_| "Cancel lock poisoned".to_string())?;
     set.insert(run_id);
     Ok(())
+}
+
+fn categorize_parse_error(message: &str) -> String {
+    let text = message.to_lowercase();
+    if text.contains("expected") {
+        return "expected-token".to_string();
+    }
+    if text.contains("unexpected") {
+        return "unexpected-token".to_string();
+    }
+    if text.contains("unterminated") {
+        return "unterminated".to_string();
+    }
+    if text.contains("invalid") {
+        return "invalid-syntax".to_string();
+    }
+    "other".to_string()
+}
+
+fn summarize_parse_error_categories(files: &[CompileFileResult]) -> Vec<ParseErrorCategoryView> {
+    let mut categories = HashMap::<String, usize>::new();
+    for file in files {
+        if file.ok {
+            continue;
+        }
+        for message in &file.errors {
+            let key = categorize_parse_error(message);
+            *categories.entry(key).or_insert(0) += 1;
+        }
+    }
+    let mut out = categories
+        .into_iter()
+        .map(|(category, count)| ParseErrorCategoryView { category, count })
+        .collect::<Vec<_>>();
+    out.sort_by(|a, b| b.count.cmp(&a.count).then(a.category.cmp(&b.category)));
+    out
+}
+
+fn performance_warnings(
+    parse_duration_ms: u128,
+    analysis_duration_ms: u128,
+    stdlib_duration_ms: u128,
+    total_duration_ms: u128,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if total_duration_ms > 2000 {
+        warnings.push("compile exceeded 2000 ms performance budget".to_string());
+    }
+    if parse_duration_ms > 750 {
+        warnings.push("parse stage exceeded 750 ms".to_string());
+    }
+    if analysis_duration_ms > 750 {
+        warnings.push("analysis stage exceeded 750 ms".to_string());
+    }
+    if stdlib_duration_ms > 500 {
+        warnings.push("stdlib load exceeded 500 ms".to_string());
+    }
+    warnings
+}
+
+pub fn query_semantic_symbols(state: &CoreState, root: String) -> Result<Vec<SymbolView>, String> {
+    let indexed = query_project_symbols(state, root.clone(), None, None, None).unwrap_or_default();
+    let mut span_seed = HashMap::<String, SymbolSpan>::new();
+    for symbol in indexed {
+        let key = symbol_key(&symbol.file_path, &symbol.qualified_name);
+        span_seed.insert(
+            key,
+            SymbolSpan {
+                start_line: symbol.start_line,
+                start_col: symbol.start_col,
+                end_line: symbol.end_line,
+                end_col: symbol.end_col,
+            },
+        );
+    }
+    let query = SemanticQuery {
+        metatype: None,
+        metatype_is_a: None,
+        predicates: Vec::new(),
+    };
+    let elements = query_semantic(state, root, query)?;
+    let mut out = Vec::with_capacity(elements.len());
+    for element in elements {
+        out.push(map_semantic_element_to_symbol(element, &span_seed));
+    }
+    Ok(out)
 }
 
 pub fn compile_workspace_sync<F: Fn(CompileProgressPayload)>(
@@ -395,9 +553,22 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
     drop(workspace);
 
     if has_parse_errors && !allow_parse_errors {
+        let parse_duration_ms = parse_start.elapsed().as_millis();
+        let analysis_duration_ms = 0;
+        let stdlib_duration_ms = 0;
+        let total_duration_ms = compile_start.elapsed().as_millis();
+        let parse_error_categories = summarize_parse_error_categories(&file_results);
+        let performance_warnings = performance_warnings(
+            parse_duration_ms,
+            analysis_duration_ms,
+            stdlib_duration_ms,
+            total_duration_ms,
+        );
         return Ok(CompileResponse {
             ok: false,
             files: file_results,
+            parse_error_categories,
+            performance_warnings,
             symbols: Vec::new(),
             project_symbol_count: 0,
             library_symbol_count: 0,
@@ -408,11 +579,11 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
             parse_failed: true,
             stdlib_cache_hit: false,
             parsed_files,
-            parse_duration_ms: parse_start.elapsed().as_millis(),
-            analysis_duration_ms: 0,
-            stdlib_duration_ms: 0,
+            parse_duration_ms,
+            analysis_duration_ms,
+            stdlib_duration_ms,
             stdlib_file_count: 0,
-            total_duration_ms: compile_start.elapsed().as_millis(),
+            total_duration_ms,
         });
     }
 
@@ -518,9 +689,20 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
 
     let analysis_duration_ms = analysis_start.elapsed().as_millis();
 
+    let parse_duration_ms = parse_start.elapsed().as_millis();
+    let total_duration_ms = compile_start.elapsed().as_millis();
+    let parse_error_categories = summarize_parse_error_categories(&file_results);
+    let performance_warnings = performance_warnings(
+        parse_duration_ms,
+        analysis_duration_ms,
+        stdlib_duration_ms,
+        total_duration_ms,
+    );
     let response = CompileResponse {
         ok: file_results.iter().all(|f| f.ok),
         files: file_results,
+        parse_error_categories,
+        performance_warnings,
         symbols,
         project_symbol_count,
         library_symbol_count,
@@ -531,11 +713,11 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
         parse_failed: false,
         stdlib_cache_hit,
         parsed_files,
-        parse_duration_ms: parse_start.elapsed().as_millis(),
+        parse_duration_ms,
         analysis_duration_ms,
         stdlib_duration_ms,
         stdlib_file_count: stdlib_files.len(),
-        total_duration_ms: compile_start.elapsed().as_millis(),
+        total_duration_ms,
     };
     if include_library_symbols {
         let _ = index_symbols_for_project(
@@ -1426,9 +1608,79 @@ fn map_semantic_element_to_symbol(
     element: SemanticElementView,
     symbol_spans: &HashMap<String, SymbolSpan>,
 ) -> SymbolView {
+    fn normalize_attr_key(input: &str) -> String {
+        input.replace(':', "").to_lowercase()
+    }
+
+    fn semantic_attr(attributes: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
+        let wanted = keys
+            .iter()
+            .map(|key| normalize_attr_key(key))
+            .collect::<Vec<_>>();
+        for (key, value) in attributes {
+            let norm = normalize_attr_key(key);
+            if wanted.iter().any(|candidate| candidate == &norm) {
+                let text = value.trim();
+                if !text.is_empty() {
+                    return Some(text.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn semantic_attr_by_suffix(attributes: &HashMap<String, String>, suffixes: &[&str]) -> Option<String> {
+        for (key, value) in attributes {
+            for suffix in suffixes {
+                if key == suffix || key.ends_with(&format!("::{suffix}")) {
+                    let text = value.trim();
+                    if !text.is_empty() {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    let qualified_name = semantic_attr(
+        &element.attributes,
+        &["emf::qualifiedName", "Element::qualifiedName"],
+    )
+    .unwrap_or_else(|| element.qualified_name.clone());
+    let name = semantic_attr(&element.attributes, &["emf::name", "NamedElement::name"])
+        .or_else(|| {
+            qualified_name
+                .split("::")
+                .filter(|segment| !segment.is_empty())
+                .last()
+                .map(|segment| segment.to_string())
+        })
+        .unwrap_or_else(|| element.name.clone());
+    let metatype_qname = semantic_attr(
+        &element.attributes,
+        &["emf::metatype", "Element::metatype"],
+    )
+    .or_else(|| element.metatype_qname.clone());
+    let kind = semantic_attr(&element.attributes, &["emf::kind", "Element::kind", "kind"])
+        .or_else(|| {
+            metatype_qname
+                .as_deref()
+                .and_then(|value| value.rsplit("::").next())
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string())
+        })
+        .unwrap_or_else(|| "Unknown".to_string());
+    let multiplicity_text = semantic_attr(
+        &element.attributes,
+        &["emf::multiplicityText", "multiplicityText", "multiplicity"],
+    )
+    .or_else(|| semantic_attr_by_suffix(&element.attributes, &["multiplicityText", "multiplicity"]));
+    let owner_qname = semantic_attr(&element.attributes, &["emf::owner", "Element::owner"]);
+
     let mut keys = element.attributes.keys().cloned().collect::<Vec<_>>();
     keys.sort();
-    let properties = keys
+    let mut properties = keys
         .into_iter()
         .filter_map(|key| {
             element.attributes.get(&key).map(|value| PropertyItemView {
@@ -1442,23 +1694,50 @@ fn map_semantic_element_to_symbol(
             })
         })
         .collect::<Vec<_>>();
-
-    let kind = element
-        .metatype_qname
-        .as_deref()
-        .and_then(|value| value.rsplit("::").next())
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_string())
-        .or_else(|| element.attributes.get("kind").cloned())
-        .unwrap_or_else(|| "element".to_string());
-    let key = symbol_key(&element.file_path, &element.qualified_name);
+    if let Some(metatype_qname) = metatype_qname.as_ref() {
+        properties.push(PropertyItemView {
+            name: "metatype_qname".to_string(),
+            label: "metatype_qname".to_string(),
+            value: PropertyValueView::Text {
+                value: metatype_qname.clone(),
+            },
+            hint: None,
+            group: None,
+        });
+    }
+    if let Some(multiplicity_text) = multiplicity_text.as_ref() {
+        properties.push(PropertyItemView {
+            name: "multiplicity".to_string(),
+            label: "multiplicity".to_string(),
+            value: PropertyValueView::Text {
+                value: multiplicity_text.clone(),
+            },
+            hint: None,
+            group: None,
+        });
+    }
+    let key = symbol_key(&element.file_path, &qualified_name);
     let span = symbol_spans.get(&key);
+    let relationships = owner_qname
+        .as_ref()
+        .map(|owner| {
+            vec![RelationshipView {
+                kind: "owningNamespace".to_string(),
+                target: owner.clone(),
+                resolved_target: Some(owner.clone()),
+                start_line: span.map(|s| s.start_line).unwrap_or(0),
+                start_col: span.map(|s| s.start_col).unwrap_or(0),
+                end_line: span.map(|s| s.end_line).unwrap_or(0),
+                end_col: span.map(|s| s.end_col).unwrap_or(0),
+            }]
+        })
+        .unwrap_or_default();
 
     SymbolView {
         file_path: element.file_path,
-        name: element.name.clone(),
+        name,
         short_name: None,
-        qualified_name: element.qualified_name,
+        qualified_name,
         kind,
         file: 0,
         start_line: span.map(|s| s.start_line).unwrap_or(0),
@@ -1475,7 +1754,7 @@ fn map_semantic_element_to_symbol(
         short_name_end_col: None,
         doc: None,
         supertypes: Vec::new(),
-        relationships: Vec::new(),
+        relationships,
         type_refs: Vec::new(),
         is_public: true,
         properties,
@@ -2502,6 +2781,116 @@ standard library package KerML {
         let a2 = load_library_symbols_sync(&state, project_a.to_string_lossy().to_string(), None, true)
             .expect("load a2");
         assert!(a2.stdlib_cache_hit);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compile_response_includes_parse_error_categories() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_parse_category_{stamp}"));
+        let library_dir = root.join("stdlib");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&library_dir).expect("create library dir");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(
+            library_dir.join("KerML.kerml"),
+            "standard library package KerML { package Root { metaclass Element specializes Anything {} } }",
+        )
+        .expect("write library file");
+        fs::write(project_dir.join("main.sysml"), "package P {\n  part def A\n}\n")
+            .expect("write project file");
+        fs::write(
+            project_dir.join(".project"),
+            format!(
+                "{{\"name\":\"parse-categories\",\"library\":{{\"path\":\"{}\"}},\"src\":[\"*.sysml\"]}}",
+                library_dir.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let response = compile_project_delta_sync(
+            &state,
+            project_dir.to_string_lossy().to_string(),
+            99,
+            true,
+            None,
+            Vec::new(),
+            |_| {},
+        )
+        .expect("compile response");
+
+        assert!(!response.ok);
+        assert!(!response.parse_error_categories.is_empty());
+        let total_categorized = response
+            .parse_error_categories
+            .iter()
+            .map(|row| row.count)
+            .sum::<usize>();
+        assert!(total_categorized >= 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn performance_warning_thresholds_are_reported() {
+        let warnings = super::performance_warnings(800, 900, 600, 2100);
+        assert!(warnings.iter().any(|w| w.contains("compile exceeded")));
+        assert!(warnings.iter().any(|w| w.contains("parse stage exceeded")));
+        assert!(warnings.iter().any(|w| w.contains("analysis stage exceeded")));
+        assert!(warnings.iter().any(|w| w.contains("stdlib load exceeded")));
+    }
+
+    #[test]
+    fn query_semantic_symbols_returns_project_symbol_views() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_semantic_symbols_{stamp}"));
+        let library_dir = root.join("stdlib");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&library_dir).expect("create library dir");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(
+            library_dir.join("KerML.kerml"),
+            "standard library package KerML { package Root { metaclass Element specializes Anything {} } }",
+        )
+        .expect("write library file");
+        fs::write(
+            project_dir.join("main.sysml"),
+            "package Demo {\n  part def Engine;\n}\n",
+        )
+        .expect("write project file");
+        fs::write(
+            project_dir.join(".project"),
+            format!(
+                "{{\"name\":\"semantic\",\"library\":{{\"path\":\"{}\"}},\"src\":[\"*.sysml\"]}}",
+                library_dir.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let project_root = project_dir.to_string_lossy().to_string();
+        let _ = compile_project_delta_sync(
+            &state,
+            project_root.clone(),
+            7,
+            true,
+            None,
+            Vec::new(),
+            |_| {},
+        )
+        .expect("compile response");
+
+        let semantic = query_semantic_symbols(&state, project_root).expect("query semantic symbols");
+        assert!(!semantic.is_empty());
+        assert!(semantic.iter().any(|symbol| symbol.qualified_name == "Demo"));
 
         let _ = fs::remove_dir_all(root);
     }

@@ -219,7 +219,7 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
-pub(crate) fn resolve_under_root(root: &Path, target: &Path) -> Result<PathBuf, String> {
+pub fn resolve_under_root(root: &Path, target: &Path) -> Result<PathBuf, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let joined = if target.is_absolute() {
         target.to_path_buf()

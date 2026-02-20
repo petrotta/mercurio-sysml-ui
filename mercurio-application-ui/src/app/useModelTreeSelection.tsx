@@ -103,8 +103,12 @@ export function useModelTreeSelection({
     }
     const row = modelRows[modelCursorIndex];
     modelCursorRowKeyRef.current = row?.key ?? null;
+  }, [modelCursorIndex, modelRows]);
+
+  useEffect(() => {
+    if (modelCursorIndex == null) return;
     modelListRef.current?.scrollToRow({ index: modelCursorIndex, align: "smart" });
-  }, [modelCursorIndex, modelRows.length]);
+  }, [modelCursorIndex]);
 
   useEffect(() => {
     if (!modelRows.length) {

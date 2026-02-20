@@ -9,11 +9,13 @@ pub mod diagram;
 pub mod fs_ops;
 pub mod git;
 pub mod stdlib;
+pub mod tools;
 pub mod window;
 
 pub use ai::{ai_agent_run, ai_test_endpoint};
 pub use core::{
     get_project_element_attributes, get_project_model, get_user_projects_root, query_semantic,
+    query_semantic_symbols,
 };
 pub use diagram::{read_diagram, write_diagram};
 pub use fs_ops::{
@@ -25,4 +27,5 @@ pub use git::{
     git_stage_paths, git_status, git_unstage_paths,
 };
 pub use stdlib::{get_default_stdlib, get_stdlib_metamodel, list_stdlib_versions, set_default_stdlib};
+pub use tools::{call_tool, list_tools};
 pub use window::{window_close, window_minimize, window_toggle_maximize};

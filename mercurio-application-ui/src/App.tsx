@@ -1,6 +1,6 @@
 ﻿import "./style.css";
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import type { MouseEvent as ReactMouseEvent } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getName, getTauriVersion, getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
@@ -48,7 +48,7 @@ import { useCompileRunner } from "./app/useCompileRunner";
 import { useAstLoader } from "./app/useAstLoader";
 import { readFileText } from "./app/fileOps";
 import { useProjectTree } from "./app/useProjectTree";
-import { runAgent } from "./app/agentClient";
+import { callTool, runAgent } from "./app/agentClient";
 import { parseErrorLocation } from "./app/parseErrors";
 import { isPathWithin } from "./app/pathUtils";
 import type {
@@ -69,6 +69,12 @@ type TerminalTabState = {
   lines: string[];
   history: string[];
   historyIndex: number | null;
+};
+
+type GotoSymbolCandidate = {
+  name: string;
+  qualified_name: string;
+  file_path: string;
 };
 
 export function App() {
@@ -224,6 +230,12 @@ export function App() {
   const [exportAfterBuild, setExportAfterBuild] = useState(false);
   const [showNewProject, setShowNewProject] = useState(false);
   const [showOpenProject, setShowOpenProject] = useState(false);
+  const [showGotoDialog, setShowGotoDialog] = useState(false);
+  const [gotoQuery, setGotoQuery] = useState("");
+  const [gotoLoading, setGotoLoading] = useState(false);
+  const [gotoError, setGotoError] = useState("");
+  const [gotoCandidates, setGotoCandidates] = useState<GotoSymbolCandidate[]>([]);
+  const [gotoSelectedIndex, setGotoSelectedIndex] = useState(0);
   const [openProjectPath, setOpenProjectPath] = useState("");
   const [newProjectLocation, setNewProjectLocation] = useState("");
   const [newProjectName, setNewProjectName] = useState("");
@@ -397,6 +409,7 @@ export function App() {
   const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
   const cursorListenerRef = useRef<null | { dispose: () => void }>(null);
   const parseReqRef = useRef(0);
+  const gotoInputRef = useRef<HTMLInputElement | null>(null);
     const editorOptions: Parameters<typeof MonacoEditor>[0]["options"] = {
       minimap: { enabled: false },
       fontSize: 14,
@@ -667,8 +680,8 @@ export function App() {
     void (async () => {
       try {
         const [versions, selected] = await Promise.all([
-          invoke<string[]>("list_stdlib_versions"),
-          invoke<string | null>("get_default_stdlib"),
+          callTool<string[]>("stdlib.list_versions@v1", {}),
+          callTool<string | null>("stdlib.get_default@v1", {}),
         ]);
         const nextVersions = Array.isArray(versions) ? versions : [];
         setSettingsStdlibVersions(nextVersions);
@@ -858,7 +871,9 @@ export function App() {
     setStdlibMetamodelLoadingState(true);
     setStdlibMetamodelErrorState("");
     try {
-      const payload = await invoke<StdlibMetamodelView>("get_stdlib_metamodel", { root: rootPath });
+      const payload = await callTool<StdlibMetamodelView>("core.get_stdlib_metamodel@v1", {
+        root: rootPath,
+      });
       setStdlibMetamodel(payload);
     } catch (error) {
       setStdlibMetamodelErrorState(`Failed to load metamodel: ${String(error)}`);
@@ -877,7 +892,7 @@ export function App() {
     setProjectModelLoading(true);
     setProjectModelError("");
     try {
-      const payload = await invoke<ProjectModelView>("get_project_model", { root: rootPath });
+      const payload = await callTool<ProjectModelView>("core.get_project_model@v1", { root: rootPath });
       setProjectModelView(payload);
     } catch (error) {
       setProjectModelError(`Failed to load project model: ${String(error)}`);
@@ -983,6 +998,73 @@ export function App() {
     if (!rootPath) return;
     void runBackgroundCompile(rootPath);
   }, [rootPath, backgroundCompileEnabled, activeEditorPath]);
+
+  useEffect(() => {
+    if (!showGotoDialog) return;
+    gotoInputRef.current?.focus();
+    gotoInputRef.current?.select();
+  }, [showGotoDialog]);
+
+  useEffect(() => {
+    if (!showGotoDialog) return;
+    if (!rootPath) {
+      setGotoCandidates([]);
+      setGotoError("Open a project folder first.");
+      setGotoLoading(false);
+      return;
+    }
+    let active = true;
+    setGotoLoading(true);
+    setGotoError("");
+    type SemanticElementResult = {
+      name: string;
+      qualified_name: string;
+      file_path: string;
+      attributes?: Record<string, string>;
+    };
+    void callTool<SemanticElementResult[]>("core.query_semantic@v1", {
+      root: rootPath,
+      query: {
+        metatype: null,
+        metatype_is_a: null,
+        predicates: [],
+      },
+    })
+      .then((rows) => {
+        if (!active) return;
+        const dedup = new Map<string, GotoSymbolCandidate>();
+        for (const row of rows || []) {
+          const qname =
+            (row.qualified_name || "").trim() ||
+            (row.attributes?.["emf::qualifiedName"] || "").trim();
+          const name =
+            (row.name || "").trim() ||
+            (row.attributes?.["emf::name"] || "").trim() ||
+            qname.split("::").pop() ||
+            "Unnamed";
+          const filePath = (row.file_path || "").trim();
+          if (!qname || !filePath) continue;
+          const key = `${qname}|${filePath}`.toLowerCase();
+          if (dedup.has(key)) continue;
+          dedup.set(key, { name, qualified_name: qname, file_path: filePath });
+        }
+        setGotoCandidates(
+          Array.from(dedup.values()).sort((a, b) => a.qualified_name.localeCompare(b.qualified_name)),
+        );
+      })
+      .catch((error) => {
+        if (!active) return;
+        setGotoCandidates([]);
+        setGotoError(`Failed to load symbols: ${String(error)}`);
+      })
+      .finally(() => {
+        if (!active) return;
+        setGotoLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [showGotoDialog, rootPath]);
 
   useEffect(() => {
     if (!rootPath) {
@@ -1128,6 +1210,71 @@ export function App() {
     setActiveTabPath,
     setOpenTabs,
   });
+  const filteredGotoCandidates = useMemo(() => {
+    const raw = gotoQuery.trim().toLowerCase();
+    const baseline = gotoCandidates;
+    if (!raw) {
+      return baseline.slice(0, 300);
+    }
+    const starts: GotoSymbolCandidate[] = [];
+    const contains: GotoSymbolCandidate[] = [];
+    for (const item of baseline) {
+      const qn = item.qualified_name.toLowerCase();
+      const nm = item.name.toLowerCase();
+      if (qn.startsWith(raw) || nm.startsWith(raw)) {
+        starts.push(item);
+      } else if (qn.includes(raw) || nm.includes(raw)) {
+        contains.push(item);
+      }
+    }
+    return [...starts, ...contains].slice(0, 300);
+  }, [gotoCandidates, gotoQuery]);
+  const selectedGotoCandidate =
+    filteredGotoCandidates[Math.max(0, Math.min(gotoSelectedIndex, filteredGotoCandidates.length - 1))] || null;
+
+  useEffect(() => {
+    setGotoSelectedIndex(0);
+  }, [gotoQuery, gotoCandidates.length, showGotoDialog]);
+
+  const openGotoCandidate = useCallback(
+    async (candidate: GotoSymbolCandidate | null) => {
+      if (!candidate) return;
+      setShowGotoDialog(false);
+      setGotoQuery("");
+      setGotoSelectedIndex(0);
+      await navigateTo({
+        path: candidate.file_path,
+        name: candidate.file_path.split(/[\\/]/).pop() || candidate.name || candidate.qualified_name,
+      });
+    },
+    [navigateTo],
+  );
+
+  const handleGotoInputKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      if (!filteredGotoCandidates.length) return;
+      setGotoSelectedIndex((prev) => Math.min(filteredGotoCandidates.length - 1, prev + 1));
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      if (!filteredGotoCandidates.length) return;
+      setGotoSelectedIndex((prev) => Math.max(0, prev - 1));
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      if (!selectedGotoCandidate) return;
+      void openGotoCandidate(selectedGotoCandidate);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setShowGotoDialog(false);
+      return;
+    }
+  };
   const {
     selectTab,
     openAiViewTab,
@@ -1273,7 +1420,7 @@ export function App() {
           import_entries?: string[];
           raw_json?: string;
         }>("ensure_project_descriptor", { root: rootPath }),
-        invoke<string[]>("list_stdlib_versions"),
+        callTool<string[]>("stdlib.list_versions@v1", {}),
       ]);
       setProjectDescriptor(descriptor || null);
       setHasProjectDescriptor(!!descriptor);
@@ -1970,7 +2117,7 @@ export function App() {
           metatype_is_a: null,
           predicates: [{ name: "qualified_name", equals: qname }],
         };
-        const matches = await invoke<SemanticElementResult[]>("query_semantic", {
+        const matches = await callTool<SemanticElementResult[]>("core.query_semantic@v1", {
           root: rootPath,
           query,
         });
@@ -2223,7 +2370,12 @@ export function App() {
       const isBuild = (event.ctrlKey || event.metaKey) && key === "b";
       const isSave = (event.ctrlKey || event.metaKey) && key === "s";
       const isTerminalToggle = (event.ctrlKey || event.metaKey) && key === "t";
+      const isGoto = (event.ctrlKey || event.metaKey) && key === "g";
       if (event.key === "Escape") {
+        if (aiFloatingSteps.length) {
+          setAiFloatingSteps([]);
+          return;
+        }
         if (openMenu) {
           setOpenMenu(null);
           return;
@@ -2264,6 +2416,15 @@ export function App() {
           setShowNewProject(false);
           return;
         }
+        if (showGotoDialog) {
+          setShowGotoDialog(false);
+          return;
+        }
+        return;
+      }
+      if (isGoto) {
+        event.preventDefault();
+        setShowGotoDialog(true);
         return;
       }
       if (isBuild) {
@@ -2303,7 +2464,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeTabPath, activeTabMeta, activeEditorPath, contextMenu, openMenu, showExport, showNewFile, showNewProject, showOpenProject, showProjectProperties, showSettings, tabMenu]);
+  }, [activeTabPath, activeTabMeta, activeEditorPath, aiFloatingSteps.length, contextMenu, openMenu, showExport, showGotoDialog, showNewFile, showNewProject, showOpenProject, showProjectProperties, showSettings, tabMenu]);
 
   const resetEndpointDraft = () => {
     setEndpointDraft({ name: "", url: "", type: "chat", provider: "openai", model: "", token: "" });
@@ -2397,7 +2558,7 @@ export function App() {
     setSettingsStdlibStatus("Saving...");
     try {
       const selected = settingsDefaultStdlib.trim();
-      const saved = await invoke<string | null>("set_default_stdlib", {
+      const saved = await callTool<string | null>("stdlib.set_default@v1", {
         stdlib: selected ? selected : null,
       });
       setSettingsDefaultStdlib(saved || "");
@@ -2565,48 +2726,53 @@ export function App() {
           }
         };
         const parsedAgent = parseAgentJson(content);
-        let parsedSummary: string | undefined;
-        let parsedSteps: Array<{ id: string; label: string; recommended: boolean; action: string }> | undefined;
-        let parsedToolNote: string | undefined;
-        if (parsedAgent && typeof parsedAgent === "object" && typeof parsedAgent.action === "string") {
-          if (parsedAgent.action === "final" && typeof parsedAgent.content === "string") {
-            const parsedFinal = parseAgentJson(parsedAgent.content);
-            if (parsedFinal && typeof parsedFinal.summary === "string") {
-              parsedSummary = parsedFinal.summary;
-            }
-            if (Array.isArray(parsedFinal?.next_steps)) {
-              parsedSteps = parsedFinal.next_steps
-                .map((step: any, index: number) => ({
-                  id: typeof step?.id === "string" && step.id.trim() ? step.id : String(index + 1),
-                  label: typeof step?.label === "string" ? step.label : "",
-                  recommended: Boolean(step?.recommended),
-                  action: typeof step?.action === "string" ? step.action : "",
-                }))
-                .filter((step: { label: string; action: string }) => step.label || step.action);
-            }
-          } else {
-            const detail = parsedAgent.path || parsedAgent.query || parsedAgent.detail || "";
-            parsedToolNote = `Tool request: ${parsedAgent.action}${detail ? ` ${detail}` : ""}`;
+        const parseSteps = (value: unknown) => {
+          if (!Array.isArray(value)) return undefined;
+          const mapped = value
+            .map((step: any, index: number) => ({
+              id: typeof step?.id === "string" && step.id.trim() ? step.id : String(index + 1),
+              label: typeof step?.label === "string" ? step.label : "",
+              recommended: Boolean(step?.recommended),
+              action: typeof step?.action === "string" ? step.action : "",
+            }))
+            .filter((step: { label: string; action: string }) => step.label || step.action);
+          return mapped.length ? mapped : undefined;
+        };
+        const extractSummaryAndSteps = (
+          value: any,
+        ): {
+          summary?: string;
+          steps?: Array<{ id: string; label: string; recommended: boolean; action: string }>;
+        } => {
+          if (!value || typeof value !== "object") return {};
+          if (typeof value.summary === "string") {
+            return { summary: value.summary, steps: parseSteps(value.next_steps) };
           }
-        } else {
-          parsedSummary = parsedAgent && typeof parsedAgent.summary === "string" ? parsedAgent.summary : undefined;
-          parsedSteps = Array.isArray(parsedAgent?.next_steps)
-            ? parsedAgent.next_steps
-                .map((step: any, index: number) => ({
-                  id: typeof step?.id === "string" && step.id.trim() ? step.id : String(index + 1),
-                  label: typeof step?.label === "string" ? step.label : "",
-                  recommended: Boolean(step?.recommended),
-                  action: typeof step?.action === "string" ? step.action : "",
-                }))
-                .filter((step: { label: string; action: string }) => step.label || step.action)
-            : undefined;
-        }
-        const nextText =
-          response?.final_response?.summary ||
-          parsedSummary ||
-          parsedToolNote ||
+          if (typeof value.action === "string" && value.action === "final") {
+            const nested =
+              typeof value.content === "string" ? parseAgentJson(value.content) : value.content;
+            return extractSummaryAndSteps(nested);
+          }
+          return {};
+        };
+        const extractedFromResponse = extractSummaryAndSteps(response?.final_response);
+        const extractedFromContent = extractSummaryAndSteps(parsedAgent);
+        let nextSteps =
+          extractedFromResponse.steps ||
+          extractedFromContent.steps;
+        let nextText =
+          extractedFromResponse.summary ||
+          extractedFromContent.summary ||
+          (response?.final_error ? `Agent error: ${response.final_error}` : undefined) ||
           content ||
           "No response.";
+        const extractedFromText = extractSummaryAndSteps(parseAgentJson(nextText));
+        if (extractedFromText.summary) {
+          nextText = extractedFromText.summary;
+          if (!nextSteps) {
+            nextSteps = extractedFromText.steps;
+          }
+        }
         const toolEdits = (response?.steps || [])
           .filter((step) => step.kind === "tool" && typeof step.detail === "string")
           .map((step) => step.detail);
@@ -2648,9 +2814,6 @@ export function App() {
             );
           }
         }
-        const nextSteps = Array.isArray(response?.final_response?.next_steps)
-          ? response.final_response.next_steps
-          : parsedSteps;
       setAiMessages((prev) =>
         prev.map((msg) =>
           msg.pendingId === requestId
@@ -3941,6 +4104,72 @@ export function App() {
             ) : null}
           </div>
         ) : null}
+        <Modal
+          open={showGotoDialog}
+          onClose={() => setShowGotoDialog(false)}
+          cardClassName="legacy-modal"
+          ariaLabelledBy="goto-qn-title"
+        >
+          <div className="modal-header">
+            <h3 id="goto-qn-title">Go to Qualified Name</h3>
+          </div>
+          <div className="modal-body goto-qn-body">
+            <label className="field">
+              <span className="field-label">Qualified name</span>
+              <input
+                ref={gotoInputRef}
+                value={gotoQuery}
+                onChange={(event) => setGotoQuery(event.target.value)}
+                onKeyDown={handleGotoInputKeyDown}
+                placeholder="Type a qualified name, e.g. Parts::Part"
+                autoComplete="off"
+              />
+            </label>
+            {gotoLoading ? <div className="muted">Loading semantic symbols...</div> : null}
+            {!gotoLoading && gotoError ? <div className="field-hint error">{gotoError}</div> : null}
+            {!gotoLoading && !gotoError ? (
+              <div className="goto-qn-list" role="listbox" aria-label="Qualified name matches">
+                {filteredGotoCandidates.length ? (
+                  filteredGotoCandidates.map((candidate, index) => {
+                    const selected = index === gotoSelectedIndex;
+                    return (
+                      <button
+                        key={`${candidate.qualified_name}|${candidate.file_path}`}
+                        type="button"
+                        className={`goto-qn-item ${selected ? "selected" : ""}`}
+                        onClick={() => {
+                          setGotoSelectedIndex(index);
+                          void openGotoCandidate(candidate);
+                        }}
+                        onMouseEnter={() => setGotoSelectedIndex(index)}
+                        title={candidate.file_path}
+                      >
+                        <span className="goto-qn-qualified">{candidate.qualified_name}</span>
+                        <span className="goto-qn-path">{candidate.file_path}</span>
+                      </button>
+                    );
+                  })
+                ) : (
+                  <div className="muted">No matching qualified names.</div>
+                )}
+              </div>
+            ) : null}
+          </div>
+          <div className="modal-actions">
+            <button type="button" className="ghost" onClick={() => setShowGotoDialog(false)}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                void openGotoCandidate(selectedGotoCandidate);
+              }}
+              disabled={!selectedGotoCandidate}
+            >
+              Open
+            </button>
+          </div>
+        </Modal>
           {showNewFile ? (
             <div className="modal">
               <div className="modal-card">
@@ -4584,7 +4813,22 @@ export function App() {
               }}
             >
               <span>Next steps</span>
-              <button type="button" className="ghost" onClick={() => setAiFloatingSteps([])}>x</button>
+              <button
+                type="button"
+                className="ghost"
+                onPointerDown={(event) => {
+                  event.stopPropagation();
+                }}
+                onMouseDown={(event) => {
+                  event.stopPropagation();
+                }}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setAiFloatingSteps([]);
+                }}
+              >
+                x
+              </button>
             </div>
             <div className="ai-floating-list">
               {aiFloatingSteps.map((step) => (
