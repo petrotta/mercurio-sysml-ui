@@ -13,6 +13,7 @@ type UseModelGroupsOptions = {
   rootPath: string;
   libraryPath: string | null;
   libraryFilePaths: string[];
+  projectFilePaths?: string[];
   stdlibFileCount: number;
   librarySymbolCount: number;
   dataExcludeStdlib: boolean;
@@ -24,6 +25,7 @@ export function useModelGroups({
   rootPath,
   libraryPath,
   libraryFilePaths,
+  projectFilePaths,
   stdlibFileCount,
   librarySymbolCount,
   dataExcludeStdlib,
@@ -85,14 +87,27 @@ export function useModelGroups({
   };
 
   const projectGroups = useMemo(() => {
-    return groupedSymbols.filter((group) => {
+    const grouped = groupedSymbols.filter((group) => {
       const scope = groupScope(group);
       if (scope === "project") return true;
       if (scope === "library") return false;
       if (shouldTreatAsLibrary(group.path)) return false;
       return rootPath ? isPathWithin(group.path, rootPath) : true;
-    }).sort((a, b) => a.path.localeCompare(b.path));
-  }, [groupedSymbols, rootPath, libraryPath, libraryFilePathSet]);
+    });
+    const byPath = new Map<string, { path: string; list: SymbolView[] }>();
+    grouped.forEach((entry) => {
+      byPath.set(normalizeFsPath(entry.path), entry);
+    });
+    (projectFilePaths || []).forEach((path) => {
+      const normalized = normalizeFsPath(path);
+      if (!normalized) return;
+      if (shouldTreatAsLibrary(path)) return;
+      if (!byPath.has(normalized)) {
+        byPath.set(normalized, { path, list: [] });
+      }
+    });
+    return Array.from(byPath.values()).sort((a, b) => a.path.localeCompare(b.path));
+  }, [groupedSymbols, rootPath, libraryPath, libraryFilePathSet, projectFilePaths]);
 
   const libraryGroups = useMemo(() => {
     const grouped = groupedSymbols.filter((group) => {

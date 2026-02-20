@@ -2613,6 +2613,7 @@ name = "mercurio-core"
 version = "0.1.0"
 dependencies = [
  "mercurio-symbol-index",
+ "mercurio-sysml",
  "mercurio-sysml-core",
  "mercurio-sysml-semantics",
  "mercurio-sysml-workspace",

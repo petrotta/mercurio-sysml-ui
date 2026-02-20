@@ -1,4 +1,5 @@
-﻿use mercurio_sysml_core::parser::Parser;
+use mercurio_sysml_core::parser::Parser;
+use mercurio_sysml_pkg::parse_tree_for_content;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -49,6 +50,21 @@ pub struct ParseErrorView {
 pub struct ParseErrorsPayload {
     pub path: String,
     pub errors: Vec<ParseErrorView>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ParseTreeNodeView {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub kind: String,
+    pub label: String,
+    pub start_offset: usize,
+    pub end_offset: usize,
+    pub start_line: usize,
+    pub start_col: usize,
+    pub end_line: usize,
+    pub end_col: usize,
+    pub depth: usize,
 }
 
 pub fn read_diagram(root: &Path, path: &Path) -> Result<DiagramFile, String> {
@@ -147,6 +163,29 @@ pub fn get_ast_for_content(path: &Path, content: &str) -> Result<String, String>
         }
     }
     Ok(out)
+}
+
+pub fn get_parse_tree_for_content(path: &Path, content: &str) -> Result<Vec<ParseTreeNodeView>, String> {
+    if !is_model_file(path) {
+        return Err("Parse tree is only available for .sysml or .kerml files".to_string());
+    }
+    let nodes = parse_tree_for_content(content);
+    Ok(nodes
+        .into_iter()
+        .map(|node| ParseTreeNodeView {
+            id: node.id,
+            parent_id: node.parent_id,
+            kind: node.kind,
+            label: node.label,
+            start_offset: node.start_offset,
+            end_offset: node.end_offset,
+            start_line: node.start_line,
+            start_col: node.start_col,
+            end_line: node.end_line,
+            end_col: node.end_col,
+            depth: node.depth,
+        })
+        .collect())
 }
 
 fn offset_to_line_col(text: &str, offset: usize) -> (usize, usize) {

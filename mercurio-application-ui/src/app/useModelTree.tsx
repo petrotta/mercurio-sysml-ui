@@ -27,6 +27,7 @@ type UseModelTreeOptions = {
   getKindKey: (kind: string) => string;
   showUsages: boolean;
   modelShowFiles: boolean;
+  defaultExpanded?: boolean;
   libraryLoadingFilePaths: string[];
   libraryLoadErrors: Record<string, string>;
   libraryKindFilter: string | null;
@@ -46,6 +47,7 @@ export function useModelTree({
   getKindKey,
   showUsages,
   modelShowFiles,
+  defaultExpanded = false,
   libraryLoadingFilePaths,
   libraryLoadErrors,
   libraryKindFilter,
@@ -54,7 +56,11 @@ export function useModelTree({
     const symbolQname = (symbol: SymbolView) => {
       const qualified = (symbol.qualified_name || "").trim();
       if (qualified) return qualified;
-      return (symbol.name || "").trim();
+      const name = (symbol.name || "").trim();
+      if (name) return name;
+      const line = Math.max(0, symbol.start_line || 0);
+      const col = Math.max(0, symbol.start_col || 0);
+      return `@${symbol.kind || "Node"}:${line}:${col}`;
     };
     const lastSegment = (qualified: string) => {
       const parts = qualified.split("::").filter(Boolean);
@@ -82,15 +88,62 @@ export function useModelTree({
       symbolsByQname.get(qualified)?.push(symbol);
     });
     const knownQnames = new Set(Array.from(symbolsByQname.keys()));
+    const ensureQnameNode = (qualified: string) => {
+      if (!qualified) return;
+      if (!symbolsByQname.has(qualified)) {
+        symbolsByQname.set(qualified, []);
+      }
+      knownQnames.add(qualified);
+    };
+    // Fill implicit parent containers from qualified names so hierarchy remains visible
+    // even when the parser only emits leaf nodes.
+    Array.from(knownQnames).forEach((qualified) => {
+      const parts = qualified.split("::").filter(Boolean);
+      if (parts.length <= 1) return;
+      let prefix = "";
+      for (let i = 0; i < parts.length - 1; i += 1) {
+        prefix = prefix ? `${prefix}::${parts[i]}` : parts[i];
+        ensureQnameNode(prefix);
+      }
+    });
     const parentByQname = new Map<string, string>();
     list.forEach((symbol) => {
       const owner = symbolQname(symbol);
       if (!owner) return;
       (symbol.relationships || []).forEach((rel) => {
-        if (!rel.kind?.toLowerCase().startsWith("owned")) return;
+        const relKind = (rel.kind || "").toLowerCase();
         const target = (rel.resolved_target || rel.target || "").trim();
-        if (!target || !knownQnames.has(target) || parentByQname.has(target)) return;
-        parentByQname.set(target, owner);
+        if (!target) return;
+        if (target === owner) return;
+        ensureQnameNode(target);
+        if (relKind.startsWith("owning") || relKind.includes("owning")) {
+          // owning* relationships directly encode parent of current symbol.
+          if (!parentByQname.has(owner)) {
+            parentByQname.set(owner, target);
+          }
+          return;
+        }
+        if (!relKind.startsWith("owned")) return;
+        const ownerIsNestedUnderTarget = owner.startsWith(`${target}::`);
+        const targetIsNestedUnderOwner = target.startsWith(`${owner}::`);
+        if (ownerIsNestedUnderTarget) {
+          // Relationship points to a containing owner (common in fast symbols).
+          if (!parentByQname.has(owner)) {
+            parentByQname.set(owner, target);
+          }
+          return;
+        }
+        if (targetIsNestedUnderOwner) {
+          // Relationship points to an owned element.
+          if (!parentByQname.has(target)) {
+            parentByQname.set(target, owner);
+          }
+          return;
+        }
+        // Fallback: preserve previous behavior when direction is unclear.
+        if (!parentByQname.has(target)) {
+          parentByQname.set(target, owner);
+        }
       });
     });
     Array.from(knownQnames).forEach((qualified) => {
@@ -136,7 +189,7 @@ export function useModelTree({
     };
     sortQnamesByParseOrder(Array.from(knownQnames)).forEach((qualified) => {
       const parent = parentByQname.get(qualified);
-      if (parent && knownQnames.has(parent)) return;
+      if (parent && parent !== qualified && knownQnames.has(parent)) return;
       root.children.set(qualified, buildNode(qualified, new Set<string>()));
     });
     return root;
@@ -166,10 +219,12 @@ export function useModelTree({
     const walk = (node: SymbolNode, depth: number, isTop: boolean, pathKey: string) => {
       const displayName = isTop && node.name === "root" && rootLabel ? rootLabel : node.name;
       const nodeId = `${rootKey}::${node.fullName || pathKey}`;
-      const kindLabel = Array.from(new Set(node.symbols.map((symbol) => symbol.kind).filter(Boolean))).join(" ");
+      const kindLabel =
+        Array.from(new Set(node.symbols.map((symbol) => symbol.kind).filter(Boolean))).join(" ") ||
+        (node.children.size ? "Package" : "");
       const kindKey = getKindKey(node.symbols[0]?.kind || "");
       const hasChildren = node.children.size > 0;
-      const expandedState = collapseAll ? false : expanded[nodeId] ?? false;
+      const expandedState = collapseAll ? false : expanded[nodeId] ?? defaultExpanded;
       const isVirtualRoot = node.name === "root" && node.symbols.length === 0;
       if (!isVirtualRoot) {
         rows.push({
@@ -344,6 +399,7 @@ export function useModelTree({
     libraryLoadingFilePaths,
     libraryLoadErrors,
     libraryKindFilter,
+    defaultExpanded,
   ]);
 
   return { modelRows };

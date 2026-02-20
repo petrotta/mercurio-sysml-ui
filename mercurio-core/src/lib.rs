@@ -1,8 +1,9 @@
 ﻿mod files;
 pub use files::{
     get_ast_for_content, get_ast_for_path, get_parse_errors, get_parse_errors_for_content,
+    get_parse_tree_for_content,
     read_diagram, write_diagram, DiagramFile, DiagramNode, DiagramOffset, DiagramSize,
-    ParseErrorView, ParseErrorsPayload,
+    ParseErrorView, ParseErrorsPayload, ParseTreeNodeView,
 };
 
 mod project;

@@ -53,10 +53,9 @@ import { parseErrorLocation } from "./app/parseErrors";
 import { isPathWithin } from "./app/pathUtils";
 import type {
   FileEntry,
+  ModelRow,
   OpenTab,
-  ProjectElementAttributesView,
   ProjectModelView,
-  SymbolMetatypeMappingView,
   StdlibMetamodelView,
   SymbolView,
 } from "./app/types";
@@ -312,10 +311,6 @@ export function App() {
     libraryLoadErrors,
     libraryBulkLoading,
     loadedLibraryFileCount,
-    libraryBulkTotal,
-    libraryBulkCompleted,
-    libraryBulkFailed,
-    libraryImportCount,
     libraryKindCounts,
     libraryIndexedSymbolCount,
     loadLibrarySymbolsForFile,
@@ -324,6 +319,7 @@ export function App() {
     cancelLibrarySymbolLoading,
     stdlibFileCount,
     projectSymbolsLoaded,
+    parsedFiles,
     parseErrorPaths,
     setEditorParseError,
   } = useCompileRunner({ rootPath });
@@ -340,7 +336,9 @@ export function App() {
   const [selectedNodeSymbols, setSelectedNodeSymbols] = useState<SymbolView[] | null>(null);
   const [modelTreeHeight, setModelTreeHeight] = useState(260);
   const [collapseAllModel, setCollapseAllModel] = useState(false);
+  const [rightPaneTab, setRightPaneTab] = useState<"semantic" | "file_editor">("semantic");
   const [showPropertiesPane, setShowPropertiesPane] = useState(true);
+  const [showFilePropertiesPane, setShowFilePropertiesPane] = useState(true);
   const [propertiesDock, setPropertiesDock] = useState<"bottom" | "right">(() => {
     try {
       const stored = window.localStorage?.getItem(MODEL_PROPERTIES_DOCK_KEY);
@@ -359,6 +357,8 @@ export function App() {
   });
   const [modelExpanded, setModelExpanded] = useState<Record<string, boolean>>({});
   const [modelSectionOpen, setModelSectionOpen] = useState({ project: true, library: true, errors: true });
+  const [fileModelExpanded, setFileModelExpanded] = useState<Record<string, boolean>>({});
+  const [fileModelSectionOpen, setFileModelSectionOpen] = useState({ project: true, library: false, errors: false });
   const [showOnlyModelFiles, setShowOnlyModelFiles] = useState(() => {
     try {
       return window.localStorage?.getItem(FILTER_MODEL_FILES_KEY) === "true";
@@ -375,8 +375,17 @@ export function App() {
     }
   });
   const modelTreeRef = useRef<HTMLDivElement | null>(null);
+  const fileModelTreeRef = useRef<HTMLDivElement | null>(null);
   const modelPaneContainerRef = useRef<HTMLDivElement | null>(null);
+  const rightPaneHeaderRef = useRef<HTMLDivElement | null>(null);
   const [modelPaneHeight, setModelPaneHeight] = useState(0);
+  const [rightPaneHeaderHeight, setRightPaneHeaderHeight] = useState(0);
+  const draggedFileSymbolRef = useRef<SymbolView | null>(null);
+  const [fileDropIndicator, setFileDropIndicator] = useState<{
+    key: string;
+    position: "before" | "after";
+  } | null>(null);
+  const [fileInsertMenuOpen, setFileInsertMenuOpen] = useState(false);
   const navReqRef = useRef(0);
   const pendingNavRef = useRef<{
     path: string;
@@ -384,8 +393,6 @@ export function App() {
     selection?: { startLine: number; startCol: number; endLine: number; endCol: number };
   } | null>(null);
   const lastCompiledContentRef = useRef<Record<string, string>>({});
-  const elementAttrsCacheRef = useRef<Record<string, ProjectElementAttributesView | null>>({});
-  const elementAttrsInflightRef = useRef<Record<string, Promise<ProjectElementAttributesView | null>>>({});
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
   const cursorListenerRef = useRef<null | { dispose: () => void }>(null);
@@ -432,6 +439,21 @@ export function App() {
       prev.map((tab) => (tab.id === activeTerminalTabId ? updater(tab) : tab)),
     );
   };
+  const handleRightBarTabClick = useCallback(
+    (tab: "file_editor" | "semantic") => {
+      if (!rightCollapsed && rightPaneTab === tab) {
+        rightStoredWidthRef.current = rightWidth;
+        setRightCollapsed(true);
+        return;
+      }
+      setRightPaneTab(tab);
+      if (rightCollapsed) {
+        setRightCollapsed(false);
+        setRightWidth(rightStoredWidthRef.current || 320);
+      }
+    },
+    [rightCollapsed, rightPaneTab, rightWidth],
+  );
 
   const ensureTerminalTab = () => {
     setTerminalTabs((prev) => {
@@ -548,8 +570,9 @@ export function App() {
         setModelContextMenu(null);
         setModelOptionsMenu(null);
       }
-      if (!target || !target.closest(".tab-menu")) {
+      if (!target || (!target.closest(".tab-menu") && !target.closest(".right-pane-insert"))) {
         setTabMenu(null);
+        setFileInsertMenuOpen(false);
       }
       if (!target || !target.closest(".tab-overflow")) {
         setTabOverflowOpen(false);
@@ -673,12 +696,6 @@ export function App() {
   useEffect(() => {
     window.localStorage?.setItem(MODEL_PROPERTIES_DOCK_KEY, propertiesDock);
   }, [propertiesDock]);
-
-  useEffect(() => {
-    elementAttrsCacheRef.current = {};
-    elementAttrsInflightRef.current = {};
-  }, [rootPath, symbols]);
-
 
   useEffect(() => {
     if (selectedChatEndpoint) {
@@ -878,10 +895,6 @@ export function App() {
     await loadProjectModel();
   };
 
-  const reloadStdlibMetamodel = useCallback(() => {
-    void loadStdlibMetamodel();
-  }, [loadStdlibMetamodel]);
-
   useEffect(() => {
     const onMove = (event: PointerEvent) => {
       if (!draggingRef.current) return;
@@ -995,6 +1008,17 @@ export function App() {
     observer.observe(modelPaneContainerRef.current);
     return () => observer.disconnect();
   }, [rightCollapsed]);
+
+  useEffect(() => {
+    if (!rightPaneHeaderRef.current) return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      setRightPaneHeaderHeight(Math.round(entry.contentRect.height));
+    });
+    observer.observe(rightPaneHeaderRef.current);
+    return () => observer.disconnect();
+  }, [rightPaneTab, rightCollapsed]);
 
 
   const startDrag = (side: "left" | "right" | "model" | "modelProps", event: React.PointerEvent) => {
@@ -1200,138 +1224,6 @@ export function App() {
     setAstViewTitle(label);
     setAstViewOpen(true);
     await loadAstViewForPath(filePath);
-  };
-
-  const loadElementAttributes = async (symbol: SymbolView): Promise<ProjectElementAttributesView | null> => {
-    if (!rootPath || !symbol.qualified_name) return null;
-    const cacheKey = `${rootPath}::${symbol.qualified_name}::${symbol.kind || ""}`;
-    if (cacheKey in elementAttrsCacheRef.current) {
-      return elementAttrsCacheRef.current[cacheKey];
-    }
-    const inflight = elementAttrsInflightRef.current[cacheKey];
-    if (inflight) {
-      return inflight;
-    }
-    const request = (async () => {
-      try {
-        const data = await invoke<ProjectElementAttributesView>("get_project_element_attributes", {
-          root: rootPath,
-          elementQualifiedName: symbol.qualified_name,
-          symbolKind: symbol.kind || null,
-        });
-        if (data.metatype_qname && data.metatype_qname.trim()) {
-          elementAttrsCacheRef.current[cacheKey] = data;
-          return data;
-        }
-        try {
-          const mapping = await invoke<SymbolMetatypeMappingView | null>(
-            "query_index_symbol_metatype_mapping",
-            {
-              root: rootPath,
-              symbolQualifiedName: symbol.qualified_name,
-              filePath: symbol.file_path || null,
-            },
-          );
-          if (mapping?.resolved_metatype_qname && mapping.resolved_metatype_qname.trim()) {
-            const enriched: ProjectElementAttributesView = {
-              ...data,
-              metatype_qname: mapping.resolved_metatype_qname,
-              diagnostics: [
-                ...data.diagnostics,
-                `Metatype resolved via symbol index mapping (${mapping.mapping_source}, confidence=${mapping.confidence.toFixed(2)}).`,
-              ],
-            };
-            elementAttrsCacheRef.current[cacheKey] = enriched;
-            return enriched;
-          }
-        } catch {
-          // Ignore mapping lookup failure and fall through to original payload.
-        }
-        elementAttrsCacheRef.current[cacheKey] = data;
-        return data;
-      } catch {
-        return null;
-      } finally {
-        delete elementAttrsInflightRef.current[cacheKey];
-      }
-    })();
-    elementAttrsInflightRef.current[cacheKey] = request;
-    try {
-      return await request;
-    } catch {
-      return null;
-    }
-  };
-
-  const openAttributeInProjectModel = (
-    symbol: SymbolView,
-    attrQualifiedName: string,
-    attrName: string,
-  ) => {
-    setProjectModelFocusQuery(attrQualifiedName || `${symbol.qualified_name}::${attrName}`);
-    openProjectModelViewTab();
-  };
-
-  const openAttributeSourceText = async (
-    symbol: SymbolView,
-    attrQualifiedName: string,
-    attrName: string,
-  ) => {
-    if (!rootPath) return;
-    type SemanticQueryPayload = {
-      metatype?: string | null;
-      metatype_is_a?: string | null;
-      predicates: Array<{ name: string; equals: string }>;
-    };
-    type SemanticElementResult = {
-      file_path: string;
-      start_line: number;
-      start_col: number;
-      end_line: number;
-      end_col: number;
-    };
-    try {
-      const query: SemanticQueryPayload = {
-        metatype: null,
-        metatype_is_a: null,
-        predicates: [
-          {
-            name: "qualified_name",
-            equals: attrQualifiedName,
-          },
-        ],
-      };
-      const matches = await invoke<SemanticElementResult[]>("query_semantic", {
-        root: rootPath,
-        query,
-      });
-      const first = Array.isArray(matches) && matches.length ? matches[0] : null;
-      if (first?.file_path) {
-        await navigateTo({
-          path: first.file_path,
-          name: first.file_path.split(/[\\/]/).pop() || attrName || "Attribute",
-          selection: {
-            startLine: first.start_line,
-            startCol: first.start_col,
-            endLine: first.end_line,
-            endCol: first.end_col,
-          },
-        });
-        return;
-      }
-    } catch {
-      // Fall back to opening the owning symbol when attribute lookup fails.
-    }
-    await navigateTo({
-      path: symbol.file_path,
-      name: symbol.file_path.split(/[\\/]/).pop() || symbol.name || "Source",
-      selection: {
-        startLine: symbol.start_line,
-        startCol: symbol.start_col,
-        endLine: symbol.end_line,
-        endCol: symbol.end_col,
-      },
-    });
   };
 
   const handleContextAction = async (action: string) => {
@@ -2056,6 +1948,48 @@ export function App() {
     });
   };
 
+  const openQualifiedNameInSource = useCallback(
+    async (qualifiedName: string) => {
+      const qname = qualifiedName.trim();
+      if (!qname) return;
+      if (!rootPath) {
+        setCompileStatus("Open a project folder first.");
+        return;
+      }
+      type SemanticQueryPayload = {
+        metatype?: string | null;
+        metatype_is_a?: string | null;
+        predicates: Array<{ name: string; equals: string }>;
+      };
+      type SemanticElementResult = {
+        file_path: string;
+      };
+      try {
+        const query: SemanticQueryPayload = {
+          metatype: null,
+          metatype_is_a: null,
+          predicates: [{ name: "qualified_name", equals: qname }],
+        };
+        const matches = await invoke<SemanticElementResult[]>("query_semantic", {
+          root: rootPath,
+          query,
+        });
+        const first = Array.isArray(matches) ? matches.find((item) => item?.file_path) || null : null;
+        if (!first?.file_path) {
+          setCompileStatus(`No source found for ${qname}`);
+          return;
+        }
+        await navigateTo({
+          path: first.file_path,
+          name: first.file_path.split(/[\\/]/).pop() || qname,
+        });
+      } catch (error) {
+        setCompileStatus(`Lookup failed for ${qname}: ${String(error)}`);
+      }
+    },
+    [navigateTo, rootPath, setCompileStatus],
+  );
+
   const evaluateTerminalExpression = async (rawExpr: string): Promise<string> => {
     if (!rawExpr.trim()) return "Error = missing expression";
     if (!rootPath) return "Error = no project root selected";
@@ -2776,6 +2710,31 @@ export function App() {
 
   const deferredSymbols = useDeferredValue(symbols);
   const deferredUnresolved = useDeferredValue(unresolved);
+  const projectTreeSymbols = useMemo(() => deferredSymbols, [deferredSymbols]);
+  const normalizeModelPath = useCallback((value: string | null | undefined) => {
+    return (value || "").replace(/\//g, "\\").toLowerCase();
+  }, []);
+  const activeFileTreeSymbols = useMemo(() => {
+    const activeKey = normalizeModelPath(activeEditorPath);
+    if (!activeKey) return [] as SymbolView[];
+    return deferredSymbols.filter(
+      (symbol) =>
+        symbol.source_scope !== "library" &&
+        normalizeModelPath(symbol.file_path) === activeKey,
+    );
+  }, [deferredSymbols, activeEditorPath, normalizeModelPath]);
+  const activeFileUnresolved = useMemo(() => {
+    const activeKey = normalizeModelPath(activeEditorPath);
+    if (!activeKey) return [];
+    return deferredUnresolved.filter((issue) => normalizeModelPath(issue.file_path) === activeKey);
+  }, [deferredUnresolved, activeEditorPath, normalizeModelPath]);
+
+  useEffect(() => {
+    if (rightPaneTab !== "file_editor") {
+      setFileInsertMenuOpen(false);
+      setFileDropIndicator(null);
+    }
+  }, [rightPaneTab]);
 
   useEffect(() => {
     if (!selectedSymbol) return;
@@ -2801,11 +2760,12 @@ export function App() {
     dataViewSymbols,
     dataViewSymbolKindCounts,
   } = useModelGroups({
-    deferredSymbols,
+    deferredSymbols: projectTreeSymbols,
     deferredUnresolved,
     rootPath,
     libraryPath,
     libraryFilePaths: libraryFiles,
+    projectFilePaths: parsedFiles,
     stdlibFileCount,
     librarySymbolCount: libraryIndexedSymbolCount,
     dataExcludeStdlib,
@@ -2825,22 +2785,73 @@ export function App() {
     getKindKey,
     showUsages: showUsageNodes,
     modelShowFiles,
+    defaultExpanded: false,
     libraryLoadingFilePaths: libraryLoadingFiles,
     libraryLoadErrors,
     libraryKindFilter,
   });
+
+  const {
+    projectGroups: fileProjectGroups,
+    libraryGroups: fileLibraryGroups,
+    projectCounts: fileProjectCounts,
+    libraryCounts: fileLibraryCounts,
+    errorCounts: fileErrorCounts,
+  } = useModelGroups({
+    deferredSymbols: activeFileTreeSymbols,
+    deferredUnresolved: activeFileUnresolved,
+    rootPath,
+    libraryPath: null,
+    libraryFilePaths: [],
+    stdlibFileCount: 0,
+    librarySymbolCount: 0,
+    dataExcludeStdlib: true,
+  });
+
+  const { modelRows: fileModelRows } = useModelTree({
+    projectGroups: fileProjectGroups,
+    libraryGroups: [],
+    deferredUnresolved: activeFileUnresolved,
+    modelExpanded: fileModelExpanded,
+    collapseAllModel,
+    modelSectionOpen: fileModelSectionOpen,
+    projectCounts: fileProjectCounts,
+    libraryCounts: fileLibraryCounts,
+    errorCounts: fileErrorCounts,
+    projectSymbolsLoaded: !!activeEditorPath,
+    getKindKey,
+    showUsages: true,
+    modelShowFiles: false,
+    defaultExpanded: true,
+    libraryLoadingFilePaths: [],
+    libraryLoadErrors: {},
+    libraryKindFilter: null,
+  });
+  const fileEditorModelRows = useMemo<ModelRow[]>(() => {
+    const symbolRows = fileModelRows.filter((row) => row.type === "symbol");
+    if (symbolRows.length) return symbolRows;
+    return [
+      {
+        type: "empty",
+        key: "empty-file-editor",
+        text: activeEditorPath ? "No symbols in current file." : "No active file.",
+      },
+    ];
+  }, [fileModelRows, activeEditorPath]);
   const pendingLibraryFiles = Math.max(0, libraryFiles.length - loadedLibraryFileCount);
   const failedLibraryFiles = Object.keys(libraryLoadErrors).length;
-  const libraryStatusLabel = libraryBulkLoading
-    ? `Library ${libraryBulkCompleted}/${libraryBulkTotal || pendingLibraryFiles} loading${libraryBulkFailed ? ` (${libraryBulkFailed} failed)` : ""}`
-    : `Library ${loadedLibraryFileCount}/${libraryFiles.length} loaded | ${libraryIndexedSymbolCount} symbols${failedLibraryFiles ? ` (${failedLibraryFiles} failed)` : ""}${libraryImportCount ? ` | imports ${libraryImportCount}` : ""}${libraryKindFilter ? ` | filter ${libraryKindFilter}` : ""}`;
 
-  const undockedTreeHeight = Math.max(
-    modelTreeHeight,
-    modelPaneHeight > 0 ? modelPaneHeight - 44 : modelTreeHeight,
-  );
-  const effectiveModelTreeHeight =
-    showPropertiesPane && propertiesDock === "bottom" ? modelTreeHeight : undockedTreeHeight;
+  const paneGap = 10;
+  const availableModelPaneHeight =
+    modelPaneHeight > 0 ? Math.max(120, modelPaneHeight - rightPaneHeaderHeight - paneGap) : modelTreeHeight;
+  const semanticTreeHeight =
+    showPropertiesPane && propertiesDock === "bottom"
+      ? modelTreeHeight
+      : Math.max(modelTreeHeight, availableModelPaneHeight);
+  const fileTreeHeight = showFilePropertiesPane
+    ? Math.min(modelTreeHeight, availableModelPaneHeight)
+    : availableModelPaneHeight;
+  const effectiveModelTreeHeight = rightPaneTab === "file_editor" ? fileTreeHeight : semanticTreeHeight;
 
   const {
     modelListRef,
@@ -2867,6 +2878,31 @@ export function App() {
     },
     projectGroups,
     libraryGroups,
+  });
+
+  const {
+    modelListRef: fileModelListRef,
+    modelSectionIndent: fileModelSectionIndent,
+    modelListHeight: fileModelListHeight,
+    modelCursorIndex: fileModelCursorIndex,
+    setModelCursorIndex: setFileModelCursorIndex,
+    findSelectedSymbolIndex: findSelectedFileSymbolIndex,
+    syncModelTreeToSymbol: syncFileModelTreeToSymbol,
+    handleModelTreeKeyDown: handleFileModelTreeKeyDown,
+    getModelRowHeight: getFileModelRowHeight,
+  } = useModelTreeSelection({
+    modelRows: fileEditorModelRows,
+    modelTreeHeight: effectiveModelTreeHeight,
+    setModelSectionOpen: setFileModelSectionOpen,
+    setModelExpanded: setFileModelExpanded,
+    selectedSymbol,
+    setSelectedSymbol,
+    setSelectedNodeSymbols,
+    selectSymbolInEditor,
+    navigateTo,
+    onRequestLibraryFileSymbols: () => {},
+    projectGroups: fileProjectGroups,
+    libraryGroups: fileLibraryGroups,
   });
 
   const {
@@ -2911,9 +2947,123 @@ export function App() {
     onTrack: (symbol) => {
       setSelectedSymbol(symbol);
       setSelectedNodeSymbols([symbol]);
-      syncModelTreeToSymbol(symbol);
+      if (rightPaneTab === "file_editor") {
+        syncFileModelTreeToSymbol(symbol);
+      } else {
+        syncModelTreeToSymbol(symbol);
+      }
     },
   });
+
+  const insertSnippetIntoActiveFile = useCallback((snippet: string) => {
+    const editor = editorRef.current;
+    const monaco = monacoRef.current;
+    if (!editor || !monaco || !activeEditorPath) return;
+    const activeKey = normalizeModelPath(activeEditorPath);
+    const anchor =
+      selectedSymbol && normalizeModelPath(selectedSymbol.file_path) === activeKey
+        ? selectedSymbol
+        : null;
+    const selection = anchor
+      ? new monaco.Range(
+          Math.max(1, (anchor.end_line || 0) + 1),
+          1,
+          Math.max(1, (anchor.end_line || 0) + 1),
+          1,
+        )
+      : editor.getSelection();
+    if (!selection) return;
+    editor.executeEdits("file-tree-insert", [
+      {
+        range: selection,
+        text: snippet,
+        forceMoveMarkers: true,
+      },
+    ]);
+    editor.focus();
+    setCompileStatus("File tree: inserted snippet");
+    setFileInsertMenuOpen(false);
+  }, [activeEditorPath, normalizeModelPath, selectedSymbol, setCompileStatus]);
+
+  const reorderActiveFileSymbol = useCallback((
+    source: SymbolView,
+    target: SymbolView,
+    position: "before" | "after",
+  ) => {
+    const editor = editorRef.current;
+    if (!editor || !activeEditorPath) return;
+    if (normalizeModelPath(source.file_path) !== normalizeModelPath(activeEditorPath)) return;
+    if (normalizeModelPath(target.file_path) !== normalizeModelPath(activeEditorPath)) return;
+    if ((source.qualified_name || source.name) === (target.qualified_name || target.name)) return;
+    const model = editor.getModel();
+    if (!model) return;
+    const text = model.getValue();
+    const lines = text.split(/\r?\n/);
+    const toLineIndex = (line: number | undefined) => Math.max(0, (line || 1) - 1);
+    const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const findAnchorLine = (symbol: SymbolView) => {
+      const name = (symbol.name || "").trim();
+      const preferred = toLineIndex(symbol.start_line);
+      if (preferred < lines.length) {
+        if (!name || lines[preferred]?.includes(name)) return preferred;
+      }
+      if (name) {
+        const pattern = new RegExp(`\\b${escapeRegExp(name)}\\b`);
+        const hit = lines.findIndex((line) => pattern.test(line));
+        if (hit >= 0) return hit;
+      }
+      return preferred;
+    };
+    const expandRangeEnd = (start: number, fallbackEnd: number) => {
+      let end = Math.max(start, fallbackEnd);
+      let depth = 0;
+      let seenOpen = false;
+      for (let i = start; i < lines.length; i += 1) {
+        const current = lines[i] || "";
+        const opens = (current.match(/{/g) || []).length;
+        const closes = (current.match(/}/g) || []).length;
+        if (opens > 0) seenOpen = true;
+        depth += opens - closes;
+        end = i;
+        if (seenOpen && depth <= 0) {
+          break;
+        }
+        if (!seenOpen && i > start && current.trim() === "") {
+          end = i - 1;
+          break;
+        }
+      }
+      return Math.max(start, end);
+    };
+    const start = findAnchorLine(source);
+    const fallbackEnd = Math.max(start, toLineIndex(source.end_line || source.start_line));
+    const end = expandRangeEnd(start, fallbackEnd);
+    const targetStart = findAnchorLine(target);
+    if (start >= lines.length || targetStart >= lines.length) return;
+    const sliceEnd = Math.min(lines.length, end + 1);
+    const moving = lines.slice(start, sliceEnd);
+    if (!moving.length) return;
+    const remaining = [...lines.slice(0, start), ...lines.slice(sliceEnd)];
+    let insertAt = targetStart + (position === "after" ? 1 : 0);
+    if (targetStart > start) {
+      insertAt = Math.max(0, targetStart - (sliceEnd - start));
+      if (position === "after") {
+        insertAt = Math.min(remaining.length, insertAt + 1);
+      }
+    }
+    insertAt = Math.min(insertAt, remaining.length);
+    const updated = [...remaining.slice(0, insertAt), ...moving, ...remaining.slice(insertAt)].join("\n");
+    editor.executeEdits("file-tree-reorder", [
+      {
+        range: model.getFullModelRange(),
+        text: updated,
+        forceMoveMarkers: true,
+      },
+    ]);
+    editor.pushUndoStop();
+    setCompileStatus("File tree: reordered symbol block");
+    setFileDropIndicator(null);
+  }, [activeEditorPath, normalizeModelPath, setCompileStatus]);
 
   const renderModelRow = useMemo(
     () =>
@@ -2939,6 +3089,7 @@ export function App() {
         onRetryLibraryFileSymbols: (filePath) => {
           void loadLibrarySymbolsForFile(filePath);
         },
+        openOnClick: false,
       }),
     [
       modelCursorIndex,
@@ -2956,6 +3107,62 @@ export function App() {
     ],
   );
 
+  const renderFileModelRow = useMemo(
+    () =>
+      createModelRowRenderer({
+        modelCursorIndex: fileModelCursorIndex,
+        modelSectionOpen: fileModelSectionOpen,
+        modelSectionIndent: fileModelSectionIndent,
+        modelTreeRef: fileModelTreeRef,
+        handleModelTreeKeyDown: handleFileModelTreeKeyDown,
+        onModelContextMenu: showModelContext,
+        setModelCursorIndex: setFileModelCursorIndex,
+        setModelSectionOpen: setFileModelSectionOpen,
+        setModelExpanded: setFileModelExpanded,
+        selectedSymbol,
+        setSelectedSymbol,
+        setSelectedNodeSymbols,
+        selectSymbolInEditor,
+        navigateTo,
+        renderTypeIcon,
+        onRequestLibraryFileSymbols: () => {},
+        onRetryLibraryFileSymbols: () => {},
+        openOnClick: true,
+        onDragStartSymbol: (symbol) => {
+          draggedFileSymbolRef.current = symbol;
+        },
+        setDropIndicator: (key, position) => {
+          if (!key || !position) {
+            setFileDropIndicator(null);
+            return;
+          }
+          setFileDropIndicator({ key, position });
+        },
+        isDropIndicator: (key, position) =>
+          fileDropIndicator?.key === key && fileDropIndicator?.position === position,
+        getDraggedSymbol: () => draggedFileSymbolRef.current,
+        onDropSymbolOnSymbol: (source, target, position) => {
+          reorderActiveFileSymbol(source, target, position);
+          draggedFileSymbolRef.current = null;
+        },
+      }),
+    [
+      fileModelCursorIndex,
+      fileModelSectionOpen,
+      fileModelSectionIndent,
+      handleFileModelTreeKeyDown,
+      showModelContext,
+      selectedSymbol,
+      setSelectedSymbol,
+      setSelectedNodeSymbols,
+      selectSymbolInEditor,
+      navigateTo,
+      renderTypeIcon,
+      fileDropIndicator,
+      reorderActiveFileSymbol,
+    ],
+  );
+
     return (
       <div
         className="app-shell"
@@ -2963,7 +3170,7 @@ export function App() {
           ["--left-width" as string]: `${leftCollapsed ? 0 : leftWidth}px`,
           ["--right-width" as string]: `${rightCollapsed ? 0 : rightWidth}px`,
           ["--split-left-width" as string]: `${leftCollapsed ? 16 : 6}px`,
-          ["--split-right-width" as string]: `${rightCollapsed ? 16 : 6}px`,
+          ["--split-right-width" as string]: "0px",
         }}
       >
       <header className="titlebar" data-tauri-drag-region>
@@ -3120,7 +3327,7 @@ export function App() {
             </button>
         </div>
       </header>
-      <main className="content">
+      <main className={`content ${rightCollapsed ? "right-collapsed" : "right-open"}`}>
           {leftCollapsed ? <div className="panel-spacer" /> : (
             <section className="panel sidebar">
               <div className="project-actions inline">
@@ -3414,58 +3621,117 @@ export function App() {
           </EditorPane>
           <>
           <div
-            className={`splitter ${rightCollapsed ? "collapsed" : ""}`}
-            onPointerDown={rightCollapsed ? undefined : (event) => startDrag("right", event)}
+            className={`splitter right-side-bar ${rightCollapsed ? "collapsed" : ""}`}
           >
-            {rightCollapsed ? (
+            <div
+              className="right-side-handle"
+              onPointerDown={rightCollapsed ? undefined : (event) => startDrag("right", event)}
+              title={rightCollapsed ? "Model pane collapsed" : "Resize model pane"}
+            />
+            <div className="right-side-buttons">
               <button
                 type="button"
-                className="splitter-toggle"
-                onClick={() => {
-                  setRightCollapsed(false);
-                  setRightWidth(rightStoredWidthRef.current || 320);
-                }}
-                title="Restore model pane"
+                className={`side-tool-btn ${rightPaneTab === "file_editor" ? "active" : ""}`}
+                onClick={() => handleRightBarTabClick("file_editor")}
+                title={rightCollapsed ? "Open File View" : "Toggle File View"}
+                aria-label={rightCollapsed ? "Open File View" : "Toggle File View"}
               >
-                {"<<"}
+                <span className="side-tool-icon side-tool-icon-file" aria-hidden="true" />
               </button>
-            ) : null}
+              <button
+                type="button"
+                className={`side-tool-btn ${rightPaneTab === "semantic" ? "active" : ""}`}
+                onClick={() => handleRightBarTabClick("semantic")}
+                title={rightCollapsed ? "Open Project View" : "Toggle Project View"}
+                aria-label={rightCollapsed ? "Open Project View" : "Toggle Project View"}
+              >
+                <span className="side-tool-icon side-tool-icon-project" aria-hidden="true" />
+              </button>
+            </div>
           </div>
           {rightCollapsed ? null : (
-            <section className="panel sidebar" ref={modelPaneContainerRef}>
-              <div className="panel-header">
-              <ModelHeader
-                collapseAll={collapseAllModel}
-                libraryStatus={libraryStatusLabel}
-                onCollapseAll={() => setCollapseAllModel(true)}
-                onExpandAll={() => setCollapseAllModel(false)}
-                onOpenOptions={showModelOptions}
+            <section className="panel sidebar right-pane" ref={modelPaneContainerRef}>
+              <div
+                className="right-pane-resizer"
+                onPointerDown={(event) => startDrag("right", event)}
+                title="Resize model pane"
               />
-              <button
-                type="button"
-                className="ghost collapse-btn"
-                onClick={() => {
-                  rightStoredWidthRef.current = rightWidth;
-                  setRightCollapsed(true);
-                }}
-                title="Collapse model pane"
-              >
-                {">>"}
-              </button>
+              <div className="panel-header" ref={rightPaneHeaderRef}>
+              {rightPaneTab === "file_editor" ? (
+                <div className="right-pane-toolbar">
+                  <span className="muted">
+                    {activeEditorPath ? activeEditorPath.split(/[\\/]/).pop() : "No active file"}
+                  </span>
+                  <div className="right-pane-actions">
+                    <button
+                      type="button"
+                      className={`ghost icon-properties ${showFilePropertiesPane ? "active" : ""}`}
+                      onClick={() => setShowFilePropertiesPane((prev) => !prev)}
+                      title={showFilePropertiesPane ? "Hide Properties" : "Show Properties"}
+                      aria-label={showFilePropertiesPane ? "Hide Properties" : "Show Properties"}
+                    >
+                    </button>
+                    <div className="right-pane-insert">
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={() => setFileInsertMenuOpen((prev) => !prev)}
+                        title="Insert into active file"
+                        disabled={!activeEditorPath}
+                      >
+                        +
+                      </button>
+                      {fileInsertMenuOpen ? (
+                        <div className="context-menu tab-menu" style={{ right: 0, top: 28, left: "auto" }}>
+                          <button type="button" onClick={() => insertSnippetIntoActiveFile("\npart def NewPart {\n}\n")}>
+                            Insert Part Def
+                          </button>
+                          <button type="button" onClick={() => insertSnippetIntoActiveFile("\naction def NewAction {\n}\n")}>
+                            Insert Action Def
+                          </button>
+                          <button type="button" onClick={() => insertSnippetIntoActiveFile("\nattribute def NewAttribute;\n")}>
+                            Insert Attribute Def
+                          </button>
+                          <button type="button" onClick={() => insertSnippetIntoActiveFile("\nimport Kernel::*;\n")}>
+                            Insert Import
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="right-pane-toolbar">
+                  <ModelHeader
+                    collapseAll={collapseAllModel}
+                    libraryStatus={`Library ${loadedLibraryFileCount}/${libraryFiles.length} | ${libraryIndexedSymbolCount} sym`}
+                    onCollapseAll={() => setCollapseAllModel(true)}
+                    onExpandAll={() => setCollapseAllModel(false)}
+                    onOpenOptions={showModelOptions}
+                  />
+                  <span className="muted">Semantic</span>
+                </div>
+              )}              
             </div>
             <ModelPane
               modelTreeHeight={effectiveModelTreeHeight}
-              showPropertiesPane={showPropertiesPane}
-              propertiesDock={propertiesDock}
+              showPropertiesPane={rightPaneTab === "file_editor" ? showFilePropertiesPane : showPropertiesPane}
+              propertiesDock={rightPaneTab === "file_editor" ? "bottom" : propertiesDock}
               modelPropertiesWidth={modelPropertiesWidth}
-              modelTreeRef={modelTreeRef}
-              modelListRef={modelListRef}
-              modelRows={modelRows}
-              modelListHeight={modelListHeight}
-              getModelRowHeight={getModelRowHeight}
-              renderModelRow={renderModelRow}
-              handleModelTreeKeyDown={handleModelTreeKeyDown}
+              modelTreeRef={rightPaneTab === "file_editor" ? fileModelTreeRef : modelTreeRef}
+              modelListRef={rightPaneTab === "file_editor" ? fileModelListRef : modelListRef}
+              modelRows={rightPaneTab === "file_editor" ? fileEditorModelRows : modelRows}
+              modelListHeight={rightPaneTab === "file_editor" ? fileModelListHeight : modelListHeight}
+              getModelRowHeight={rightPaneTab === "file_editor" ? getFileModelRowHeight : getModelRowHeight}
+              renderModelRow={rightPaneTab === "file_editor" ? renderFileModelRow : renderModelRow}
+              handleModelTreeKeyDown={rightPaneTab === "file_editor" ? handleFileModelTreeKeyDown : handleModelTreeKeyDown}
               onModelTreeFocus={() => {
+                if (rightPaneTab === "file_editor") {
+                  if (fileModelCursorIndex != null || !fileEditorModelRows.length) return;
+                  const selectedIndex = findSelectedFileSymbolIndex();
+                  setFileModelCursorIndex(selectedIndex >= 0 ? selectedIndex : 0);
+                  return;
+                }
                 if (modelCursorIndex != null || !modelRows.length) return;
                 const selectedIndex = findSelectedSymbolIndex();
                 setModelCursorIndex(selectedIndex >= 0 ? selectedIndex : 0);
@@ -3482,18 +3748,7 @@ export function App() {
                 setProjectModelFocusQuery(symbol.qualified_name || symbol.name || symbol.kind);
                 openProjectModelViewTab();
               }}
-              onOpenMetatypeInProjectModel={(metatypeQname) => {
-                if (!metatypeQname) return;
-                setProjectModelFocusQuery(metatypeQname);
-                openProjectModelViewTab();
-              }}
-              onOpenAttributeInProjectModel={openAttributeInProjectModel}
-              onOpenAttributeSourceText={openAttributeSourceText}
-              loadElementAttributes={loadElementAttributes}
-              stdlibMetamodel={stdlibMetamodel}
-              stdlibMetamodelLoading={stdlibMetamodelLoadingState}
-              stdlibMetamodelError={stdlibMetamodelErrorState}
-              onReloadStdlibMetamodel={reloadStdlibMetamodel}
+              onOpenQualifiedNameInSource={openQualifiedNameInSource}
             />
             </section>
           )}
@@ -4394,6 +4649,7 @@ export function App() {
             {cursorPos && activeEditorPath ? (
               <span className="status-cursor">Ln {cursorPos.line}, Col {cursorPos.col}</span>
             ) : null}
+            <span className="muted">Active: Semantic</span>
             <span
               className={`status-compile-indicator ${backgroundCompileActive ? "active" : ""} ${backgroundCompileEnabled ? "" : "disabled"}`}
               title={backgroundCompileEnabled ? "Background compile enabled (right-click to disable)" : "Background compile disabled (right-click to enable)"}

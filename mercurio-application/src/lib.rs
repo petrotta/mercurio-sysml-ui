@@ -34,6 +34,7 @@ use mercurio_core::{
     export_model_to_path as core_export_model_to_path,
     get_ast_for_content as core_get_ast_for_content,
     get_ast_for_path as core_get_ast_for_path,
+    get_parse_tree_for_content as core_get_parse_tree_for_content,
     get_parse_errors_for_content as core_get_parse_errors_for_content,
     get_project_descriptor_view,
     query_library_symbols as core_query_library_symbols,
@@ -55,6 +56,7 @@ use mercurio_core::{
     LibraryConfig,
     MercurioPaths,
     ParseErrorsPayload,
+    ParseTreeNodeView,
     ProjectConfig,
     ProjectDescriptor,
     ProjectDescriptorView,
@@ -326,6 +328,12 @@ fn get_ast_for_path(path: String) -> Result<String, String> {
 fn get_ast_for_content(path: String, content: String) -> Result<String, String> {
     let file_path = PathBuf::from(&path);
     core_get_ast_for_content(&file_path, &content)
+}
+
+#[tauri::command]
+fn get_parse_tree_for_content(path: String, content: String) -> Result<Vec<ParseTreeNodeView>, String> {
+    let file_path = PathBuf::from(&path);
+    core_get_parse_tree_for_content(&file_path, &content)
 }
 
 #[tauri::command]
@@ -946,6 +954,7 @@ pub fn run() {
             get_parse_errors_for_content,
             get_ast_for_path,
             get_ast_for_content,
+            get_parse_tree_for_content,
             eval_expression,
             get_project_descriptor,
             create_project_descriptor,

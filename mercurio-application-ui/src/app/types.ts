@@ -70,6 +70,20 @@ export type SymbolView = {
   relationships?: SymbolRelationship[];
 };
 
+export type ParseTreeNodeView = {
+  id: string;
+  parent_id?: string | null;
+  kind: string;
+  label: string;
+  start_offset: number;
+  end_offset: number;
+  start_line: number;
+  start_col: number;
+  end_line: number;
+  end_col: number;
+  depth: number;
+};
+
 export type UnresolvedIssue = {
   file_path: string;
   message: string;

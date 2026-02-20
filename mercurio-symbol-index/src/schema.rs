@@ -18,7 +18,7 @@ CREATE TABLE IF NOT EXISTS symbols (
 
 CREATE INDEX IF NOT EXISTS idx_symbols_project_scope
   ON symbols(project_root, scope);
-
+    
 CREATE INDEX IF NOT EXISTS idx_symbols_metatype
   ON symbols(project_root, metatype_qname);
 
