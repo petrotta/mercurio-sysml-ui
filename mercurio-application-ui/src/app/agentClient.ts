@@ -20,6 +20,33 @@ export type AgentResponse = {
   final_error?: string | null;
 };
 
+export type ToolDefinition = {
+  name: string;
+  description: string;
+  input_schema: unknown;
+  read_only: boolean;
+};
+
+export type ToolCallResponse = {
+  ok: boolean;
+  result?: unknown;
+  error?: string | null;
+};
+
+export const listTools = async () => {
+  return invoke<ToolDefinition[]>("list_tools");
+};
+
+export const callTool = async <T = unknown>(tool: string, args: Record<string, unknown>) => {
+  const response = await invoke<ToolCallResponse>("call_tool", {
+    payload: { tool, args },
+  });
+  if (!response?.ok) {
+    throw new Error(response?.error || `Tool call failed: ${tool}`);
+  }
+  return (response.result as T) ?? (null as T);
+};
+
 export const runAgent = async (request: AgentRequest) => {
   return invoke<AgentResponse>("ai_agent_run", {
     payload: {

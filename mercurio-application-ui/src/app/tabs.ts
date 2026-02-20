@@ -12,6 +12,7 @@ export function makeDiagramTabName(filePath: string): string {
 export function getTabIcon(tab: OpenTab): string {
   if (tab.kind === "ai") return "AI";
   if (tab.kind === "data") return "DT";
+  if (tab.kind === "project-model") return "PM";
   if (tab.kind === "diagram") return "DG";
   if (tab.kind === "descriptor") return "PD";
   const ext = tab.path.split(".").pop()?.toLowerCase() || "";
@@ -23,7 +24,13 @@ export function getTabIcon(tab: OpenTab): string {
 }
 
 export function getTabKindClass(tab: OpenTab): string {
-  if (tab.kind === "ai" || tab.kind === "data" || tab.kind === "diagram" || tab.kind === "descriptor") {
+  if (
+    tab.kind === "ai" ||
+    tab.kind === "data" ||
+    tab.kind === "project-model" ||
+    tab.kind === "diagram" ||
+    tab.kind === "descriptor"
+  ) {
     return tab.kind;
   }
   const ext = tab.path.split(".").pop()?.toLowerCase() || "";

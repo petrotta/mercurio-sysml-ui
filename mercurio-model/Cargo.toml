@@ -1,9 +1,0 @@
-[package]
-name = "mercurio-model"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-salsa = "0.18"
-serde = { version = "1", features = ["derive"] }
-syster = { package = "syster-base", path = "C:\\dev\\git\\sysml\\syster-base" }

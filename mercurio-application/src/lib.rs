@@ -17,36 +17,55 @@ mod agent;
 // Re-exported Tauri commands from focused modules.
 use commands::{
     ai_agent_run, ai_test_endpoint, create_dir, create_file, detect_git_repo, get_user_projects_root,
+    get_project_element_attributes, get_project_model, query_semantic, query_semantic_symbols,
+    get_default_stdlib, get_stdlib_metamodel,
     git_checkout_branch, git_commit, git_create_branch, git_list_branches, git_push, git_stage_paths,
     git_status, git_unstage_paths, list_dir, list_stdlib_versions, open_in_explorer, path_exists,
     read_diagram, read_file, rename_path, window_close, window_minimize, window_toggle_maximize,
-    write_diagram, write_file,
+    call_tool, list_tools,
+    write_diagram, write_file, set_default_stdlib,
 };
 
 
 use mercurio_core::{
     cancel_compile as core_cancel_compile,
+    compile_project_delta_sync as core_compile_project_delta_sync,
     compile_workspace_sync as core_compile_workspace_sync,
+    create_project_descriptor as core_create_project_descriptor,
     ensure_mercurio_paths,
+    ensure_project_descriptor as core_ensure_project_descriptor,
     export_model_to_path as core_export_model_to_path,
     get_ast_for_content as core_get_ast_for_content,
     get_ast_for_path as core_get_ast_for_path,
+    get_parse_tree_for_content as core_get_parse_tree_for_content,
     get_parse_errors_for_content as core_get_parse_errors_for_content,
     get_project_descriptor_view,
+    update_project_descriptor as core_update_project_descriptor,
+    query_library_symbols as core_query_library_symbols,
+    query_library_summary as core_query_library_summary,
+    query_project_symbols as core_query_project_symbols,
+    query_symbol_metatype_mapping as core_query_symbol_metatype_mapping,
+    query_stdlib_documentation_symbols as core_query_stdlib_documentation_symbols,
+    query_symbols_by_metatype as core_query_symbols_by_metatype,
     list_stdlib_versions_from_root,
     load_app_settings,
     save_app_settings,
     AppSettings,
+    CompileRequest,
     CompileResponse,
     CoreState,
+    IndexedSymbolView,
+    LibraryIndexSummaryView,
+    LibrarySymbolsRequest,
+    LibrarySymbolsResponse,
+    SymbolMetatypeMappingView,
     LibraryConfig,
     MercurioPaths,
     ParseErrorsPayload,
-    ProjectConfig,
-    ProjectDescriptor,
+    ParseTreeNodeView,
+    ProjectDescriptorUpdate,
     ProjectDescriptorView,
-    UnsavedFile,
-    load_project_descriptor,
+    load_library_symbols_sync as core_load_library_symbols_sync,
 };
 
 #[derive(Serialize)]
@@ -180,76 +199,6 @@ fn ensure_packaged_stdlibs(
     Ok(())
 }
 
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(Path::new("\\")),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(segment) => normalized.push(segment),
-        }
-    }
-    normalized
-}
-
-fn is_path_under_root(root: &Path, path: &Path) -> bool {
-    let mut root_iter = root.components();
-    let mut path_iter = path.components();
-    loop {
-        match (root_iter.next(), path_iter.next()) {
-            (None, _) => return true,
-            (Some(root_comp), Some(path_comp)) => {
-                if root_comp != path_comp {
-                    return false;
-                }
-            }
-            (Some(_), None) => return false,
-        }
-    }
-}
-
-fn resolve_under_root(root: &Path, target: &Path) -> Result<PathBuf, String> {
-    let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let joined = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        root.join(target)
-    };
-    let normalized = normalize_path(&joined);
-    let canonical = normalized.canonicalize().unwrap_or(normalized);
-    if !is_path_under_root(&root, &canonical) {
-        return Err("Path escapes root".to_string());
-    }
-    Ok(canonical)
-}
-
-fn build_default_descriptor(name: Option<String>) -> ProjectDescriptor {
-    ProjectDescriptor {
-        name,
-        author: None,
-        description: None,
-        organization: None,
-        config: ProjectConfig {
-            library: None,
-            stdlib: Some("default".to_string()),
-            src: Some(vec!["**/*.sysml".to_string(), "**/*.kerml".to_string()]),
-            import_entries: Some(vec!["**/*.sysmlx".to_string(), "**/*.kermlx".to_string()]),
-        },
-    }
-}
-
-fn write_project_descriptor(root: &Path, descriptor: &ProjectDescriptor) -> Result<ProjectDescriptorView, String> {
-    let content = serde_json::to_string_pretty(descriptor).map_err(|e| e.to_string())?;
-    let config_path = root.join(".project");
-    fs::write(config_path, &content).map_err(|e| e.to_string())?;
-    get_project_descriptor_view(root)?
-        .ok_or_else(|| "Failed to load project descriptor".to_string())
-}
-
 #[tauri::command]
 fn set_watch_root(app: tauri::AppHandle, state: tauri::State<AppState>, root: String) -> Result<(), String> {
     let root_path = PathBuf::from(&root);
@@ -315,53 +264,271 @@ fn get_ast_for_content(path: String, content: String) -> Result<String, String> 
 }
 
 #[tauri::command]
+fn get_parse_tree_for_content(path: String, content: String) -> Result<Vec<ParseTreeNodeView>, String> {
+    let file_path = PathBuf::from(&path);
+    core_get_parse_tree_for_content(&file_path, &content)
+}
+
+#[tauri::command]
 async fn compile_workspace(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    payload: serde_json::Value,
+    payload: CompileRequest,
 ) -> Result<CompileResponse, String> {
+    let (root, run_id, allow_parse_errors, target_path, unsaved) = payload.into_parts();
+    let core = state.core.clone();
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        core_compile_workspace_sync(
+            &core,
+            root,
+            run_id,
+            allow_parse_errors,
+            target_path,
+            unsaved,
+            |progress| {
+                let _ = app_handle.emit_to(
+                    EventTarget::webview_window("main"),
+                    "compile-progress",
+                    progress,
+                );
+            },
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn collect_model_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let read_dir = fs::read_dir(root).map_err(|e| e.to_string())?;
+    for entry in read_dir {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_model_files_recursive(&path, out)?;
+            continue;
+        }
+        let Some(ext) = path.extension().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if ext.eq_ignore_ascii_case("sysml") || ext.eq_ignore_ascii_case("kerml") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn eval_expression(root: String, expression: String) -> Result<String, String> {
+    let root_path = PathBuf::from(&root);
+    if !root_path.exists() {
+        return Err("Root path does not exist".to_string());
+    }
+    let mut files = Vec::<PathBuf>::new();
+    collect_model_files_recursive(&root_path, &mut files)?;
+    files.sort();
+    files.dedup();
+    let mut sources = Vec::<String>::new();
+    for file in files {
+        if let Ok(text) = fs::read_to_string(&file) {
+            sources.push(text);
+        }
+    }
+    if sources.is_empty() {
+        return Err("No model files found under root".to_string());
+    }
+    mercurio_sysml::expression_eval::eval_expression_in_sources(&sources, &expression)
+}
+
+#[tauri::command]
+async fn compile_project_delta(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    payload: CompileRequest,
+) -> Result<CompileResponse, String> {
+    let (root, run_id, allow_parse_errors, target_path, unsaved) = payload.into_parts();
+    let core = state.core.clone();
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        core_compile_project_delta_sync(
+            &core,
+            root,
+            run_id,
+            allow_parse_errors,
+            target_path,
+            unsaved,
+            |progress| {
+                let _ = app_handle.emit_to(
+                    EventTarget::webview_window("main"),
+                    "compile-progress",
+                    progress,
+                );
+            },
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn load_library_symbols(
+    state: tauri::State<'_, AppState>,
+    payload: LibrarySymbolsRequest,
+) -> Result<LibrarySymbolsResponse, String> {
+    let (root, target_path, include_symbols) = payload.into_parts();
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        core_load_library_symbols_sync(&core, root, target_path, include_symbols)
+    })
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn query_index_symbols_by_metatype(
+    state: tauri::State<'_, AppState>,
+    payload: serde_json::Value,
+) -> Result<Vec<IndexedSymbolView>, String> {
     let root = payload
         .get("root")
         .and_then(|value| value.as_str())
         .ok_or_else(|| "Missing required 'root' argument".to_string())?
         .to_string();
-    let run_id = payload
-        .get("run_id")
-        .or_else(|| payload.get("runId"))
-        .or_else(|| payload.get("runld"))
-        .and_then(|value| value.as_u64())
-        .unwrap_or(0);
-    let allow_parse_errors = payload
-        .get("allow_parse_errors")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    let unsaved = payload
-        .get("unsaved")
-        .and_then(|value| value.as_array())
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|entry| {
-                    let path = entry.get("path").and_then(|v| v.as_str())?;
-                    let content = entry.get("content").and_then(|v| v.as_str())?;
-                    Some(UnsavedFile {
-                        path: PathBuf::from(path),
-                        content: content.to_string(),
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let metatype_qname = payload
+        .get("metatype_qname")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'metatype_qname' argument".to_string())?
+        .to_string();
     let core = state.core.clone();
-    let app_handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        core_compile_workspace_sync(&core, root, run_id, allow_parse_errors, unsaved, |progress| {
-            let _ = app_handle.emit_to(
-                EventTarget::webview_window("main"),
-                "compile-progress",
-                progress,
-            );
-        })
+        core_query_symbols_by_metatype(&core, root, metatype_qname)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn query_index_stdlib_documentation_symbols(
+    state: tauri::State<'_, AppState>,
+    payload: serde_json::Value,
+) -> Result<Vec<IndexedSymbolView>, String> {
+    let library_key = payload
+        .get("library_key")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'library_key' argument".to_string())?
+        .to_string();
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        core_query_stdlib_documentation_symbols(&core, library_key)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn query_index_library_symbols(
+    state: tauri::State<'_, AppState>,
+    payload: serde_json::Value,
+) -> Result<Vec<IndexedSymbolView>, String> {
+    let root = payload
+        .get("root")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'root' argument".to_string())?
+        .to_string();
+    let file = payload
+        .get("file")
+        .or_else(|| payload.get("path"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let offset = payload
+        .get("offset")
+        .or_else(|| payload.get("skip"))
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize);
+    let limit = payload
+        .get("limit")
+        .or_else(|| payload.get("take"))
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize);
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        core_query_library_symbols(&core, root, file, offset, limit)
+    })
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn query_index_project_symbols(
+    state: tauri::State<'_, AppState>,
+    payload: serde_json::Value,
+) -> Result<Vec<IndexedSymbolView>, String> {
+    let root = payload
+        .get("root")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'root' argument".to_string())?
+        .to_string();
+    let file = payload
+        .get("file")
+        .or_else(|| payload.get("path"))
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let offset = payload
+        .get("offset")
+        .or_else(|| payload.get("skip"))
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize);
+    let limit = payload
+        .get("limit")
+        .or_else(|| payload.get("take"))
+        .and_then(|value| value.as_u64())
+        .map(|value| value as usize);
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        core_query_project_symbols(&core, root, file, offset, limit)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn query_index_library_summary(
+    state: tauri::State<'_, AppState>,
+    payload: serde_json::Value,
+) -> Result<LibraryIndexSummaryView, String> {
+    let root = payload
+        .get("root")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'root' argument".to_string())?
+        .to_string();
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || core_query_library_summary(&core, root))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn query_index_symbol_metatype_mapping(
+    state: tauri::State<'_, AppState>,
+    payload: serde_json::Value,
+) -> Result<Option<SymbolMetatypeMappingView>, String> {
+    let root = payload
+        .get("root")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'root' argument".to_string())?
+        .to_string();
+    let symbol_qualified_name = payload
+        .get("symbol_qualified_name")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Missing required 'symbol_qualified_name' argument".to_string())?
+        .to_string();
+    let file_path = payload
+        .get("file_path")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        core_query_symbol_metatype_mapping(&core, root, symbol_qualified_name, file_path)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -413,53 +580,20 @@ fn get_project_descriptor(root: String) -> Result<Option<ProjectDescriptorView>,
 #[tauri::command]
 fn create_project_descriptor(payload: CreateProjectDescriptorPayload) -> Result<ProjectDescriptorView, String> {
     let root_path = PathBuf::from(payload.root);
-    if root_path.exists() {
-        return Err("Project folder already exists".to_string());
-    }
-    fs::create_dir_all(&root_path).map_err(|e| e.to_string())?;
-    let config = ProjectConfig {
-        library: None,
-        stdlib: if payload.use_default_library {
-            Some("default".to_string())
-        } else {
-            None
-        },
-        src: Some(vec!["**/*.sysml".to_string(), "**/*.kerml".to_string()]),
-        import_entries: Some(vec!["**/*.sysmlx".to_string(), "**/*.kermlx".to_string()]),
-    };
-    let descriptor = ProjectDescriptor {
-        name: Some(payload.name),
-        author: payload.author,
-        description: payload.description,
-        organization: payload.organization,
-        config,
-    };
-    write_project_descriptor(&root_path, &descriptor)
+    core_create_project_descriptor(
+        &root_path,
+        payload.name,
+        payload.author,
+        payload.description,
+        payload.organization,
+        payload.use_default_library,
+    )
 }
 
 #[tauri::command]
 fn ensure_project_descriptor(root: String) -> Result<ProjectDescriptorView, String> {
     let root_path = PathBuf::from(root);
-    if !root_path.exists() {
-        return Err("Root path does not exist".to_string());
-    }
-
-    let config_path = root_path.join(".project");
-    if config_path.exists() {
-        return get_project_descriptor_view(&root_path)?
-            .ok_or_else(|| "Failed to load project descriptor".to_string());
-    }
-
-    if let Some(legacy) = load_project_descriptor(&root_path)? {
-        write_project_descriptor(&root_path, &legacy)
-    } else {
-        let name = root_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|value| value.to_string());
-        let descriptor = build_default_descriptor(name);
-        write_project_descriptor(&root_path, &descriptor)
-    }
+    core_ensure_project_descriptor(&root_path)
 }
 
 #[tauri::command]
@@ -468,33 +602,17 @@ fn update_project_descriptor(
     payload: UpdateProjectDescriptorPayload,
 ) -> Result<ProjectDescriptorView, String> {
     let root_path = PathBuf::from(&payload.root);
-    if !root_path.exists() {
-        return Err("Root path does not exist".to_string());
-    }
-
-    if let Some(stdlib_id) = payload.stdlib.as_ref() {
-        let trimmed = stdlib_id.trim();
-        if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("default") {
-            let candidate = state.core.stdlib_root.join(trimmed);
-            if !candidate.exists() || !candidate.is_dir() {
-                return Err("Stdlib version not found".to_string());
-            }
-        }
-    }
-
-    let descriptor = ProjectDescriptor {
+    let update = ProjectDescriptorUpdate {
         name: payload.name,
         author: payload.author,
         description: payload.description,
         organization: payload.organization,
-        config: ProjectConfig {
-            library: payload.library,
-            stdlib: payload.stdlib,
-            src: payload.src,
-            import_entries: payload.import_entries,
-        },
+        src: payload.src,
+        import_entries: payload.import_entries,
+        stdlib: payload.stdlib,
+        library: payload.library,
     };
-    write_project_descriptor(&root_path, &descriptor)
+    core_update_project_descriptor(&root_path, &state.core.stdlib_root, update)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -555,6 +673,9 @@ pub fn run() {
             let toggle_project = MenuItemBuilder::with_id("view.toggle_project", "Toggle Project")
                 .accelerator("Ctrl+Shift+P")
                 .build(app)?;
+            let toggle_terminal = MenuItemBuilder::with_id("view.toggle_terminal", "View Terminal")
+                .accelerator("Ctrl+`")
+                .build(app)?;
             let about = MenuItemBuilder::with_id("help.about", "About").build(app)?;
 
             let file_menu = SubmenuBuilder::new(app, "File")
@@ -570,6 +691,7 @@ pub fn run() {
                 .build()?;
             let view_menu = SubmenuBuilder::new(app, "View")
                 .item(&toggle_project)
+                .item(&toggle_terminal)
                 .separator()
                 .item(&PredefinedMenuItem::fullscreen(app, None)?)
                 .build()?;
@@ -592,6 +714,7 @@ pub fn run() {
                 "build.compile" => Some("compile-workspace"),
                 "build.options" => Some("build-options"),
                 "view.toggle_project" => Some("toggle-project"),
+                "view.toggle_terminal" => Some("toggle-terminal"),
                 "help.about" => Some("about"),
                 _ => None,
             };
@@ -602,6 +725,13 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_user_projects_root,
             list_stdlib_versions,
+            get_default_stdlib,
+            set_default_stdlib,
+            get_stdlib_metamodel,
+            get_project_model,
+            get_project_element_attributes,
+            query_semantic,
+            query_semantic_symbols,
             list_dir,
             read_file,
             path_exists,
@@ -616,6 +746,8 @@ pub fn run() {
             get_parse_errors_for_content,
             get_ast_for_path,
             get_ast_for_content,
+            get_parse_tree_for_content,
+            eval_expression,
             get_project_descriptor,
             create_project_descriptor,
             ensure_project_descriptor,
@@ -633,11 +765,20 @@ pub fn run() {
             window_toggle_maximize,
             window_close,
             compile_workspace,
+            compile_project_delta,
+            load_library_symbols,
+            query_index_symbols_by_metatype,
+            query_index_stdlib_documentation_symbols,
+            query_index_library_symbols,
+            query_index_project_symbols,
+            query_index_library_summary,
+            query_index_symbol_metatype_mapping,
             cancel_compile,
             export_compiled_model,
             ai_test_endpoint,
-            ai_agent_run
-            ,
+            ai_agent_run,
+            list_tools,
+            call_tool,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

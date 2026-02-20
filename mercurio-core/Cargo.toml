@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "mercurio-core"
 version = "0.1.0"
 edition = "2021"
@@ -6,5 +6,9 @@ edition = "2021"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-syster = { package = "syster-base", path = "C:\\dev\\git\\sysml\\syster-base", features = ["interchange"] }
-mercurio-model = { path = "..\\mercurio-model" }
+salsa = "0.18"
+mercurio-sysml-core = { path = "..\\..\\mercurio-sysml\\crates\\mercurio-sysml-core" }
+mercurio_sysml_pkg = { package = "mercurio-sysml", path = "..\\..\\mercurio-sysml" }
+mercurio-sysml-workspace = { path = "..\\..\\mercurio-sysml\\crates\\mercurio-sysml-workspace" }
+mercurio-sysml-semantics = { path = "..\\..\\mercurio-sysml\\crates\\mercurio-sysml-semantics" }
+mercurio-symbol-index = { path = "..\\mercurio-symbol-index" }

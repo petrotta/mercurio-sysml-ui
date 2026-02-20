@@ -1,6 +1,6 @@
 import { useCallback } from "react";
 import type { MutableRefObject } from "react";
-import { AI_VIEW_TAB, DATA_VIEW_TAB, PROJECT_DESCRIPTOR_TAB } from "./constants";
+import { AI_VIEW_TAB, DATA_VIEW_TAB, PROJECT_DESCRIPTOR_TAB, PROJECT_MODEL_VIEW_TAB } from "./constants";
 import { makeDiagramTabId, makeDiagramTabName } from "./tabs";
 import type { OpenTab, SymbolView } from "./types";
 
@@ -29,7 +29,7 @@ type UseTabsOptions = {
   activeTabPath: string | null;
   setActiveTabPath: (path: string | null) => void;
   activeTabPathRef: MutableRefObject<string | null>;
-  setCenterView: (value: "file" | "diagram" | "ai" | "data") => void;
+  setCenterView: (value: "file" | "diagram" | "ai" | "data" | "project-model") => void;
   setActiveEditorDoc: (path: string | null, text: string, dirty: boolean) => void;
   setDescriptorViewMode: (mode: "view" | "json") => void;
   setProjectDescriptor: (descriptor: DescriptorPayload | null) => void;
@@ -117,6 +117,12 @@ export function useTabs({
         setActiveTabPath(tab.path);
         return;
       }
+      if (tab?.kind === "project-model") {
+        setCenterView("project-model");
+        setActiveEditorDoc(null, "", false);
+        setActiveTabPath(tab.path);
+        return;
+      }
       if (tab?.kind === "diagram") {
         setCenterView("diagram");
         setActiveEditorDoc(null, "", false);
@@ -147,6 +153,16 @@ export function useTabs({
     setActiveTabPath(DATA_VIEW_TAB);
     setActiveEditorDoc(null, "", false);
     setCenterView("data");
+  }, [setOpenTabs, setActiveTabPath, setActiveEditorDoc, setCenterView]);
+
+  const openProjectModelViewTab = useCallback(() => {
+    setOpenTabs((prev) => {
+      if (prev.some((tab) => tab.path === PROJECT_MODEL_VIEW_TAB)) return prev;
+      return [...prev, { path: PROJECT_MODEL_VIEW_TAB, name: "Project Model", dirty: false, kind: "project-model" }];
+    });
+    setActiveTabPath(PROJECT_MODEL_VIEW_TAB);
+    setActiveEditorDoc(null, "", false);
+    setCenterView("project-model");
   }, [setOpenTabs, setActiveTabPath, setActiveEditorDoc, setCenterView]);
 
   const openDiagramViewTab = useCallback(
@@ -270,6 +286,9 @@ export function useTabs({
       } else if (kept.kind === "data") {
         setCenterView("data");
         setActiveEditorDoc(null, "", false);
+      } else if (kept.kind === "project-model") {
+        setCenterView("project-model");
+        setActiveEditorDoc(null, "", false);
       } else if (kept.kind === "diagram") {
         setCenterView("diagram");
         setActiveEditorDoc(null, "", false);
@@ -296,6 +315,7 @@ export function useTabs({
     selectTab,
     openAiViewTab,
     openDataViewTab,
+    openProjectModelViewTab,
     openDiagramViewTab,
     reorderTabs,
     closeTab,

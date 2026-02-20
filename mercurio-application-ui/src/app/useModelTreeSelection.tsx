@@ -18,6 +18,7 @@ type UseModelTreeSelectionOptions = {
   setSelectedNodeSymbols: (symbols: SymbolView[] | null) => void;
   selectSymbolInEditor: (symbol: SymbolView) => Promise<void> | void;
   navigateTo: (target: NavigateTarget) => Promise<void> | void;
+  onRequestLibraryFileSymbols: (filePath: string) => void;
   projectGroups: Array<{ path: string; list: SymbolView[] }>;
   libraryGroups: Array<{ path: string; list: SymbolView[] }>;
 };
@@ -32,11 +33,13 @@ export function useModelTreeSelection({
   setSelectedNodeSymbols,
   selectSymbolInEditor,
   navigateTo,
+  onRequestLibraryFileSymbols,
   projectGroups,
   libraryGroups,
 }: UseModelTreeSelectionOptions) {
   const modelListRef = useRef<ListImperativeAPI | null>(null);
   const pendingScrollSymbolRef = useRef<string | null>(null);
+  const modelCursorRowKeyRef = useRef<string | null>(null);
   const [modelCursorIndex, setModelCursorIndex] = useState<number | null>(null);
   const modelSectionIndent = 12;
   const modelListHeight = Math.max(120, modelTreeHeight - 16);
@@ -98,8 +101,30 @@ export function useModelTreeSelection({
       setModelCursorIndex(modelRows.length ? 0 : null);
       return;
     }
+    const row = modelRows[modelCursorIndex];
+    modelCursorRowKeyRef.current = row?.key ?? null;
+  }, [modelCursorIndex, modelRows]);
+
+  useEffect(() => {
+    if (modelCursorIndex == null) return;
     modelListRef.current?.scrollToRow({ index: modelCursorIndex, align: "smart" });
-  }, [modelCursorIndex, modelRows.length]);
+  }, [modelCursorIndex]);
+
+  useEffect(() => {
+    if (!modelRows.length) {
+      modelCursorRowKeyRef.current = null;
+      if (modelCursorIndex != null) {
+        setModelCursorIndex(null);
+      }
+      return;
+    }
+    const key = modelCursorRowKeyRef.current;
+    if (!key) return;
+    const index = modelRows.findIndex((row) => row.key === key);
+    if (index >= 0 && index !== modelCursorIndex) {
+      setModelCursorIndex(index);
+    }
+  }, [modelRows, modelCursorIndex]);
 
   const activateModelRow = (row: ModelRow, index: number) => {
     if (row.type === "section") {
@@ -166,6 +191,9 @@ export function useModelTreeSelection({
       if (row.type === "section") {
         setModelSectionOpen((prev) => ({ ...prev, [row.section]: true }));
       } else if (row.type === "symbol" && row.hasChildren && !row.expanded) {
+        if (row.section === "library" && row.isFileRoot && row.filePath) {
+          onRequestLibraryFileSymbols(row.filePath);
+        }
         setModelExpanded((prev) => ({ ...prev, [row.key]: true }));
       }
       return;

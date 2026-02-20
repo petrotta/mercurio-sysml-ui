@@ -3,12 +3,15 @@
 //! Intent: keep provider-specific request shaping in one place behind a stable Tauri command API.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tauri::command;
+use mercurio_core::resolve_under_root;
 
 use crate::agent::{AgentFinal, parse_agent_final};
-use crate::resolve_under_root;
+use crate::commands::tools::{execute_tool, tool_catalog};
+use crate::AppState;
 
 #[derive(Deserialize)]
 pub struct AiEndpointPayload {
@@ -251,6 +254,11 @@ enum AgentAction {
     Final {
         content: String,
     },
+    ListTools,
+    CallTool {
+        tool: String,
+        args: Value,
+    },
     ReadFile {
         path: String,
     },
@@ -281,8 +289,186 @@ struct ToolOutcome {
 }
 
 fn parse_agent_action(text: &str) -> Option<AgentAction> {
+    fn clean_token(input: &str) -> String {
+        input
+            .trim()
+            .trim_matches('`')
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim_end_matches(',')
+            .trim()
+            .to_string()
+    }
+
+    fn strip_fences(input: &str) -> String {
+        let trimmed = input.trim();
+        if !trimmed.starts_with("```") {
+            return trimmed.to_string();
+        }
+        let mut lines = trimmed.lines();
+        let _ = lines.next();
+        let mut out = Vec::new();
+        for line in lines {
+            if line.trim_start().starts_with("```") {
+                break;
+            }
+            out.push(line);
+        }
+        if out.is_empty() {
+            trimmed
+                .replace("```json", "")
+                .replace("```yaml", "")
+                .replace("```yml", "")
+                .replace("```", "")
+                .trim()
+                .to_string()
+        } else {
+            out.join("\n").trim().to_string()
+        }
+    }
+
     if let Ok(action) = serde_json::from_str::<AgentAction>(text.trim()) {
         return Some(action);
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(text.trim()) {
+        if let Some(obj) = value.as_object() {
+            if let Some(action) = obj.get("action").and_then(|v| v.as_str()) {
+                if action.eq_ignore_ascii_case("list_tools") {
+                    return Some(AgentAction::ListTools);
+                }
+                if action.eq_ignore_ascii_case("call_tool") {
+                    let tool = obj
+                        .get("tool")
+                        .and_then(|v| v.as_str())
+                        .map(clean_token)
+                        .unwrap_or_default();
+                    if tool.is_empty() {
+                        return None;
+                    }
+                    let args = obj
+                        .get("args")
+                        .cloned()
+                        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+                    return Some(AgentAction::CallTool { tool, args });
+                }
+                if action.eq_ignore_ascii_case("final") {
+                    if let Some(content) = obj.get("content").and_then(|v| v.as_str()) {
+                        return Some(AgentAction::Final {
+                            content: content.to_string(),
+                        });
+                    }
+                }
+            }
+            if let Some(tool) = obj.get("tool").and_then(|v| v.as_str()) {
+                let tool = clean_token(tool);
+                if tool.eq_ignore_ascii_case("list_tools") {
+                    return Some(AgentAction::ListTools);
+                }
+            }
+        }
+    }
+    // Fallback for simple YAML-like tool directives some models emit.
+    // Example:
+    // tool: list_tools
+    // or:
+    // tool: call_tool
+    // name: core.query_semantic@v1
+    // args: {"root":"...","query":{...}}
+    let trimmed = strip_fences(text);
+    if !trimmed.is_empty() {
+        let mut action_name: Option<String> = None;
+        let mut tool_name: Option<String> = None;
+        let mut call_name: Option<String> = None;
+        let mut args_raw: Option<String> = None;
+        for line in trimmed.lines() {
+            let line = line
+                .trim()
+                .trim_start_matches('-')
+                .trim()
+                .trim_start_matches('*')
+                .trim();
+            if line.is_empty() {
+                continue;
+            }
+            // Accept "key:value", "key : value", and case variants.
+            if let Some((raw_key, raw_value)) = line.split_once(':') {
+                let key = raw_key.trim().to_ascii_lowercase();
+                let value = clean_token(raw_value);
+                if key == "action" || key == "tool request" || key == "request" {
+                    action_name = Some(value);
+                } else if key == "tool" {
+                    tool_name = Some(value);
+                } else if key == "name" || key == "tool_name" {
+                    call_name = Some(value);
+                } else if key == "args" {
+                    args_raw = Some(raw_value.trim().to_string());
+                }
+            }
+        }
+        // Super-loose fallback for one-liners.
+        if tool_name.is_none() {
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.contains("tool: list_tools") || lower.contains("tool : list_tools") {
+                tool_name = Some("list_tools".to_string());
+            }
+        }
+        if action_name
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("list_tools"))
+        {
+            return Some(AgentAction::ListTools);
+        }
+        if let Some(tool) = tool_name {
+            if tool.eq_ignore_ascii_case("list_tools") {
+                return Some(AgentAction::ListTools);
+            }
+            if tool.eq_ignore_ascii_case("call_tool")
+                || action_name
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("call_tool"))
+            {
+                let tool = call_name.unwrap_or_default();
+                if tool.is_empty() {
+                    return None;
+                }
+                let args = args_raw
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                    .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+                return Some(AgentAction::CallTool { tool, args });
+            }
+            // Also accept direct tool ids like "tool: core.query_semantic@v1".
+            if tool.contains('@') || tool.contains('.') {
+                let args = args_raw
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                    .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+                return Some(AgentAction::CallTool { tool, args });
+            }
+        }
+
+        // Ultra-loose token fallback for prose-like outputs.
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("list_tools") {
+            return Some(AgentAction::ListTools);
+        }
+        if lower.contains("call_tool") {
+            if let Some(name_line) = trimmed
+                .lines()
+                .map(str::trim)
+                .find(|line| line.to_ascii_lowercase().starts_with("name:"))
+            {
+                if let Some((_, raw_name)) = name_line.split_once(':') {
+                    let tool = clean_token(raw_name);
+                    if !tool.is_empty() {
+                        return Some(AgentAction::CallTool {
+                            tool,
+                            args: Value::Object(serde_json::Map::new()),
+                        });
+                    }
+                }
+            }
+        }
     }
     let start = text.find('{')?;
     let end = text.rfind('}')?;
@@ -290,6 +476,66 @@ fn parse_agent_action(text: &str) -> Option<AgentAction> {
         return None;
     }
     serde_json::from_str::<AgentAction>(&text[start..=end]).ok()
+}
+
+fn parse_agent_actions(text: &str) -> Vec<AgentAction> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    if let Some(action) = parse_agent_action(trimmed) {
+        return vec![action];
+    }
+
+    let mut actions = Vec::new();
+    let mut depth = 0usize;
+    let mut start: Option<usize> = None;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, ch) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if ch == '"' {
+            in_string = true;
+            continue;
+        }
+        if ch == '{' {
+            if depth == 0 {
+                start = Some(idx);
+            }
+            depth += 1;
+            continue;
+        }
+        if ch == '}' && depth > 0 {
+            depth -= 1;
+            if depth == 0 {
+                if let Some(s) = start {
+                    let candidate = &text[s..=idx];
+                    if let Some(action) = parse_agent_action(candidate) {
+                        actions.push(action);
+                    }
+                }
+                start = None;
+            }
+        }
+    }
+
+    actions
 }
 
 fn read_file_under_root(root: &Path, path: &str) -> Result<String, String> {
@@ -438,6 +684,9 @@ fn run_agent_tool(action: AgentAction, root: Option<&Path>) -> Result<ToolOutcom
             detail: "final".to_string(),
             result: content,
         }),
+        AgentAction::ListTools | AgentAction::CallTool { .. } => {
+            Err("Use list_tools/call_tool handling path".to_string())
+        }
         AgentAction::ReadFile { path } => {
             let root = root.ok_or_else(|| "Tool unavailable: root path missing".to_string())?;
             Ok(ToolOutcome {
@@ -546,7 +795,10 @@ pub async fn ai_test_endpoint(payload: AiEndpointPayload) -> Result<serde_json::
 
 #[command]
 /// Runs a lightweight multi-step agent loop with optional local tools.
-pub async fn ai_agent_run(payload: AiAgentPayload) -> Result<AiAgentResponse, String> {
+pub async fn ai_agent_run(
+    state: tauri::State<'_, AppState>,
+    payload: AiAgentPayload,
+) -> Result<AiAgentResponse, String> {
     let provider = AiProvider::from_input(payload.provider.as_deref());
     let adapter = adapter_for(provider);
     let root_path = payload.root.as_ref().map(PathBuf::from);
@@ -582,8 +834,14 @@ pub async fn ai_agent_run(payload: AiAgentPayload) -> Result<AiAgentResponse, St
             0,
             AiMessagePayload {
                 role: "system".to_string(),
-                content: format!(
-                    r#"You are a coding assistant with local tools. Respond ONLY with JSON using one of these actions: {{"action":"final","content":"...json..."}}, {{"action":"read_file","path":"..."}}, {{"action":"list_dir","path":"..."}}, {{"action":"search_text","query":"...","limit":20}}, {{"action":"write_file","path":"...","content":"...","create_dirs":true}}, or {{"action":"apply_patch","path":"...","find":"...","replace":"...","replace_all":false,"apply":false}}. Use apply_patch with apply=false first to preview; only set apply=true when confident.
+                content: {
+                    let prompt = r#"You are a coding assistant with local tools. Respond ONLY with JSON using one of these actions:
+{"action":"list_tools"}
+{"action":"call_tool","tool":"tool_name@v1","args":{...}}
+{"action":"final","content":"...json..."}
+
+Legacy actions are still accepted: {"action":"read_file","path":"..."}, {"action":"list_dir","path":"..."}, {"action":"search_text","query":"...","limit":20}, {"action":"write_file","path":"...","content":"...","create_dirs":true}, {"action":"apply_patch","path":"...","find":"...","replace":"...","replace_all":false,"apply":false}.
+Use apply_patch with apply=false first to preview; only set apply=true when confident.
 All tool paths MUST be under the workspace root. Prefer relative paths like "src/foo.sysml". If a user gives an absolute path, ensure it is within the workspace root; otherwise refuse and ask for a path under the root.
 
 When you are done, respond with {{"action":"final","content":"..."}} where content is a JSON object encoded as a string in this exact shape:
@@ -595,7 +853,9 @@ When you are done, respond with {{"action":"final","content":"..."}} where conte
   ]
 }}
 Mark 1-3 steps with recommended=true. Do not include any extra text outside the JSON."#
-                ) + &root_note,
+                        .to_string();
+                    prompt + &root_note
+                },
             },
         );
     }
@@ -628,77 +888,104 @@ Mark 1-3 steps with recommended=true. Do not include any extra text outside the 
             });
         }
 
-        let action = match parse_agent_action(&text) {
-            Some(action) => action,
-            None => {
-                let message = if text.is_empty() {
-                    if let Some(result) = last_tool_result.as_deref() {
-                        format!("Tool result:\n{}", clamp_tool_result(result))
-                    } else {
-                        "No response.".to_string()
-                    }
+        let actions = parse_agent_actions(&text);
+        if actions.is_empty() {
+            let message = if text.is_empty() {
+                if let Some(result) = last_tool_result.as_deref() {
+                    format!("Tool result:\n{}", clamp_tool_result(result))
                 } else {
-                    text
-                };
-                return Ok(AiAgentResponse {
-                    message,
-                    steps,
-                    final_response: None,
-                    final_error: Some("Invalid agent action".to_string()),
-                });
-            }
-        };
+                    "No response.".to_string()
+                }
+            } else {
+                text
+            };
+            return Ok(AiAgentResponse {
+                message,
+                steps,
+                final_response: None,
+                final_error: None,
+            });
+        }
 
-        if let AgentAction::Final { content } = action {
-            match parse_agent_final(&content) {
-                Ok(final_response) => {
-                    return Ok(AiAgentResponse {
-                        message: final_response.summary.clone(),
-                        steps,
-                        final_response: Some(final_response),
-                        final_error: None,
+        for action in actions {
+            if let AgentAction::Final { content } = action {
+                match parse_agent_final(&content) {
+                    Ok(final_response) => {
+                        return Ok(AiAgentResponse {
+                            message: final_response.summary.clone(),
+                            steps,
+                            final_response: Some(final_response),
+                            final_error: None,
+                        });
+                    }
+                    Err(error) => {
+                        return Ok(AiAgentResponse {
+                            message: content,
+                            steps,
+                            final_response: None,
+                            final_error: Some(error),
+                        });
+                    }
+                }
+            }
+
+            let outcome = match action {
+                AgentAction::ListTools => Ok(ToolOutcome {
+                    detail: "list_tools".to_string(),
+                    result: serde_json::to_string(&tool_catalog()).map_err(|e| e.to_string())?,
+                }),
+                AgentAction::CallTool { tool, mut args } => {
+                    if args.get("root").is_none() {
+                        if let Some(root) = root {
+                            if tool.starts_with("fs.") || tool.starts_with("core.") {
+                                args["root"] = Value::String(root.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                    let value = execute_tool(state.core.clone(), &tool, args).await?;
+                    let result = if value.is_string() {
+                        value.as_str().unwrap_or_default().to_string()
+                    } else {
+                        value.to_string()
+                    };
+                    Ok(ToolOutcome {
+                        detail: format!("call_tool:{}", tool),
+                        result,
+                    })
+                }
+                other => run_agent_tool(other, root),
+            };
+
+            match outcome {
+                Ok(outcome) => {
+                    last_tool_result = Some(outcome.result.clone());
+                    steps.push(AiAgentStep {
+                        kind: "tool".to_string(),
+                        detail: outcome.detail.clone(),
+                    });
+                    conversation.push(AiMessagePayload {
+                        role: "assistant".to_string(),
+                        content: serde_json::json!({
+                            "action": "tool_result",
+                            "detail": outcome.detail,
+                        })
+                        .to_string(),
+                    });
+                    conversation.push(AiMessagePayload {
+                        role: "user".to_string(),
+                        content: format!("Tool result: {}", outcome.result),
                     });
                 }
                 Err(error) => {
-                    return Ok(AiAgentResponse {
-                        message: content,
-                        steps,
-                        final_response: None,
-                        final_error: Some(error),
+                    steps.push(AiAgentStep {
+                        kind: "tool_error".to_string(),
+                        detail: error.clone(),
+                    });
+                    conversation.push(AiMessagePayload {
+                        role: "user".to_string(),
+                        content: format!("Tool error: {}", error),
                     });
                 }
-            }
-        }
-
-        match run_agent_tool(action, root) {
-            Ok(outcome) => {
-                last_tool_result = Some(outcome.result.clone());
-                steps.push(AiAgentStep {
-                    kind: "tool".to_string(),
-                    detail: outcome.detail.clone(),
-                });
-                conversation.push(AiMessagePayload {
-                    role: "assistant".to_string(),
-                    content: serde_json::json!({
-                        "action": "tool_result",
-                        "detail": outcome.detail,
-                    })
-                    .to_string(),
-                });
-                conversation.push(AiMessagePayload {
-                    role: "user".to_string(),
-                    content: format!("Tool result: {}", outcome.result),
-                });
-            }
-            Err(error) => {
-                steps.push(AiAgentStep {
-                    kind: "tool_error".to_string(),
-                    detail: error.clone(),
-                });
-                conversation.push(AiMessagePayload {
-                    role: "user".to_string(),
-                    content: format!("Tool error: {}", error),
-                });
             }
         }
     }

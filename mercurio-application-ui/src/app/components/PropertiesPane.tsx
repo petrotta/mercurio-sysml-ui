@@ -1,20 +1,43 @@
-﻿import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import type { SymbolView } from "../types";
 
 type PropertiesPaneProps = {
   selectedSymbols: SymbolView[] | null;
   getDoc: (path: string) => { path: string; text: string; dirty: boolean } | null;
   readFile: (path: string) => Promise<string>;
+  onOpenInProjectModel: (symbol: SymbolView) => void;
+  onOpenQualifiedNameInSource: (qualifiedName: string) => void;
 };
 
 type SnippetState = {
-  raw: string | null;
   expr: string | null;
-  loading: boolean;
 };
 
 const symbolKey = (symbol: SymbolView) =>
   `${symbol.file_path}:${symbol.qualified_name}:${symbol.start_line}:${symbol.start_col}:${symbol.end_line}:${symbol.end_col}`;
+const QUALIFIED_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)+$/;
+
+const isQualifiedName = (value: string | null | undefined): value is string =>
+  Boolean(value && QUALIFIED_NAME_PATTERN.test(value.trim()));
+
+const propertyValueToText = (value: SymbolView["properties"][number]["value"]): string | null => {
+  if ("type" in value && value.type === "text") return value.value ?? null;
+  if ("type" in value && value.type === "bool") return value.value ? "true" : "false";
+  if ("type" in value && value.type === "number") return String(value.value);
+  return null;
+};
+
+const resolveTopDocumentation = (symbol: SymbolView): string | null => {
+  if (symbol.doc && symbol.doc.trim()) return symbol.doc;
+  const docProp = symbol.properties.find((prop) => {
+    const key = (prop.name || "").toLowerCase();
+    const label = (prop.label || "").toLowerCase();
+    return key === "documentation" || label === "documentation" || key === "doc" || label === "doc";
+  });
+  if (!docProp || docProp.value.type !== "text") return null;
+  const text = (docProp.value.value || "").trim();
+  return text ? text : null;
+};
 
 const extractSnippet = (
   content: string,
@@ -49,12 +72,60 @@ const extractSnippet = (
   return joined.length ? joined : (lines[start]?.trim() ?? joined);
 };
 
-export function PropertiesPane({ selectedSymbols, getDoc, readFile }: PropertiesPaneProps) {
+export function PropertiesPane({
+  selectedSymbols,
+  getDoc,
+  readFile,
+  onOpenInProjectModel,
+  onOpenQualifiedNameInSource,
+}: PropertiesPaneProps) {
   const [snippets, setSnippets] = useState<Record<string, SnippetState>>({});
+  const [keyColumnPercent, setKeyColumnPercent] = useState(32);
+  const paneRef = useRef<HTMLDivElement | null>(null);
+  const splitDragActiveRef = useRef(false);
+  const linkButtonStyle = {
+    border: "none",
+    background: "transparent",
+    color: "inherit",
+    cursor: "pointer",
+    textDecoration: "underline",
+    padding: 0,
+    font: "inherit",
+  } as const;
   const normalizedSymbols = useMemo(
     () => (selectedSymbols && selectedSymbols.length ? selectedSymbols : null),
     [selectedSymbols],
   );
+  const updateKeySplitFromClientX = useCallback((clientX: number) => {
+    const rect = paneRef.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0) return;
+    const nextPercent = Math.round(((clientX - rect.left) / rect.width) * 100);
+    setKeyColumnPercent(Math.max(20, Math.min(60, nextPercent)));
+  }, []);
+  const startKeySplitDrag = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      event.preventDefault();
+      splitDragActiveRef.current = true;
+      updateKeySplitFromClientX(event.clientX);
+    },
+    [updateKeySplitFromClientX],
+  );
+  const renderPropertyValue = (value: string | null): ReactNode => {
+    const text = value?.trim() || "";
+    if (!text) return null;
+    if (!isQualifiedName(text)) return text;
+    return (
+      <button
+        type="button"
+        className="model-kind"
+        onClick={() => onOpenQualifiedNameInSource(text)}
+        title={`Open ${text} source`}
+        style={linkButtonStyle}
+      >
+        {text}
+      </button>
+    );
+  };
 
   useEffect(() => {
     let active = true;
@@ -65,18 +136,15 @@ export function PropertiesPane({ selectedSymbols, getDoc, readFile }: Properties
       }
       const nextState: Record<string, SnippetState> = {};
       normalizedSymbols.forEach((symbol) => {
-        nextState[symbolKey(symbol)] = { raw: null, expr: null, loading: true };
+        nextState[symbolKey(symbol)] = { expr: null };
       });
       setSnippets(nextState);
+
       await Promise.all(
         normalizedSymbols.map(async (symbol) => {
           if (!symbol.file_path) return;
           const key = symbolKey(symbol);
           const cached = getDoc(symbol.file_path);
-          const rangeStartLine = symbol.start_line;
-          const rangeStartCol = symbol.start_col;
-          const rangeEndLine = symbol.end_line;
-          const rangeEndCol = symbol.end_col;
           const exprRangeStartLine = symbol.expr_start_line;
           const exprRangeStartCol = symbol.expr_start_col;
           const exprRangeEndLine = symbol.expr_end_line;
@@ -87,13 +155,6 @@ export function PropertiesPane({ selectedSymbols, getDoc, readFile }: Properties
             exprRangeEndLine != null &&
             exprRangeEndCol != null;
           const apply = (content: string) => {
-            const snippet = extractSnippet(
-              content,
-              rangeStartLine,
-              rangeStartCol,
-              rangeEndLine,
-              rangeEndCol,
-            );
             const expr = hasExprRange
               ? extractSnippet(
                   content,
@@ -106,7 +167,7 @@ export function PropertiesPane({ selectedSymbols, getDoc, readFile }: Properties
             if (!active) return;
             setSnippets((prev) => ({
               ...prev,
-              [key]: { raw: snippet, expr, loading: false },
+              [key]: { expr },
             }));
           };
           if (cached) {
@@ -121,7 +182,7 @@ export function PropertiesPane({ selectedSymbols, getDoc, readFile }: Properties
             if (!active) return;
             setSnippets((prev) => ({
               ...prev,
-              [key]: { raw: null, expr: null, loading: false },
+              [key]: { expr: null },
             }));
           }
         }),
@@ -133,95 +194,97 @@ export function PropertiesPane({ selectedSymbols, getDoc, readFile }: Properties
     };
   }, [getDoc, readFile, normalizedSymbols]);
 
+  useEffect(() => {
+    const onPointerMove = (event: PointerEvent) => {
+      if (!splitDragActiveRef.current) return;
+      updateKeySplitFromClientX(event.clientX);
+    };
+    const onPointerUp = () => {
+      splitDragActiveRef.current = false;
+    };
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+    };
+  }, [updateKeySplitFromClientX]);
+
   return (
-    <div className="properties-pane">
-      <div className="properties-header" />
+    <div ref={paneRef} className="properties-pane" style={{ ["--properties-key-col" as string]: `${keyColumnPercent}%` }}>
       {normalizedSymbols ? (
         <div className="properties-body">
           {normalizedSymbols.map((symbol, idx) => {
             const key = symbolKey(symbol);
             const snippet = snippets[key];
+            const topDocumentation = resolveTopDocumentation(symbol);
+            const baseProperties = [
+              { label: "Kind", value: symbol.kind || "n/a" },
+              { label: "Qualified name", value: symbol.qualified_name || "n/a" },
+              { label: "File", value: symbol.file_path || "n/a" },
+              {
+                label: "Span",
+                value: `${symbol.start_line ?? 0}:${symbol.start_col ?? 0} - ${symbol.end_line ?? 0}:${symbol.end_col ?? 0}`,
+              },
+            ];
+            const dynamicProperties = Array.isArray(symbol.properties) ? symbol.properties : [];
             return (
               <div key={`${key}-${idx}`} className="properties-block">
                 <div className="properties-title">
                   <span>{symbol.name}</span>
-                  <span className="model-kind">{symbol.kind}</span>
+                  <button
+                    type="button"
+                    className="model-kind"
+                    onClick={() => onOpenInProjectModel(symbol)}
+                    title="Open in Project Model"
+                    style={linkButtonStyle}
+                  >
+                    {symbol.kind}
+                  </button>
                 </div>
-                {symbol.doc ? <div className="properties-doc">{symbol.doc}</div> : null}
-                <div className="properties-list">
-                  {symbol.properties.length ? (
-                    symbol.properties.map((prop, index) => (
-                      <div key={`${prop.name}-${index}`} className="properties-row">
-                        <div className="properties-key">{prop.label}</div>
-                        <div className="properties-value">
-                          {"type" in prop.value && prop.value.type === "text" ? prop.value.value : null}
-                          {"type" in prop.value && prop.value.type === "bool" ? (prop.value.value ? "true" : "false") : null}
-                          {"type" in prop.value && prop.value.type === "number" ? String(prop.value.value) : null}
-                          {"type" in prop.value && prop.value.type === "list" ? prop.value.items.join(", ") : null}
-                        </div>
-                      </div>
-                    ))
-                  ) : (
-                    <div className="muted">No properties.</div>
-                  )}
-                  {snippet?.expr ? (
-                    <div className="properties-row">
-                      <div className="properties-key">Expression</div>
-                      <div className="properties-value">{snippet.expr}</div>
-                    </div>
-                  ) : null}
-                </div>
-                <details className="properties-section" key={`parse-${symbol.qualified_name}`}>
-                  <summary>Parse information</summary>
+                {topDocumentation ? <div className="properties-doc">{topDocumentation}</div> : null}
+                <details className="properties-section" key={`element-${symbol.qualified_name}`} open>
+                  <summary>Element details</summary>
                   <div className="properties-parse">
-                    {symbol.file == null &&
-                    symbol.start_line == null &&
-                    symbol.start_col == null &&
-                    symbol.end_line == null &&
-                    symbol.end_col == null ? (
-                      <div className="muted">No parse data available.</div>
-                    ) : (
-                      <>
-                        <div className="properties-row">
-                          <div className="properties-key">File id</div>
+                    <div className="properties-row properties-row-header">
+                      <div className="properties-key properties-key-header">
+                        Key
+                        <div
+                          className="properties-header-divider"
+                          onPointerDown={startKeySplitDrag}
+                          title="Drag to resize key/value split"
+                        />
+                      </div>
+                      <div className="properties-value properties-value-header">Value</div>
+                    </div>
+                    {baseProperties.map((prop, index) => (
+                      <div key={`core-${prop.label}-${index}`} className="properties-row">
+                        <div className="properties-key">{prop.label}</div>
+                        <div className="properties-value">{renderPropertyValue(prop.value)}</div>
+                      </div>
+                    ))}
+                    {dynamicProperties.length ? (
+                      dynamicProperties.map((prop, index) => (
+                        <div key={`${prop.name}-${index}`} className="properties-row">
+                          <div className="properties-key">{prop.label}</div>
                           <div className="properties-value">
-                            {symbol.file == null ? "â€”" : String(symbol.file)}
+                            {"type" in prop.value && prop.value.type === "list"
+                              ? prop.value.items.map((item, itemIndex) => (
+                                  <div key={`${prop.name}-${index}-${itemIndex}`}>{renderPropertyValue(item)}</div>
+                                ))
+                              : renderPropertyValue(propertyValueToText(prop.value))}
                           </div>
                         </div>
-                        <div className="properties-row">
-                          <div className="properties-key">File path</div>
-                          <div className="properties-value">{symbol.file_path ?? "â€”"}</div>
-                        </div>
-                        <div className="properties-row">
-                          <div className="properties-key">Start line</div>
-                          <div className="properties-value">{symbol.start_line ?? "â€”"}</div>
-                        </div>
-                        <div className="properties-row">
-                          <div className="properties-key">Start column</div>
-                          <div className="properties-value">{symbol.start_col ?? "â€”"}</div>
-                        </div>
-                        <div className="properties-row">
-                          <div className="properties-key">End line</div>
-                          <div className="properties-value">{symbol.end_line ?? "â€”"}</div>
-                        </div>
-                        <div className="properties-row">
-                          <div className="properties-key">End column</div>
-                          <div className="properties-value">{symbol.end_col ?? "â€”"}</div>
-                        </div>
-                      </>
-                    )}
-                  </div>
-                </details>
-                <details className="properties-section" key={`raw-${symbol.qualified_name}`}>
-                  <summary>Raw source</summary>
-                  <div className="properties-parse">
-                    {snippet?.loading ? (
-                      <div className="muted">Loading source...</div>
-                    ) : snippet?.raw ? (
-                      <pre className="properties-raw">{snippet.raw}</pre>
+                      ))
                     ) : (
-                      <div className="muted">No source available.</div>
+                      <div className="muted">No additional properties.</div>
                     )}
+                    {snippet?.expr ? (
+                      <div className="properties-row">
+                        <div className="properties-key">Expression</div>
+                        <div className="properties-value">{renderPropertyValue(snippet.expr)}</div>
+                      </div>
+                    ) : null}
                   </div>
                 </details>
               </div>
