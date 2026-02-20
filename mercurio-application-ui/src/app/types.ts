@@ -40,10 +40,21 @@ export type SymbolProperty = {
   group?: string | null;
 };
 
+export type SymbolRelationship = {
+  kind: string;
+  target: string;
+  resolved_target?: string | null;
+  start_line: number;
+  start_col: number;
+  end_line: number;
+  end_col: number;
+};
+
 export type SymbolView = {
   name: string;
   kind: string;
   file_path: string;
+  source_scope?: "project" | "library";
   qualified_name: string;
   file: number;
   start_line: number;
@@ -56,6 +67,21 @@ export type SymbolView = {
   expr_end_col?: number;
   doc?: string | null;
   properties: SymbolProperty[];
+  relationships?: SymbolRelationship[];
+};
+
+export type ParseTreeNodeView = {
+  id: string;
+  parent_id?: string | null;
+  kind: string;
+  label: string;
+  start_offset: number;
+  end_offset: number;
+  start_line: number;
+  start_col: number;
+  end_line: number;
+  end_col: number;
+  depth: number;
 };
 
 export type UnresolvedIssue = {
@@ -77,6 +103,11 @@ export type ModelRow =
   | {
       type: "symbol";
       key: string;
+      section: "project" | "library";
+      filePath: string | null;
+      isFileRoot: boolean;
+      isLoading: boolean;
+      loadError?: string;
       name: string;
       kindLabel: string;
       kindKey: string;
@@ -207,4 +238,17 @@ export type ProjectElementAttributesView = {
   explicit_attributes: ProjectModelAttributeView[];
   inherited_attributes: ProjectElementInheritedAttributeView[];
   diagnostics: string[];
+};
+
+export type SymbolMetatypeMappingView = {
+  project_root: string;
+  symbol_id: string;
+  symbol_file_path: string;
+  symbol_qualified_name: string;
+  symbol_kind: string;
+  resolved_metatype_qname?: string | null;
+  target_symbol_id?: string | null;
+  mapping_source: string;
+  confidence: number;
+  diagnostic?: string | null;
 };

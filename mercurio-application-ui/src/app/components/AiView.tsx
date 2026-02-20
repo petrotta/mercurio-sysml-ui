@@ -22,7 +22,10 @@ type AiViewProps = {
 
 export function AiView(props: AiViewProps) {
   const [inputHeight, setInputHeight] = useState(72);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const dragRef = useRef<{ startY: number; startHeight: number } | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const messagesRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const onMove = (event: PointerEvent) => {
@@ -42,15 +45,51 @@ export function AiView(props: AiViewProps) {
     };
   }, []);
 
+  useEffect(() => {
+    const focusInput = () => {
+      const el = inputRef.current;
+      if (!el) return;
+      el.focus();
+      const pos = el.value.length;
+      el.setSelectionRange(pos, pos);
+    };
+    focusInput();
+    const timer = window.setTimeout(focusInput, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    const el = messagesRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [props.aiMessages]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const onPointerDown = () => setContextMenu(null);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setContextMenu(null);
+      }
+    };
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [contextMenu]);
+
   return (
     <div className="ai-view">
       <div className="view-header" />
       <div className="ai-pane" style={{ gridTemplateRows: `1fr 6px ${inputHeight}px` }}>
         <div
+          ref={messagesRef}
           className="ai-messages"
           onContextMenu={(event) => {
             event.preventDefault();
-            props.onClear();
+            setContextMenu({ x: event.clientX, y: event.clientY });
           }}
         >
           {props.aiMessages.length ? (
@@ -92,6 +131,25 @@ export function AiView(props: AiViewProps) {
             <div className="muted">Ask about your model.</div>
           )}
         </div>
+        {contextMenu ? (
+          <div
+            className="context-menu"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
+            onPointerDown={(event) => {
+              event.stopPropagation();
+            }}
+          >
+            <button
+              type="button"
+              onClick={() => {
+                props.onClear();
+                setContextMenu(null);
+              }}
+            >
+              Clear screen
+            </button>
+          </div>
+        ) : null}
         <div
           className="ai-splitter"
           onPointerDown={(event) => {
@@ -101,10 +159,11 @@ export function AiView(props: AiViewProps) {
         />
         <div className="ai-input" style={{ height: inputHeight }}>
           <textarea
+            ref={inputRef}
             value={props.aiInput}
             onChange={(e) => props.onInputChange(e.target.value)}
             onKeyDown={(event) => {
-              if (event.key === "Enter" && event.shiftKey) {
+              if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
                 props.onSend();
               }

@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  core-and-ui:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install UI dependencies
+        run: npm --prefix mercurio-application-ui ci
+
+      - name: UI typecheck
+        run: npx --prefix mercurio-application-ui tsc --noEmit
+
+      - name: UI path-utils tests
+        run: npm --prefix mercurio-application-ui run -s test:path-utils
+
+      - name: Cargo check
+        run: cargo check -p mercurio-core -p mercurio-application
+
+      - name: Core tests
+        run: cargo test -p mercurio-core

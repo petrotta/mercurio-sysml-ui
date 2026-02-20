@@ -2,6 +2,7 @@ import type { MouseEvent } from "react";
 
 type ModelHeaderProps = {
   collapseAll: boolean;
+  libraryStatus: string;
   onCollapseAll: () => void;
   onExpandAll: () => void;
   onOpenOptions: (event: MouseEvent<HTMLButtonElement>) => void;
@@ -9,12 +10,14 @@ type ModelHeaderProps = {
 
 export function ModelHeader({
   collapseAll,
+  libraryStatus,
   onCollapseAll,
   onExpandAll,
   onOpenOptions,
 }: ModelHeaderProps) {
   return (
     <>
+      <span className="model-header-status">{libraryStatus}</span>
       <button
         type="button"
         className="ghost collapse-btn"

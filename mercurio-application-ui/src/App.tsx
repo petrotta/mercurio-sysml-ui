@@ -1,6 +1,6 @@
 ﻿import "./style.css";
-import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import type { MouseEvent as ReactMouseEvent } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getName, getTauriVersion, getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
@@ -16,7 +16,6 @@ import {
   THEME_KEY,
   TRACK_TEXT_KEY,
   FILTER_MODEL_FILES_KEY,
-  MODEL_SORT_KEY,
   MODEL_SHOW_FILES_KEY,
   MODEL_PROPERTIES_DOCK_KEY,
 } from "./app/constants";
@@ -30,7 +29,9 @@ import { ProjectTree } from "./app/components/ProjectTree";
 import { DataView } from "./app/components/DataView";
 import { ProjectModelPaneView } from "./app/components/ProjectModelView";
 import { DescriptorView } from "./app/components/DescriptorView";
+import { SettingsDialog } from "./app/components/SettingsDialog";
 import { DiagramView } from "./app/components/DiagramView";
+import { TerminalPane } from "./app/components/TerminalPane";
 import { AstStatus } from "./app/components/AstStatus";
 import { CompileToastPanel } from "./app/components/CompileToast";
 import { Modal } from "./app/components/Modal";
@@ -47,12 +48,13 @@ import { useCompileRunner } from "./app/useCompileRunner";
 import { useAstLoader } from "./app/useAstLoader";
 import { readFileText } from "./app/fileOps";
 import { useProjectTree } from "./app/useProjectTree";
-import { runAgent } from "./app/agentClient";
+import { callTool, runAgent } from "./app/agentClient";
 import { parseErrorLocation } from "./app/parseErrors";
+import { isPathWithin } from "./app/pathUtils";
 import type {
   FileEntry,
+  ModelRow,
   OpenTab,
-  ProjectElementAttributesView,
   ProjectModelView,
   StdlibMetamodelView,
   SymbolView,
@@ -60,10 +62,30 @@ import type {
 
 loader.config({ paths: { vs: "/monaco/vs" } });
 
+type TerminalTabState = {
+  id: string;
+  title: string;
+  input: string;
+  lines: string[];
+  history: string[];
+  historyIndex: number | null;
+};
+
+type GotoSymbolCandidate = {
+  name: string;
+  qualified_name: string;
+  file_path: string;
+};
+
 export function App() {
   void getCurrentWindow();
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<"theme" | "ai" | "stdlib">("theme");
+  const [settingsStdlibVersions, setSettingsStdlibVersions] = useState<string[]>([]);
+  const [settingsDefaultStdlib, setSettingsDefaultStdlib] = useState("");
+  const [settingsStdlibBusy, setSettingsStdlibBusy] = useState(false);
+  const [settingsStdlibStatus, setSettingsStdlibStatus] = useState("");
   const [appTheme, setAppTheme] = useState<"dark" | "light">(
     (window.localStorage?.getItem(THEME_KEY) as "dark" | "light") || "dark",
   );
@@ -100,7 +122,14 @@ export function App() {
   const [descriptorViewMode, setDescriptorViewMode] = useState<"view" | "json">("view");
   const suppressDirtyRef = useRef(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; entry: FileEntry; scope: "root" | "node" } | null>(null);
-  const [modelContextMenu, setModelContextMenu] = useState<{ x: number; y: number; filePath: string | null; label: string } | null>(null);
+  const [modelContextMenu, setModelContextMenu] = useState<{
+    x: number;
+    y: number;
+    filePath: string | null;
+    label: string;
+    section: "project" | "library";
+    loadError?: string;
+  } | null>(null);
   const [modelOptionsMenu, setModelOptionsMenu] = useState<{ x: number; y: number } | null>(null);
   const [astViewOpen, setAstViewOpen] = useState(false);
   const [astViewTitle, setAstViewTitle] = useState("");
@@ -108,6 +137,7 @@ export function App() {
   const [tabMenu, setTabMenu] = useState<{ x: number; y: number; path: string } | null>(null);
   const [tabOverflowOpen, setTabOverflowOpen] = useState(false);
   const [showUsageNodes, setShowUsageNodes] = useState(true);
+  const [libraryKindFilter, setLibraryKindFilter] = useState<string | null>(null);
   const [showAstSplit, setShowAstSplit] = useState(false);
   const {
     astState: astSplitState,
@@ -116,8 +146,8 @@ export function App() {
     clearTimer: clearAstSplitTimer,
   } = useAstLoader();
   const [showAbout, setShowAbout] = useState(false);
-  const [metamodelDebugLoading, setMetamodelDebugLoading] = useState(false);
-  const [metamodelDebugError, setMetamodelDebugError] = useState("");
+  const [stdlibMetamodelLoadingState, setStdlibMetamodelLoadingState] = useState(false);
+  const [stdlibMetamodelErrorState, setStdlibMetamodelErrorState] = useState("");
   const [stdlibMetamodel, setStdlibMetamodel] = useState<StdlibMetamodelView | null>(null);
   const [projectModelView, setProjectModelView] = useState<ProjectModelView | null>(null);
   const [projectModelLoading, setProjectModelLoading] = useState(false);
@@ -200,6 +230,12 @@ export function App() {
   const [exportAfterBuild, setExportAfterBuild] = useState(false);
   const [showNewProject, setShowNewProject] = useState(false);
   const [showOpenProject, setShowOpenProject] = useState(false);
+  const [showGotoDialog, setShowGotoDialog] = useState(false);
+  const [gotoQuery, setGotoQuery] = useState("");
+  const [gotoLoading, setGotoLoading] = useState(false);
+  const [gotoError, setGotoError] = useState("");
+  const [gotoCandidates, setGotoCandidates] = useState<GotoSymbolCandidate[]>([]);
+  const [gotoSelectedIndex, setGotoSelectedIndex] = useState(0);
   const [openProjectPath, setOpenProjectPath] = useState("");
   const [newProjectLocation, setNewProjectLocation] = useState("");
   const [newProjectName, setNewProjectName] = useState("");
@@ -282,15 +318,39 @@ export function App() {
     symbols,
     unresolved,
     libraryPath,
+    libraryFiles,
+    libraryLoadingFiles,
+    libraryLoadErrors,
+    libraryBulkLoading,
+    loadedLibraryFileCount,
+    libraryKindCounts,
+    libraryIndexedSymbolCount,
+    loadLibrarySymbolsForFile,
+    loadAllLibrarySymbols,
+    retryFailedLibraryLoads,
+    cancelLibrarySymbolLoading,
+    stdlibFileCount,
     projectSymbolsLoaded,
+    parsedFiles,
     parseErrorPaths,
+    setEditorParseError,
   } = useCompileRunner({ rootPath });
   const [dataExcludeStdlib, setDataExcludeStdlib] = useState(true);
+  const [showTerminal, setShowTerminal] = useState(false);
+  const [terminalHeight, setTerminalHeight] = useState(180);
+  const [terminalTabs, setTerminalTabs] = useState<TerminalTabState[]>([
+    { id: "term-1", title: "Terminal 1", input: "", lines: [], history: [], historyIndex: null },
+  ]);
+  const [activeTerminalTabId, setActiveTerminalTabId] = useState<string | null>("term-1");
+  const terminalTabCounterRef = useRef(1);
+  const terminalResizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
   const [selectedSymbol, setSelectedSymbol] = useState<SymbolView | null>(null);
   const [selectedNodeSymbols, setSelectedNodeSymbols] = useState<SymbolView[] | null>(null);
   const [modelTreeHeight, setModelTreeHeight] = useState(260);
   const [collapseAllModel, setCollapseAllModel] = useState(false);
+  const [rightPaneTab, setRightPaneTab] = useState<"semantic" | "file_editor">("semantic");
   const [showPropertiesPane, setShowPropertiesPane] = useState(true);
+  const [showFilePropertiesPane, setShowFilePropertiesPane] = useState(true);
   const [propertiesDock, setPropertiesDock] = useState<"bottom" | "right">(() => {
     try {
       const stored = window.localStorage?.getItem(MODEL_PROPERTIES_DOCK_KEY);
@@ -309,19 +369,13 @@ export function App() {
   });
   const [modelExpanded, setModelExpanded] = useState<Record<string, boolean>>({});
   const [modelSectionOpen, setModelSectionOpen] = useState({ project: true, library: true, errors: true });
+  const [fileModelExpanded, setFileModelExpanded] = useState<Record<string, boolean>>({});
+  const [fileModelSectionOpen, setFileModelSectionOpen] = useState({ project: true, library: false, errors: false });
   const [showOnlyModelFiles, setShowOnlyModelFiles] = useState(() => {
     try {
       return window.localStorage?.getItem(FILTER_MODEL_FILES_KEY) === "true";
     } catch {
       return false;
-    }
-  });
-  const [modelSortBy, setModelSortBy] = useState<"name" | "qualified_name">(() => {
-    try {
-      const stored = window.localStorage?.getItem(MODEL_SORT_KEY);
-      return stored === "qualified_name" ? "qualified_name" : "name";
-    } catch {
-      return "name";
     }
   });
   const [modelShowFiles, setModelShowFiles] = useState(() => {
@@ -333,8 +387,17 @@ export function App() {
     }
   });
   const modelTreeRef = useRef<HTMLDivElement | null>(null);
+  const fileModelTreeRef = useRef<HTMLDivElement | null>(null);
   const modelPaneContainerRef = useRef<HTMLDivElement | null>(null);
+  const rightPaneHeaderRef = useRef<HTMLDivElement | null>(null);
   const [modelPaneHeight, setModelPaneHeight] = useState(0);
+  const [rightPaneHeaderHeight, setRightPaneHeaderHeight] = useState(0);
+  const draggedFileSymbolRef = useRef<SymbolView | null>(null);
+  const [fileDropIndicator, setFileDropIndicator] = useState<{
+    key: string;
+    position: "before" | "after";
+  } | null>(null);
+  const [fileInsertMenuOpen, setFileInsertMenuOpen] = useState(false);
   const navReqRef = useRef(0);
   const pendingNavRef = useRef<{
     path: string;
@@ -342,12 +405,11 @@ export function App() {
     selection?: { startLine: number; startCol: number; endLine: number; endCol: number };
   } | null>(null);
   const lastCompiledContentRef = useRef<Record<string, string>>({});
-  const elementAttrsCacheRef = useRef<Record<string, ProjectElementAttributesView | null>>({});
-  const elementAttrsInflightRef = useRef<Record<string, Promise<ProjectElementAttributesView | null>>>({});
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
   const cursorListenerRef = useRef<null | { dispose: () => void }>(null);
   const parseReqRef = useRef(0);
+  const gotoInputRef = useRef<HTMLInputElement | null>(null);
     const editorOptions: Parameters<typeof MonacoEditor>[0]["options"] = {
       minimap: { enabled: false },
       fontSize: 14,
@@ -379,6 +441,41 @@ export function App() {
     if (activeTabMeta?.kind === "diagram") return activeTabMeta.sourcePath || null;
     return null;
   }, [activeTabMeta]);
+  const activeTerminalTab = useMemo(
+    () => terminalTabs.find((tab) => tab.id === activeTerminalTabId) || null,
+    [terminalTabs, activeTerminalTabId],
+  );
+
+  const updateActiveTerminalTab = (updater: (tab: TerminalTabState) => TerminalTabState) => {
+    if (!activeTerminalTabId) return;
+    setTerminalTabs((prev) =>
+      prev.map((tab) => (tab.id === activeTerminalTabId ? updater(tab) : tab)),
+    );
+  };
+  const handleRightBarTabClick = useCallback(
+    (tab: "file_editor" | "semantic") => {
+      if (!rightCollapsed && rightPaneTab === tab) {
+        rightStoredWidthRef.current = rightWidth;
+        setRightCollapsed(true);
+        return;
+      }
+      setRightPaneTab(tab);
+      if (rightCollapsed) {
+        setRightCollapsed(false);
+        setRightWidth(rightStoredWidthRef.current || 320);
+      }
+    },
+    [rightCollapsed, rightPaneTab, rightWidth],
+  );
+
+  const ensureTerminalTab = () => {
+    setTerminalTabs((prev) => {
+      if (prev.length) return prev;
+      terminalTabCounterRef.current = 1;
+      return [{ id: "term-1", title: "Terminal 1", input: "", lines: [], history: [], historyIndex: null }];
+    });
+    setActiveTerminalTabId((prev) => prev || "term-1");
+  };
 
   useEffect(() => {
     document.body.classList.toggle("theme-light", appTheme === "light");
@@ -486,8 +583,9 @@ export function App() {
         setModelContextMenu(null);
         setModelOptionsMenu(null);
       }
-      if (!target || !target.closest(".tab-menu")) {
+      if (!target || (!target.closest(".tab-menu") && !target.closest(".right-pane-insert"))) {
         setTabMenu(null);
+        setFileInsertMenuOpen(false);
       }
       if (!target || !target.closest(".tab-overflow")) {
         setTabOverflowOpen(false);
@@ -498,6 +596,30 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    if (!showTerminal) return;
+    ensureTerminalTab();
+  }, [showTerminal]);
+
+  useEffect(() => {
+    const onPointerMove = (event: PointerEvent) => {
+      const drag = terminalResizeRef.current;
+      if (!drag) return;
+      const delta = drag.startY - event.clientY;
+      const next = Math.max(120, Math.min(520, drag.startHeight + delta));
+      setTerminalHeight(next);
+    };
+    const onPointerUp = () => {
+      terminalResizeRef.current = null;
+    };
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+    };
+  }, []);
+
+  useEffect(() => {
     const unlistenPromise = listen<string>("menu-action", (event) => {
       if (event.payload === "about") {
         setShowAbout(true);
@@ -505,12 +627,23 @@ export function App() {
         void runCompile();
       } else if (event.payload === "build-options") {
         openBuildOptions();
+      } else if (event.payload === "toggle-project") {
+        setLeftCollapsed((prev) => {
+          if (!prev) {
+            leftStoredWidthRef.current = leftWidth;
+          } else {
+            setLeftWidth(leftStoredWidthRef.current || 240);
+          }
+          return !prev;
+        });
+      } else if (event.payload === "toggle-terminal") {
+        toggleTerminal();
       }
     });
     return () => {
       unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
     };
-  }, []);
+  }, [leftWidth, runCompile]);
 
   useEffect(() => {
     let active = true;
@@ -541,6 +674,27 @@ export function App() {
   }, [aiEndpoints]);
 
   useEffect(() => {
+    if (!showSettings) return;
+    setSettingsTab("theme");
+    setSettingsStdlibStatus("");
+    void (async () => {
+      try {
+        const [versions, selected] = await Promise.all([
+          callTool<string[]>("stdlib.list_versions@v1", {}),
+          callTool<string | null>("stdlib.get_default@v1", {}),
+        ]);
+        const nextVersions = Array.isArray(versions) ? versions : [];
+        setSettingsStdlibVersions(nextVersions);
+        setSettingsDefaultStdlib(selected || "");
+      } catch (error) {
+        setSettingsStdlibStatus(`Failed to load stdlib settings: ${String(error)}`);
+        setSettingsStdlibVersions([]);
+        setSettingsDefaultStdlib("");
+      }
+    })();
+  }, [showSettings]);
+
+  useEffect(() => {
     window.localStorage?.setItem(TRACK_TEXT_KEY, trackText ? "true" : "false");
   }, [trackText]);
 
@@ -549,22 +703,12 @@ export function App() {
   }, [showOnlyModelFiles]);
 
   useEffect(() => {
-    window.localStorage?.setItem(MODEL_SORT_KEY, modelSortBy);
-  }, [modelSortBy]);
-
-  useEffect(() => {
     window.localStorage?.setItem(MODEL_SHOW_FILES_KEY, modelShowFiles ? "true" : "false");
   }, [modelShowFiles]);
 
   useEffect(() => {
     window.localStorage?.setItem(MODEL_PROPERTIES_DOCK_KEY, propertiesDock);
   }, [propertiesDock]);
-
-  useEffect(() => {
-    elementAttrsCacheRef.current = {};
-    elementAttrsInflightRef.current = {};
-  }, [rootPath, symbols]);
-
 
   useEffect(() => {
     if (selectedChatEndpoint) {
@@ -718,24 +862,26 @@ export function App() {
     }
   };
 
-  const loadStdlibMetamodel = async () => {
+  const loadStdlibMetamodel = useCallback(async () => {
     if (!rootPath) {
-      setMetamodelDebugError("Select a project root first.");
+      setStdlibMetamodelErrorState("Select a project root first.");
       setStdlibMetamodel(null);
       return;
     }
-    setMetamodelDebugLoading(true);
-    setMetamodelDebugError("");
+    setStdlibMetamodelLoadingState(true);
+    setStdlibMetamodelErrorState("");
     try {
-      const payload = await invoke<StdlibMetamodelView>("get_stdlib_metamodel", { root: rootPath });
+      const payload = await callTool<StdlibMetamodelView>("core.get_stdlib_metamodel@v1", {
+        root: rootPath,
+      });
       setStdlibMetamodel(payload);
     } catch (error) {
-      setMetamodelDebugError(`Failed to load metamodel: ${String(error)}`);
+      setStdlibMetamodelErrorState(`Failed to load metamodel: ${String(error)}`);
       setStdlibMetamodel(null);
     } finally {
-      setMetamodelDebugLoading(false);
+      setStdlibMetamodelLoadingState(false);
     }
-  };
+  }, [rootPath]);
 
   const loadProjectModel = async () => {
     if (!rootPath) {
@@ -746,7 +892,7 @@ export function App() {
     setProjectModelLoading(true);
     setProjectModelError("");
     try {
-      const payload = await invoke<ProjectModelView>("get_project_model", { root: rootPath });
+      const payload = await callTool<ProjectModelView>("core.get_project_model@v1", { root: rootPath });
       setProjectModelView(payload);
     } catch (error) {
       setProjectModelError(`Failed to load project model: ${String(error)}`);
@@ -756,8 +902,12 @@ export function App() {
     }
   };
 
-  const loadProjectAndLibraryModel = async () => {
-    await Promise.all([loadProjectModel(), loadStdlibMetamodel()]);
+  const loadProjectModelAndMaybeStdlib = async (includeLibrary = true) => {
+    if (includeLibrary) {
+      await Promise.all([loadProjectModel(), loadStdlibMetamodel()]);
+      return;
+    }
+    await loadProjectModel();
   };
 
   useEffect(() => {
@@ -847,12 +997,87 @@ export function App() {
   useEffect(() => {
     if (!rootPath) return;
     void runBackgroundCompile(rootPath);
-  }, [rootPath, backgroundCompileEnabled]);
+  }, [rootPath, backgroundCompileEnabled, activeEditorPath]);
+
+  useEffect(() => {
+    if (!showGotoDialog) return;
+    gotoInputRef.current?.focus();
+    gotoInputRef.current?.select();
+  }, [showGotoDialog]);
+
+  useEffect(() => {
+    if (!showGotoDialog) return;
+    if (!rootPath) {
+      setGotoCandidates([]);
+      setGotoError("Open a project folder first.");
+      setGotoLoading(false);
+      return;
+    }
+    let active = true;
+    setGotoLoading(true);
+    setGotoError("");
+    type SemanticElementResult = {
+      name: string;
+      qualified_name: string;
+      file_path: string;
+      attributes?: Record<string, string>;
+    };
+    void callTool<SemanticElementResult[]>("core.query_semantic@v1", {
+      root: rootPath,
+      query: {
+        metatype: null,
+        metatype_is_a: null,
+        predicates: [],
+      },
+    })
+      .then((rows) => {
+        if (!active) return;
+        const dedup = new Map<string, GotoSymbolCandidate>();
+        for (const row of rows || []) {
+          const qname =
+            (row.qualified_name || "").trim() ||
+            (row.attributes?.["emf::qualifiedName"] || "").trim();
+          const name =
+            (row.name || "").trim() ||
+            (row.attributes?.["emf::name"] || "").trim() ||
+            qname.split("::").pop() ||
+            "Unnamed";
+          const filePath = (row.file_path || "").trim();
+          if (!qname || !filePath) continue;
+          const key = `${qname}|${filePath}`.toLowerCase();
+          if (dedup.has(key)) continue;
+          dedup.set(key, { name, qualified_name: qname, file_path: filePath });
+        }
+        setGotoCandidates(
+          Array.from(dedup.values()).sort((a, b) => a.qualified_name.localeCompare(b.qualified_name)),
+        );
+      })
+      .catch((error) => {
+        if (!active) return;
+        setGotoCandidates([]);
+        setGotoError(`Failed to load symbols: ${String(error)}`);
+      })
+      .finally(() => {
+        if (!active) return;
+        setGotoLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [showGotoDialog, rootPath]);
+
+  useEffect(() => {
+    if (!rootPath) {
+      setStdlibMetamodel(null);
+      return;
+    }
+    void loadStdlibMetamodel();
+  }, [rootPath, loadStdlibMetamodel]);
 
   useEffect(() => {
     if (activeTabMeta?.kind !== "project-model") return;
     if (!rootPath) return;
-    void loadProjectAndLibraryModel();
+    void loadProjectModelAndMaybeStdlib(false);
   }, [activeTabMeta?.kind, rootPath]);
 
   useEffect(() => {
@@ -865,6 +1090,17 @@ export function App() {
     observer.observe(modelPaneContainerRef.current);
     return () => observer.disconnect();
   }, [rightCollapsed]);
+
+  useEffect(() => {
+    if (!rightPaneHeaderRef.current) return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      setRightPaneHeaderHeight(Math.round(entry.contentRect.height));
+    });
+    observer.observe(rightPaneHeaderRef.current);
+    return () => observer.disconnect();
+  }, [rightPaneTab, rightCollapsed]);
 
 
   const startDrag = (side: "left" | "right" | "model" | "modelProps", event: React.PointerEvent) => {
@@ -974,6 +1210,71 @@ export function App() {
     setActiveTabPath,
     setOpenTabs,
   });
+  const filteredGotoCandidates = useMemo(() => {
+    const raw = gotoQuery.trim().toLowerCase();
+    const baseline = gotoCandidates;
+    if (!raw) {
+      return baseline.slice(0, 300);
+    }
+    const starts: GotoSymbolCandidate[] = [];
+    const contains: GotoSymbolCandidate[] = [];
+    for (const item of baseline) {
+      const qn = item.qualified_name.toLowerCase();
+      const nm = item.name.toLowerCase();
+      if (qn.startsWith(raw) || nm.startsWith(raw)) {
+        starts.push(item);
+      } else if (qn.includes(raw) || nm.includes(raw)) {
+        contains.push(item);
+      }
+    }
+    return [...starts, ...contains].slice(0, 300);
+  }, [gotoCandidates, gotoQuery]);
+  const selectedGotoCandidate =
+    filteredGotoCandidates[Math.max(0, Math.min(gotoSelectedIndex, filteredGotoCandidates.length - 1))] || null;
+
+  useEffect(() => {
+    setGotoSelectedIndex(0);
+  }, [gotoQuery, gotoCandidates.length, showGotoDialog]);
+
+  const openGotoCandidate = useCallback(
+    async (candidate: GotoSymbolCandidate | null) => {
+      if (!candidate) return;
+      setShowGotoDialog(false);
+      setGotoQuery("");
+      setGotoSelectedIndex(0);
+      await navigateTo({
+        path: candidate.file_path,
+        name: candidate.file_path.split(/[\\/]/).pop() || candidate.name || candidate.qualified_name,
+      });
+    },
+    [navigateTo],
+  );
+
+  const handleGotoInputKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      if (!filteredGotoCandidates.length) return;
+      setGotoSelectedIndex((prev) => Math.min(filteredGotoCandidates.length - 1, prev + 1));
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      if (!filteredGotoCandidates.length) return;
+      setGotoSelectedIndex((prev) => Math.max(0, prev - 1));
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      if (!selectedGotoCandidate) return;
+      void openGotoCandidate(selectedGotoCandidate);
+      return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setShowGotoDialog(false);
+      return;
+    }
+  };
   const {
     selectTab,
     openAiViewTab,
@@ -1039,10 +1340,20 @@ export function App() {
     setModelOptionsMenu(null);
   };
 
-  const showModelContext = (event: ReactMouseEvent, payload: { filePath: string | null; label: string }) => {
+  const showModelContext = (
+    event: ReactMouseEvent,
+    payload: { filePath: string | null; label: string; section: "project" | "library"; loadError?: string },
+  ) => {
     event.preventDefault();
     event.stopPropagation();
-    setModelContextMenu({ x: event.clientX, y: event.clientY, filePath: payload.filePath, label: payload.label });
+    setModelContextMenu({
+      x: event.clientX,
+      y: event.clientY,
+      filePath: payload.filePath,
+      label: payload.label,
+      section: payload.section,
+      loadError: payload.loadError,
+    });
     setModelOptionsMenu(null);
     setContextMenu(null);
   };
@@ -1060,110 +1371,6 @@ export function App() {
     setAstViewTitle(label);
     setAstViewOpen(true);
     await loadAstViewForPath(filePath);
-  };
-
-  const loadElementAttributes = async (symbol: SymbolView): Promise<ProjectElementAttributesView | null> => {
-    if (!rootPath || !symbol.qualified_name) return null;
-    const cacheKey = `${rootPath}::${symbol.qualified_name}::${symbol.kind || ""}`;
-    if (cacheKey in elementAttrsCacheRef.current) {
-      return elementAttrsCacheRef.current[cacheKey];
-    }
-    const inflight = elementAttrsInflightRef.current[cacheKey];
-    if (inflight) {
-      return inflight;
-    }
-    const request = (async () => {
-      try {
-        const data = await invoke<ProjectElementAttributesView>("get_project_element_attributes", {
-          root: rootPath,
-          elementQualifiedName: symbol.qualified_name,
-          symbolKind: symbol.kind || null,
-        });
-        elementAttrsCacheRef.current[cacheKey] = data;
-        return data;
-      } catch {
-        return null;
-      } finally {
-        delete elementAttrsInflightRef.current[cacheKey];
-      }
-    })();
-    elementAttrsInflightRef.current[cacheKey] = request;
-    try {
-      return await request;
-    } catch {
-      return null;
-    }
-  };
-
-  const openAttributeInProjectModel = (
-    symbol: SymbolView,
-    attrQualifiedName: string,
-    attrName: string,
-  ) => {
-    setProjectModelFocusQuery(attrQualifiedName || `${symbol.qualified_name}::${attrName}`);
-    openProjectModelViewTab();
-  };
-
-  const openAttributeSourceText = async (
-    symbol: SymbolView,
-    attrQualifiedName: string,
-    attrName: string,
-  ) => {
-    if (!rootPath) return;
-    type SemanticQueryPayload = {
-      metatype?: string | null;
-      metatype_is_a?: string | null;
-      predicates: Array<{ name: string; equals: string }>;
-    };
-    type SemanticElementResult = {
-      file_path: string;
-      start_line: number;
-      start_col: number;
-      end_line: number;
-      end_col: number;
-    };
-    try {
-      const query: SemanticQueryPayload = {
-        metatype: null,
-        metatype_is_a: null,
-        predicates: [
-          {
-            name: "qualified_name",
-            equals: attrQualifiedName,
-          },
-        ],
-      };
-      const matches = await invoke<SemanticElementResult[]>("query_semantic", {
-        root: rootPath,
-        query,
-      });
-      const first = Array.isArray(matches) && matches.length ? matches[0] : null;
-      if (first?.file_path) {
-        await navigateTo({
-          path: first.file_path,
-          name: first.file_path.split(/[\\/]/).pop() || attrName || "Attribute",
-          selection: {
-            startLine: first.start_line,
-            startCol: first.start_col,
-            endLine: first.end_line,
-            endCol: first.end_col,
-          },
-        });
-        return;
-      }
-    } catch {
-      // Fall back to opening the owning symbol when attribute lookup fails.
-    }
-    await navigateTo({
-      path: symbol.file_path,
-      name: symbol.file_path.split(/[\\/]/).pop() || symbol.name || "Source",
-      selection: {
-        startLine: symbol.start_line,
-        startCol: symbol.start_col,
-        endLine: symbol.end_line,
-        endCol: symbol.end_col,
-      },
-    });
   };
 
   const handleContextAction = async (action: string) => {
@@ -1213,7 +1420,7 @@ export function App() {
           import_entries?: string[];
           raw_json?: string;
         }>("ensure_project_descriptor", { root: rootPath }),
-        invoke<string[]>("list_stdlib_versions"),
+        callTool<string[]>("stdlib.list_versions@v1", {}),
       ]);
       setProjectDescriptor(descriptor || null);
       setHasProjectDescriptor(!!descriptor);
@@ -1840,14 +2047,16 @@ export function App() {
             endColumn: (err.column || 1) + 1,
           }));
           monaco.editor.setModelMarkers(model, "sysml-parse", markers);
+          setEditorParseError(activeEditorPath, markers.length > 0);
         })
         .catch(() => {
           if (reqId !== parseReqRef.current) return;
           monaco.editor.setModelMarkers(model, "sysml-parse", []);
+          setEditorParseError(activeEditorPath, false);
         });
     }, 450);
     return () => window.clearTimeout(timer);
-  }, [editorChangeTick, activeEditorPath]);
+  }, [editorChangeTick, activeEditorPath, setEditorParseError]);
 
   useEffect(() => {
     if (!rootPath || !activeEditorPath) return;
@@ -1864,10 +2073,16 @@ export function App() {
   const selectSymbolInEditor = async (symbol: SymbolView) => {
     if (!symbol) return;
     if (!symbol.file_path) return;
-    const startLine = (symbol.start_line ?? 0) + 1;
-    const startCol = (symbol.start_col ?? 0) + 1;
-    const endLine = (symbol.end_line ?? symbol.start_line ?? 0) + 1;
-    const endCol = (symbol.end_col ?? symbol.start_col ?? 0) + 1;
+    const startLine = Math.max(1, symbol.start_line || 1);
+    const startCol = Math.max(1, symbol.start_col || 1);
+    let endLine = Math.max(startLine, symbol.end_line || symbol.start_line || 1);
+    let endCol = Math.max(1, symbol.end_col || symbol.start_col || 1);
+    if (endLine === startLine && endCol < startCol) {
+      endCol = startCol;
+    }
+    if (endLine === startLine && endCol === startCol) {
+      endCol = startCol + 1;
+    }
     await navigateTo({
       path: symbol.file_path,
       name: symbol.file_path.split(/[\\/]/).pop() || "Untitled",
@@ -1877,6 +2092,248 @@ export function App() {
         endLine,
         endCol,
       },
+    });
+  };
+
+  const openQualifiedNameInSource = useCallback(
+    async (qualifiedName: string) => {
+      const qname = qualifiedName.trim();
+      if (!qname) return;
+      if (!rootPath) {
+        setCompileStatus("Open a project folder first.");
+        return;
+      }
+      type SemanticQueryPayload = {
+        metatype?: string | null;
+        metatype_is_a?: string | null;
+        predicates: Array<{ name: string; equals: string }>;
+      };
+      type SemanticElementResult = {
+        file_path: string;
+      };
+      try {
+        const query: SemanticQueryPayload = {
+          metatype: null,
+          metatype_is_a: null,
+          predicates: [{ name: "qualified_name", equals: qname }],
+        };
+        const matches = await callTool<SemanticElementResult[]>("core.query_semantic@v1", {
+          root: rootPath,
+          query,
+        });
+        const first = Array.isArray(matches) ? matches.find((item) => item?.file_path) || null : null;
+        if (!first?.file_path) {
+          setCompileStatus(`No source found for ${qname}`);
+          return;
+        }
+        await navigateTo({
+          path: first.file_path,
+          name: first.file_path.split(/[\\/]/).pop() || qname,
+        });
+      } catch (error) {
+        setCompileStatus(`Lookup failed for ${qname}: ${String(error)}`);
+      }
+    },
+    [navigateTo, rootPath, setCompileStatus],
+  );
+
+  const evaluateTerminalExpression = async (rawExpr: string): Promise<string> => {
+    if (!rawExpr.trim()) return "Error = missing expression";
+    if (!rootPath) return "Error = no project root selected";
+    try {
+      const value = await invoke<string>("eval_expression", { root: rootPath, expression: rawExpr });
+      return `Result = ${value}`;
+    } catch (error) {
+      return `Error = ${String(error)}`;
+    }
+  };
+
+  const normalizeTerminalRef = (value: string) => value.trim().replace(/\./g, "::");
+
+  const appendTerminalLines = (next: string[]) => {
+    updateActiveTerminalTab((tab) => ({ ...tab, lines: [...tab.lines, ...next].slice(-300) }));
+  };
+
+  const toggleTerminal = () => {
+    setShowTerminal((prev) => {
+      const next = !prev;
+      if (next) ensureTerminalTab();
+      return next;
+    });
+  };
+
+  const inspectByType = (raw: string): string[] => {
+    const needle = raw.trim().toLowerCase();
+    if (!needle) return ["Error = missing type query"];
+    const projectSymbols = symbols.filter((symbol) => !isPathWithin(symbol.file_path, libraryPath));
+    const matches = projectSymbols.filter((symbol) => {
+      const kind = (symbol.kind || "").toLowerCase();
+      if (kind === needle) return true;
+      const metatype = (symbol.properties || []).find(
+        (prop) => prop.name === "metatype_qname" && prop.value?.type === "text",
+      );
+      if (metatype && metatype.value.type === "text") {
+        const value = (metatype.value.value || "").toLowerCase();
+        return value.endsWith(needle) || value.includes(needle);
+      }
+      return false;
+    });
+    if (!matches.length) return [`Result = no symbols for type '${raw.trim()}'`];
+    const lines = [`Result = ${matches.length} symbols`];
+    matches.slice(0, 20).forEach((symbol) => {
+      lines.push(
+        `- ${symbol.kind} ${symbol.qualified_name} @ ${symbol.file_path}:${symbol.start_line || 0}`,
+      );
+    });
+    if (matches.length > 20) {
+      lines.push(`... ${matches.length - 20} more`);
+    }
+    return lines;
+  };
+
+  const inspectSymbol = (raw: string): string[] => {
+    const query = normalizeTerminalRef(raw);
+    if (!query) return ["Error = missing symbol query"];
+    const projectSymbols = symbols.filter((symbol) => !isPathWithin(symbol.file_path, libraryPath));
+    let symbol = projectSymbols.find((item) => (item.qualified_name || "").trim() === query);
+    if (!symbol) {
+      symbol = projectSymbols.find((item) => (item.name || "").trim() === query);
+    }
+    if (!symbol) {
+      const partial = projectSymbols.filter((item) => {
+        const qn = (item.qualified_name || "").trim();
+        return qn.endsWith(`::${query}`) || qn.includes(query);
+      });
+      if (!partial.length) return [`Result = symbol '${raw.trim()}' not found`];
+      const lines = [`Result = ${partial.length} matches`];
+      partial.slice(0, 20).forEach((item) => {
+        lines.push(`- ${item.kind} ${item.qualified_name} @ ${item.file_path}:${item.start_line || 0}`);
+      });
+      if (partial.length > 20) lines.push(`... ${partial.length - 20} more`);
+      return lines;
+    }
+    const lines = [
+      `Result = ${symbol.kind} ${symbol.qualified_name}`,
+      `file = ${symbol.file_path}`,
+      `span = ${symbol.start_line || 0}:${symbol.start_col || 0} - ${symbol.end_line || 0}:${symbol.end_col || 0}`,
+    ];
+    const properties = symbol.properties || [];
+    if (properties.length) {
+      lines.push("properties:");
+      properties.slice(0, 16).forEach((prop) => {
+        const value =
+          prop.value.type === "text"
+            ? prop.value.value
+            : prop.value.type === "number"
+              ? String(prop.value.value)
+              : prop.value.type === "bool"
+                ? String(prop.value.value)
+                : `[${prop.value.items.join(", ")}]`;
+        lines.push(`- ${prop.name} = ${value}`);
+      });
+      if (properties.length > 16) lines.push(`... ${properties.length - 16} more properties`);
+    }
+    const rels = symbol.relationships || [];
+    if (rels.length) {
+      lines.push("relationships:");
+      rels.slice(0, 12).forEach((rel) => {
+        lines.push(`- ${rel.kind} -> ${rel.resolved_target || rel.target}`);
+      });
+      if (rels.length > 12) lines.push(`... ${rels.length - 12} more relationships`);
+    }
+    return lines;
+  };
+
+  const runTerminalCommand = async () => {
+    const command = (activeTerminalTab?.input || "").trim();
+    if (!command) return;
+    updateActiveTerminalTab((tab) => ({
+      ...tab,
+      history: [...tab.history, command].slice(-200),
+      historyIndex: null,
+      input: "",
+    }));
+    appendTerminalLines([`> ${command}`]);
+    if (command.toLowerCase().startsWith("eval ")) {
+      const expr = command.slice(5);
+      const result = await evaluateTerminalExpression(expr);
+      appendTerminalLines([result]);
+      return;
+    }
+    if (command.toLowerCase().startsWith("inspect ")) {
+      const rest = command.slice(8).trim();
+      if (rest.toLowerCase().startsWith("type ")) {
+        appendTerminalLines(inspectByType(rest.slice(5)));
+      } else {
+        appendTerminalLines(inspectSymbol(rest));
+      }
+      return;
+    }
+    appendTerminalLines(["Error = unknown command (try: eval A.x or inspect A.x or inspect type Usage)"]);
+  };
+
+  const autocompleteTerminalEval = () => {
+    const trimmed = (activeTerminalTab?.input || "").trim().toLowerCase();
+    if (trimmed === "e" || trimmed === "ev" || trimmed === "eva" || trimmed === "eval") {
+      updateActiveTerminalTab((tab) => ({ ...tab, input: "eval " }));
+    }
+  };
+
+  const terminalHistoryUp = () => {
+    updateActiveTerminalTab((tab) => {
+      if (!tab.history.length) return tab;
+      if (tab.historyIndex == null) {
+        const nextIndex = tab.history.length - 1;
+        return { ...tab, historyIndex: nextIndex, input: tab.history[nextIndex] || "" };
+      }
+      const nextIndex = Math.max(0, tab.historyIndex - 1);
+      return { ...tab, historyIndex: nextIndex, input: tab.history[nextIndex] || "" };
+    });
+  };
+
+  const terminalHistoryDown = () => {
+    updateActiveTerminalTab((tab) => {
+      if (!tab.history.length || tab.historyIndex == null) return tab;
+      const lastIndex = tab.history.length - 1;
+      if (tab.historyIndex >= lastIndex) {
+        return { ...tab, historyIndex: null, input: "" };
+      }
+      const nextIndex = tab.historyIndex + 1;
+      return { ...tab, historyIndex: nextIndex, input: tab.history[nextIndex] || "" };
+    });
+  };
+
+  const createTerminalTab = () => {
+    terminalTabCounterRef.current += 1;
+    const id = `term-${terminalTabCounterRef.current}`;
+    const next: TerminalTabState = {
+      id,
+      title: `Terminal ${terminalTabCounterRef.current}`,
+      input: "",
+      lines: [],
+      history: [],
+      historyIndex: null,
+    };
+    setTerminalTabs((prev) => [...prev, next]);
+    setActiveTerminalTabId(id);
+    setShowTerminal(true);
+  };
+
+  const closeTerminalTab = (id: string) => {
+    setTerminalTabs((prev) => {
+      const idx = prev.findIndex((tab) => tab.id === id);
+      if (idx < 0) return prev;
+      const next = prev.filter((tab) => tab.id !== id);
+      if (!next.length) {
+        setShowTerminal(false);
+        setActiveTerminalTabId(null);
+        return next;
+      }
+      if (activeTerminalTabId === id) {
+        const fallback = next[Math.max(0, idx - 1)]?.id || next[0].id;
+        setActiveTerminalTabId(fallback);
+      }
+      return next;
     });
   };
 
@@ -1912,7 +2369,13 @@ export function App() {
       const key = event.key.toLowerCase();
       const isBuild = (event.ctrlKey || event.metaKey) && key === "b";
       const isSave = (event.ctrlKey || event.metaKey) && key === "s";
+      const isTerminalToggle = (event.ctrlKey || event.metaKey) && key === "t";
+      const isGoto = (event.ctrlKey || event.metaKey) && key === "g";
       if (event.key === "Escape") {
+        if (aiFloatingSteps.length) {
+          setAiFloatingSteps([]);
+          return;
+        }
         if (openMenu) {
           setOpenMenu(null);
           return;
@@ -1953,6 +2416,15 @@ export function App() {
           setShowNewProject(false);
           return;
         }
+        if (showGotoDialog) {
+          setShowGotoDialog(false);
+          return;
+        }
+        return;
+      }
+      if (isGoto) {
+        event.preventDefault();
+        setShowGotoDialog(true);
         return;
       }
       if (isBuild) {
@@ -1963,6 +2435,11 @@ export function App() {
       if (isSave) {
         event.preventDefault();
         void saveActiveTab();
+        return;
+      }
+      if (isTerminalToggle) {
+        event.preventDefault();
+        toggleTerminal();
         return;
       }
       if (event.key === "F10") {
@@ -1987,7 +2464,7 @@ export function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeTabPath, activeTabMeta, activeEditorPath, contextMenu, openMenu, showExport, showNewFile, showNewProject, showOpenProject, showProjectProperties, showSettings, tabMenu]);
+  }, [activeTabPath, activeTabMeta, activeEditorPath, aiFloatingSteps.length, contextMenu, openMenu, showExport, showGotoDialog, showNewFile, showNewProject, showOpenProject, showProjectProperties, showSettings, tabMenu]);
 
   const resetEndpointDraft = () => {
     setEndpointDraft({ name: "", url: "", type: "chat", provider: "openai", model: "", token: "" });
@@ -2076,6 +2553,23 @@ export function App() {
     }
   };
 
+  const saveDefaultStdlibSelection = async () => {
+    setSettingsStdlibBusy(true);
+    setSettingsStdlibStatus("Saving...");
+    try {
+      const selected = settingsDefaultStdlib.trim();
+      const saved = await callTool<string | null>("stdlib.set_default@v1", {
+        stdlib: selected ? selected : null,
+      });
+      setSettingsDefaultStdlib(saved || "");
+      setSettingsStdlibStatus("Saved default stdlib.");
+    } catch (error) {
+      setSettingsStdlibStatus(`Failed to save stdlib setting: ${String(error)}`);
+    } finally {
+      setSettingsStdlibBusy(false);
+    }
+  };
+
   const sendAiMessage = async (text: string) => {
     const endpoint = selectedChatEndpoint ? aiEndpoints.find((item) => item.id === selectedChatEndpoint) : null;
     const requestId = ++aiRequestRef.current;
@@ -2104,7 +2598,7 @@ export function App() {
     }
     const buildModelContext = () => {
       const activePath = activeEditorPath || activeDoc.path || "";
-      const projectSymbols = symbols.filter((symbol) => !(libraryPath && symbol.file_path.startsWith(libraryPath)));
+      const projectSymbols = symbols.filter((symbol) => !isPathWithin(symbol.file_path, libraryPath));
       const activeSymbols = activePath
         ? projectSymbols.filter((symbol) => symbol.file_path === activePath).slice(0, 40)
         : [];
@@ -2115,10 +2609,10 @@ export function App() {
           : "";
       const symbolLines = activeSymbols.map(
         (symbol) =>
-          `- ${symbol.kind} ${symbol.qualified_name} @ ${symbol.file_path}:${(symbol.start_line ?? 0) + 1}`,
+          `- ${symbol.kind} ${symbol.qualified_name} @ ${symbol.file_path}:${symbol.start_line ?? 0}`,
       );
       const unresolvedLines = unresolvedTop.map(
-        (item) => `- ${item.file_path}:${(item.line ?? 0) + 1}:${(item.column ?? 0) + 1} ${item.message}`,
+        (item) => `- ${item.file_path}:${item.line ?? 0}:${item.column ?? 0} ${item.message}`,
       );
       return [
         `root: ${rootPath || "unknown"}`,
@@ -2232,48 +2726,53 @@ export function App() {
           }
         };
         const parsedAgent = parseAgentJson(content);
-        let parsedSummary: string | undefined;
-        let parsedSteps: Array<{ id: string; label: string; recommended: boolean; action: string }> | undefined;
-        let parsedToolNote: string | undefined;
-        if (parsedAgent && typeof parsedAgent === "object" && typeof parsedAgent.action === "string") {
-          if (parsedAgent.action === "final" && typeof parsedAgent.content === "string") {
-            const parsedFinal = parseAgentJson(parsedAgent.content);
-            if (parsedFinal && typeof parsedFinal.summary === "string") {
-              parsedSummary = parsedFinal.summary;
-            }
-            if (Array.isArray(parsedFinal?.next_steps)) {
-              parsedSteps = parsedFinal.next_steps
-                .map((step: any, index: number) => ({
-                  id: typeof step?.id === "string" && step.id.trim() ? step.id : String(index + 1),
-                  label: typeof step?.label === "string" ? step.label : "",
-                  recommended: Boolean(step?.recommended),
-                  action: typeof step?.action === "string" ? step.action : "",
-                }))
-                .filter((step: { label: string; action: string }) => step.label || step.action);
-            }
-          } else {
-            const detail = parsedAgent.path || parsedAgent.query || parsedAgent.detail || "";
-            parsedToolNote = `Tool request: ${parsedAgent.action}${detail ? ` ${detail}` : ""}`;
+        const parseSteps = (value: unknown) => {
+          if (!Array.isArray(value)) return undefined;
+          const mapped = value
+            .map((step: any, index: number) => ({
+              id: typeof step?.id === "string" && step.id.trim() ? step.id : String(index + 1),
+              label: typeof step?.label === "string" ? step.label : "",
+              recommended: Boolean(step?.recommended),
+              action: typeof step?.action === "string" ? step.action : "",
+            }))
+            .filter((step: { label: string; action: string }) => step.label || step.action);
+          return mapped.length ? mapped : undefined;
+        };
+        const extractSummaryAndSteps = (
+          value: any,
+        ): {
+          summary?: string;
+          steps?: Array<{ id: string; label: string; recommended: boolean; action: string }>;
+        } => {
+          if (!value || typeof value !== "object") return {};
+          if (typeof value.summary === "string") {
+            return { summary: value.summary, steps: parseSteps(value.next_steps) };
           }
-        } else {
-          parsedSummary = parsedAgent && typeof parsedAgent.summary === "string" ? parsedAgent.summary : undefined;
-          parsedSteps = Array.isArray(parsedAgent?.next_steps)
-            ? parsedAgent.next_steps
-                .map((step: any, index: number) => ({
-                  id: typeof step?.id === "string" && step.id.trim() ? step.id : String(index + 1),
-                  label: typeof step?.label === "string" ? step.label : "",
-                  recommended: Boolean(step?.recommended),
-                  action: typeof step?.action === "string" ? step.action : "",
-                }))
-                .filter((step: { label: string; action: string }) => step.label || step.action)
-            : undefined;
-        }
-        const nextText =
-          response?.final_response?.summary ||
-          parsedSummary ||
-          parsedToolNote ||
+          if (typeof value.action === "string" && value.action === "final") {
+            const nested =
+              typeof value.content === "string" ? parseAgentJson(value.content) : value.content;
+            return extractSummaryAndSteps(nested);
+          }
+          return {};
+        };
+        const extractedFromResponse = extractSummaryAndSteps(response?.final_response);
+        const extractedFromContent = extractSummaryAndSteps(parsedAgent);
+        let nextSteps =
+          extractedFromResponse.steps ||
+          extractedFromContent.steps;
+        let nextText =
+          extractedFromResponse.summary ||
+          extractedFromContent.summary ||
+          (response?.final_error ? `Agent error: ${response.final_error}` : undefined) ||
           content ||
           "No response.";
+        const extractedFromText = extractSummaryAndSteps(parseAgentJson(nextText));
+        if (extractedFromText.summary) {
+          nextText = extractedFromText.summary;
+          if (!nextSteps) {
+            nextSteps = extractedFromText.steps;
+          }
+        }
         const toolEdits = (response?.steps || [])
           .filter((step) => step.kind === "tool" && typeof step.detail === "string")
           .map((step) => step.detail);
@@ -2315,9 +2814,6 @@ export function App() {
             );
           }
         }
-        const nextSteps = Array.isArray(response?.final_response?.next_steps)
-          ? response.final_response.next_steps
-          : parsedSteps;
       setAiMessages((prev) =>
         prev.map((msg) =>
           msg.pendingId === requestId
@@ -2377,6 +2873,31 @@ export function App() {
 
   const deferredSymbols = useDeferredValue(symbols);
   const deferredUnresolved = useDeferredValue(unresolved);
+  const projectTreeSymbols = useMemo(() => deferredSymbols, [deferredSymbols]);
+  const normalizeModelPath = useCallback((value: string | null | undefined) => {
+    return (value || "").replace(/\//g, "\\").toLowerCase();
+  }, []);
+  const activeFileTreeSymbols = useMemo(() => {
+    const activeKey = normalizeModelPath(activeEditorPath);
+    if (!activeKey) return [] as SymbolView[];
+    return deferredSymbols.filter(
+      (symbol) =>
+        symbol.source_scope !== "library" &&
+        normalizeModelPath(symbol.file_path) === activeKey,
+    );
+  }, [deferredSymbols, activeEditorPath, normalizeModelPath]);
+  const activeFileUnresolved = useMemo(() => {
+    const activeKey = normalizeModelPath(activeEditorPath);
+    if (!activeKey) return [];
+    return deferredUnresolved.filter((issue) => normalizeModelPath(issue.file_path) === activeKey);
+  }, [deferredUnresolved, activeEditorPath, normalizeModelPath]);
+
+  useEffect(() => {
+    if (rightPaneTab !== "file_editor") {
+      setFileInsertMenuOpen(false);
+      setFileDropIndicator(null);
+    }
+  }, [rightPaneTab]);
 
   useEffect(() => {
     if (!selectedSymbol) return;
@@ -2399,12 +2920,17 @@ export function App() {
     projectCounts,
     libraryCounts,
     errorCounts,
+    dataViewSymbols,
     dataViewSymbolKindCounts,
   } = useModelGroups({
-    deferredSymbols,
+    deferredSymbols: projectTreeSymbols,
     deferredUnresolved,
     rootPath,
     libraryPath,
+    libraryFilePaths: libraryFiles,
+    projectFilePaths: parsedFiles,
+    stdlibFileCount,
+    librarySymbolCount: libraryIndexedSymbolCount,
     dataExcludeStdlib,
   });
 
@@ -2421,16 +2947,74 @@ export function App() {
     projectSymbolsLoaded,
     getKindKey,
     showUsages: showUsageNodes,
-    modelSortBy,
     modelShowFiles,
+    defaultExpanded: false,
+    libraryLoadingFilePaths: libraryLoadingFiles,
+    libraryLoadErrors,
+    libraryKindFilter,
   });
 
-  const undockedTreeHeight = Math.max(
-    modelTreeHeight,
-    modelPaneHeight > 0 ? modelPaneHeight - 44 : modelTreeHeight,
-  );
-  const effectiveModelTreeHeight =
-    showPropertiesPane && propertiesDock === "bottom" ? modelTreeHeight : undockedTreeHeight;
+  const {
+    projectGroups: fileProjectGroups,
+    libraryGroups: fileLibraryGroups,
+    projectCounts: fileProjectCounts,
+    libraryCounts: fileLibraryCounts,
+    errorCounts: fileErrorCounts,
+  } = useModelGroups({
+    deferredSymbols: activeFileTreeSymbols,
+    deferredUnresolved: activeFileUnresolved,
+    rootPath,
+    libraryPath: null,
+    libraryFilePaths: [],
+    stdlibFileCount: 0,
+    librarySymbolCount: 0,
+    dataExcludeStdlib: true,
+  });
+
+  const { modelRows: fileModelRows } = useModelTree({
+    projectGroups: fileProjectGroups,
+    libraryGroups: [],
+    deferredUnresolved: activeFileUnresolved,
+    modelExpanded: fileModelExpanded,
+    collapseAllModel,
+    modelSectionOpen: fileModelSectionOpen,
+    projectCounts: fileProjectCounts,
+    libraryCounts: fileLibraryCounts,
+    errorCounts: fileErrorCounts,
+    projectSymbolsLoaded: !!activeEditorPath,
+    getKindKey,
+    showUsages: true,
+    modelShowFiles: false,
+    defaultExpanded: true,
+    libraryLoadingFilePaths: [],
+    libraryLoadErrors: {},
+    libraryKindFilter: null,
+  });
+  const fileEditorModelRows = useMemo<ModelRow[]>(() => {
+    const symbolRows = fileModelRows.filter((row) => row.type === "symbol");
+    if (symbolRows.length) return symbolRows;
+    return [
+      {
+        type: "empty",
+        key: "empty-file-editor",
+        text: activeEditorPath ? "No symbols in current file." : "No active file.",
+      },
+    ];
+  }, [fileModelRows, activeEditorPath]);
+  const pendingLibraryFiles = Math.max(0, libraryFiles.length - loadedLibraryFileCount);
+  const failedLibraryFiles = Object.keys(libraryLoadErrors).length;
+
+  const paneGap = 10;
+  const availableModelPaneHeight =
+    modelPaneHeight > 0 ? Math.max(120, modelPaneHeight - rightPaneHeaderHeight - paneGap) : modelTreeHeight;
+  const semanticTreeHeight =
+    showPropertiesPane && propertiesDock === "bottom"
+      ? modelTreeHeight
+      : Math.max(modelTreeHeight, availableModelPaneHeight);
+  const fileTreeHeight = showFilePropertiesPane
+    ? Math.min(modelTreeHeight, availableModelPaneHeight)
+    : availableModelPaneHeight;
+  const effectiveModelTreeHeight = rightPaneTab === "file_editor" ? fileTreeHeight : semanticTreeHeight;
 
   const {
     modelListRef,
@@ -2452,8 +3036,36 @@ export function App() {
     setSelectedNodeSymbols,
     selectSymbolInEditor,
     navigateTo,
+    onRequestLibraryFileSymbols: (filePath) => {
+      void loadLibrarySymbolsForFile(filePath);
+    },
     projectGroups,
     libraryGroups,
+  });
+
+  const {
+    modelListRef: fileModelListRef,
+    modelSectionIndent: fileModelSectionIndent,
+    modelListHeight: fileModelListHeight,
+    modelCursorIndex: fileModelCursorIndex,
+    setModelCursorIndex: setFileModelCursorIndex,
+    findSelectedSymbolIndex: findSelectedFileSymbolIndex,
+    syncModelTreeToSymbol: syncFileModelTreeToSymbol,
+    handleModelTreeKeyDown: handleFileModelTreeKeyDown,
+    getModelRowHeight: getFileModelRowHeight,
+  } = useModelTreeSelection({
+    modelRows: fileEditorModelRows,
+    modelTreeHeight: effectiveModelTreeHeight,
+    setModelSectionOpen: setFileModelSectionOpen,
+    setModelExpanded: setFileModelExpanded,
+    selectedSymbol,
+    setSelectedSymbol,
+    setSelectedNodeSymbols,
+    selectSymbolInEditor,
+    navigateTo,
+    onRequestLibraryFileSymbols: () => {},
+    projectGroups: fileProjectGroups,
+    libraryGroups: fileLibraryGroups,
   });
 
   const {
@@ -2498,9 +3110,123 @@ export function App() {
     onTrack: (symbol) => {
       setSelectedSymbol(symbol);
       setSelectedNodeSymbols([symbol]);
-      syncModelTreeToSymbol(symbol);
+      if (rightPaneTab === "file_editor") {
+        syncFileModelTreeToSymbol(symbol);
+      } else {
+        syncModelTreeToSymbol(symbol);
+      }
     },
   });
+
+  const insertSnippetIntoActiveFile = useCallback((snippet: string) => {
+    const editor = editorRef.current;
+    const monaco = monacoRef.current;
+    if (!editor || !monaco || !activeEditorPath) return;
+    const activeKey = normalizeModelPath(activeEditorPath);
+    const anchor =
+      selectedSymbol && normalizeModelPath(selectedSymbol.file_path) === activeKey
+        ? selectedSymbol
+        : null;
+    const selection = anchor
+      ? new monaco.Range(
+          Math.max(1, (anchor.end_line || 0) + 1),
+          1,
+          Math.max(1, (anchor.end_line || 0) + 1),
+          1,
+        )
+      : editor.getSelection();
+    if (!selection) return;
+    editor.executeEdits("file-tree-insert", [
+      {
+        range: selection,
+        text: snippet,
+        forceMoveMarkers: true,
+      },
+    ]);
+    editor.focus();
+    setCompileStatus("File tree: inserted snippet");
+    setFileInsertMenuOpen(false);
+  }, [activeEditorPath, normalizeModelPath, selectedSymbol, setCompileStatus]);
+
+  const reorderActiveFileSymbol = useCallback((
+    source: SymbolView,
+    target: SymbolView,
+    position: "before" | "after",
+  ) => {
+    const editor = editorRef.current;
+    if (!editor || !activeEditorPath) return;
+    if (normalizeModelPath(source.file_path) !== normalizeModelPath(activeEditorPath)) return;
+    if (normalizeModelPath(target.file_path) !== normalizeModelPath(activeEditorPath)) return;
+    if ((source.qualified_name || source.name) === (target.qualified_name || target.name)) return;
+    const model = editor.getModel();
+    if (!model) return;
+    const text = model.getValue();
+    const lines = text.split(/\r?\n/);
+    const toLineIndex = (line: number | undefined) => Math.max(0, (line || 1) - 1);
+    const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const findAnchorLine = (symbol: SymbolView) => {
+      const name = (symbol.name || "").trim();
+      const preferred = toLineIndex(symbol.start_line);
+      if (preferred < lines.length) {
+        if (!name || lines[preferred]?.includes(name)) return preferred;
+      }
+      if (name) {
+        const pattern = new RegExp(`\\b${escapeRegExp(name)}\\b`);
+        const hit = lines.findIndex((line) => pattern.test(line));
+        if (hit >= 0) return hit;
+      }
+      return preferred;
+    };
+    const expandRangeEnd = (start: number, fallbackEnd: number) => {
+      let end = Math.max(start, fallbackEnd);
+      let depth = 0;
+      let seenOpen = false;
+      for (let i = start; i < lines.length; i += 1) {
+        const current = lines[i] || "";
+        const opens = (current.match(/{/g) || []).length;
+        const closes = (current.match(/}/g) || []).length;
+        if (opens > 0) seenOpen = true;
+        depth += opens - closes;
+        end = i;
+        if (seenOpen && depth <= 0) {
+          break;
+        }
+        if (!seenOpen && i > start && current.trim() === "") {
+          end = i - 1;
+          break;
+        }
+      }
+      return Math.max(start, end);
+    };
+    const start = findAnchorLine(source);
+    const fallbackEnd = Math.max(start, toLineIndex(source.end_line || source.start_line));
+    const end = expandRangeEnd(start, fallbackEnd);
+    const targetStart = findAnchorLine(target);
+    if (start >= lines.length || targetStart >= lines.length) return;
+    const sliceEnd = Math.min(lines.length, end + 1);
+    const moving = lines.slice(start, sliceEnd);
+    if (!moving.length) return;
+    const remaining = [...lines.slice(0, start), ...lines.slice(sliceEnd)];
+    let insertAt = targetStart + (position === "after" ? 1 : 0);
+    if (targetStart > start) {
+      insertAt = Math.max(0, targetStart - (sliceEnd - start));
+      if (position === "after") {
+        insertAt = Math.min(remaining.length, insertAt + 1);
+      }
+    }
+    insertAt = Math.min(insertAt, remaining.length);
+    const updated = [...remaining.slice(0, insertAt), ...moving, ...remaining.slice(insertAt)].join("\n");
+    editor.executeEdits("file-tree-reorder", [
+      {
+        range: model.getFullModelRange(),
+        text: updated,
+        forceMoveMarkers: true,
+      },
+    ]);
+    editor.pushUndoStop();
+    setCompileStatus("File tree: reordered symbol block");
+    setFileDropIndicator(null);
+  }, [activeEditorPath, normalizeModelPath, setCompileStatus]);
 
   const renderModelRow = useMemo(
     () =>
@@ -2520,6 +3246,13 @@ export function App() {
         selectSymbolInEditor,
         navigateTo,
         renderTypeIcon,
+        onRequestLibraryFileSymbols: (filePath) => {
+          void loadLibrarySymbolsForFile(filePath);
+        },
+        onRetryLibraryFileSymbols: (filePath) => {
+          void loadLibrarySymbolsForFile(filePath);
+        },
+        openOnClick: false,
       }),
     [
       modelCursorIndex,
@@ -2533,6 +3266,63 @@ export function App() {
       selectSymbolInEditor,
       navigateTo,
       renderTypeIcon,
+      loadLibrarySymbolsForFile,
+    ],
+  );
+
+  const renderFileModelRow = useMemo(
+    () =>
+      createModelRowRenderer({
+        modelCursorIndex: fileModelCursorIndex,
+        modelSectionOpen: fileModelSectionOpen,
+        modelSectionIndent: fileModelSectionIndent,
+        modelTreeRef: fileModelTreeRef,
+        handleModelTreeKeyDown: handleFileModelTreeKeyDown,
+        onModelContextMenu: showModelContext,
+        setModelCursorIndex: setFileModelCursorIndex,
+        setModelSectionOpen: setFileModelSectionOpen,
+        setModelExpanded: setFileModelExpanded,
+        selectedSymbol,
+        setSelectedSymbol,
+        setSelectedNodeSymbols,
+        selectSymbolInEditor,
+        navigateTo,
+        renderTypeIcon,
+        onRequestLibraryFileSymbols: () => {},
+        onRetryLibraryFileSymbols: () => {},
+        openOnClick: true,
+        onDragStartSymbol: (symbol) => {
+          draggedFileSymbolRef.current = symbol;
+        },
+        setDropIndicator: (key, position) => {
+          if (!key || !position) {
+            setFileDropIndicator(null);
+            return;
+          }
+          setFileDropIndicator({ key, position });
+        },
+        isDropIndicator: (key, position) =>
+          fileDropIndicator?.key === key && fileDropIndicator?.position === position,
+        getDraggedSymbol: () => draggedFileSymbolRef.current,
+        onDropSymbolOnSymbol: (source, target, position) => {
+          reorderActiveFileSymbol(source, target, position);
+          draggedFileSymbolRef.current = null;
+        },
+      }),
+    [
+      fileModelCursorIndex,
+      fileModelSectionOpen,
+      fileModelSectionIndent,
+      handleFileModelTreeKeyDown,
+      showModelContext,
+      selectedSymbol,
+      setSelectedSymbol,
+      setSelectedNodeSymbols,
+      selectSymbolInEditor,
+      navigateTo,
+      renderTypeIcon,
+      fileDropIndicator,
+      reorderActiveFileSymbol,
     ],
   );
 
@@ -2543,7 +3333,7 @@ export function App() {
           ["--left-width" as string]: `${leftCollapsed ? 0 : leftWidth}px`,
           ["--right-width" as string]: `${rightCollapsed ? 0 : rightWidth}px`,
           ["--split-left-width" as string]: `${leftCollapsed ? 16 : 6}px`,
-          ["--split-right-width" as string]: `${rightCollapsed ? 16 : 6}px`,
+          ["--split-right-width" as string]: "0px",
         }}
       >
       <header className="titlebar" data-tauri-drag-region>
@@ -2589,6 +3379,15 @@ export function App() {
                 }}
               >
                 {showAstSplit ? "✓ " : ""}AST Split
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setOpenMenu(null);
+                  toggleTerminal();
+                }}
+              >
+                {showTerminal ? "✓ " : ""}View Terminal
               </button>
               <div className="menu-divider" />
               <button type="button" onClick={() => { setOpenMenu(null); openAiViewTab(); }}>Agent</button>
@@ -2691,7 +3490,7 @@ export function App() {
             </button>
         </div>
       </header>
-      <main className="content">
+      <main className={`content ${rightCollapsed ? "right-collapsed" : "right-open"}`}>
           {leftCollapsed ? <div className="panel-spacer" /> : (
             <section className="panel sidebar">
               <div className="project-actions inline">
@@ -2796,9 +3595,12 @@ export function App() {
                 <DataView
                   dataExcludeStdlib={dataExcludeStdlib}
                   onToggleExcludeStdlib={setDataExcludeStdlib}
+                  rootPath={rootPath}
+                  libraryPath={libraryPath}
                   projectCounts={projectCounts}
                   libraryCounts={libraryCounts}
                   errorCounts={errorCounts}
+                  dataViewSymbols={dataViewSymbols}
                   dataViewSymbolKindCounts={dataViewSymbolKindCounts}
                 />
               ) : activeTabMeta?.kind === "project-model" ? (
@@ -2807,12 +3609,12 @@ export function App() {
                   model={projectModelView}
                   library={stdlibMetamodel}
                   loading={projectModelLoading}
-                  libraryLoading={metamodelDebugLoading}
+                  libraryLoading={stdlibMetamodelLoadingState}
                   error={projectModelError}
-                  libraryError={metamodelDebugError}
+                  libraryError={stdlibMetamodelErrorState}
                   focusQuery={projectModelFocusQuery}
                   onRefresh={() => {
-                    void loadProjectAndLibraryModel();
+                    void loadProjectModelAndMaybeStdlib();
                   }}
                 />
               ) : !activeTabPath ? (
@@ -2952,60 +3754,147 @@ export function App() {
                 renderTypeIcon={renderTypeIcon}
               />
             )}
+            <TerminalPane
+              open={showTerminal}
+              height={terminalHeight}
+              tabs={terminalTabs.map((tab) => ({ id: tab.id, title: tab.title }))}
+              activeTabId={activeTerminalTabId}
+              onSelectTab={setActiveTerminalTabId}
+              onNewTab={createTerminalTab}
+              onCloseTab={closeTerminalTab}
+              onResizeStart={(event) => {
+                terminalResizeRef.current = { startY: event.clientY, startHeight: terminalHeight };
+              }}
+              lines={activeTerminalTab?.lines || []}
+              input={activeTerminalTab?.input || ""}
+              onInputChange={(value) => {
+                updateActiveTerminalTab((tab) => ({ ...tab, input: value, historyIndex: null }));
+              }}
+              onSubmit={() => {
+                void runTerminalCommand();
+              }}
+              onClose={() => setShowTerminal(false)}
+              onAutocompleteEval={autocompleteTerminalEval}
+              onHistoryUp={terminalHistoryUp}
+              onHistoryDown={terminalHistoryDown}
+              onClear={() => {
+                updateActiveTerminalTab((tab) => ({ ...tab, lines: [] }));
+              }}
+            />
           </EditorPane>
           <>
           <div
-            className={`splitter ${rightCollapsed ? "collapsed" : ""}`}
-            onPointerDown={rightCollapsed ? undefined : (event) => startDrag("right", event)}
+            className={`splitter right-side-bar ${rightCollapsed ? "collapsed" : ""}`}
           >
-            {rightCollapsed ? (
+            <div
+              className="right-side-handle"
+              onPointerDown={rightCollapsed ? undefined : (event) => startDrag("right", event)}
+              title={rightCollapsed ? "Model pane collapsed" : "Resize model pane"}
+            />
+            <div className="right-side-buttons">
               <button
                 type="button"
-                className="splitter-toggle"
-                onClick={() => {
-                  setRightCollapsed(false);
-                  setRightWidth(rightStoredWidthRef.current || 320);
-                }}
-                title="Restore model pane"
+                className={`side-tool-btn ${rightPaneTab === "file_editor" ? "active" : ""}`}
+                onClick={() => handleRightBarTabClick("file_editor")}
+                title={rightCollapsed ? "Open File View" : "Toggle File View"}
+                aria-label={rightCollapsed ? "Open File View" : "Toggle File View"}
               >
-                {"<<"}
+                <span className="side-tool-icon side-tool-icon-file" aria-hidden="true" />
               </button>
-            ) : null}
+              <button
+                type="button"
+                className={`side-tool-btn ${rightPaneTab === "semantic" ? "active" : ""}`}
+                onClick={() => handleRightBarTabClick("semantic")}
+                title={rightCollapsed ? "Open Project View" : "Toggle Project View"}
+                aria-label={rightCollapsed ? "Open Project View" : "Toggle Project View"}
+              >
+                <span className="side-tool-icon side-tool-icon-project" aria-hidden="true" />
+              </button>
+            </div>
           </div>
           {rightCollapsed ? null : (
-            <section className="panel sidebar" ref={modelPaneContainerRef}>
-              <div className="panel-header">
-              <ModelHeader
-                collapseAll={collapseAllModel}
-                onCollapseAll={() => setCollapseAllModel(true)}
-                onExpandAll={() => setCollapseAllModel(false)}
-                onOpenOptions={showModelOptions}
+            <section className="panel sidebar right-pane" ref={modelPaneContainerRef}>
+              <div
+                className="right-pane-resizer"
+                onPointerDown={(event) => startDrag("right", event)}
+                title="Resize model pane"
               />
-              <button
-                type="button"
-                className="ghost collapse-btn"
-                onClick={() => {
-                  rightStoredWidthRef.current = rightWidth;
-                  setRightCollapsed(true);
-                }}
-                title="Collapse model pane"
-              >
-                {">>"}
-              </button>
+              <div className="panel-header" ref={rightPaneHeaderRef}>
+              {rightPaneTab === "file_editor" ? (
+                <div className="right-pane-toolbar">
+                  <span className="muted">
+                    {activeEditorPath ? activeEditorPath.split(/[\\/]/).pop() : "No active file"}
+                  </span>
+                  <div className="right-pane-actions">
+                    <button
+                      type="button"
+                      className={`ghost icon-properties ${showFilePropertiesPane ? "active" : ""}`}
+                      onClick={() => setShowFilePropertiesPane((prev) => !prev)}
+                      title={showFilePropertiesPane ? "Hide Properties" : "Show Properties"}
+                      aria-label={showFilePropertiesPane ? "Hide Properties" : "Show Properties"}
+                    >
+                    </button>
+                    <div className="right-pane-insert">
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={() => setFileInsertMenuOpen((prev) => !prev)}
+                        title="Insert into active file"
+                        disabled={!activeEditorPath}
+                      >
+                        +
+                      </button>
+                      {fileInsertMenuOpen ? (
+                        <div className="context-menu tab-menu" style={{ right: 0, top: 28, left: "auto" }}>
+                          <button type="button" onClick={() => insertSnippetIntoActiveFile("\npart def NewPart {\n}\n")}>
+                            Insert Part Def
+                          </button>
+                          <button type="button" onClick={() => insertSnippetIntoActiveFile("\naction def NewAction {\n}\n")}>
+                            Insert Action Def
+                          </button>
+                          <button type="button" onClick={() => insertSnippetIntoActiveFile("\nattribute def NewAttribute;\n")}>
+                            Insert Attribute Def
+                          </button>
+                          <button type="button" onClick={() => insertSnippetIntoActiveFile("\nimport Kernel::*;\n")}>
+                            Insert Import
+                          </button>
+                        </div>
+                      ) : null}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="right-pane-toolbar">
+                  <ModelHeader
+                    collapseAll={collapseAllModel}
+                    libraryStatus={`Library ${loadedLibraryFileCount}/${libraryFiles.length} | ${libraryIndexedSymbolCount} sym`}
+                    onCollapseAll={() => setCollapseAllModel(true)}
+                    onExpandAll={() => setCollapseAllModel(false)}
+                    onOpenOptions={showModelOptions}
+                  />
+                  <span className="muted">Semantic</span>
+                </div>
+              )}              
             </div>
             <ModelPane
               modelTreeHeight={effectiveModelTreeHeight}
-              showPropertiesPane={showPropertiesPane}
-              propertiesDock={propertiesDock}
+              showPropertiesPane={rightPaneTab === "file_editor" ? showFilePropertiesPane : showPropertiesPane}
+              propertiesDock={rightPaneTab === "file_editor" ? "bottom" : propertiesDock}
               modelPropertiesWidth={modelPropertiesWidth}
-              modelTreeRef={modelTreeRef}
-              modelListRef={modelListRef}
-              modelRows={modelRows}
-              modelListHeight={modelListHeight}
-              getModelRowHeight={getModelRowHeight}
-              renderModelRow={renderModelRow}
-              handleModelTreeKeyDown={handleModelTreeKeyDown}
+              modelTreeRef={rightPaneTab === "file_editor" ? fileModelTreeRef : modelTreeRef}
+              modelListRef={rightPaneTab === "file_editor" ? fileModelListRef : modelListRef}
+              modelRows={rightPaneTab === "file_editor" ? fileEditorModelRows : modelRows}
+              modelListHeight={rightPaneTab === "file_editor" ? fileModelListHeight : modelListHeight}
+              getModelRowHeight={rightPaneTab === "file_editor" ? getFileModelRowHeight : getModelRowHeight}
+              renderModelRow={rightPaneTab === "file_editor" ? renderFileModelRow : renderModelRow}
+              handleModelTreeKeyDown={rightPaneTab === "file_editor" ? handleFileModelTreeKeyDown : handleModelTreeKeyDown}
               onModelTreeFocus={() => {
+                if (rightPaneTab === "file_editor") {
+                  if (fileModelCursorIndex != null || !fileEditorModelRows.length) return;
+                  const selectedIndex = findSelectedFileSymbolIndex();
+                  setFileModelCursorIndex(selectedIndex >= 0 ? selectedIndex : 0);
+                  return;
+                }
                 if (modelCursorIndex != null || !modelRows.length) return;
                 const selectedIndex = findSelectedSymbolIndex();
                 setModelCursorIndex(selectedIndex >= 0 ? selectedIndex : 0);
@@ -3022,9 +3911,7 @@ export function App() {
                 setProjectModelFocusQuery(symbol.qualified_name || symbol.name || symbol.kind);
                 openProjectModelViewTab();
               }}
-              onOpenAttributeInProjectModel={openAttributeInProjectModel}
-              onOpenAttributeSourceText={openAttributeSourceText}
-              loadElementAttributes={loadElementAttributes}
+              onOpenQualifiedNameInSource={openQualifiedNameInSource}
             />
             </section>
           )}
@@ -3090,29 +3977,43 @@ export function App() {
             <button
               type="button"
               onClick={() => {
-                setModelSortBy("name");
-                setModelOptionsMenu(null);
-              }}
-            >
-              Sort by: Name{modelSortBy === "name" ? " (current)" : ""}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setModelSortBy("qualified_name");
-                setModelOptionsMenu(null);
-              }}
-            >
-              Sort by: Qualified Name{modelSortBy === "qualified_name" ? " (current)" : ""}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
                 setModelShowFiles((prev) => !prev);
                 setModelOptionsMenu(null);
               }}
             >
               {modelShowFiles ? "Hide File Groups" : "Show File Groups"}
+            </button>
+            <button
+              type="button"
+              disabled={!pendingLibraryFiles || libraryBulkLoading}
+              onClick={() => {
+                void loadAllLibrarySymbols();
+                setModelOptionsMenu(null);
+              }}
+            >
+              {libraryBulkLoading
+                ? "Loading Library Symbols..."
+                : `Load All Library Symbols (${loadedLibraryFileCount}/${libraryFiles.length})`}
+            </button>
+            <button
+              type="button"
+              disabled={!libraryBulkLoading}
+              onClick={() => {
+                cancelLibrarySymbolLoading();
+                setModelOptionsMenu(null);
+              }}
+            >
+              Cancel Library Load
+            </button>
+            <button
+              type="button"
+              disabled={!failedLibraryFiles || libraryBulkLoading}
+              onClick={() => {
+                void retryFailedLibraryLoads();
+                setModelOptionsMenu(null);
+              }}
+            >
+              Retry Failed Library Loads{failedLibraryFiles ? ` (${failedLibraryFiles})` : ""}
             </button>
             <button
               type="button"
@@ -3152,6 +4053,26 @@ export function App() {
             >
               {showUsageNodes ? "Hide Usages" : "Show Usages"}
             </button>
+            <div className="context-meta">
+              Library kinds ({libraryKindCounts.reduce((sum, [, count]) => sum + count, 0)}):
+            </div>
+            {libraryKindCounts.slice(0, 8).map(([kind, count]) => (
+              <button
+                key={`library-kind-${kind}`}
+                type="button"
+                className={libraryKindFilter === kind ? "context-kind-filter active" : "context-kind-filter"}
+                onClick={() => setLibraryKindFilter((prev) => (prev === kind ? null : kind))}
+              >
+                {kind}: {count}
+              </button>
+            ))}
+            <button
+              type="button"
+              disabled={!libraryKindFilter}
+              onClick={() => setLibraryKindFilter(null)}
+            >
+              Clear Library Kind Filter
+            </button>
           </div>
         ) : null}
         {modelContextMenu ? (
@@ -3167,8 +4088,88 @@ export function App() {
             >
               Show AST
             </button>
+            <button
+              type="button"
+              disabled={modelContextMenu.section !== "library" || !modelContextMenu.filePath}
+              onClick={() => {
+                if (!modelContextMenu.filePath || modelContextMenu.section !== "library") return;
+                void loadLibrarySymbolsForFile(modelContextMenu.filePath);
+                setModelContextMenu(null);
+              }}
+            >
+              Retry Library File Load
+            </button>
+            {modelContextMenu.section === "library" && modelContextMenu.loadError ? (
+              <div className="context-meta">Last load error: {modelContextMenu.loadError}</div>
+            ) : null}
           </div>
         ) : null}
+        <Modal
+          open={showGotoDialog}
+          onClose={() => setShowGotoDialog(false)}
+          cardClassName="legacy-modal"
+          ariaLabelledBy="goto-qn-title"
+        >
+          <div className="modal-header">
+            <h3 id="goto-qn-title">Go to Qualified Name</h3>
+          </div>
+          <div className="modal-body goto-qn-body">
+            <label className="field">
+              <span className="field-label">Qualified name</span>
+              <input
+                ref={gotoInputRef}
+                value={gotoQuery}
+                onChange={(event) => setGotoQuery(event.target.value)}
+                onKeyDown={handleGotoInputKeyDown}
+                placeholder="Type a qualified name, e.g. Parts::Part"
+                autoComplete="off"
+              />
+            </label>
+            {gotoLoading ? <div className="muted">Loading semantic symbols...</div> : null}
+            {!gotoLoading && gotoError ? <div className="field-hint error">{gotoError}</div> : null}
+            {!gotoLoading && !gotoError ? (
+              <div className="goto-qn-list" role="listbox" aria-label="Qualified name matches">
+                {filteredGotoCandidates.length ? (
+                  filteredGotoCandidates.map((candidate, index) => {
+                    const selected = index === gotoSelectedIndex;
+                    return (
+                      <button
+                        key={`${candidate.qualified_name}|${candidate.file_path}`}
+                        type="button"
+                        className={`goto-qn-item ${selected ? "selected" : ""}`}
+                        onClick={() => {
+                          setGotoSelectedIndex(index);
+                          void openGotoCandidate(candidate);
+                        }}
+                        onMouseEnter={() => setGotoSelectedIndex(index)}
+                        title={candidate.file_path}
+                      >
+                        <span className="goto-qn-qualified">{candidate.qualified_name}</span>
+                        <span className="goto-qn-path">{candidate.file_path}</span>
+                      </button>
+                    );
+                  })
+                ) : (
+                  <div className="muted">No matching qualified names.</div>
+                )}
+              </div>
+            ) : null}
+          </div>
+          <div className="modal-actions">
+            <button type="button" className="ghost" onClick={() => setShowGotoDialog(false)}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                void openGotoCandidate(selectedGotoCandidate);
+              }}
+              disabled={!selectedGotoCandidate}
+            >
+              Open
+            </button>
+          </div>
+        </Modal>
           {showNewFile ? (
             <div className="modal">
               <div className="modal-card">
@@ -3768,131 +4769,35 @@ export function App() {
           </div>
         </div>
       ) : null}
-        {showSettings ? (
-          <div className="modal">
-            <div className="modal-backdrop" onClick={() => setShowSettings(false)} />
-            <div className="modal-card legacy-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
-            <div className="modal-header">
-              <h3 id="settings-title">Settings</h3>
-            </div>
-            <div className="modal-body">
-              <div className="field">
-                <span className="field-label">Theme</span>
-                <div className="theme-toggle">
-                  <button
-                    type="button"
-                    className={`theme-option ${appTheme === "dark" ? "active" : ""}`}
-                    onClick={() => setAppTheme("dark")}
-                  >
-                    Dark
-                  </button>
-                  <button
-                    type="button"
-                    className={`theme-option ${appTheme === "light" ? "active" : ""}`}
-                    onClick={() => setAppTheme("light")}
-                  >
-                    Light
-                  </button>
-                </div>
-              </div>
-              <div className="project-properties-section">
-                <div className="project-properties-title">AI Settings</div>
-                <div className="endpoint-list">
-                  {aiEndpoints.length ? (
-                    aiEndpoints.map((endpoint) => (
-                      <div key={endpoint.id} className="endpoint-row">
-                        <div className="endpoint-main">
-                          <div className="endpoint-title">{endpoint.name}</div>
-                          <div className="endpoint-meta">{endpoint.provider.toUpperCase()} / {endpoint.type.toUpperCase()} / {endpoint.url}</div>
-                          {endpoint.model ? <div className="endpoint-meta">Model: {endpoint.model}</div> : null}
-                          {endpointTestStatus[endpoint.id] ? (
-                            <div className={`endpoint-status ${endpointTestStatus[endpoint.id].startsWith("pass") ? "ok" : endpointTestStatus[endpoint.id].startsWith("fail") ? "fail" : ""}`}>
-                              {endpointTestStatus[endpoint.id]}
-                            </div>
-                          ) : null}
-                        </div>
-                        <div className="endpoint-actions">
-                          <button type="button" className="ghost" onClick={() => editEndpoint(endpoint.id)}>Edit</button>
-                          <button type="button" className="ghost" onClick={() => deleteEndpoint(endpoint.id)}>Delete</button>
-                        </div>
-                      </div>
-                    ))
-                  ) : (
-                    <div className="muted">No endpoints configured.</div>
-                  )}
-                </div>
-                <div className="endpoint-selectors">
-                  <label className="field">
-                    <span className="field-label">Chat endpoint</span>
-                    <div className="field-inline">
-                      <select
-                        value={selectedChatEndpoint || ""}
-                        onChange={(event) => setSelectedChatEndpoint(event.target.value || null)}
-                      >
-                        <option value="">None</option>
-                        {aiEndpoints.filter((endpoint) => endpoint.type === "chat").map((endpoint) => (
-                          <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>
-                        ))}
-                      </select>
-                      <button
-                        type="button"
-                        className="ghost"
-                        disabled={!selectedChatEndpoint}
-                        onClick={() => selectedChatEndpoint && testEndpoint(selectedChatEndpoint)}
-                      >
-                        Test
-                      </button>
-                    </div>
-                  </label>
-                </div>
-                <div className="endpoint-form">
-                  <div className="endpoint-form-title">{endpointDraft.id ? "Edit endpoint" : "Add endpoint"}</div>
-                  <label className="field">
-                    <span className="field-label">Name</span>
-                    <input value={endpointDraft.name} onChange={(e) => setEndpointDraft({ ...endpointDraft, name: e.target.value })} />
-                  </label>
-                  <label className="field">
-                    <span className="field-label">URL</span>
-                    <input
-                      value={endpointDraft.url}
-                      onChange={(e) => setEndpointDraft({ ...endpointDraft, url: e.target.value })}
-                      placeholder={endpointDraft.provider === "anthropic" ? "https://api.anthropic.com" : "https://api.openai.com"}
-                    />
-                  </label>
-                  <label className="field">
-                    <span className="field-label">Type</span>
-                    <select value={endpointDraft.type} onChange={(e) => setEndpointDraft({ ...endpointDraft, type: e.target.value as "chat" | "embeddings" })}>
-                      <option value="chat">Chat</option>
-                    </select>
-                  </label>
-                  <label className="field">
-                    <span className="field-label">Provider</span>
-                    <select value={endpointDraft.provider} onChange={(e) => setEndpointDraft({ ...endpointDraft, provider: e.target.value as "openai" | "anthropic" })}>
-                      <option value="openai">OpenAI-compatible</option>
-                      <option value="anthropic">Anthropic</option>
-                    </select>
-                  </label>
-                  <label className="field">
-                    <span className="field-label">Model</span>
-                    <input value={endpointDraft.model} onChange={(e) => setEndpointDraft({ ...endpointDraft, model: e.target.value })} />
-                  </label>
-                  <label className="field">
-                    <span className="field-label">Token</span>
-                    <input type="password" value={endpointDraft.token} onChange={(e) => setEndpointDraft({ ...endpointDraft, token: e.target.value })} />
-                  </label>
-                  <div className="modal-actions">
-                    <button type="button" className="ghost" onClick={resetEndpointDraft}>Clear</button>
-                    <button type="button" onClick={saveEndpointDraft}>{endpointDraft.id ? "Update" : "Add"}</button>
-                  </div>
-                </div>
-              </div>
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="ghost" onClick={() => setShowSettings(false)}>Close</button>
-            </div>
-          </div>
-        </div>
-      ) : null}
+        <SettingsDialog
+          open={showSettings}
+          onClose={() => setShowSettings(false)}
+          appTheme={appTheme}
+          onThemeChange={setAppTheme}
+          settingsTab={settingsTab}
+          onSettingsTabChange={setSettingsTab}
+          aiEndpoints={aiEndpoints}
+          endpointTestStatus={endpointTestStatus}
+          onEditEndpoint={editEndpoint}
+          onDeleteEndpoint={deleteEndpoint}
+          selectedChatEndpoint={selectedChatEndpoint}
+          onSelectedChatEndpointChange={setSelectedChatEndpoint}
+          onTestEndpoint={(endpointId) => {
+            void testEndpoint(endpointId);
+          }}
+          endpointDraft={endpointDraft}
+          onEndpointDraftChange={setEndpointDraft}
+          onResetEndpointDraft={resetEndpointDraft}
+          onSaveEndpointDraft={saveEndpointDraft}
+          settingsDefaultStdlib={settingsDefaultStdlib}
+          onSettingsDefaultStdlibChange={setSettingsDefaultStdlib}
+          settingsStdlibVersions={settingsStdlibVersions}
+          settingsStdlibStatus={settingsStdlibStatus}
+          settingsStdlibBusy={settingsStdlibBusy}
+          onSaveDefaultStdlibSelection={() => {
+            void saveDefaultStdlibSelection();
+          }}
+        />
         {aiFloatingSteps.length ? (
           <div className="ai-floating" style={{ left: aiFloatingPos.x, top: aiFloatingPos.y }}>
             <div
@@ -3908,7 +4813,22 @@ export function App() {
               }}
             >
               <span>Next steps</span>
-              <button type="button" className="ghost" onClick={() => setAiFloatingSteps([])}>x</button>
+              <button
+                type="button"
+                className="ghost"
+                onPointerDown={(event) => {
+                  event.stopPropagation();
+                }}
+                onMouseDown={(event) => {
+                  event.stopPropagation();
+                }}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setAiFloatingSteps([]);
+                }}
+              >
+                x
+              </button>
             </div>
             <div className="ai-floating-list">
               {aiFloatingSteps.map((step) => (
@@ -3973,6 +4893,7 @@ export function App() {
             {cursorPos && activeEditorPath ? (
               <span className="status-cursor">Ln {cursorPos.line}, Col {cursorPos.col}</span>
             ) : null}
+            <span className="muted">Active: Semantic</span>
             <span
               className={`status-compile-indicator ${backgroundCompileActive ? "active" : ""} ${backgroundCompileEnabled ? "" : "disabled"}`}
               title={backgroundCompileEnabled ? "Background compile enabled (right-click to disable)" : "Background compile disabled (right-click to enable)"}

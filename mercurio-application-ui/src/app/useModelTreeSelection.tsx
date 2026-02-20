@@ -18,6 +18,7 @@ type UseModelTreeSelectionOptions = {
   setSelectedNodeSymbols: (symbols: SymbolView[] | null) => void;
   selectSymbolInEditor: (symbol: SymbolView) => Promise<void> | void;
   navigateTo: (target: NavigateTarget) => Promise<void> | void;
+  onRequestLibraryFileSymbols: (filePath: string) => void;
   projectGroups: Array<{ path: string; list: SymbolView[] }>;
   libraryGroups: Array<{ path: string; list: SymbolView[] }>;
 };
@@ -32,6 +33,7 @@ export function useModelTreeSelection({
   setSelectedNodeSymbols,
   selectSymbolInEditor,
   navigateTo,
+  onRequestLibraryFileSymbols,
   projectGroups,
   libraryGroups,
 }: UseModelTreeSelectionOptions) {
@@ -101,8 +103,12 @@ export function useModelTreeSelection({
     }
     const row = modelRows[modelCursorIndex];
     modelCursorRowKeyRef.current = row?.key ?? null;
+  }, [modelCursorIndex, modelRows]);
+
+  useEffect(() => {
+    if (modelCursorIndex == null) return;
     modelListRef.current?.scrollToRow({ index: modelCursorIndex, align: "smart" });
-  }, [modelCursorIndex, modelRows.length]);
+  }, [modelCursorIndex]);
 
   useEffect(() => {
     if (!modelRows.length) {
@@ -185,6 +191,9 @@ export function useModelTreeSelection({
       if (row.type === "section") {
         setModelSectionOpen((prev) => ({ ...prev, [row.section]: true }));
       } else if (row.type === "symbol" && row.hasChildren && !row.expanded) {
+        if (row.section === "library" && row.isFileRoot && row.filePath) {
+          onRequestLibraryFileSymbols(row.filePath);
+        }
         setModelExpanded((prev) => ({ ...prev, [row.key]: true }));
       }
       return;

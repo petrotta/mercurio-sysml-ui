@@ -26,8 +26,11 @@ type UseModelTreeOptions = {
   projectSymbolsLoaded: boolean;
   getKindKey: (kind: string) => string;
   showUsages: boolean;
-  modelSortBy: "name" | "qualified_name";
   modelShowFiles: boolean;
+  defaultExpanded?: boolean;
+  libraryLoadingFilePaths: string[];
+  libraryLoadErrors: Record<string, string>;
+  libraryKindFilter: string | null;
 };
 
 export function useModelTree({
@@ -43,34 +46,151 @@ export function useModelTree({
   projectSymbolsLoaded,
   getKindKey,
   showUsages,
-  modelSortBy,
   modelShowFiles,
+  defaultExpanded = false,
+  libraryLoadingFilePaths,
+  libraryLoadErrors,
+  libraryKindFilter,
 }: UseModelTreeOptions) {
   const buildSymbolTree = (list: SymbolView[]) => {
+    const symbolQname = (symbol: SymbolView) => {
+      const qualified = (symbol.qualified_name || "").trim();
+      if (qualified) return qualified;
+      const name = (symbol.name || "").trim();
+      if (name) return name;
+      const line = Math.max(0, symbol.start_line || 0);
+      const col = Math.max(0, symbol.start_col || 0);
+      return `@${symbol.kind || "Node"}:${line}:${col}`;
+    };
+    const lastSegment = (qualified: string) => {
+      const parts = qualified.split("::").filter(Boolean);
+      return parts.length ? parts[parts.length - 1] : qualified;
+    };
+    const findNearestParent = (qualified: string, known: Set<string>) => {
+      let probe = qualified;
+      while (probe.includes("::")) {
+        probe = probe.substring(0, probe.lastIndexOf("::"));
+        if (known.has(probe)) return probe;
+      }
+      return null;
+    };
     const root: SymbolNode = {
       name: "root",
       fullName: "",
       symbols: [],
       children: new Map(),
     };
+    const symbolsByQname = new Map<string, SymbolView[]>();
     list.forEach((symbol) => {
-      const qualified = symbol.qualified_name || symbol.name;
-      const segments = qualified.split("::").filter(Boolean);
-      let cursor = root;
-      segments.forEach((segment, index) => {
-        if (!cursor.children.has(segment)) {
-          cursor.children.set(segment, {
-            name: segment,
-            fullName: cursor.fullName ? `${cursor.fullName}::${segment}` : segment,
-            symbols: [],
-            children: new Map(),
-          });
+      const qualified = symbolQname(symbol);
+      if (!qualified) return;
+      if (!symbolsByQname.has(qualified)) symbolsByQname.set(qualified, []);
+      symbolsByQname.get(qualified)?.push(symbol);
+    });
+    const knownQnames = new Set(Array.from(symbolsByQname.keys()));
+    const ensureQnameNode = (qualified: string) => {
+      if (!qualified) return;
+      if (!symbolsByQname.has(qualified)) {
+        symbolsByQname.set(qualified, []);
+      }
+      knownQnames.add(qualified);
+    };
+    // Fill implicit parent containers from qualified names so hierarchy remains visible
+    // even when the parser only emits leaf nodes.
+    Array.from(knownQnames).forEach((qualified) => {
+      const parts = qualified.split("::").filter(Boolean);
+      if (parts.length <= 1) return;
+      let prefix = "";
+      for (let i = 0; i < parts.length - 1; i += 1) {
+        prefix = prefix ? `${prefix}::${parts[i]}` : parts[i];
+        ensureQnameNode(prefix);
+      }
+    });
+    const parentByQname = new Map<string, string>();
+    list.forEach((symbol) => {
+      const owner = symbolQname(symbol);
+      if (!owner) return;
+      (symbol.relationships || []).forEach((rel) => {
+        const relKind = (rel.kind || "").toLowerCase();
+        const target = (rel.resolved_target || rel.target || "").trim();
+        if (!target) return;
+        if (target === owner) return;
+        ensureQnameNode(target);
+        if (relKind.startsWith("owning") || relKind.includes("owning")) {
+          // owning* relationships directly encode parent of current symbol.
+          if (!parentByQname.has(owner)) {
+            parentByQname.set(owner, target);
+          }
+          return;
         }
-        cursor = cursor.children.get(segment)!;
-        if (index === segments.length - 1) {
-          cursor.symbols.push(symbol);
+        if (!relKind.startsWith("owned")) return;
+        const ownerIsNestedUnderTarget = owner.startsWith(`${target}::`);
+        const targetIsNestedUnderOwner = target.startsWith(`${owner}::`);
+        if (ownerIsNestedUnderTarget) {
+          // Relationship points to a containing owner (common in fast symbols).
+          if (!parentByQname.has(owner)) {
+            parentByQname.set(owner, target);
+          }
+          return;
+        }
+        if (targetIsNestedUnderOwner) {
+          // Relationship points to an owned element.
+          if (!parentByQname.has(target)) {
+            parentByQname.set(target, owner);
+          }
+          return;
+        }
+        // Fallback: preserve previous behavior when direction is unclear.
+        if (!parentByQname.has(target)) {
+          parentByQname.set(target, owner);
         }
       });
+    });
+    Array.from(knownQnames).forEach((qualified) => {
+      if (parentByQname.has(qualified)) return;
+      const fallback = findNearestParent(qualified, knownQnames);
+      if (fallback) parentByQname.set(qualified, fallback);
+    });
+    const childrenByParent = new Map<string, string[]>();
+    parentByQname.forEach((parent, child) => {
+      if (!childrenByParent.has(parent)) childrenByParent.set(parent, []);
+      childrenByParent.get(parent)?.push(child);
+    });
+    const parseOrderFor = (qname: string) => {
+      const sym = symbolsByQname.get(qname)?.[0];
+      return {
+        line: sym?.start_line ?? Number.MAX_SAFE_INTEGER,
+        col: sym?.start_col ?? Number.MAX_SAFE_INTEGER,
+      };
+    };
+    const sortQnamesByParseOrder = (qnames: string[]) =>
+      [...qnames].sort((a, b) => {
+        const ao = parseOrderFor(a);
+        const bo = parseOrderFor(b);
+        if (ao.line !== bo.line) return ao.line - bo.line;
+        if (ao.col !== bo.col) return ao.col - bo.col;
+        return a.localeCompare(b);
+      });
+    const buildNode = (qualified: string, stack: Set<string>): SymbolNode => {
+      const node: SymbolNode = {
+        name: lastSegment(qualified),
+        fullName: qualified,
+        symbols: symbolsByQname.get(qualified) || [],
+        children: new Map(),
+      };
+      if (stack.has(qualified)) return node;
+      stack.add(qualified);
+      const children = sortQnamesByParseOrder(childrenByParent.get(qualified) || []);
+      children.forEach((childQname) => {
+        node.children.set(childQname, buildNode(childQname, stack));
+      });
+      stack.delete(qualified);
+      return node;
+    };
+    sortQnamesByParseOrder(Array.from(knownQnames)).forEach((qualified) => {
+      const parent = parentByQname.get(qualified);
+      if (parent && parent !== qualified && knownQnames.has(parent)) return;
+      root.children.set(qualified, buildNode(qualified, new Set<string>()));
     });
     return root;
   };
@@ -99,10 +219,12 @@ export function useModelTree({
     const walk = (node: SymbolNode, depth: number, isTop: boolean, pathKey: string) => {
       const displayName = isTop && node.name === "root" && rootLabel ? rootLabel : node.name;
       const nodeId = `${rootKey}::${node.fullName || pathKey}`;
-      const kindLabel = Array.from(new Set(node.symbols.map((symbol) => symbol.kind).filter(Boolean))).join(" ");
+      const kindLabel =
+        Array.from(new Set(node.symbols.map((symbol) => symbol.kind).filter(Boolean))).join(" ") ||
+        (node.children.size ? "Package" : "");
       const kindKey = getKindKey(node.symbols[0]?.kind || "");
       const hasChildren = node.children.size > 0;
-      const expandedState = collapseAll ? false : expanded[nodeId] ?? false;
+      const expandedState = collapseAll ? false : expanded[nodeId] ?? defaultExpanded;
       const isVirtualRoot = node.name === "root" && node.symbols.length === 0;
       if (!isVirtualRoot) {
         rows.push({
@@ -118,14 +240,7 @@ export function useModelTree({
       }
       if (hasChildren && (expandedState || isVirtualRoot)) {
         const byNameCount = new Map<string, number>();
-        Array.from(node.children.values())
-          .sort((a, b) => {
-            if (modelSortBy === "qualified_name") {
-              return a.fullName.localeCompare(b.fullName);
-            }
-            return a.name.localeCompare(b.name);
-          })
-          .forEach((child) => {
+        Array.from(node.children.values()).forEach((child) => {
             const keyBase = child.name || "node";
             const count = (byNameCount.get(keyBase) || 0) + 1;
             byNameCount.set(keyBase, count);
@@ -142,15 +257,24 @@ export function useModelTree({
     const rows: ModelRow[] = [];
     const pushSymbolGroups = (groups: SymbolGroup[], sectionKey: string) => {
       if (!modelShowFiles) {
-        const merged = groups.flatMap((group) =>
-          showUsages ? group.list : group.list.filter((symbol) => !isUsageSymbol(symbol)),
-        );
+        const merged = groups.flatMap((group) => {
+          const usageFiltered = showUsages ? group.list : group.list.filter((symbol) => !isUsageSymbol(symbol));
+          if (sectionKey === "library" && libraryKindFilter) {
+            return usageFiltered.filter((symbol) => symbol.kind === libraryKindFilter);
+          }
+          return usageFiltered;
+        });
         const tree = buildSymbolTree(merged);
         const builtRows = buildRowsForTree(tree, undefined, `${sectionKey}::all`, modelExpanded, collapseAllModel);
         builtRows.forEach((row) => {
           rows.push({
             type: "symbol",
             key: row.id,
+            section: sectionKey as "project" | "library",
+            filePath: null,
+            isFileRoot: false,
+            isLoading: false,
+            loadError: undefined,
             name: row.name,
             kindLabel: row.kindLabel,
             kindKey: row.kindKey,
@@ -164,7 +288,11 @@ export function useModelTree({
       }
       groups.forEach((group) => {
         const rootLabel = group.path.split(/[\\/]/).pop() || group.path;
-        const filtered = showUsages ? group.list : group.list.filter((symbol) => !isUsageSymbol(symbol));
+        const usageFiltered = showUsages ? group.list : group.list.filter((symbol) => !isUsageSymbol(symbol));
+        const filtered =
+          sectionKey === "library" && libraryKindFilter
+            ? usageFiltered.filter((symbol) => symbol.kind === libraryKindFilter)
+            : usageFiltered;
         const fileRow: SymbolNode = {
           name: rootLabel,
           fullName: `${sectionKey}::${group.path}`,
@@ -176,6 +304,17 @@ export function useModelTree({
           rows.push({
             type: "symbol",
             key: row.id,
+            section: sectionKey as "project" | "library",
+            filePath: group.path,
+            isFileRoot: row.depth === 0,
+            isLoading:
+              (sectionKey as "project" | "library") === "library" &&
+              row.depth === 0 &&
+              libraryLoadingFilePaths.includes(group.path),
+            loadError:
+              (sectionKey as "project" | "library") === "library" && row.depth === 0
+                ? libraryLoadErrors[group.path]
+                : undefined,
             name: row.name,
             kindLabel: row.kindLabel,
             kindKey: row.kindKey,
@@ -222,7 +361,7 @@ export function useModelTree({
           pushSymbolGroups(libraryGroups, "library");
         }
       },
-      "No library symbols loaded.",
+      libraryCounts.fileCount > 0 ? "Expand a library file to load symbols." : "No library symbols loaded.",
     );
     addSection(
       "errors",
@@ -256,8 +395,11 @@ export function useModelTree({
     projectSymbolsLoaded,
     getKindKey,
     showUsages,
-    modelSortBy,
     modelShowFiles,
+    libraryLoadingFilePaths,
+    libraryLoadErrors,
+    libraryKindFilter,
+    defaultExpanded,
   ]);
 
   return { modelRows };

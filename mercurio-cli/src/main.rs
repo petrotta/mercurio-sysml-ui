@@ -90,7 +90,15 @@ fn main() {
 
     match cli.command {
         Commands::Compile { root, allow_parse_errors, run_id } => {
-            let result = compile_workspace_sync(&state, root, run_id, allow_parse_errors, Vec::<UnsavedFile>::new(), |_| {});
+            let result = compile_workspace_sync(
+                &state,
+                root,
+                run_id,
+                allow_parse_errors,
+                None,
+                Vec::<UnsavedFile>::new(),
+                |_| {},
+            );
             match result {
                 Ok(payload) => {
                     let json = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
@@ -120,7 +128,16 @@ fn main() {
             }
         }
         Commands::Symbols { root, file, allow_parse_errors, run_id } => {
-            let result = compile_workspace_sync(&state, root, run_id, allow_parse_errors, Vec::<UnsavedFile>::new(), |_| {});
+            let target_path = file.as_ref().map(PathBuf::from);
+            let result = compile_workspace_sync(
+                &state,
+                root,
+                run_id,
+                allow_parse_errors,
+                target_path,
+                Vec::<UnsavedFile>::new(),
+                |_| {},
+            );
             match result {
                 Ok(payload) => {
                     let filtered = filter_symbols(payload, file.as_deref());

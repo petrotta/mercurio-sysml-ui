@@ -6,8 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use tauri::command;
+use mercurio_core::resolve_under_root;
 
-use crate::{resolve_under_root, DirEntry};
+use crate::DirEntry;
 
 #[command]
 /// Lists directory entries, returning folders first and then files alphabetically.

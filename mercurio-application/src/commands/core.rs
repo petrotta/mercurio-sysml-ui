@@ -8,7 +8,8 @@ use mercurio_core::{
     get_project_element_attributes as core_get_project_element_attributes,
     get_project_model as core_get_project_model,
     query_semantic as core_query_semantic,
-    ProjectElementAttributesView, ProjectModelView, SemanticElementView, SemanticQuery,
+    query_semantic_symbols as core_query_semantic_symbols,
+    ProjectElementAttributesView, ProjectModelView, SemanticElementView, SemanticQuery, SymbolView,
 };
 
 use crate::AppState;
@@ -60,6 +61,18 @@ pub async fn query_semantic(
 ) -> Result<Vec<SemanticElementView>, String> {
     let core = state.core.clone();
     tauri::async_runtime::spawn_blocking(move || core_query_semantic(&core, root, query))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[command]
+/// Queries semantic elements and projects them to UI SymbolView records in core.
+pub async fn query_semantic_symbols(
+    state: tauri::State<'_, AppState>,
+    root: String,
+) -> Result<Vec<SymbolView>, String> {
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || core_query_semantic_symbols(&core, root))
         .await
         .map_err(|e| e.to_string())?
 }

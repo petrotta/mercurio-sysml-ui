@@ -1,4 +1,4 @@
-Mercurio Software Design (High-Level)
+﻿Mercurio Software Design (High-Level)
 
 Purpose
 Mercurio is a SysML/KerML authoring and analysis application. It provides parsing, semantic indexing,
@@ -22,27 +22,27 @@ Responsibilities:
 3) Core Services (mercurio-core)
 Purpose: Application logic and orchestration.
 Responsibilities:
-- Parse/compile workspace (AST/HIR via syster).
+- Parse/compile workspace (AST/HIR via parser stack).
 - Build symbol views and project model view.
 - Bind project elements to stdlib metamodel types and attributes.
-- Provide semantic query API (delegates to mercurio-semantic).
+- Provide semantic query API (delegates to mercurio-sysml workspace/semantics through mercurio-core workspace module).
 - Export compiled models.
 
-4) Semantic Layer (mercurio-semantic)
+4) Semantic Layer (internal mercurio-core semantic_model + mercurio-sysml-semantics contracts)
 Purpose: Semantic indexing and mapping, with explicit rules for implied attributes.
 Responsibilities:
 - Build semantic index from AST/HIR + metamodel.
 - Provide query API for attributes such as short_name and comment body.
 - Centralize metatype resolution and metamodel attribute collection utilities.
 
-5) Model Layer (mercurio-model)
+5) Model Layer (internal mercurio-core walk module)
 Purpose: Workspace indexing and model graph utilities.
 Responsibilities:
 - Build FileIndex/WorkspaceIndex from parsed symbols.
 - Provide element/type/attribute reference and traversal helpers.
 - Maintain indexes for types, subtypes, and owned attributes.
 
-6) Language Infrastructure (syster-base)
+6) Language Infrastructure (parser stack-base)
 Purpose: Parser + HIR + analysis foundation for SysML/KerML.
 Responsibilities:
 - Parse source files into syntax trees and HIR symbols.
@@ -56,9 +56,11 @@ Responsibilities:
 - Tauri toolchain for desktop packaging.
 
 Data Flow (Typical Path)
-- UI action -> Tauri command -> mercurio-core -> mercurio-semantic/mercurio-model -> syster parser.
+- UI action -> Tauri command -> mercurio-core -> internal walk/semantic_model + mercurio-sysml workspace -> parser stack parser.
 - Results return to UI for rendering (project model view, semantic query results, diagnostics).
 
 Notes
 - Metamodel binding uses stdlib definitions; project types resolve their metatype via supertypes.
 - Semantic mappings are explicitly encoded for explainability and maintainability.
+
+

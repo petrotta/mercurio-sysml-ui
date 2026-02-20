@@ -37,8 +37,9 @@ const findNearestSymbol = (
   cursorPos: { line: number; col: number } | null,
 ) => {
   if (!cursorPos || !activeEditorPath) return null;
-  const line = cursorPos.line - 1;
-  const col = cursorPos.col - 1;
+  // Monaco positions are 1-based, and compile symbol spans are also 1-based.
+  const line = cursorPos.line;
+  const col = cursorPos.col;
   const candidates = symbols.filter((sym) => {
     if (sym.file_path !== activeEditorPath) return false;
     if (sym.start_line == null || sym.start_col == null || sym.end_line == null || sym.end_col == null) return false;

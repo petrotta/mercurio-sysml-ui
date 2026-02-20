@@ -1,6 +1,6 @@
 import type { KeyboardEvent, PointerEvent, RefObject, ReactElement } from "react";
 import { List, type ListImperativeAPI, type RowComponentProps } from "react-window";
-import type { ModelRow, ProjectElementAttributesView, SymbolView } from "../types";
+import type { ModelRow, SymbolView } from "../types";
 import { PropertiesPane } from "./PropertiesPane";
 
 type ModelPaneProps = {
@@ -22,9 +22,7 @@ type ModelPaneProps = {
   getDoc: (path: string) => { path: string; text: string; dirty: boolean } | null;
   readFile: (path: string) => Promise<string>;
   onOpenInProjectModel: (symbol: SymbolView) => void;
-  onOpenAttributeInProjectModel: (symbol: SymbolView, attrQualifiedName: string, attrName: string) => void;
-  onOpenAttributeSourceText: (symbol: SymbolView, attrQualifiedName: string, attrName: string) => void;
-  loadElementAttributes: (symbol: SymbolView) => Promise<ProjectElementAttributesView | null>;
+  onOpenQualifiedNameInSource: (qualifiedName: string) => void;
 };
 
 export function ModelPane({
@@ -46,9 +44,7 @@ export function ModelPane({
   getDoc,
   readFile,
   onOpenInProjectModel,
-  onOpenAttributeInProjectModel,
-  onOpenAttributeSourceText,
-  loadElementAttributes,
+  onOpenQualifiedNameInSource,
 }: ModelPaneProps) {
   const dockRight = showPropertiesPane && propertiesDock === "right";
   return (
@@ -92,9 +88,7 @@ export function ModelPane({
             getDoc={getDoc}
             readFile={readFile}
             onOpenInProjectModel={onOpenInProjectModel}
-            onOpenAttributeInProjectModel={onOpenAttributeInProjectModel}
-            onOpenAttributeSourceText={onOpenAttributeSourceText}
-            loadElementAttributes={loadElementAttributes}
+            onOpenQualifiedNameInSource={onOpenQualifiedNameInSource}
           />
         </>
       ) : null}
