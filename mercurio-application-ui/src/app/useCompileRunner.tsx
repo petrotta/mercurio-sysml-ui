@@ -598,7 +598,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
         },
       });
       if (token !== backgroundCompileTokenRef.current || path !== rootPath) {
-        return;
+        return false;
       }
       setProjectFastSymbols((prev) => {
         const incomingProject = withScope(response?.symbols, "project");
@@ -646,8 +646,8 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
     refreshSemanticProjectSymbols,
   ]);
 
-  const runBackgroundCompileWithUnsaved = useCallback(async (path: string, filePath: string, content: string) => {
-    if (!backgroundCompileEnabled || !path || compileRunId || backgroundCompileRef.current) return;
+  const runBackgroundCompileWithUnsaved = useCallback(async (path: string, filePath: string, content: string): Promise<boolean> => {
+    if (!backgroundCompileEnabled || !path || compileRunId || backgroundCompileRef.current) return false;
     const runId = Date.now();
     const token = backgroundCompileTokenRef.current;
     backgroundCompileRef.current = runId;
@@ -672,10 +672,15 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
         },
       });
       if (token !== backgroundCompileTokenRef.current || path !== rootPath) {
-        return;
+        return false;
       }
       setProjectFastSymbols((prev) => {
         const incomingProject = withScope(response?.symbols, "project");
+        return mergeProjectSymbolsByFile(prev, incomingProject, filePath);
+      });
+      setProjectSemanticSymbols((prev) => {
+        const incoming = (response?.symbols || []).filter((symbol) => symbol.source_scope !== "library");
+        const incomingProject = withScope(incoming, "project");
         return mergeProjectSymbolsByFile(prev, incomingProject, filePath);
       });
       if (!response?.symbols || response.symbols.length === 0) {
@@ -694,7 +699,6 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
           ? `Background compile: complete (${symbolCount} symbols)`
           : `Background compile: finished with errors (${symbolCount} symbols)`,
       );
-      void refreshSemanticProjectSymbols(path);
     } catch (error) {
       if (token === backgroundCompileTokenRef.current) {
         setCompileStatus(`Background compile: failed: ${error}`);
@@ -709,6 +713,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
         setBackgroundCompileActive(false);
       }
     }
+    return true;
   }, [
     backgroundCompileEnabled,
     compileRunId,

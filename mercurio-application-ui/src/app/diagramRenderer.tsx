@@ -48,12 +48,13 @@ export function createDiagramRenderer(options: DiagramRendererOptions) {
     const node = nodeByQualified.get(layout.node.fullName);
     const kindLabel = node?.kind || layout.node.kind;
     const kindKey = getKindKey(kindLabel || "");
+    const isPartDefShape = kindKey === "part-def";
     const isSelected = selectedNode?.qualified === layout.node.fullName;
     const offset = diagramNodeOffsets[layout.node.fullName] || { x: 0, y: 0 };
     const sizeOverride = diagramNodeSizes[layout.node.fullName];
     return (
       <div
-        className={`diagram-node ${isSelected ? "selected" : ""}`}
+        className={`diagram-node ${isSelected ? "selected" : ""} ${isPartDefShape ? "part-def-shape" : ""}`}
         style={{
           width: `${sizeOverride?.width ?? layout.width}px`,
           height: `${sizeOverride?.height ?? layout.height}px`,
@@ -84,10 +85,11 @@ export function createDiagramRenderer(options: DiagramRendererOptions) {
         }}
       >
         <div className="diagram-node-header">
-          {renderTypeIcon(kindKey, "diagram")}
+          {isPartDefShape ? null : renderTypeIcon(kindKey, "diagram")}
           <span className="diagram-node-name">{layout.node.name}</span>
-          {kindLabel ? <span className="diagram-node-kind">{kindLabel}</span> : null}
+          {!isPartDefShape && kindLabel ? <span className="diagram-node-kind">{kindLabel}</span> : null}
         </div>
+        {isPartDefShape ? <div className="diagram-node-title-underline" /> : null}
         {layout.children.map((child) => {
           const childOffset = diagramNodeOffsets[child.layout.node.fullName] || { x: 0, y: 0 };
           return (

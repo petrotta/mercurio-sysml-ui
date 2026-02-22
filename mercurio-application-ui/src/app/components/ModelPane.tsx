@@ -19,8 +19,6 @@ type ModelPaneProps = {
   startDrag: (side: "left" | "right" | "model" | "modelProps", event: PointerEvent) => void;
   selectedSymbol: SymbolView | null;
   selectedSymbols: SymbolView[] | null;
-  getDoc: (path: string) => { path: string; text: string; dirty: boolean } | null;
-  readFile: (path: string) => Promise<string>;
   onOpenInProjectModel: (symbol: SymbolView) => void;
   onOpenQualifiedNameInSource: (qualifiedName: string) => void;
 };
@@ -41,8 +39,6 @@ export function ModelPane({
   startDrag,
   selectedSymbol,
   selectedSymbols,
-  getDoc,
-  readFile,
   onOpenInProjectModel,
   onOpenQualifiedNameInSource,
 }: ModelPaneProps) {
@@ -85,8 +81,6 @@ export function ModelPane({
           />
           <PropertiesPane
             selectedSymbols={selectedSymbols ?? (selectedSymbol ? [selectedSymbol] : null)}
-            getDoc={getDoc}
-            readFile={readFile}
             onOpenInProjectModel={onOpenInProjectModel}
             onOpenQualifiedNameInSource={onOpenQualifiedNameInSource}
           />

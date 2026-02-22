@@ -3,7 +3,7 @@ pub use files::{
     get_ast_for_content, get_ast_for_path, get_parse_errors, get_parse_errors_for_content,
     get_parse_tree_for_content,
     resolve_under_root,
-    read_diagram, write_diagram, DiagramFile, DiagramNode, DiagramOffset, DiagramSize,
+    read_diagram, write_diagram, DiagramFile, DiagramNode, DiagramOffset, DiagramSize, DiagramType,
     ParseErrorView, ParseErrorsPayload, ParseTreeNodeView,
 };
 

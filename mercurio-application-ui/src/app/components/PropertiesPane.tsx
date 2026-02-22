@@ -3,14 +3,8 @@ import type { SymbolView } from "../types";
 
 type PropertiesPaneProps = {
   selectedSymbols: SymbolView[] | null;
-  getDoc: (path: string) => { path: string; text: string; dirty: boolean } | null;
-  readFile: (path: string) => Promise<string>;
   onOpenInProjectModel: (symbol: SymbolView) => void;
   onOpenQualifiedNameInSource: (qualifiedName: string) => void;
-};
-
-type SnippetState = {
-  expr: string | null;
 };
 
 const symbolKey = (symbol: SymbolView) =>
@@ -39,47 +33,11 @@ const resolveTopDocumentation = (symbol: SymbolView): string | null => {
   return text ? text : null;
 };
 
-const extractSnippet = (
-  content: string,
-  startLine: number | null | undefined,
-  startCol: number | null | undefined,
-  endLine: number | null | undefined,
-  endCol: number | null | undefined,
-) => {
-  if (startLine == null || endLine == null) return null;
-  const lines = content.split(/\r?\n/);
-  if (startLine < 0 || endLine < 0 || startLine >= lines.length) return null;
-  const lastLine = Math.min(endLine, lines.length - 1);
-  const start = Math.max(0, startLine);
-  const end = Math.max(start, lastLine);
-  if (start === end) {
-    const line = lines[start] ?? "";
-    const startIdx = Math.max(0, startCol ?? 0);
-    const endIdx = endCol == null ? line.length : Math.min(line.length, Math.max(startIdx, endCol));
-    const slice = line.slice(startIdx, endIdx).trim();
-    return slice.length ? slice : line.trim();
-  }
-  const chunk = lines.slice(start, end + 1);
-  if (chunk.length === 0) return null;
-  if (startCol != null) {
-    chunk[0] = chunk[0].slice(Math.max(0, startCol));
-  }
-  if (endCol != null) {
-    const lastIndex = chunk.length - 1;
-    chunk[lastIndex] = chunk[lastIndex].slice(0, Math.max(0, endCol));
-  }
-  const joined = chunk.join("\n").trim();
-  return joined.length ? joined : (lines[start]?.trim() ?? joined);
-};
-
 export function PropertiesPane({
   selectedSymbols,
-  getDoc,
-  readFile,
   onOpenInProjectModel,
   onOpenQualifiedNameInSource,
 }: PropertiesPaneProps) {
-  const [snippets, setSnippets] = useState<Record<string, SnippetState>>({});
   const [keyColumnPercent, setKeyColumnPercent] = useState(32);
   const paneRef = useRef<HTMLDivElement | null>(null);
   const splitDragActiveRef = useRef(false);
@@ -128,73 +86,6 @@ export function PropertiesPane({
   };
 
   useEffect(() => {
-    let active = true;
-    const loadAll = async () => {
-      if (!normalizedSymbols) {
-        setSnippets({});
-        return;
-      }
-      const nextState: Record<string, SnippetState> = {};
-      normalizedSymbols.forEach((symbol) => {
-        nextState[symbolKey(symbol)] = { expr: null };
-      });
-      setSnippets(nextState);
-
-      await Promise.all(
-        normalizedSymbols.map(async (symbol) => {
-          if (!symbol.file_path) return;
-          const key = symbolKey(symbol);
-          const cached = getDoc(symbol.file_path);
-          const exprRangeStartLine = symbol.expr_start_line;
-          const exprRangeStartCol = symbol.expr_start_col;
-          const exprRangeEndLine = symbol.expr_end_line;
-          const exprRangeEndCol = symbol.expr_end_col;
-          const hasExprRange =
-            exprRangeStartLine != null &&
-            exprRangeStartCol != null &&
-            exprRangeEndLine != null &&
-            exprRangeEndCol != null;
-          const apply = (content: string) => {
-            const expr = hasExprRange
-              ? extractSnippet(
-                  content,
-                  exprRangeStartLine,
-                  exprRangeStartCol,
-                  exprRangeEndLine,
-                  exprRangeEndCol,
-                )
-              : null;
-            if (!active) return;
-            setSnippets((prev) => ({
-              ...prev,
-              [key]: { expr },
-            }));
-          };
-          if (cached) {
-            apply(cached.text);
-            return;
-          }
-          try {
-            const content = await readFile(symbol.file_path);
-            if (!active) return;
-            apply(content);
-          } catch {
-            if (!active) return;
-            setSnippets((prev) => ({
-              ...prev,
-              [key]: { expr: null },
-            }));
-          }
-        }),
-      );
-    };
-    void loadAll();
-    return () => {
-      active = false;
-    };
-  }, [getDoc, readFile, normalizedSymbols]);
-
-  useEffect(() => {
     const onPointerMove = (event: PointerEvent) => {
       if (!splitDragActiveRef.current) return;
       updateKeySplitFromClientX(event.clientX);
@@ -216,7 +107,6 @@ export function PropertiesPane({
         <div className="properties-body">
           {normalizedSymbols.map((symbol, idx) => {
             const key = symbolKey(symbol);
-            const snippet = snippets[key];
             const topDocumentation = resolveTopDocumentation(symbol);
             const baseProperties = [
               { label: "Kind", value: symbol.kind || "n/a" },
@@ -244,7 +134,7 @@ export function PropertiesPane({
                 </div>
                 {topDocumentation ? <div className="properties-doc">{topDocumentation}</div> : null}
                 <details className="properties-section" key={`element-${symbol.qualified_name}`} open>
-                  <summary>Element details</summary>
+                  <summary>Semantic properties</summary>
                   <div className="properties-parse">
                     <div className="properties-row properties-row-header">
                       <div className="properties-key properties-key-header">
@@ -279,12 +169,6 @@ export function PropertiesPane({
                     ) : (
                       <div className="muted">No additional properties.</div>
                     )}
-                    {snippet?.expr ? (
-                      <div className="properties-row">
-                        <div className="properties-key">Expression</div>
-                        <div className="properties-value">{renderPropertyValue(snippet.expr)}</div>
-                      </div>
-                    ) : null}
                   </div>
                 </details>
               </div>

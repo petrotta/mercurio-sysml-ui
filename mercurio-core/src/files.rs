@@ -9,12 +9,23 @@ use std::path::{Component, Path, PathBuf};
 pub struct DiagramFile {
     #[serde(default = "default_diagram_version")]
     pub version: u32,
+    #[serde(default = "default_diagram_type")]
+    pub diagram_type: DiagramType,
     #[serde(default)]
     pub nodes: Vec<DiagramNode>,
     #[serde(default)]
     pub offsets: HashMap<String, DiagramOffset>,
     #[serde(default)]
     pub sizes: HashMap<String, DiagramSize>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagramType {
+    #[default]
+    Bdd,
+    Ibd,
+    Package,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -252,6 +263,10 @@ pub(crate) fn is_model_file(path: &Path) -> bool {
 
 fn default_diagram_version() -> u32 {
     1
+}
+
+fn default_diagram_type() -> DiagramType {
+    DiagramType::Bdd
 }
 
 fn normalize_diagram(diagram: &mut DiagramFile) {

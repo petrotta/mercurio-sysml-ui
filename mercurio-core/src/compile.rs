@@ -498,7 +498,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
 
         let mut should_parse = false;
         let mut content_override = None;
-        if let Some(content) = unsaved_map.get(path) {
+        if let Some(content) = unsaved_content_for_path(&unsaved_map, path) {
             should_parse = true;
             content_override = Some(content.as_str());
         } else {
@@ -646,23 +646,23 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
             project_symbol_count += 1;
         }
     }
-    // Delta compiles prioritize responsiveness for UI symbol tree updates.
-    // Skip the expensive semantic projection pass here and rely on defmap-backed symbols.
-    if include_library_symbols {
-        for element in semantic_elements_for_project(
-            &project_symbol_files,
-            &unsaved_map,
-            stdlib_metatype_index.as_ref(),
-            stdlib_files.len(),
-        ) {
-            let key = format!(
-                "{}|{}|{}",
-                element.file_path, element.qualified_name, element.name
-            );
-            if seen.insert(key) {
-                symbols.push(map_semantic_element_to_symbol(element, &symbol_spans));
-                project_symbol_count += 1;
-            }
+    // Always run semantic projection for project files so delta compiles
+    // include nested members (for example attributes inside a part def).
+    // For delta mode this is scoped by `project_symbol_files` (target file),
+    // so the additional cost remains bounded.
+    for element in semantic_elements_for_project(
+        &project_symbol_files,
+        &unsaved_map,
+        stdlib_metatype_index.as_ref(),
+        stdlib_files.len(),
+    ) {
+        let key = format!(
+            "{}|{}|{}",
+            element.file_path, element.qualified_name, element.name
+        );
+        if seen.insert(key) {
+            symbols.push(map_semantic_element_to_symbol(element, &symbol_spans));
+            project_symbol_count += 1;
         }
     }
     if include_library_symbols {
@@ -1072,6 +1072,18 @@ fn normalized_compare_key(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+fn unsaved_content_for_path<'a>(
+    unsaved_map: &'a HashMap<PathBuf, String>,
+    path: &Path,
+) -> Option<&'a String> {
+    unsaved_map.get(path).or_else(|| {
+        unsaved_map
+            .iter()
+            .find(|(candidate, _)| same_path(candidate, path))
+            .map(|(_, content)| content)
+    })
+}
+
 fn semantic_elements_for_project(
     project_files: &[PathBuf],
     unsaved_map: &HashMap<PathBuf, String>,
@@ -1080,8 +1092,7 @@ fn semantic_elements_for_project(
 ) -> Vec<SemanticElementView> {
     let mut analyses = Vec::new();
     for file in project_files {
-        let source = unsaved_map
-            .get(file)
+        let source = unsaved_content_for_path(unsaved_map, file)
             .cloned()
             .or_else(|| fs::read_to_string(file).ok());
         let Some(source) = source else {
@@ -1125,8 +1136,7 @@ fn project_import_symbols(
 ) -> Vec<SymbolView> {
     let mut out = Vec::new();
     for file in project_files {
-        let source = unsaved_map
-            .get(file)
+        let source = unsaved_content_for_path(unsaved_map, file)
             .cloned()
             .or_else(|| fs::read_to_string(file).ok());
         let Some(source) = source else {
@@ -1153,8 +1163,7 @@ fn project_decl_symbols(
 ) -> Vec<SymbolView> {
     let mut out = Vec::new();
     for file in project_files {
-        let source = unsaved_map
-            .get(file)
+        let source = unsaved_content_for_path(unsaved_map, file)
             .cloned()
             .or_else(|| fs::read_to_string(file).ok());
         let Some(source) = source else {
@@ -1188,8 +1197,7 @@ fn project_connection_end_symbols(
 ) -> Vec<SymbolView> {
     let mut out = Vec::new();
     for file in project_files {
-        let source = unsaved_map
-            .get(file)
+        let source = unsaved_content_for_path(unsaved_map, file)
             .cloned()
             .or_else(|| fs::read_to_string(file).ok());
         let Some(source) = source else {
@@ -1865,8 +1873,7 @@ fn build_symbol_span_index(
     let mut out = HashMap::new();
 
     for path in files {
-        let text = unsaved_map
-            .get(path)
+        let text = unsaved_content_for_path(unsaved_map, path)
             .cloned()
             .or_else(|| fs::read_to_string(path).ok());
         let Some(text) = text else {

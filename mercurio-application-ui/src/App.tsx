@@ -137,7 +137,6 @@ export function App() {
   const [tabMenu, setTabMenu] = useState<{ x: number; y: number; path: string } | null>(null);
   const [tabOverflowOpen, setTabOverflowOpen] = useState(false);
   const [showUsageNodes, setShowUsageNodes] = useState(true);
-  const [libraryKindFilter, setLibraryKindFilter] = useState<string | null>(null);
   const [showAstSplit, setShowAstSplit] = useState(false);
   const {
     astState: astSplitState,
@@ -323,7 +322,6 @@ export function App() {
     libraryLoadErrors,
     libraryBulkLoading,
     loadedLibraryFileCount,
-    libraryKindCounts,
     libraryIndexedSymbolCount,
     loadLibrarySymbolsForFile,
     loadAllLibrarySymbols,
@@ -351,7 +349,7 @@ export function App() {
   const [rightPaneTab, setRightPaneTab] = useState<"semantic" | "file_editor">("semantic");
   const [showPropertiesPane, setShowPropertiesPane] = useState(true);
   const [showFilePropertiesPane, setShowFilePropertiesPane] = useState(true);
-  const [propertiesDock, setPropertiesDock] = useState<"bottom" | "right">(() => {
+  const [propertiesDock] = useState<"bottom" | "right">(() => {
     try {
       const stored = window.localStorage?.getItem(MODEL_PROPERTIES_DOCK_KEY);
       return stored === "right" ? "right" : "bottom";
@@ -397,7 +395,6 @@ export function App() {
     key: string;
     position: "before" | "after";
   } | null>(null);
-  const [fileInsertMenuOpen, setFileInsertMenuOpen] = useState(false);
   const navReqRef = useRef(0);
   const pendingNavRef = useRef<{
     path: string;
@@ -452,21 +449,6 @@ export function App() {
       prev.map((tab) => (tab.id === activeTerminalTabId ? updater(tab) : tab)),
     );
   };
-  const handleRightBarTabClick = useCallback(
-    (tab: "file_editor" | "semantic") => {
-      if (!rightCollapsed && rightPaneTab === tab) {
-        rightStoredWidthRef.current = rightWidth;
-        setRightCollapsed(true);
-        return;
-      }
-      setRightPaneTab(tab);
-      if (rightCollapsed) {
-        setRightCollapsed(false);
-        setRightWidth(rightStoredWidthRef.current || 320);
-      }
-    },
-    [rightCollapsed, rightPaneTab, rightWidth],
-  );
 
   const ensureTerminalTab = () => {
     setTerminalTabs((prev) => {
@@ -583,9 +565,8 @@ export function App() {
         setModelContextMenu(null);
         setModelOptionsMenu(null);
       }
-      if (!target || (!target.closest(".tab-menu") && !target.closest(".right-pane-insert"))) {
+      if (!target || !target.closest(".tab-menu")) {
         setTabMenu(null);
-        setFileInsertMenuOpen(false);
       }
       if (!target || !target.closest(".tab-overflow")) {
         setTabOverflowOpen(false);
@@ -1781,7 +1762,7 @@ export function App() {
         await invoke("write_diagram", {
           root: rootPath,
           path: createdPath,
-          diagram: { version: 1, nodes: [], offsets: {}, sizes: {} },
+          diagram: { version: 1, diagram_type: "bdd", nodes: [], offsets: {}, sizes: {} },
         });
       } else {
         await invoke("create_file", { root: rootPath, parent, name: finalName });
@@ -2060,19 +2041,20 @@ export function App() {
 
   useEffect(() => {
     if (!rootPath || !activeEditorPath) return;
-    if (!activeDoc.dirty) return;
     const content = editorValueRef.current;
     if (lastCompiledContentRef.current[activeEditorPath] === content) return;
     const timer = window.setTimeout(() => {
-      lastCompiledContentRef.current[activeEditorPath] = content;
-      void runBackgroundCompileWithUnsaved(rootPath, activeEditorPath, content);
+      void runBackgroundCompileWithUnsaved(rootPath, activeEditorPath, content).then((started) => {
+        if (started) {
+          lastCompiledContentRef.current[activeEditorPath] = content;
+        }
+      });
     }, 800);
     return () => window.clearTimeout(timer);
-  }, [editorChangeTick, activeEditorPath, rootPath, activeDoc.dirty]);
+  }, [editorChangeTick, activeEditorPath, rootPath]);
 
   const selectSymbolInEditor = async (symbol: SymbolView) => {
-    if (!symbol) return;
-    if (!symbol.file_path) return;
+    if (!symbol || !symbol.file_path) return;
     const startLine = Math.max(1, symbol.start_line || 1);
     const startCol = Math.max(1, symbol.start_col || 1);
     let endLine = Math.max(startLine, symbol.end_line || symbol.start_line || 1);
@@ -2894,7 +2876,6 @@ export function App() {
 
   useEffect(() => {
     if (rightPaneTab !== "file_editor") {
-      setFileInsertMenuOpen(false);
       setFileDropIndicator(null);
     }
   }, [rightPaneTab]);
@@ -2951,7 +2932,7 @@ export function App() {
     defaultExpanded: false,
     libraryLoadingFilePaths: libraryLoadingFiles,
     libraryLoadErrors,
-    libraryKindFilter,
+    libraryKindFilter: null,
   });
 
   const {
@@ -3069,6 +3050,8 @@ export function App() {
   });
 
   const {
+    diagramType,
+    setDiagramType,
     diagramScale,
     setDiagramScale,
     diagramOffset,
@@ -3117,36 +3100,6 @@ export function App() {
       }
     },
   });
-
-  const insertSnippetIntoActiveFile = useCallback((snippet: string) => {
-    const editor = editorRef.current;
-    const monaco = monacoRef.current;
-    if (!editor || !monaco || !activeEditorPath) return;
-    const activeKey = normalizeModelPath(activeEditorPath);
-    const anchor =
-      selectedSymbol && normalizeModelPath(selectedSymbol.file_path) === activeKey
-        ? selectedSymbol
-        : null;
-    const selection = anchor
-      ? new monaco.Range(
-          Math.max(1, (anchor.end_line || 0) + 1),
-          1,
-          Math.max(1, (anchor.end_line || 0) + 1),
-          1,
-        )
-      : editor.getSelection();
-    if (!selection) return;
-    editor.executeEdits("file-tree-insert", [
-      {
-        range: selection,
-        text: snippet,
-        forceMoveMarkers: true,
-      },
-    ]);
-    editor.focus();
-    setCompileStatus("File tree: inserted snippet");
-    setFileInsertMenuOpen(false);
-  }, [activeEditorPath, normalizeModelPath, selectedSymbol, setCompileStatus]);
 
   const reorderActiveFileSymbol = useCallback((
     source: SymbolView,
@@ -3252,6 +3205,7 @@ export function App() {
         onRetryLibraryFileSymbols: (filePath) => {
           void loadLibrarySymbolsForFile(filePath);
         },
+        onDragStartSymbol: () => {},
         openOnClick: false,
       }),
     [
@@ -3333,7 +3287,7 @@ export function App() {
           ["--left-width" as string]: `${leftCollapsed ? 0 : leftWidth}px`,
           ["--right-width" as string]: `${rightCollapsed ? 0 : rightWidth}px`,
           ["--split-left-width" as string]: `${leftCollapsed ? 16 : 6}px`,
-          ["--split-right-width" as string]: "0px",
+          ["--split-right-width" as string]: `${rightCollapsed ? 16 : 6}px`,
         }}
       >
       <header className="titlebar" data-tauri-drag-region>
@@ -3725,6 +3679,8 @@ export function App() {
                 paletteDragRef={paletteDragRef}
                 paletteCreateRef={paletteCreateRef}
                 diagramDropActive={diagramDropActive}
+                diagramType={diagramType}
+                onDiagramTypeChange={setDiagramType}
                 onSwitchToText={() => {
                   if (activeDiagramPath) {
                     void navigateTo({ path: activeDiagramPath });
@@ -3784,97 +3740,45 @@ export function App() {
           </EditorPane>
           <>
           <div
-            className={`splitter right-side-bar ${rightCollapsed ? "collapsed" : ""}`}
-          >
-            <div
-              className="right-side-handle"
-              onPointerDown={rightCollapsed ? undefined : (event) => startDrag("right", event)}
-              title={rightCollapsed ? "Model pane collapsed" : "Resize model pane"}
-            />
-            <div className="right-side-buttons">
-              <button
-                type="button"
-                className={`side-tool-btn ${rightPaneTab === "file_editor" ? "active" : ""}`}
-                onClick={() => handleRightBarTabClick("file_editor")}
-                title={rightCollapsed ? "Open File View" : "Toggle File View"}
-                aria-label={rightCollapsed ? "Open File View" : "Toggle File View"}
-              >
-                <span className="side-tool-icon side-tool-icon-file" aria-hidden="true" />
-              </button>
-              <button
-                type="button"
-                className={`side-tool-btn ${rightPaneTab === "semantic" ? "active" : ""}`}
-                onClick={() => handleRightBarTabClick("semantic")}
-                title={rightCollapsed ? "Open Project View" : "Toggle Project View"}
-                aria-label={rightCollapsed ? "Open Project View" : "Toggle Project View"}
-              >
-                <span className="side-tool-icon side-tool-icon-project" aria-hidden="true" />
-              </button>
-            </div>
-          </div>
+            className={`splitter ${rightCollapsed ? "collapsed" : ""}`}
+            onPointerDown={rightCollapsed ? undefined : (event) => startDrag("right", event)}
+            title={rightCollapsed ? "Model pane collapsed" : "Resize model pane"}
+          />
           {rightCollapsed ? null : (
             <section className="panel sidebar right-pane" ref={modelPaneContainerRef}>
-              <div
-                className="right-pane-resizer"
-                onPointerDown={(event) => startDrag("right", event)}
-                title="Resize model pane"
-              />
               <div className="panel-header" ref={rightPaneHeaderRef}>
-              {rightPaneTab === "file_editor" ? (
-                <div className="right-pane-toolbar">
-                  <span className="muted">
-                    {activeEditorPath ? activeEditorPath.split(/[\\/]/).pop() : "No active file"}
-                  </span>
-                  <div className="right-pane-actions">
-                    <button
-                      type="button"
-                      className={`ghost icon-properties ${showFilePropertiesPane ? "active" : ""}`}
-                      onClick={() => setShowFilePropertiesPane((prev) => !prev)}
-                      title={showFilePropertiesPane ? "Hide Properties" : "Show Properties"}
-                      aria-label={showFilePropertiesPane ? "Hide Properties" : "Show Properties"}
-                    >
-                    </button>
-                    <div className="right-pane-insert">
-                      <button
-                        type="button"
-                        className="ghost"
-                        onClick={() => setFileInsertMenuOpen((prev) => !prev)}
-                        title="Insert into active file"
-                        disabled={!activeEditorPath}
-                      >
-                        +
-                      </button>
-                      {fileInsertMenuOpen ? (
-                        <div className="context-menu tab-menu" style={{ right: 0, top: 28, left: "auto" }}>
-                          <button type="button" onClick={() => insertSnippetIntoActiveFile("\npart def NewPart {\n}\n")}>
-                            Insert Part Def
-                          </button>
-                          <button type="button" onClick={() => insertSnippetIntoActiveFile("\naction def NewAction {\n}\n")}>
-                            Insert Action Def
-                          </button>
-                          <button type="button" onClick={() => insertSnippetIntoActiveFile("\nattribute def NewAttribute;\n")}>
-                            Insert Attribute Def
-                          </button>
-                          <button type="button" onClick={() => insertSnippetIntoActiveFile("\nimport Kernel::*;\n")}>
-                            Insert Import
-                          </button>
-                        </div>
-                      ) : null}
-                    </div>
-                  </div>
-                </div>
-              ) : (
                 <div className="right-pane-toolbar">
                   <ModelHeader
                     collapseAll={collapseAllModel}
-                    libraryStatus={`Library ${loadedLibraryFileCount}/${libraryFiles.length} | ${libraryIndexedSymbolCount} sym`}
+                    libraryStatus=""
                     onCollapseAll={() => setCollapseAllModel(true)}
                     onExpandAll={() => setCollapseAllModel(false)}
                     onOpenOptions={showModelOptions}
                   />
-                  <span className="muted">Semantic</span>
+                  <div className="right-pane-actions">
+                    <button
+                      type="button"
+                      className={`ghost icon-properties ${(rightPaneTab === "file_editor" ? showFilePropertiesPane : showPropertiesPane) ? "active" : ""}`}
+                      onClick={() => {
+                        if (rightPaneTab === "file_editor") {
+                          setShowFilePropertiesPane((prev) => !prev);
+                          return;
+                        }
+                        setShowPropertiesPane((prev) => !prev);
+                      }}
+                      title={(rightPaneTab === "file_editor" ? showFilePropertiesPane : showPropertiesPane) ? "Hide Properties" : "Show Properties"}
+                      aria-label={(rightPaneTab === "file_editor" ? showFilePropertiesPane : showPropertiesPane) ? "Hide Properties" : "Show Properties"}
+                    >
+                    </button>
+                    <button
+                      type="button"
+                      className={`ghost icon-mode ${rightPaneTab === "file_editor" ? "file-only" : "project"}`}
+                      onClick={() => setRightPaneTab((prev) => (prev === "semantic" ? "file_editor" : "semantic"))}
+                      title={rightPaneTab === "semantic" ? "Switch to File Only" : "Switch to Project"}
+                      aria-label={rightPaneTab === "semantic" ? "Switch to File Only" : "Switch to Project"}
+                    />
+                  </div>
                 </div>
-              )}              
             </div>
             <ModelPane
               modelTreeHeight={effectiveModelTreeHeight}
@@ -3902,11 +3806,6 @@ export function App() {
               startDrag={startDrag}
               selectedSymbol={selectedSymbol}
               selectedSymbols={selectedNodeSymbols}
-              getDoc={getDoc}
-              readFile={async (path: string) => {
-                const content = await readFileText(path);
-                return content || "";
-              }}
               onOpenInProjectModel={(symbol) => {
                 setProjectModelFocusQuery(symbol.qualified_name || symbol.name || symbol.kind);
                 openProjectModelViewTab();
@@ -4018,60 +3917,11 @@ export function App() {
             <button
               type="button"
               onClick={() => {
-                setShowPropertiesPane((prev) => !prev);
-                setModelOptionsMenu(null);
-              }}
-            >
-              {showPropertiesPane ? "Undock Properties Panel" : "Dock Properties Panel"}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setPropertiesDock("bottom");
-                setShowPropertiesPane(true);
-                setModelOptionsMenu(null);
-              }}
-            >
-              Dock Properties: Bottom{propertiesDock === "bottom" ? " (current)" : ""}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setPropertiesDock("right");
-                setShowPropertiesPane(true);
-                setModelOptionsMenu(null);
-              }}
-            >
-              Dock Properties: Right{propertiesDock === "right" ? " (current)" : ""}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
                 setShowUsageNodes((prev) => !prev);
                 setModelOptionsMenu(null);
               }}
             >
               {showUsageNodes ? "Hide Usages" : "Show Usages"}
-            </button>
-            <div className="context-meta">
-              Library kinds ({libraryKindCounts.reduce((sum, [, count]) => sum + count, 0)}):
-            </div>
-            {libraryKindCounts.slice(0, 8).map(([kind, count]) => (
-              <button
-                key={`library-kind-${kind}`}
-                type="button"
-                className={libraryKindFilter === kind ? "context-kind-filter active" : "context-kind-filter"}
-                onClick={() => setLibraryKindFilter((prev) => (prev === kind ? null : kind))}
-              >
-                {kind}: {count}
-              </button>
-            ))}
-            <button
-              type="button"
-              disabled={!libraryKindFilter}
-              onClick={() => setLibraryKindFilter(null)}
-            >
-              Clear Library Kind Filter
             </button>
           </div>
         ) : null}
@@ -4315,20 +4165,42 @@ export function App() {
                 </label>
                 <label className="field">
                   <span>Recent</span>
-                  <select
-                    value=""
-                    onChange={(event) => {
-                      const value = event.target.value;
-                      if (value) {
-                        setOpenProjectPath(value);
-                      }
-                    }}
-                  >
-                    <option value="">Select recent</option>
-                    {recentProjects.map((path) => (
-                      <option key={path} value={path}>{path}</option>
-                    ))}
-                  </select>
+                  {recentProjects.length ? (
+                    <>
+                      <div className="open-project-recent-quick">
+                        {recentProjects.slice(0, 3).map((path) => (
+                          <button
+                            key={path}
+                            type="button"
+                            className="ghost open-project-recent-btn"
+                            onClick={() => setOpenProjectPath(path)}
+                            title={path}
+                          >
+                            {path}
+                          </button>
+                        ))}
+                      </div>
+                      {recentProjects.length > 3 ? (
+                        <select
+                          className="open-project-recent-select"
+                          value=""
+                          onChange={(event) => {
+                            const value = event.target.value;
+                            if (value) {
+                              setOpenProjectPath(value);
+                            }
+                          }}
+                        >
+                          <option value="">More recent...</option>
+                          {recentProjects.slice(3).map((path) => (
+                            <option key={path} value={path}>{path}</option>
+                          ))}
+                        </select>
+                      ) : null}
+                    </>
+                  ) : (
+                    <div className="muted">No recent projects.</div>
+                  )}
                 </label>
               </div>
               <div className="modal-actions">
@@ -4486,7 +4358,7 @@ export function App() {
       {showGitDialog ? (
         <div className="modal">
           <div className="modal-backdrop" onClick={() => setShowGitDialog(false)} />
-          <div className="modal-card modal-wide legacy-modal" role="dialog" aria-modal="true" aria-labelledby="git-dialog-title">
+          <div className="modal-card modal-wide legacy-modal git-collab-modal" role="dialog" aria-modal="true" aria-labelledby="git-dialog-title">
             <div className="modal-header">
               <h3 id="git-dialog-title">Collab</h3>
             </div>
@@ -4513,86 +4385,88 @@ export function App() {
               {gitStatusError ? (
                 <div className="field-hint error">{gitStatusError}</div>
               ) : null}
-              {gitStatus ? (
-                <div className="project-properties-section">
-                  <div className="project-properties-title">Select files</div>
-                  <div className="commit-tree">
-                    <div className="commit-header">
-                      <input
-                        type="checkbox"
-                        checked={
-                          gitStatus.staged.length + gitStatus.unstaged.length > 0 &&
-                          [...gitStatus.staged, ...gitStatus.unstaged].every((path) => gitCommitSelection[path])
-                        }
-                        onChange={(event) => toggleCommitAll("changes", event.target.checked)}
-                      />
-                      <button
-                        type="button"
-                        className="commit-toggle"
-                        onClick={() => setGitCommitSectionsOpen((prev) => ({ ...prev, changes: !prev.changes }))}
-                        aria-expanded={gitCommitSectionsOpen.changes}
-                      >
-                        {gitCommitSectionsOpen.changes ? "v" : ">"}
-                      </button>
-                      <span>Changes</span>
-                      <span>{gitStatus.staged.length + gitStatus.unstaged.length}</span>
-                    </div>
-                    {gitCommitSectionsOpen.changes ? (
-                      <div className="commit-list">
-                        {[
-                          ...gitStatus.staged.map((path) => ({ path, state: "staged" as const })),
-                          ...gitStatus.unstaged.map((path) => ({ path, state: "unstaged" as const })),
-                        ].map(({ path, state }) => (
-                          <label key={`change-${path}`} className="commit-row">
-                            <input
-                              type="checkbox"
-                              checked={!!gitCommitSelection[path]}
-                              onChange={() => toggleCommitSelection(path)}
-                            />
-                            <span>{path}</span>
-                            <span className="muted">{state}</span>
-                          </label>
-                        ))}
+              <div className="git-changes-scroll">
+                {gitStatus ? (
+                  <div className="project-properties-section">
+                    <div className="project-properties-title">Select files</div>
+                    <div className="commit-tree">
+                      <div className="commit-header">
+                        <input
+                          type="checkbox"
+                          checked={
+                            gitStatus.staged.length + gitStatus.unstaged.length > 0 &&
+                            [...gitStatus.staged, ...gitStatus.unstaged].every((path) => gitCommitSelection[path])
+                          }
+                          onChange={(event) => toggleCommitAll("changes", event.target.checked)}
+                        />
+                        <button
+                          type="button"
+                          className="commit-toggle"
+                          onClick={() => setGitCommitSectionsOpen((prev) => ({ ...prev, changes: !prev.changes }))}
+                          aria-expanded={gitCommitSectionsOpen.changes}
+                        >
+                          {gitCommitSectionsOpen.changes ? "v" : ">"}
+                        </button>
+                        <span>Changes</span>
+                        <span>{gitStatus.staged.length + gitStatus.unstaged.length}</span>
                       </div>
-                    ) : null}
-                    <div className="commit-header">
-                      <input
-                        type="checkbox"
-                        checked={
-                          gitStatus.untracked.length > 0 &&
-                          gitStatus.untracked.every((path) => gitCommitSelection[path])
-                        }
-                        onChange={(event) => toggleCommitAll("unversioned", event.target.checked)}
-                      />
-                      <button
-                        type="button"
-                        className="commit-toggle"
-                        onClick={() => setGitCommitSectionsOpen((prev) => ({ ...prev, unversioned: !prev.unversioned }))}
-                        aria-expanded={gitCommitSectionsOpen.unversioned}
-                      >
-                        {gitCommitSectionsOpen.unversioned ? "v" : ">"}
-                      </button>
-                      <span>Unversioned</span>
-                      <span>{gitStatus.untracked.length}</span>
-                    </div>
-                    {gitCommitSectionsOpen.unversioned ? (
-                      <div className="commit-list">
-                        {gitStatus.untracked.map((path) => (
-                          <label key={`unversioned-${path}`} className="commit-row">
-                            <input
-                              type="checkbox"
-                              checked={!!gitCommitSelection[path]}
-                              onChange={() => toggleCommitSelection(path)}
-                            />
-                            <span>{path}</span>
-                            <span className="muted">untracked</span>
-                          </label>
-                        ))}
+                      {gitCommitSectionsOpen.changes ? (
+                        <div className="commit-list">
+                          {[
+                            ...gitStatus.staged.map((path) => ({ path, state: "staged" as const })),
+                            ...gitStatus.unstaged.map((path) => ({ path, state: "unstaged" as const })),
+                          ].map(({ path, state }) => (
+                            <label key={`change-${path}`} className="commit-row">
+                              <input
+                                type="checkbox"
+                                checked={!!gitCommitSelection[path]}
+                                onChange={() => toggleCommitSelection(path)}
+                              />
+                              <span>{path}</span>
+                              <span className="muted">{state}</span>
+                            </label>
+                          ))}
+                        </div>
+                      ) : null}
+                      <div className="commit-header">
+                        <input
+                          type="checkbox"
+                          checked={
+                            gitStatus.untracked.length > 0 &&
+                            gitStatus.untracked.every((path) => gitCommitSelection[path])
+                          }
+                          onChange={(event) => toggleCommitAll("unversioned", event.target.checked)}
+                        />
+                        <button
+                          type="button"
+                          className="commit-toggle"
+                          onClick={() => setGitCommitSectionsOpen((prev) => ({ ...prev, unversioned: !prev.unversioned }))}
+                          aria-expanded={gitCommitSectionsOpen.unversioned}
+                        >
+                          {gitCommitSectionsOpen.unversioned ? "v" : ">"}
+                        </button>
+                        <span>Unversioned</span>
+                        <span>{gitStatus.untracked.length}</span>
                       </div>
-                    ) : null}
+                      {gitCommitSectionsOpen.unversioned ? (
+                        <div className="commit-list">
+                          {gitStatus.untracked.map((path) => (
+                            <label key={`unversioned-${path}`} className="commit-row">
+                              <input
+                                type="checkbox"
+                                checked={!!gitCommitSelection[path]}
+                                onChange={() => toggleCommitSelection(path)}
+                              />
+                              <span>{path}</span>
+                              <span className="muted">untracked</span>
+                            </label>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
                   </div>
-                </div>
-              ) : null}
+                ) : null}
+              </div>
               <label className="field field-commit-message">
                 <span className="field-label">Commit message</span>
                 <textarea
@@ -4893,7 +4767,6 @@ export function App() {
             {cursorPos && activeEditorPath ? (
               <span className="status-cursor">Ln {cursorPos.line}, Col {cursorPos.col}</span>
             ) : null}
-            <span className="muted">Active: Semantic</span>
             <span
               className={`status-compile-indicator ${backgroundCompileActive ? "active" : ""} ${backgroundCompileEnabled ? "" : "disabled"}`}
               title={backgroundCompileEnabled ? "Background compile enabled (right-click to disable)" : "Background compile disabled (right-click to enable)"}

@@ -1,5 +1,6 @@
 import type { DragEvent, MutableRefObject, ReactElement } from "react";
 import type { DiagramLayout, DiagramViewport } from "../types";
+import { DIAGRAM_TYPE_OPTIONS, type DiagramType } from "../diagrams/model";
 
 type DiagramViewProps = {
   activeDiagramPath: string | null;
@@ -17,6 +18,8 @@ type DiagramViewProps = {
   paletteDragRef: MutableRefObject<null | { startX: number; startY: number; baseX: number; baseY: number }>;
   paletteCreateRef: MutableRefObject<null | { type: string; name: string; startX: number; startY: number }>;
   diagramDropActive: boolean;
+  diagramType: DiagramType;
+  onDiagramTypeChange: (value: DiagramType) => void;
   onSwitchToText: () => void;
   onAutoLayout: () => void;
   onZoomIn: () => void;
@@ -48,6 +51,8 @@ export function DiagramView({
   paletteDragRef,
   paletteCreateRef,
   diagramDropActive,
+  diagramType,
+  onDiagramTypeChange,
   onSwitchToText,
   onAutoLayout,
   onZoomIn,
@@ -73,6 +78,17 @@ export function DiagramView({
       <div className="diagram-header">
         <span>Diagram view</span>
         <div className="diagram-controls">
+          <select
+            value={diagramType}
+            onChange={(event) => onDiagramTypeChange(event.target.value as DiagramType)}
+            title="Diagram type"
+          >
+            {DIAGRAM_TYPE_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
           <button
             type="button"
             className="ghost toggle-btn"
@@ -141,7 +157,7 @@ export function DiagramView({
       >
         {diagramLayout ? (
           <>
-            {diagramDropActive ? <div className="diagram-drop-indicator">Drop to add package</div> : null}
+            {diagramDropActive ? <div className="diagram-drop-indicator">Drop to add element</div> : null}
             <div
               className="diagram-canvas"
               onDragOver={onDiagramDragOver}

@@ -1,6 +1,7 @@
 import type { KeyboardEvent, MouseEvent, RefObject, ReactElement } from "react";
 import type { RowComponentProps } from "react-window";
 import type { ModelRow, SymbolNode, SymbolView } from "./types";
+import { setPendingDiagramDragPayload } from "./diagramDragPayload";
 
 type NavigateTarget = {
   path: string;
@@ -79,6 +80,85 @@ export function createModelRowRenderer(options: ModelRowRendererOptions) {
       if (found) return found;
     }
     return null;
+  };
+
+  let fallbackDragState:
+    | null
+    | {
+        startX: number;
+        startY: number;
+        active: boolean;
+        payload: { qualified: string; name: string; kind: string };
+      } = null;
+  let suppressClickUntil = 0;
+
+  const clearFallbackDrag = () => {
+    fallbackDragState = null;
+    window.removeEventListener("pointermove", onFallbackPointerMove);
+    window.removeEventListener("pointerup", onFallbackPointerUp);
+    window.removeEventListener("pointercancel", onFallbackCancel);
+    window.removeEventListener("blur", onFallbackCancel);
+    document.body.classList.remove("model-tree-fallback-dragging");
+  };
+
+  const onFallbackCancel = () => {
+    if (!fallbackDragState) return;
+    clearFallbackDrag();
+    window.dispatchEvent(new CustomEvent("mercurio:model-tree-drag-end"));
+  };
+
+  const onFallbackPointerMove = (event: PointerEvent) => {
+    if (!fallbackDragState) return;
+    if (!fallbackDragState.active) {
+      const dx = event.clientX - fallbackDragState.startX;
+      const dy = event.clientY - fallbackDragState.startY;
+      if (Math.hypot(dx, dy) >= 6) {
+        fallbackDragState.active = true;
+        document.body.classList.add("model-tree-fallback-dragging");
+      }
+    }
+    if (!fallbackDragState.active) return;
+    const target = document.elementFromPoint(event.clientX, event.clientY) as HTMLElement | null;
+    const overDiagram =
+      !!target?.closest(".diagram-body") &&
+      !target?.closest(".diagram-minimap") &&
+      !target?.closest(".diagram-header");
+    window.dispatchEvent(
+      new CustomEvent("mercurio:model-tree-drag-move", {
+        detail: {
+          payload: fallbackDragState.payload,
+          clientX: event.clientX,
+          clientY: event.clientY,
+          overDiagram,
+        },
+      }),
+    );
+  };
+
+  const onFallbackPointerUp = (event: PointerEvent) => {
+    if (!fallbackDragState) return;
+    const current = fallbackDragState;
+    const wasActive = current.active;
+    const payload = current.payload;
+    clearFallbackDrag();
+    window.dispatchEvent(new CustomEvent("mercurio:model-tree-drag-end"));
+    if (!wasActive) return;
+    const target = document.elementFromPoint(event.clientX, event.clientY) as HTMLElement | null;
+    const droppedOnDiagram =
+      !!target?.closest(".diagram-body") &&
+      !target?.closest(".diagram-minimap") &&
+      !target?.closest(".diagram-header");
+    if (!droppedOnDiagram) return;
+    suppressClickUntil = Date.now() + 250;
+    window.dispatchEvent(
+      new CustomEvent("mercurio:model-tree-drop", {
+        detail: {
+          payload,
+          clientX: event.clientX,
+          clientY: event.clientY,
+        },
+      }),
+    );
   };
 
   return ({ index, style, rows }: RowComponentProps<{ rows: ModelRow[] }>) => {
@@ -166,6 +246,8 @@ export function createModelRowRenderer(options: ModelRowRendererOptions) {
     }
     const directSymbol = row.node.symbols[0] || null;
     const symbol = directSymbol || findFirstSymbol(row.node);
+    const dragSymbol = directSymbol || (onDropSymbolOnSymbol ? null : symbol);
+    const useNativeDrag = !!onDropSymbolOnSymbol;
     const displayName = row.name && row.name.trim() ? row.name : "(unnamed)";
     const isUnnamed = displayName === "(unnamed)";
     const isSelected =
@@ -178,17 +260,41 @@ export function createModelRowRenderer(options: ModelRowRendererOptions) {
         style={{ ...style, paddingLeft: `${modelSectionIndent + 8 + row.depth * 14}px` }}
         className={`model-virtual-row ${isSelected ? "selected" : ""} ${isFocused ? "model-row-focused" : ""} ${
           isDropIndicator?.(row.key, "before") ? "drop-before" : ""
-        } ${isDropIndicator?.(row.key, "after") ? "drop-after" : ""}`}
+        } ${isDropIndicator?.(row.key, "after") ? "drop-after" : ""} ${!useNativeDrag ? "fallback-draggable" : ""}`}
         role="button"
         tabIndex={-1}
-        draggable={!!directSymbol && (!!onDragStartSymbol || !!onDropSymbolOnSymbol)}
+        draggable={useNativeDrag}
         onDragStart={(event) => {
-          if (!directSymbol || !onDragStartSymbol) return;
-          onDragStartSymbol(directSymbol);
-          event.dataTransfer.effectAllowed = "move";
-          event.dataTransfer.setData("text/plain", directSymbol.qualified_name || directSymbol.name || "");
+          if (!useNativeDrag) return;
+          const payloadQualified =
+            dragSymbol?.qualified_name || row.node.fullName || row.name || "(unnamed)";
+          const payloadName = dragSymbol?.name || row.name || payloadQualified;
+          const payloadKind = dragSymbol?.kind || row.kindKey || "";
+          setPendingDiagramDragPayload({
+            qualified: payloadQualified,
+            name: payloadName,
+            kind: payloadKind,
+          });
+          if (dragSymbol) {
+            onDragStartSymbol?.(dragSymbol);
+          }
+          try {
+            event.dataTransfer.effectAllowed = "move";
+            event.dataTransfer.setData(
+              "application/x-mercurio-diagram-node",
+              JSON.stringify({
+                qualified: payloadQualified,
+                name: payloadName,
+                kind: payloadKind,
+              }),
+            );
+            event.dataTransfer.setData("text/plain", payloadQualified);
+          } catch {
+            // Some embedded webviews can block/strip drag data; use in-memory fallback.
+          }
         }}
         onDragEnd={() => {
+          setPendingDiagramDragPayload(null);
           setDropIndicator?.(null);
         }}
         onDragOver={(event) => {
@@ -218,7 +324,33 @@ export function createModelRowRenderer(options: ModelRowRendererOptions) {
         onMouseDown={() => {
           modelTreeRef.current?.focus();
         }}
+        onPointerDown={(event) => {
+          if (event.button !== 0) return;
+          if (onDropSymbolOnSymbol) return;
+          const payloadQualified =
+            dragSymbol?.qualified_name || row.node.fullName || row.name || "(unnamed)";
+          const payloadName = dragSymbol?.name || row.name || payloadQualified;
+          const payloadKind = dragSymbol?.kind || row.kindKey || "";
+          fallbackDragState = {
+            startX: event.clientX,
+            startY: event.clientY,
+            active: false,
+            payload: {
+              qualified: payloadQualified,
+              name: payloadName,
+              kind: payloadKind,
+            },
+          };
+          window.addEventListener("pointermove", onFallbackPointerMove);
+          window.addEventListener("pointerup", onFallbackPointerUp);
+          window.addEventListener("pointercancel", onFallbackCancel);
+          window.addEventListener("blur", onFallbackCancel);
+        }}
         onClick={(event) => {
+          if (Date.now() < suppressClickUntil) {
+            event.stopPropagation();
+            return;
+          }
           event.stopPropagation();
           setModelCursorIndex(index);
           if (row.section === "library" && row.isFileRoot && row.filePath && row.node.symbols.length === 0) {

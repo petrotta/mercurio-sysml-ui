@@ -10,6 +10,8 @@ import type {
 } from "./types";
 import { createDiagramRenderer } from "./diagramRenderer";
 import { useDiagramLayout } from "./useDiagramLayout";
+import { DEFAULT_DIAGRAM_TYPE, normalizeDiagramType, type DiagramType } from "./diagrams/model";
+import { getPendingDiagramDragPayload, setPendingDiagramDragPayload } from "./diagramDragPayload";
 
 type UseDiagramViewOptions = {
   activeDiagramPath: string | null;
@@ -28,6 +30,7 @@ export function useDiagramView({
 }: UseDiagramViewOptions) {
   const [diagramScale, setDiagramScale] = useState(1);
   const [diagramOffset, setDiagramOffset] = useState({ x: 0, y: 0 });
+  const [diagramType, setDiagramType] = useState<DiagramType>(DEFAULT_DIAGRAM_TYPE);
   const diagramPanRef = useRef<null | { x: number; y: number; startX: number; startY: number }>(null);
   const diagramBodyRef = useRef<HTMLDivElement | null>(null);
   const diagramViewportRef = useRef<null | { startX: number; startY: number; baseX: number; baseY: number }>(null);
@@ -93,6 +96,7 @@ export function useDiagramView({
       setDiagramNodes([]);
       setDiagramNodeOffsets({});
       setDiagramNodeSizes({});
+      setDiagramType(DEFAULT_DIAGRAM_TYPE);
       setSelectedNode(null);
       return;
     }
@@ -108,11 +112,13 @@ export function useDiagramView({
         setDiagramNodes(nodes);
         setDiagramNodeOffsets(payload?.offsets || {});
         setDiagramNodeSizes(payload?.sizes || {});
+        setDiagramType(normalizeDiagramType(payload?.diagram_type));
         setSelectedNode(null);
         setDiagramScale(1);
         setDiagramOffset({ x: 0, y: 0 });
         diagramLastSavedRef.current[activeDiagramPath] = JSON.stringify({
           version: payload?.version ?? 1,
+          diagram_type: normalizeDiagramType(payload?.diagram_type),
           nodes,
           offsets: payload?.offsets || {},
           sizes: payload?.sizes || {},
@@ -124,6 +130,7 @@ export function useDiagramView({
         setDiagramNodes([]);
         setDiagramNodeOffsets({});
         setDiagramNodeSizes({});
+        setDiagramType(DEFAULT_DIAGRAM_TYPE);
       })
       .finally(() => {
         window.clearTimeout(clearLoading);
@@ -137,6 +144,7 @@ export function useDiagramView({
     if (diagramLoadingRef.current) return;
     const payload: DiagramFile = {
       version: 1,
+      diagram_type: diagramType,
       nodes: diagramNodes,
       offsets: diagramNodeOffsets,
       sizes: diagramNodeSizes,
@@ -160,7 +168,7 @@ export function useDiagramView({
         window.clearTimeout(diagramSaveTimerRef.current);
       }
     };
-  }, [diagramNodes, diagramNodeOffsets, diagramNodeSizes, activeDiagramPath, rootPath, setCompileStatus]);
+  }, [diagramNodes, diagramNodeOffsets, diagramNodeSizes, diagramType, activeDiagramPath, rootPath, setCompileStatus]);
 
   useEffect(() => {
     if (!diagramLayout || !diagramBodyRef.current) return;
@@ -338,8 +346,10 @@ export function useDiagramView({
       if (!payload?.qualified) return;
       setDiagramDropActive(false);
       const body = diagramBodyRef.current.getBoundingClientRect();
-      const x = (clientX - body.left - diagramOffset.x) / diagramScale;
-      const y = (clientY - body.top - diagramOffset.y) / diagramScale;
+      const clampedClientX = Math.min(body.right, Math.max(body.left, clientX));
+      const clampedClientY = Math.min(body.bottom, Math.max(body.top, clientY));
+      const x = (clampedClientX - body.left - diagramOffset.x) / diagramScale;
+      const y = (clampedClientY - body.top - diagramOffset.y) / diagramScale;
       const qualified = payload.qualified;
       const exists = diagramNodesRef.current.some((node) => node.qualified === qualified);
       if (!exists) {
@@ -365,9 +375,20 @@ export function useDiagramView({
     (event: DragEvent<HTMLDivElement>) => {
       if (!rootPath || !activeDiagramPath) return;
       if (!diagramBodyRef.current) return;
-      const raw = event.dataTransfer.getData("application/x-mercurio-diagram-node");
-      const fallbackText = event.dataTransfer.getData("text/plain");
-      if (!raw && !fallbackText) return;
+      const raw = (() => {
+        try {
+          return event.dataTransfer.getData("application/x-mercurio-diagram-node");
+        } catch {
+          return "";
+        }
+      })();
+      const fallbackText = (() => {
+        try {
+          return event.dataTransfer.getData("text/plain");
+        } catch {
+          return "";
+        }
+      })();
       let payload: { qualified: string; name?: string; kind?: string } | null = null;
       if (raw) {
         try {
@@ -383,18 +404,76 @@ export function useDiagramView({
           kind: "package",
         };
       }
+      if (!payload) {
+        payload = getPendingDiagramDragPayload();
+      }
       if (!payload?.qualified) return;
       event.preventDefault();
       addDiagramNodeFromPayload(payload, event.clientX, event.clientY);
+      setPendingDiagramDragPayload(null);
     },
     [rootPath, activeDiagramPath, addDiagramNodeFromPayload],
   );
+
+  useEffect(() => {
+    const onModelTreeDrop = (event: Event) => {
+      const custom = event as CustomEvent<{
+        payload?: { qualified: string; name?: string; kind?: string };
+        clientX?: number;
+        clientY?: number;
+      }>;
+      const payload = custom.detail?.payload;
+      const clientX = custom.detail?.clientX;
+      const clientY = custom.detail?.clientY;
+      if (!payload?.qualified) return;
+      if (typeof clientX !== "number" || typeof clientY !== "number") return;
+      if (!rootPath || !activeDiagramPath) return;
+      addDiagramNodeFromPayload(payload, clientX, clientY);
+      setPendingDiagramDragPayload(null);
+    };
+    const onModelTreeDragMove = (event: Event) => {
+      const custom = event as CustomEvent<{
+        payload?: { qualified: string; name?: string; kind?: string };
+        clientX?: number;
+        clientY?: number;
+        overDiagram?: boolean;
+      }>;
+      const payload = custom.detail?.payload;
+      const clientX = custom.detail?.clientX;
+      const clientY = custom.detail?.clientY;
+      const overDiagram = !!custom.detail?.overDiagram;
+      if (typeof clientX !== "number" || typeof clientY !== "number") return;
+      if (!payload?.qualified) return;
+      if (!rootPath || !activeDiagramPath) return;
+      setDiagramDropActive(overDiagram);
+      if (!overDiagram) {
+        setPaletteGhost(null);
+        return;
+      }
+      setPaletteGhost({
+        x: clientX,
+        y: clientY,
+        type: payload.kind || "package",
+      });
+    };
+    const onModelTreeDragEnd = () => {
+      setDiagramDropActive(false);
+      setPaletteGhost(null);
+    };
+    window.addEventListener("mercurio:model-tree-drop", onModelTreeDrop as EventListener);
+    window.addEventListener("mercurio:model-tree-drag-move", onModelTreeDragMove as EventListener);
+    window.addEventListener("mercurio:model-tree-drag-end", onModelTreeDragEnd as EventListener);
+    return () => {
+      window.removeEventListener("mercurio:model-tree-drop", onModelTreeDrop as EventListener);
+      window.removeEventListener("mercurio:model-tree-drag-move", onModelTreeDragMove as EventListener);
+      window.removeEventListener("mercurio:model-tree-drag-end", onModelTreeDragEnd as EventListener);
+    };
+  }, [activeDiagramPath, rootPath, addDiagramNodeFromPayload]);
 
   const handleDiagramDragOver = useCallback((event: DragEvent<HTMLDivElement>) => {
     event.preventDefault();
     event.dataTransfer.dropEffect = "copy";
     setDiagramDropActive(true);
-    setCompileStatus("Diagram dragover");
   }, []);
 
   const handleDiagramDragLeave = useCallback((event: DragEvent<HTMLDivElement>) => {
@@ -404,7 +483,42 @@ export function useDiagramView({
     setDiagramDropActive(false);
   }, []);
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!activeDiagramPath) return;
+      if (!selectedNode) return;
+      if (event.key !== "Delete" && event.key !== "Backspace") return;
+      const target = event.target as HTMLElement | null;
+      if (
+        target?.closest("input, textarea, select") ||
+        target?.isContentEditable
+      ) {
+        return;
+      }
+      event.preventDefault();
+      const qualified = selectedNode.qualified;
+      setDiagramNodes((prev) => prev.filter((node) => node.qualified !== qualified));
+      setDiagramNodeOffsets((prev) => {
+        if (!(qualified in prev)) return prev;
+        const next = { ...prev };
+        delete next[qualified];
+        return next;
+      });
+      setDiagramNodeSizes((prev) => {
+        if (!(qualified in prev)) return prev;
+        const next = { ...prev };
+        delete next[qualified];
+        return next;
+      });
+      setSelectedNode(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [activeDiagramPath, selectedNode]);
+
   return {
+    diagramType,
+    setDiagramType,
     diagramScale,
     setDiagramScale,
     diagramOffset,

@@ -30,6 +30,14 @@ export function TabBar(props: TabBarProps) {
     return () => observer.disconnect();
   }, [props.openTabs.length]);
 
+  useEffect(() => {
+    const container = tabsRef.current;
+    if (!container || !props.activeTabPath) return;
+    const active = container.querySelector<HTMLButtonElement>(".tab.active");
+    if (!active) return;
+    active.scrollIntoView({ block: "nearest", inline: "center" });
+  }, [props.activeTabPath, props.openTabs.length]);
+
   return (
     <div className="panel-header editor-tabs">
       <div className="tabs" ref={tabsRef}>

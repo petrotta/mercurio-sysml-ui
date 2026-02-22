@@ -1,3 +1,5 @@
+import type { DiagramType } from "./diagrams/model";
+
 export type FileEntry = {
   path: string;
   name: string;
@@ -140,6 +142,7 @@ export type DiagramNodeSize = { width: number; height: number };
 
 export type DiagramFile = {
   version: number;
+  diagram_type: DiagramType;
   nodes: DiagramNode[];
   offsets?: Record<string, DiagramNodeOffset>;
   sizes?: Record<string, DiagramNodeSize>;
