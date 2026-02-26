@@ -17,7 +17,6 @@ import {
   TRACK_TEXT_KEY,
   FILTER_MODEL_FILES_KEY,
   MODEL_SHOW_FILES_KEY,
-  MODEL_PROPERTIES_DOCK_KEY,
 } from "./app/constants";
 import { loadRecents, saveRecents } from "./app/storage";
 import { useEditorState } from "./app/editorState";
@@ -29,12 +28,13 @@ import { ProjectTree } from "./app/components/ProjectTree";
 import { DataView } from "./app/components/DataView";
 import { ProjectModelPaneView } from "./app/components/ProjectModelView";
 import { DescriptorView } from "./app/components/DescriptorView";
-import { SettingsDialog } from "./app/components/SettingsDialog";
 import { DiagramView } from "./app/components/DiagramView";
 import { TerminalPane } from "./app/components/TerminalPane";
 import { AstStatus } from "./app/components/AstStatus";
 import { CompileToastPanel } from "./app/components/CompileToast";
 import { Modal } from "./app/components/Modal";
+import { NextStepsFloating } from "./app/components/NextStepsFloating";
+import { AppCoreModals } from "./app/components/AppCoreModals";
 import { getKindKey, renderTypeIcon } from "./app/diagramIcons";
 import { useModelTracking } from "./app/useModelTracking";
 import { useDiagramView } from "./app/useDiagramView";
@@ -349,14 +349,7 @@ export function App() {
   const [rightPaneTab, setRightPaneTab] = useState<"semantic" | "file_editor">("semantic");
   const [showPropertiesPane, setShowPropertiesPane] = useState(true);
   const [showFilePropertiesPane, setShowFilePropertiesPane] = useState(true);
-  const [propertiesDock] = useState<"bottom" | "right">(() => {
-    try {
-      const stored = window.localStorage?.getItem(MODEL_PROPERTIES_DOCK_KEY);
-      return stored === "right" ? "right" : "bottom";
-    } catch {
-      return "bottom";
-    }
-  });
+  const propertiesDock: "bottom" | "right" = "bottom";
   const [modelPropertiesWidth, setModelPropertiesWidth] = useState(320);
   const [trackText, setTrackText] = useState(() => {
     try {
@@ -686,10 +679,6 @@ export function App() {
   useEffect(() => {
     window.localStorage?.setItem(MODEL_SHOW_FILES_KEY, modelShowFiles ? "true" : "false");
   }, [modelShowFiles]);
-
-  useEffect(() => {
-    window.localStorage?.setItem(MODEL_PROPERTIES_DOCK_KEY, propertiesDock);
-  }, [propertiesDock]);
 
   useEffect(() => {
     if (selectedChatEndpoint) {
@@ -3052,6 +3041,8 @@ export function App() {
   const {
     diagramType,
     setDiagramType,
+    snapToGrid,
+    setSnapToGrid,
     diagramScale,
     setDiagramScale,
     diagramOffset,
@@ -3064,6 +3055,16 @@ export function App() {
     diagramPanPendingRef,
     diagramLayout,
     diagramDropActive,
+    flowNodes,
+    flowEdges,
+    handleFlowNodesChange,
+    handleFlowNodeClick,
+    handleFlowNodeDoubleClick,
+    handleFlowNodeDragStop,
+    handleExpandTypeFromSelection,
+    canExpandTypeFromSelection,
+    canDeleteSelectedFlowNode,
+    handleDeleteSelectedFlowNode,
     palettePos,
     paletteGhost,
     paletteDragRef,
@@ -3079,6 +3080,7 @@ export function App() {
     handleDiagramDragLeave,
   } = useDiagramView({
     activeDiagramPath,
+    symbols,
     getKindKey,
     renderTypeIcon,
     rootPath,
@@ -3206,7 +3208,7 @@ export function App() {
           void loadLibrarySymbolsForFile(filePath);
         },
         onDragStartSymbol: () => {},
-        openOnClick: false,
+        openOnClick: trackText,
       }),
     [
       modelCursorIndex,
@@ -3221,6 +3223,7 @@ export function App() {
       navigateTo,
       renderTypeIcon,
       loadLibrarySymbolsForFile,
+      trackText,
     ],
   );
 
@@ -3244,7 +3247,7 @@ export function App() {
         renderTypeIcon,
         onRequestLibraryFileSymbols: () => {},
         onRetryLibraryFileSymbols: () => {},
-        openOnClick: true,
+        openOnClick: trackText,
         onDragStartSymbol: (symbol) => {
           draggedFileSymbolRef.current = symbol;
         },
@@ -3277,6 +3280,7 @@ export function App() {
       renderTypeIcon,
       fileDropIndicator,
       reorderActiveFileSymbol,
+      trackText,
     ],
   );
 
@@ -3671,6 +3675,32 @@ export function App() {
                 diagramViewport={diagramViewport}
                 paletteGhost={paletteGhost}
                 palettePos={palettePos}
+                flowNodes={flowNodes}
+                flowEdges={flowEdges}
+                onFlowNodesChange={handleFlowNodesChange}
+                onFlowNodeClick={handleFlowNodeClick}
+                onFlowNodeDoubleClick={handleFlowNodeDoubleClick}
+                onFlowNodeDragStop={handleFlowNodeDragStop}
+                onSelectInTree={(qualifiedName) => {
+                  const symbol = symbols.find((item) => item.qualified_name === qualifiedName) || null;
+                  if (!symbol) return;
+                  setSelectedSymbol(symbol);
+                  setSelectedNodeSymbols([symbol]);
+                  syncModelTreeToSymbol(symbol);
+                }}
+                onSelectInText={(qualifiedName) => {
+                  const symbol = symbols.find((item) => item.qualified_name === qualifiedName) || null;
+                  if (!symbol) return;
+                  setSelectedSymbol(symbol);
+                  setSelectedNodeSymbols([symbol]);
+                  void selectSymbolInEditor(symbol);
+                }}
+                onExpandTypeFromSelection={handleExpandTypeFromSelection}
+                canExpandTypeFromSelection={canExpandTypeFromSelection}
+                onDeleteSelectedFlowNode={handleDeleteSelectedFlowNode}
+                canDeleteSelectedFlowNode={canDeleteSelectedFlowNode}
+                snapToGrid={snapToGrid}
+                onToggleSnapToGrid={() => setSnapToGrid((prev) => !prev)}
                 diagramBodyRef={diagramBodyRef}
                 diagramPanRef={diagramPanRef}
                 diagramPanPendingRef={diagramPanPendingRef}
@@ -3781,6 +3811,7 @@ export function App() {
                 </div>
             </div>
             <ModelPane
+              rootPath={rootPath}
               modelTreeHeight={effectiveModelTreeHeight}
               showPropertiesPane={rightPaneTab === "file_editor" ? showFilePropertiesPane : showPropertiesPane}
               propertiesDock={rightPaneTab === "file_editor" ? "bottom" : propertiesDock}
@@ -3876,6 +3907,15 @@ export function App() {
             <button
               type="button"
               onClick={() => {
+                setTrackText((prev) => !prev);
+                setModelOptionsMenu(null);
+              }}
+            >
+              {trackText ? "✓ " : ""}Track To Selection
+            </button>
+            <button
+              type="button"
+              onClick={() => {
                 setModelShowFiles((prev) => !prev);
                 setModelOptionsMenu(null);
               }}
@@ -3954,266 +3994,128 @@ export function App() {
             ) : null}
           </div>
         ) : null}
-        <Modal
-          open={showGotoDialog}
-          onClose={() => setShowGotoDialog(false)}
-          cardClassName="legacy-modal"
-          ariaLabelledBy="goto-qn-title"
-        >
-          <div className="modal-header">
-            <h3 id="goto-qn-title">Go to Qualified Name</h3>
-          </div>
-          <div className="modal-body goto-qn-body">
-            <label className="field">
-              <span className="field-label">Qualified name</span>
-              <input
-                ref={gotoInputRef}
-                value={gotoQuery}
-                onChange={(event) => setGotoQuery(event.target.value)}
-                onKeyDown={handleGotoInputKeyDown}
-                placeholder="Type a qualified name, e.g. Parts::Part"
-                autoComplete="off"
-              />
-            </label>
-            {gotoLoading ? <div className="muted">Loading semantic symbols...</div> : null}
-            {!gotoLoading && gotoError ? <div className="field-hint error">{gotoError}</div> : null}
-            {!gotoLoading && !gotoError ? (
-              <div className="goto-qn-list" role="listbox" aria-label="Qualified name matches">
-                {filteredGotoCandidates.length ? (
-                  filteredGotoCandidates.map((candidate, index) => {
-                    const selected = index === gotoSelectedIndex;
-                    return (
-                      <button
-                        key={`${candidate.qualified_name}|${candidate.file_path}`}
-                        type="button"
-                        className={`goto-qn-item ${selected ? "selected" : ""}`}
-                        onClick={() => {
-                          setGotoSelectedIndex(index);
-                          void openGotoCandidate(candidate);
-                        }}
-                        onMouseEnter={() => setGotoSelectedIndex(index)}
-                        title={candidate.file_path}
-                      >
-                        <span className="goto-qn-qualified">{candidate.qualified_name}</span>
-                        <span className="goto-qn-path">{candidate.file_path}</span>
-                      </button>
-                    );
-                  })
-                ) : (
-                  <div className="muted">No matching qualified names.</div>
-                )}
-              </div>
-            ) : null}
-          </div>
-          <div className="modal-actions">
-            <button type="button" className="ghost" onClick={() => setShowGotoDialog(false)}>
-              Cancel
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                void openGotoCandidate(selectedGotoCandidate);
-              }}
-              disabled={!selectedGotoCandidate}
-            >
-              Open
-            </button>
-          </div>
-        </Modal>
-          {showNewFile ? (
-            <div className="modal">
-              <div className="modal-card">
-                <div className="modal-header">
-                  <span>New File</span>
-                  <button type="button" onClick={() => setShowNewFile(false)}>Close</button>
-                </div>
-                <div className="modal-body">
-                <label className="field">
-                  <span>Name</span>
-                  <input value={newFileName} onChange={(e) => setNewFileName(e.target.value)} />
-                </label>
-                <label className="field">
-                  <span>Type</span>
-                  <select value={newFileType} onChange={(e) => setNewFileType(e.target.value)}>
-                    <option value="sysml">.sysml</option>
-                    <option value="kerml">.kerml</option>
-                    <option value="diagram">.diagram</option>
-                  </select>
-                </label>
-                <div className="field">
-                  <span>Parent</span>
-                  <div className="field-value">{newFileParent || rootPath || "â€”"}</div>
-                </div>
-              </div>
-                <div className="modal-actions">
-                  <button type="button" className="ghost" onClick={() => setShowNewFile(false)}>Cancel</button>
-                  <button type="button" onClick={createNewFile}>Create</button>
-                </div>
-              </div>
-            </div>
-          ) : null}
-        {showNewProject ? (
-          <div className="modal">
-            <div className="modal-card">
-              <div className="modal-header">
-                <span>New Project</span>
-              </div>
-              <div className="modal-body">
-              <label className="field">
-                <span>Location</span>
-                <div className="field-inline">
-                  <input
-                    value={newProjectLocation}
-                    onChange={(event) => {
-                      setNewProjectLocation(event.target.value);
-                      void updateNewProjectFolderStatus();
-                    }}
-                  />
-                  <button
-                    type="button"
-                    className="ghost"
-                    onClick={async () => {
-                      const selected = await open({ directory: true, multiple: false, defaultPath: newProjectLocation || undefined });
-                      if (typeof selected === "string" && selected) {
-                        setNewProjectLocation(selected);
-                        void updateNewProjectFolderStatus();
-                      }
-                    }}
-                  >
-                    Browse
-                  </button>
-                </div>
-              </label>
-                <label className="field">
-                  <span>Project Name</span>
-                  <input
-                    id="new-project-name"
-                    value={newProjectName}
-                    onChange={(event) => {
-                      const value = event.target.value;
-                      setNewProjectName(value);
-                      const slug = slugifyProjectName(value);
-                      setNewProjectFolder(slug);
-                      void updateNewProjectFolderStatus();
-                    }}
-                    placeholder="My SysML Project"
-                  />
-                </label>
-                <label className="field">
-                  <span>Author</span>
-                  <input
-                    value={newProjectAuthor}
-                    onChange={(event) => setNewProjectAuthor(event.target.value)}
-                    placeholder="Your name"
-                  />
-                </label>
-                <label className="field">
-                  <span>Organization</span>
-                  <input
-                    value={newProjectOrganization}
-                    onChange={(event) => setNewProjectOrganization(event.target.value)}
-                    placeholder="Company or team"
-                  />
-                </label>
-                <label className="field">
-                  <span>Description</span>
-                  <input
-                    value={newProjectDescription}
-                    onChange={(event) => setNewProjectDescription(event.target.value)}
-                    placeholder="Short project summary"
-                  />
-                </label>
-                <label className="field">
-                  <span>Folder Name</span>
-                  <div className="field-value">{newProjectFolder}</div>
-                  <span className={`field-hint ${newProjectFolderStatus.includes("exists") ? "error" : ""}`}>{newProjectFolderStatus}</span>
-                </label>
-                <label className="field checkbox">
-                  <input
-                    type="checkbox"
-                    checked={newProjectDefaultLib}
-                    onChange={(event) => setNewProjectDefaultLib(event.target.checked)}
-                  />
-                  <span>Use default library</span>
-                </label>
-                {newProjectError ? <div className="field-hint error">{newProjectError}</div> : null}
-              </div>
-              <div className="modal-actions">
-                <button type="button" className="ghost" onClick={() => setShowNewProject(false)}>Cancel</button>
-                <button type="button" onClick={createNewProject} disabled={newProjectBusy || !newProjectFolderAvailable}>Create Project</button>
-              </div>
-            </div>
-          </div>
-        ) : null}
-        {showOpenProject ? (
-          <div className="modal">
-            <div className="modal-card">
-              <div className="modal-header">
-                <span>Open Project</span>
-              </div>
-              <div className="modal-body">
-                <label className="field">
-                  <span>Project folder</span>
-                  <div className="field-inline">
-                    <input
-                      value={openProjectPath}
-                      onChange={(event) => setOpenProjectPath(event.target.value)}
-                      placeholder="Select a project directory"
-                    />
-                    <button type="button" className="ghost" onClick={browseOpenProject}>Browse</button>
-                  </div>
-                </label>
-                <label className="field">
-                  <span>Recent</span>
-                  {recentProjects.length ? (
-                    <>
-                      <div className="open-project-recent-quick">
-                        {recentProjects.slice(0, 3).map((path) => (
-                          <button
-                            key={path}
-                            type="button"
-                            className="ghost open-project-recent-btn"
-                            onClick={() => setOpenProjectPath(path)}
-                            title={path}
-                          >
-                            {path}
-                          </button>
-                        ))}
-                      </div>
-                      {recentProjects.length > 3 ? (
-                        <select
-                          className="open-project-recent-select"
-                          value=""
-                          onChange={(event) => {
-                            const value = event.target.value;
-                            if (value) {
-                              setOpenProjectPath(value);
-                            }
-                          }}
-                        >
-                          <option value="">More recent...</option>
-                          {recentProjects.slice(3).map((path) => (
-                            <option key={path} value={path}>{path}</option>
-                          ))}
-                        </select>
-                      ) : null}
-                    </>
-                  ) : (
-                    <div className="muted">No recent projects.</div>
-                  )}
-                </label>
-              </div>
-              <div className="modal-actions">
-                <button type="button" className="ghost" onClick={() => setShowOpenProject(false)}>Cancel</button>
-                <button type="button" onClick={confirmOpenProject} disabled={!openProjectPath.trim()}>Open</button>
-              </div>
-            </div>
-          </div>
-        ) : null}
+        <AppCoreModals
+          showGotoDialog={showGotoDialog}
+          setShowGotoDialog={setShowGotoDialog}
+          gotoInputRef={gotoInputRef}
+          gotoQuery={gotoQuery}
+          setGotoQuery={setGotoQuery}
+          handleGotoInputKeyDown={handleGotoInputKeyDown}
+          gotoLoading={gotoLoading}
+          gotoError={gotoError}
+          filteredGotoCandidates={filteredGotoCandidates}
+          gotoSelectedIndex={gotoSelectedIndex}
+          setGotoSelectedIndex={setGotoSelectedIndex}
+          openGotoCandidate={openGotoCandidate}
+          selectedGotoCandidate={selectedGotoCandidate}
+          showNewFile={showNewFile}
+          setShowNewFile={setShowNewFile}
+          newFileName={newFileName}
+          setNewFileName={setNewFileName}
+          newFileType={newFileType}
+          setNewFileType={setNewFileType}
+          newFileParent={newFileParent}
+          rootPath={rootPath}
+          createNewFile={createNewFile}
+          showNewProject={showNewProject}
+          setShowNewProject={setShowNewProject}
+          newProjectLocation={newProjectLocation}
+          setNewProjectLocation={setNewProjectLocation}
+          updateNewProjectFolderStatus={updateNewProjectFolderStatus}
+          onBrowseNewProjectLocation={async () => {
+            const selected = await open({ directory: true, multiple: false, defaultPath: newProjectLocation || undefined });
+            if (typeof selected === "string" && selected) {
+              setNewProjectLocation(selected);
+              void updateNewProjectFolderStatus();
+            }
+          }}
+          newProjectName={newProjectName}
+          setNewProjectName={setNewProjectName}
+          slugifyProjectName={slugifyProjectName}
+          setNewProjectFolder={setNewProjectFolder}
+          newProjectAuthor={newProjectAuthor}
+          setNewProjectAuthor={setNewProjectAuthor}
+          newProjectOrganization={newProjectOrganization}
+          setNewProjectOrganization={setNewProjectOrganization}
+          newProjectDescription={newProjectDescription}
+          setNewProjectDescription={setNewProjectDescription}
+          newProjectFolder={newProjectFolder}
+          newProjectFolderStatus={newProjectFolderStatus}
+          newProjectDefaultLib={newProjectDefaultLib}
+          setNewProjectDefaultLib={setNewProjectDefaultLib}
+          newProjectError={newProjectError}
+          newProjectBusy={newProjectBusy}
+          newProjectFolderAvailable={newProjectFolderAvailable}
+          createNewProject={createNewProject}
+          showOpenProject={showOpenProject}
+          setShowOpenProject={setShowOpenProject}
+          openProjectPath={openProjectPath}
+          setOpenProjectPath={setOpenProjectPath}
+          browseOpenProject={browseOpenProject}
+          recentProjects={recentProjects}
+          confirmOpenProject={confirmOpenProject}
+          showExport={showExport}
+          setShowExport={setShowExport}
+          runBuildWithOptions={runBuildWithOptions}
+          exportAfterBuild={exportAfterBuild}
+          setExportAfterBuild={setExportAfterBuild}
+          exportFormat={exportFormat}
+          setExportFormat={setExportFormat}
+          exportPath={exportPath}
+          setExportPath={setExportPath}
+          getDefaultBuildPath={getDefaultBuildPath}
+          onBrowseExportPath={async () => {
+            const selected = await save({
+              defaultPath: exportPath || undefined,
+              filters: [
+                exportFormat === "jsonld"
+                  ? { name: "JSON-LD", extensions: ["jsonld"] }
+                  : exportFormat === "kpar"
+                    ? { name: "KPAR", extensions: ["kpar"] }
+                    : { name: "XMI", extensions: ["xmi"] },
+              ],
+            });
+            if (typeof selected === "string" && selected) {
+              setExportPath(selected);
+            }
+          }}
+          exportIncludeStdlib={exportIncludeStdlib}
+          setExportIncludeStdlib={setExportIncludeStdlib}
+          exportBusy={exportBusy}
+          showSettings={showSettings}
+          setShowSettings={setShowSettings}
+          appTheme={appTheme}
+          setAppTheme={setAppTheme}
+          settingsTab={settingsTab}
+          setSettingsTab={setSettingsTab}
+          aiEndpoints={aiEndpoints}
+          endpointTestStatus={endpointTestStatus}
+          editEndpoint={editEndpoint}
+          deleteEndpoint={deleteEndpoint}
+          selectedChatEndpoint={selectedChatEndpoint}
+          setSelectedChatEndpoint={setSelectedChatEndpoint}
+          testEndpoint={testEndpoint}
+          endpointDraft={endpointDraft}
+          setEndpointDraft={setEndpointDraft}
+          resetEndpointDraft={resetEndpointDraft}
+          saveEndpointDraft={saveEndpointDraft}
+          settingsDefaultStdlib={settingsDefaultStdlib}
+          setSettingsDefaultStdlib={setSettingsDefaultStdlib}
+          settingsStdlibVersions={settingsStdlibVersions}
+          settingsStdlibStatus={settingsStdlibStatus}
+          settingsStdlibBusy={settingsStdlibBusy}
+          saveDefaultStdlibSelection={saveDefaultStdlibSelection}
+          showAbout={showAbout}
+          setShowAbout={setShowAbout}
+          aboutVersion={aboutVersion}
+          aboutBuild={aboutBuild}
+          astViewOpen={astViewOpen}
+          setAstViewOpen={setAstViewOpen}
+          astViewTitle={astViewTitle}
+          astViewState={astViewState}
+        />
       {showProjectProperties ? (
-        <div className="modal">
-          <div className="modal-backdrop" onClick={() => setShowProjectProperties(false)} />
-          <div className="modal-card modal-wide legacy-modal" role="dialog" aria-modal="true" aria-labelledby="project-properties-title">
+        <Modal open={showProjectProperties} onClose={() => setShowProjectProperties(false)} cardClassName="modal-wide" ariaLabelledBy="project-properties-title">
             <div className="modal-header">
               <h3 id="project-properties-title">Project Properties</h3>
             </div>
@@ -4352,13 +4254,10 @@ export function App() {
               <button type="button" className="ghost" onClick={() => setShowProjectProperties(false)}>Cancel</button>
               <button type="button" onClick={saveProjectProperties} disabled={projectPropertiesBusy}>Save</button>
             </div>
-          </div>
-        </div>
+        </Modal>
       ) : null}
       {showGitDialog ? (
-        <div className="modal">
-          <div className="modal-backdrop" onClick={() => setShowGitDialog(false)} />
-          <div className="modal-card modal-wide legacy-modal git-collab-modal" role="dialog" aria-modal="true" aria-labelledby="git-dialog-title">
+        <Modal open={showGitDialog} onClose={() => setShowGitDialog(false)} cardClassName="modal-wide git-collab-modal" ariaLabelledBy="git-dialog-title">
             <div className="modal-header">
               <h3 id="git-dialog-title">Collab</h3>
             </div>
@@ -4485,13 +4384,10 @@ export function App() {
               <button type="button" onClick={() => runGitCommitFlow(false)} disabled={!gitInfo || gitCommitBusy || gitPushBusy}>Commit</button>
               <button type="button" onClick={() => runGitCommitFlow(true)} disabled={!gitInfo || gitCommitBusy || gitPushBusy}>Commit &amp; Push</button>
             </div>
-          </div>
-        </div>
+        </Modal>
       ) : null}
       {showGitBranchDialog ? (
-        <div className="modal">
-          <div className="modal-backdrop" onClick={() => setShowGitBranchDialog(false)} />
-          <div className="modal-card legacy-modal" role="dialog" aria-modal="true" aria-labelledby="git-branch-title">
+        <Modal open={showGitBranchDialog} onClose={() => setShowGitBranchDialog(false)} ariaLabelledBy="git-branch-title">
             <div className="modal-header">
               <h3 id="git-branch-title">Branches</h3>
             </div>
@@ -4548,216 +4444,23 @@ export function App() {
             <div className="modal-actions">
               <button type="button" className="ghost" onClick={() => setShowGitBranchDialog(false)}>Close</button>
             </div>
-          </div>
-        </div>
+        </Modal>
       ) : null}
-        {showExport ? (
-        <div className="modal">
-          <div
-            className="modal-card"
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault();
-                void runBuildWithOptions();
-              }
-            }}
-          >
-            <div className="modal-header">
-              <span>Build Options</span>
-              <button type="button" onClick={() => setShowExport(false)}>Close</button>
-            </div>
-            <div className="modal-body">
-              <label className="field checkbox">
-                <input
-                  type="checkbox"
-                  checked={exportAfterBuild}
-                  onChange={(event) => setExportAfterBuild(event.target.checked)}
-                />
-                <span>Export model after build</span>
-              </label>
-              <label className="field">
-                <span>Format</span>
-                <select
-                  value={exportFormat}
-                  onChange={(event) => {
-                    const next = event.target.value as "jsonld" | "kpar" | "xmi";
-                    setExportFormat(next);
-                    if (!exportPath || exportPath.includes("\\build\\")) {
-                      setExportPath(getDefaultBuildPath(next));
-                    }
-                  }}
-                  disabled={!exportAfterBuild}
-                >
-                  <option value="jsonld">JSON-LD</option>
-                  <option value="kpar">KPAR</option>
-                  <option value="xmi">XMI</option>
-                </select>
-              </label>
-              <label className="field">
-                <span>Output</span>
-                <div className="field-inline">
-                  <input
-                    value={exportPath}
-                    onChange={(event) => setExportPath(event.target.value)}
-                    placeholder="Select output file"
-                    disabled={!exportAfterBuild}
-                  />
-                  <button
-                    type="button"
-                    className="ghost"
-                    disabled={!exportAfterBuild}
-                    onClick={async () => {
-                      const selected = await save({
-                        defaultPath: exportPath || undefined,
-                        filters: [
-                          exportFormat === "jsonld"
-                            ? { name: "JSON-LD", extensions: ["jsonld"] }
-                            : exportFormat === "kpar"
-                              ? { name: "KPAR", extensions: ["kpar"] }
-                              : { name: "XMI", extensions: ["xmi"] },
-                        ],
-                      });
-                      if (typeof selected === "string" && selected) {
-                        setExportPath(selected);
-                      }
-                    }}
-                  >
-                    Browse
-                  </button>
-                </div>
-              </label>
-              <label className="field checkbox">
-                <input
-                  type="checkbox"
-                  checked={exportIncludeStdlib}
-                  onChange={(event) => setExportIncludeStdlib(event.target.checked)}
-                  disabled={!exportAfterBuild}
-                />
-                <span>Include standard library</span>
-              </label>
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="ghost" onClick={() => setShowExport(false)}>Cancel</button>
-              <button type="button" onClick={runBuildWithOptions} disabled={exportBusy}>Build</button>
-            </div>
-          </div>
-        </div>
-      ) : null}
-        <SettingsDialog
-          open={showSettings}
-          onClose={() => setShowSettings(false)}
-          appTheme={appTheme}
-          onThemeChange={setAppTheme}
-          settingsTab={settingsTab}
-          onSettingsTabChange={setSettingsTab}
-          aiEndpoints={aiEndpoints}
-          endpointTestStatus={endpointTestStatus}
-          onEditEndpoint={editEndpoint}
-          onDeleteEndpoint={deleteEndpoint}
-          selectedChatEndpoint={selectedChatEndpoint}
-          onSelectedChatEndpointChange={setSelectedChatEndpoint}
-          onTestEndpoint={(endpointId) => {
-            void testEndpoint(endpointId);
+        <NextStepsFloating
+          steps={aiFloatingSteps}
+          pos={aiFloatingPos}
+          onStartDrag={(event) => {
+            aiFloatingDragRef.current = {
+              startX: event.clientX,
+              startY: event.clientY,
+              baseX: aiFloatingPos.x,
+              baseY: aiFloatingPos.y,
+            };
+            (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
           }}
-          endpointDraft={endpointDraft}
-          onEndpointDraftChange={setEndpointDraft}
-          onResetEndpointDraft={resetEndpointDraft}
-          onSaveEndpointDraft={saveEndpointDraft}
-          settingsDefaultStdlib={settingsDefaultStdlib}
-          onSettingsDefaultStdlibChange={setSettingsDefaultStdlib}
-          settingsStdlibVersions={settingsStdlibVersions}
-          settingsStdlibStatus={settingsStdlibStatus}
-          settingsStdlibBusy={settingsStdlibBusy}
-          onSaveDefaultStdlibSelection={() => {
-            void saveDefaultStdlibSelection();
-          }}
+          onClose={() => setAiFloatingSteps([])}
+          onRunStep={runAiNextStep}
         />
-        {aiFloatingSteps.length ? (
-          <div className="ai-floating" style={{ left: aiFloatingPos.x, top: aiFloatingPos.y }}>
-            <div
-              className="ai-floating-header"
-              onPointerDown={(event) => {
-                aiFloatingDragRef.current = {
-                  startX: event.clientX,
-                  startY: event.clientY,
-                  baseX: aiFloatingPos.x,
-                  baseY: aiFloatingPos.y,
-                };
-                (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-              }}
-            >
-              <span>Next steps</span>
-              <button
-                type="button"
-                className="ghost"
-                onPointerDown={(event) => {
-                  event.stopPropagation();
-                }}
-                onMouseDown={(event) => {
-                  event.stopPropagation();
-                }}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  setAiFloatingSteps([]);
-                }}
-              >
-                x
-              </button>
-            </div>
-            <div className="ai-floating-list">
-              {aiFloatingSteps.map((step) => (
-                <button
-                  key={step.id}
-                  type="button"
-                  className={`ai-floating-item ${step.recommended ? "recommended" : ""}`}
-                  onClick={() => runAiNextStep(step)}
-                >
-                  <span className="ai-floating-id">{step.id}.</span>
-                  <span className="ai-floating-label">{step.label}</span>
-                </button>
-              ))}
-            </div>
-          </div>
-        ) : null}
-        <Modal open={showAbout} onClose={() => setShowAbout(false)} cardClassName="legacy-modal" ariaLabelledBy="about-title">
-          <div className="modal-header">
-            <h3 id="about-title">About Mercurio</h3>
-          </div>
-          <div className="modal-body">
-            <p className="about-text">
-              Mercurio is a SysML/KerML workbench for editing, compiling, and exploring models with integrated analysis tools.
-            </p>
-            {aboutVersion ? <p className="about-text">Version: {aboutVersion}</p> : null}
-            {aboutBuild ? <p className="about-text">Build: {aboutBuild}</p> : null}
-            <p className="about-text">
-              GitHub:{" "}
-              <a className="about-link" href="https://github.com/petrotta/mercurio" target="_blank" rel="noreferrer">
-                https://github.com/petrotta/mercurio
-              </a>
-            </p>
-          </div>
-          <div className="modal-actions">
-            <button type="button" className="ghost" onClick={() => setShowAbout(false)}>
-              Close
-            </button>
-          </div>
-        </Modal>
-        <Modal open={astViewOpen} onClose={() => setAstViewOpen(false)} cardClassName="modal-wide ast-modal" ariaLabelledBy="ast-title">
-          <div className="modal-header">
-            <h3 id="ast-title">AST: {astViewTitle || "Untitled"}</h3>
-            <button type="button" className="icon-button" onClick={() => setAstViewOpen(false)} aria-label="Close AST view" />
-          </div>
-          <div className="modal-body">
-            <AstStatus state={astViewState} emptyFallback={<pre className="ast-content">(empty)</pre>}>
-              <pre className="ast-content">{astViewState.content}</pre>
-            </AstStatus>
-          </div>
-          <div className="modal-actions">
-            <button type="button" className="ghost" onClick={() => setAstViewOpen(false)}>
-              Close
-            </button>
-          </div>
-        </Modal>
         <footer className="statusbar">
           <div className="status-left" />
           <div className="status-right">

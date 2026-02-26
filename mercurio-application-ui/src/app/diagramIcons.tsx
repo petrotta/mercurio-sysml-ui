@@ -1,5 +1,6 @@
 export const getKindKey = (kind: string) => {
   const value = (kind || "").toLowerCase();
+  if (value.includes("file")) return "file";
   if (value.includes("package")) return "package";
   if (value.includes("part def")) return "part-def";
   if (value.includes("part") && value.includes("usage")) return "part";
@@ -31,6 +32,11 @@ export const renderTypeIcon = (kind: string, variant: "model" | "diagram") => {
           <>
             <rect x="2" y="5" width="12" height="8" rx="1.5" />
             <rect x="2" y="2" width="6" height="3" rx="1" />
+          </>
+        ) : key === "file" ? (
+          <>
+            <path d="M4 2h6l2 2v10H4z" />
+            <path d="M10 2v2h2" />
           </>
         ) : key === "part-def" ? (
           <>

@@ -67,8 +67,6 @@ type UseCompileRunnerOptions = {
   rootPath: string;
 };
 
-type ActiveFileSymbolMode = "fast" | "semantic";
-
 function mergeSymbols(project: SymbolView[], library: SymbolView[]): SymbolView[] {
   const out: SymbolView[] = [];
   const seen = new Set<string>();
@@ -106,6 +104,13 @@ function mergeProjectSymbolsByParsedFiles(
   return mergeSymbols(kept, incoming);
 }
 
+function withScope(
+  symbols: SymbolView[] | undefined,
+  sourceScope: "project" | "library",
+): SymbolView[] {
+  return (symbols || []).map((symbol) => ({ ...symbol, source_scope: sourceScope }));
+}
+
 function mapIndexedToSymbolView(
   input: IndexedSymbolView,
   sourceScope: "project" | "library",
@@ -126,16 +131,38 @@ function mapIndexedToSymbolView(
   };
 }
 
-
-function withScope(
-  symbols: SymbolView[] | undefined,
-  sourceScope: "project" | "library",
-): SymbolView[] {
-  return (symbols || []).map((symbol) => ({ ...symbol, source_scope: sourceScope }));
-}
-
 function normalizePathKey(path: string): string {
   return (path || "").replace(/\//g, "\\").toLowerCase();
+}
+
+function formatSemanticIssue(issue: UnresolvedIssue): string {
+  const line = Number.isFinite(issue.line) && issue.line > 0 ? issue.line : 1;
+  const col = Number.isFinite(issue.column) && issue.column > 0 ? issue.column : 1;
+  return `[semantic ${line}:${col}] ${issue.message}`;
+}
+
+function buildCompileErrorBuckets(
+  files: Array<{ path: string; ok: boolean; errors: string[]; symbol_count: number }>,
+  unresolved: UnresolvedIssue[],
+): Array<{ path: string; errors: string[] }> {
+  const byPath = new Map<string, { path: string; errors: string[] }>();
+  for (const file of files || []) {
+    if (!file?.path) continue;
+    const errs = Array.isArray(file.errors) ? file.errors.filter(Boolean) : [];
+    if (!errs.length) continue;
+    byPath.set(file.path, { path: file.path, errors: [...errs] });
+  }
+  for (const issue of unresolved || []) {
+    if (!issue?.file_path) continue;
+    const message = formatSemanticIssue(issue);
+    const existing = byPath.get(issue.file_path);
+    if (existing) {
+      existing.errors.push(message);
+    } else {
+      byPath.set(issue.file_path, { path: issue.file_path, errors: [message] });
+    }
+  }
+  return Array.from(byPath.values());
 }
 
 export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
@@ -156,9 +183,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
   const [backgroundCompileActive, setBackgroundCompileActive] = useState(false);
   const loadedLibraryFilesRef = useRef<Set<string>>(new Set());
   const [backgroundCompileEnabled, setBackgroundCompileEnabled] = useState(true);
-  const [projectFastSymbols, setProjectFastSymbols] = useState<SymbolView[]>([]);
   const [projectSemanticSymbols, setProjectSemanticSymbols] = useState<SymbolView[]>([]);
-  const [activeFileSymbolMode, setActiveFileSymbolMode] = useState<ActiveFileSymbolMode>("semantic");
   const [librarySymbols, setLibrarySymbols] = useState<SymbolView[]>([]);
   const [libraryFiles, setLibraryFiles] = useState<string[]>([]);
   const [libraryLoadingFiles, setLibraryLoadingFiles] = useState<string[]>([]);
@@ -191,7 +216,6 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
   useEffect(() => {
       setProjectSymbolsLoaded(false);
       setStdlibFileCount(0);
-      setProjectFastSymbols([]);
       setProjectSemanticSymbols([]);
       setLibrarySymbols([]);
       setLibraryFiles([]);
@@ -211,7 +235,6 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
       backgroundCompileRef.current = null;
       clearBackgroundCompileTimeout();
       setBackgroundCompileActive(false);
-      setActiveFileSymbolMode("semantic");
       libraryBootstrapRef.current = null;
   }, [rootPath, clearBackgroundCompileTimeout]);
 
@@ -264,19 +287,6 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
       });
       setLibraryIndexedSymbolCount(summary?.symbol_count || 0);
       setLibraryKindCounts(summary?.kind_counts || []);
-    } catch {
-    }
-  }, []);
-
-  const loadProjectSymbolsFromIndex = useCallback(async (path: string) => {
-    if (!path) return;
-    try {
-      const indexed = await invoke<IndexedSymbolView[]>("query_index_project_symbols", {
-        payload: { root: path },
-      });
-      const mapped = (indexed || []).map((symbol) => mapIndexedToSymbolView(symbol, "project"));
-      setProjectFastSymbols(mapped);
-      setProjectSymbolsLoaded(true);
     } catch {
     }
   }, []);
@@ -441,10 +451,9 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
 
   useEffect(() => {
     if (!rootPath) return;
-    void loadProjectSymbolsFromIndex(rootPath);
     void refreshSemanticProjectSymbols(rootPath);
     void loadLibrarySymbols(rootPath, undefined, false);
-  }, [rootPath, loadLibrarySymbols, loadProjectSymbolsFromIndex, refreshSemanticProjectSymbols]);
+  }, [rootPath, loadLibrarySymbols, refreshSemanticProjectSymbols]);
 
   useEffect(() => {
     if (!rootPath) return;
@@ -485,7 +494,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
         },
       });
       const incomingProject = withScope(response?.symbols, "project");
-      setProjectFastSymbols((prev) =>
+      setProjectSemanticSymbols((prev) =>
         filePath
           ? mergeProjectSymbolsByFile(prev, incomingProject, filePath)
           : mergeProjectSymbolsByParsedFiles(prev, incomingProject, response?.parsed_files),
@@ -494,9 +503,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
       setProjectSymbolsLoaded(true);
       setParsedFiles(response?.parsed_files || []);
       const ok = !!response?.ok;
-      const parseErrors = (response?.files || [])
-        .filter((file) => !file.ok && file.errors && file.errors.length)
-        .map((file) => ({ path: file.path, errors: file.errors }));
+      const parseErrors = buildCompileErrorBuckets(response?.files || [], response?.unresolved || []);
       setParseErrorPaths(new Set(parseErrors.map((file) => normalizePathKey(file.path))));
       const details: string[] = [];
       if (typeof response?.stdlib_cache_hit === "boolean") {
@@ -540,7 +547,6 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
       }
       setCompileStatus(ok ? "Compile: complete" : "Compile: finished with errors");
       setCompileToast((prev) => ({ ...prev, ok, open: true, parseErrors, details, parsedFiles }));
-      void refreshSemanticProjectSymbols(rootPath);
       await loadLibrarySymbols(rootPath, undefined, false);
       if (ok) {
         if (compileToastTimerRef.current !== undefined) {
@@ -564,7 +570,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
     } finally {
       setCompileRunId(null);
     }
-  }, [rootPath, loadLibrarySymbols, refreshSemanticProjectSymbols]);
+  }, [rootPath, loadLibrarySymbols]);
 
   const cancelCompile = useCallback(async () => {
     if (!compileRunId) return;
@@ -600,29 +606,23 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
       if (token !== backgroundCompileTokenRef.current || path !== rootPath) {
         return false;
       }
-      setProjectFastSymbols((prev) => {
+      setProjectSemanticSymbols((prev) => {
         const incomingProject = withScope(response?.symbols, "project");
         return filePath
           ? mergeProjectSymbolsByFile(prev, incomingProject, filePath)
           : mergeProjectSymbolsByParsedFiles(prev, incomingProject, response?.parsed_files);
       });
-      if (!filePath && (!response?.symbols || response.symbols.length === 0)) {
-        await loadProjectSymbolsFromIndex(path);
-      }
       setUnresolved(response?.unresolved || []);
       setProjectSymbolsLoaded(true);
       setParsedFiles(response?.parsed_files || []);
-      const parseErrors = (response?.files || [])
-        .filter((file) => !file.ok && file.errors && file.errors.length)
-        .map((file) => file.path);
-      setParseErrorPaths(new Set(parseErrors.map((path) => normalizePathKey(path))));
+      const parseErrors = buildCompileErrorBuckets(response?.files || [], response?.unresolved || []);
+      setParseErrorPaths(new Set(parseErrors.map((file) => normalizePathKey(file.path))));
       const symbolCount = response?.symbols?.length || 0;
       setCompileStatus(
         response?.ok
           ? `Background compile: complete (${symbolCount} symbols)`
           : `Background compile: finished with errors (${symbolCount} symbols)`,
       );
-      void refreshSemanticProjectSymbols(path);
     } catch (error) {
       if (token === backgroundCompileTokenRef.current) {
         setCompileStatus(`Background compile: failed: ${error}`);
@@ -642,8 +642,6 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
     compileRunId,
     rootPath,
     clearBackgroundCompileTimeout,
-    loadProjectSymbolsFromIndex,
-    refreshSemanticProjectSymbols,
   ]);
 
   const runBackgroundCompileWithUnsaved = useCallback(async (path: string, filePath: string, content: string): Promise<boolean> => {
@@ -674,25 +672,15 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
       if (token !== backgroundCompileTokenRef.current || path !== rootPath) {
         return false;
       }
-      setProjectFastSymbols((prev) => {
+      setProjectSemanticSymbols((prev) => {
         const incomingProject = withScope(response?.symbols, "project");
         return mergeProjectSymbolsByFile(prev, incomingProject, filePath);
       });
-      setProjectSemanticSymbols((prev) => {
-        const incoming = (response?.symbols || []).filter((symbol) => symbol.source_scope !== "library");
-        const incomingProject = withScope(incoming, "project");
-        return mergeProjectSymbolsByFile(prev, incomingProject, filePath);
-      });
-      if (!response?.symbols || response.symbols.length === 0) {
-        await loadProjectSymbolsFromIndex(path);
-      }
       setUnresolved(response?.unresolved || []);
       setProjectSymbolsLoaded(true);
       setParsedFiles(response?.parsed_files || []);
-      const parseErrors = (response?.files || [])
-        .filter((file) => !file.ok && file.errors && file.errors.length)
-        .map((file) => file.path);
-      setParseErrorPaths(new Set(parseErrors.map((path) => normalizePathKey(path))));
+      const parseErrors = buildCompileErrorBuckets(response?.files || [], response?.unresolved || []);
+      setParseErrorPaths(new Set(parseErrors.map((file) => normalizePathKey(file.path))));
       const symbolCount = response?.symbols?.length || 0;
       setCompileStatus(
         response?.ok
@@ -719,8 +707,6 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
     compileRunId,
     rootPath,
     clearBackgroundCompileTimeout,
-    loadProjectSymbolsFromIndex,
-    refreshSemanticProjectSymbols,
   ]);
 
   const cancelBackgroundCompile = useCallback(async () => {
@@ -761,9 +747,6 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
     backgroundCompileEnabled,
     setBackgroundCompileEnabled,
     backgroundCompileActive,
-    activeFileSymbolMode,
-    setActiveFileSymbolMode,
-    projectFastSymbols,
     projectSemanticSymbols,
     symbols,
     unresolved,

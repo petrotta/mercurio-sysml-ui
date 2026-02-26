@@ -1,9 +1,11 @@
+import { useMemo } from "react";
 import type { KeyboardEvent, PointerEvent, RefObject, ReactElement } from "react";
 import { List, type ListImperativeAPI, type RowComponentProps } from "react-window";
 import type { ModelRow, SymbolView } from "../types";
 import { PropertiesPane } from "./PropertiesPane";
 
 type ModelPaneProps = {
+  rootPath: string;
   modelTreeHeight: number;
   showPropertiesPane: boolean;
   propertiesDock: "bottom" | "right";
@@ -24,6 +26,7 @@ type ModelPaneProps = {
 };
 
 export function ModelPane({
+  rootPath,
   modelTreeHeight,
   showPropertiesPane,
   propertiesDock,
@@ -43,6 +46,10 @@ export function ModelPane({
   onOpenQualifiedNameInSource,
 }: ModelPaneProps) {
   const dockRight = showPropertiesPane && propertiesDock === "right";
+  const effectiveSelectedSymbols = useMemo(
+    () => selectedSymbols ?? (selectedSymbol ? [selectedSymbol] : null),
+    [selectedSymbols, selectedSymbol],
+  );
   return (
     <div
       className={`model-pane ${showPropertiesPane ? "" : "no-properties"} ${dockRight ? "dock-right" : "dock-bottom"}`}
@@ -80,7 +87,8 @@ export function ModelPane({
             onPointerDown={(event) => startDrag(dockRight ? "modelProps" : "model", event)}
           />
           <PropertiesPane
-            selectedSymbols={selectedSymbols ?? (selectedSymbol ? [selectedSymbol] : null)}
+            rootPath={rootPath}
+            selectedSymbols={effectiveSelectedSymbols}
             onOpenInProjectModel={onOpenInProjectModel}
             onOpenQualifiedNameInSource={onOpenQualifiedNameInSource}
           />

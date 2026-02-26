@@ -48,12 +48,8 @@ type SettingsDialogProps = {
 };
 
 export function SettingsDialog(props: SettingsDialogProps) {
-  if (!props.open) return null;
-
   return (
-    <div className="modal">
-      <div className="modal-backdrop" onClick={props.onClose} />
-      <div className="modal-card legacy-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <Modal open={props.open} onClose={props.onClose} ariaLabelledBy="settings-title">
         <div className="modal-header">
           <h3 id="settings-title">Settings</h3>
         </div>
@@ -285,7 +281,7 @@ export function SettingsDialog(props: SettingsDialogProps) {
             Close
           </button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }
+import { Modal } from "./Modal";

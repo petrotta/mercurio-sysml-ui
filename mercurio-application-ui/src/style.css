@@ -1275,35 +1275,6 @@ body.theme-light .modal-card {
   width: min(860px, 92vw);
 }
 
-.modal-card.legacy-modal {
-  background: #2b2d30;
-  border-radius: 8px;
-  padding: 14px;
-  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.5);
-}
-
-body.theme-light .modal-card.legacy-modal {
-  background: #f7f9fb;
-  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.25);
-}
-
-.modal-card.legacy-modal .modal-body {
-  display: grid;
-  gap: 10px;
-  max-height: 60vh;
-  overflow: auto;
-}
-
-.modal-card.legacy-modal .modal-header h3 {
-  margin: 0;
-  font-size: 0.95rem;
-  color: #d7dae0;
-}
-
-.modal-card.legacy-modal .field-label {
-  color: #c8cbd0;
-  font-size: 0.8rem;
-}
 
 .settings-tabs {
   display: flex;
@@ -4228,6 +4199,98 @@ body.theme-light .descriptor-json {
   transform-origin: 0 0;
 }
 
+.diagram-reactflow {
+  width: 100%;
+  height: 100%;
+}
+
+.diagram-reactflow .react-flow__node {
+  background: linear-gradient(180deg, rgba(20, 27, 36, 0.96) 0%, rgba(13, 18, 24, 0.96) 100%);
+  border: 1px solid #2f3b4a;
+  color: #d7e2f1;
+  border-radius: 8px;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
+  font-size: 0.76rem;
+}
+
+.diagram-reactflow .react-flow__node.selected,
+.diagram-reactflow .react-flow__node:focus {
+  border-color: #6aa2ff;
+  box-shadow:
+    0 0 0 2px rgba(106, 162, 255, 0.45),
+    0 8px 18px rgba(0, 0, 0, 0.4);
+}
+
+.flow-semantic-node {
+  min-width: 180px;
+  position: relative;
+}
+
+.flow-semantic-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.flow-semantic-name {
+  font-weight: 600;
+}
+
+.flow-semantic-type {
+  font-size: 0.68rem;
+  text-transform: lowercase;
+  color: #cfe1ff;
+  background: rgba(37, 62, 94, 0.9);
+  border: 1px solid #4f79ac;
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
+.flow-package-node {
+  border: 1px solid #5f87c6;
+  background: linear-gradient(180deg, rgba(23, 36, 54, 0.98) 0%, rgba(18, 28, 42, 0.98) 100%);
+  border-radius: 8px;
+  min-height: 100%;
+  height: 100%;
+  padding-top: 6px;
+}
+
+.flow-package-tab {
+  position: absolute;
+  top: -11px;
+  left: 10px;
+  width: 92px;
+  height: 11px;
+  border: 1px solid #5f87c6;
+  border-bottom: none;
+  border-top-left-radius: 6px;
+  border-top-right-radius: 6px;
+  background: linear-gradient(180deg, rgba(31, 49, 72, 0.98) 0%, rgba(20, 32, 48, 0.98) 100%);
+}
+
+.flow-partdef-node {
+  border: 1px solid #3f5c84;
+  background: linear-gradient(180deg, rgba(24, 33, 45, 0.97) 0%, rgba(16, 22, 32, 0.97) 100%);
+}
+
+.flow-partdef-divider {
+  margin-top: 6px;
+  border-top: 1px solid #6f8eb8;
+}
+
+.flow-node-resize-corner {
+  width: 10px !important;
+  height: 10px !important;
+  border: 1px solid #9fc0ff !important;
+  border-radius: 2px !important;
+  background: #1c2f49 !important;
+}
+
+.diagram-reactflow .react-flow__edge-text {
+  fill: #91a5be;
+}
+
 .diagram-node {
   border: 1px solid #2f3b4a;
   border-radius: 6px;
@@ -4410,6 +4473,19 @@ body.theme-light .descriptor-json {
   pointer-events: none;
   opacity: 0.8;
   z-index: 20;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.diagram-ghost-label {
+  font-size: 0.72rem;
+  color: #d7e2f1;
+  text-transform: lowercase;
+  background: rgba(15, 20, 26, 0.9);
+  border: 1px solid #2b3644;
+  border-radius: 4px;
+  padding: 1px 6px;
 }
 
 .diagram-minimap {
@@ -4511,14 +4587,6 @@ body.theme-light .tree-icon-label {
 
 body.theme-light .context-menu button {
   color: #1e1f22;
-}
-
-body.theme-light .modal-card.legacy-modal .modal-header h3 {
-  color: #1e1f22;
-}
-
-body.theme-light .modal-card.legacy-modal .field-label {
-  color: #4f5a6a;
 }
 
 body.theme-light .settings-tabs {

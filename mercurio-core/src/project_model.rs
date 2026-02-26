@@ -1,14 +1,23 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use mercurio_symbol_index::SymbolIndexStore;
+use mercurio_sysml_core::vfs::Vfs;
 pub use mercurio_sysml_semantics::semantic_project_model_contract::{
     ProjectElementAttributesView, ProjectElementInheritedAttributeView, ProjectModelAttributeView,
     ProjectModelElementView, ProjectModelView,
 };
+use mercurio_sysml_semantics::stdlib::{
+    build_metatype_index, load_stdlib_from_path, MetatypeIndex, MetatypeInfo,
+};
 
+use crate::compile::compile_project_delta_sync;
+use crate::project::load_project_config;
 use crate::project_model_seed::seed_symbol_index_if_empty;
 use crate::project_model_transform::{resolve_mapped_metatype, symbol_to_attribute_rows};
 use crate::state::CoreState;
+use crate::stdlib::resolve_stdlib_path;
 
 pub fn get_project_element_attributes(
     state: &CoreState,
@@ -22,28 +31,233 @@ pub fn get_project_element_attributes(
     }
     seed_symbol_index_if_empty(state, &root)?;
 
-    let store = state
-        .symbol_index
-        .lock()
-        .map_err(|_| "Symbol index lock poisoned".to_string())?;
-    let Some(symbol) = store.project_symbol(&root, &element_qualified_name, symbol_kind.as_deref()) else {
-        return Ok(ProjectElementAttributesView {
-            element_qualified_name,
-            metatype_qname: None,
-            explicit_attributes: Vec::new(),
-            inherited_attributes: Vec::new(),
-            diagnostics: vec!["Element not found in current project symbol index.".to_string()],
-        });
+    let (mut symbol, mut metatype_qname, mut diagnostics) = {
+        let store = state
+            .symbol_index
+            .lock()
+            .map_err(|_| "Symbol index lock poisoned".to_string())?;
+        let Some(symbol) = store.project_symbol(&root, &element_qualified_name, symbol_kind.as_deref()) else {
+            return Ok(ProjectElementAttributesView {
+                element_qualified_name,
+                metatype_qname: None,
+                explicit_attributes: Vec::new(),
+                inherited_attributes: Vec::new(),
+                diagnostics: vec!["Element not found in current project symbol index.".to_string()],
+            });
+        };
+        let (metatype_qname, diagnostics) = resolve_mapped_metatype(&*store, &root, &symbol);
+        (symbol, metatype_qname, diagnostics)
     };
-    let (metatype_qname, diagnostics) = resolve_mapped_metatype(&*store, &root, &symbol);
+
+    if metatype_qname.is_none() {
+        let _ = compile_project_delta_sync(
+            state,
+            root.clone(),
+            0,
+            true,
+            Some(PathBuf::from(symbol.file_path.clone())),
+            Vec::new(),
+            |_| {},
+        );
+        if let Ok(store) = state.symbol_index.lock() {
+            if let Some(refreshed) = store.project_symbol(&root, &element_qualified_name, symbol_kind.as_deref()) {
+                let (retry_metatype, retry_diagnostics) = resolve_mapped_metatype(&*store, &root, &refreshed);
+                symbol = refreshed;
+                metatype_qname = retry_metatype;
+                diagnostics.extend(retry_diagnostics);
+                if metatype_qname.is_some() {
+                    diagnostics.push(
+                        "Metatype resolved after targeted semantic refresh from mercurio-sysml."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    if metatype_qname.is_none() {
+        if diagnostics.is_empty() {
+            diagnostics.push(format!(
+                "Metatype unresolved: no mapping found for element '{}' (kind='{}', file='{}').",
+                symbol.qualified_name, symbol.kind, symbol.file_path
+            ));
+        } else {
+            diagnostics.push(format!(
+                "Metatype unresolved for element '{}' (kind='{}').",
+                symbol.qualified_name, symbol.kind
+            ));
+        }
+    }
+    let explicit_attributes = symbol_to_attribute_rows(&symbol, metatype_qname.as_deref());
+    let inherited_attributes = collect_inherited_attributes(
+        state,
+        &root,
+        metatype_qname.as_deref(),
+        &explicit_attributes,
+        &mut diagnostics,
+    );
 
     Ok(ProjectElementAttributesView {
         element_qualified_name,
         metatype_qname: metatype_qname.clone(),
-        explicit_attributes: symbol_to_attribute_rows(&symbol, metatype_qname.as_deref()),
-        inherited_attributes: Vec::<ProjectElementInheritedAttributeView>::new(),
+        explicit_attributes,
+        inherited_attributes,
         diagnostics,
     })
+}
+
+fn collect_inherited_attributes(
+    state: &CoreState,
+    root: &str,
+    metatype_qname: Option<&str>,
+    explicit_attributes: &[ProjectModelAttributeView],
+    diagnostics: &mut Vec<String>,
+) -> Vec<ProjectElementInheritedAttributeView> {
+    let Some(metatype_qname) = metatype_qname else {
+        diagnostics.push("Inherited attributes unavailable because metatype is unresolved.".to_string());
+        return Vec::new();
+    };
+
+    let index = match load_stdlib_metatype_index(state, root) {
+        Ok(Some(index)) => index,
+        Ok(None) => return Vec::new(),
+        Err(error) => {
+            diagnostics.push(format!("Unable to load stdlib metatype index: {error}"));
+            return Vec::new();
+        }
+    };
+
+    let Some(metatype) = resolve_metatype_info(&index, metatype_qname) else {
+        diagnostics.push(format!(
+            "Metatype '{metatype_qname}' was not found in resolved stdlib metamodel."
+        ));
+        return Vec::new();
+    };
+
+    let explicit_names = explicit_attributes
+        .iter()
+        .map(|attr| attr.name.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+
+    let infos_by_id = index
+        .infos
+        .iter()
+        .map(|info| (info.id, info))
+        .collect::<HashMap<_, _>>();
+    let mut inherited_by_name = HashMap::<String, ProjectElementInheritedAttributeView>::new();
+
+    for super_id in index
+        .supertypes
+        .get(&metatype.id)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let Some(super_info) = infos_by_id.get(&super_id).copied() else {
+            continue;
+        };
+        for attr in &super_info.attributes {
+            let attr_key = attr.name.to_ascii_lowercase();
+            if explicit_names.contains(&attr_key) {
+                continue;
+            }
+            inherited_by_name.insert(
+                attr_key,
+                ProjectElementInheritedAttributeView {
+                    name: attr.name.clone(),
+                    qualified_name: format!("{}::{}", super_info.qualified_name, attr.name),
+                    declared_on: super_info.qualified_name.clone(),
+                    declared_type: attr.ty.clone(),
+                    multiplicity: attr.multiplicity.clone(),
+                    direction: None,
+                    documentation: None,
+                    cst_value: attr.expr.clone(),
+                },
+            );
+        }
+    }
+
+    let mut inherited = inherited_by_name.into_values().collect::<Vec<_>>();
+    inherited.sort_by(|a, b| a.name.cmp(&b.name).then(a.declared_on.cmp(&b.declared_on)));
+    inherited
+}
+
+fn load_stdlib_metatype_index(state: &CoreState, root: &str) -> Result<Option<Arc<MetatypeIndex>>, String> {
+    let root_path = PathBuf::from(root);
+    if !root_path.exists() {
+        return Err("Root path does not exist".to_string());
+    }
+
+    let default_stdlib = state
+        .settings
+        .lock()
+        .ok()
+        .and_then(|settings| settings.default_stdlib.clone());
+    let project_config = load_project_config(&root_path).ok().flatten();
+    let library_config = project_config
+        .as_ref()
+        .and_then(|config| config.library.as_ref());
+    let stdlib_override = project_config
+        .as_ref()
+        .and_then(|config| config.stdlib.as_ref());
+    let (_loader, stdlib_path) = resolve_stdlib_path(
+        &state.stdlib_root,
+        default_stdlib.as_deref(),
+        library_config,
+        stdlib_override,
+        &root_path,
+    );
+    let Some(path) = stdlib_path else {
+        return Ok(None);
+    };
+    if !path.exists() {
+        return Err(format!(
+            "Resolved stdlib path does not exist: {}",
+            path.to_string_lossy()
+        ));
+    }
+
+    if let Ok(cache) = state.stdlib_cache.lock() {
+        let target = normalize_compare_key(&path);
+        if let Some(found) = cache
+            .values()
+            .find(|entry| normalize_compare_key(&entry.path) == target)
+            .map(|entry| entry.metatype_index.clone())
+        {
+            return Ok(Some(found));
+        }
+    }
+
+    let mut vfs = Vfs::new();
+    let files = load_stdlib_from_path(&mut vfs, &path);
+    Ok(Some(Arc::new(build_metatype_index(&vfs, &files))))
+}
+
+fn resolve_metatype_info<'a>(index: &'a MetatypeIndex, metatype_qname: &str) -> Option<&'a MetatypeInfo> {
+    if let Some(found) = index
+        .infos
+        .iter()
+        .find(|info| info.qualified_name == metatype_qname)
+    {
+        return Some(found);
+    }
+    let tail = metatype_qname.rsplit("::").next().unwrap_or(metatype_qname);
+    let matches = index
+        .infos
+        .iter()
+        .filter(|info| info.qualified_name.rsplit("::").next().unwrap_or(info.name.as_str()) == tail)
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        return matches.first().copied();
+    }
+    None
+}
+
+fn normalize_compare_key(path: &std::path::Path) -> String {
+    let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    normalized
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase()
 }
 
 pub fn get_project_model(state: &CoreState, root: String) -> Result<ProjectModelView, String> {

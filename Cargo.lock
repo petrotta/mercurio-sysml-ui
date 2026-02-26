@@ -2616,7 +2616,6 @@ dependencies = [
  "mercurio-sysml",
  "mercurio-sysml-core",
  "mercurio-sysml-semantics",
- "mercurio-sysml-workspace",
  "salsa 0.18.0",
  "serde",
  "serde_json",
@@ -2635,9 +2634,10 @@ name = "mercurio-sysml"
 version = "0.1.0"
 dependencies = [
  "mercurio-sysml-core",
- "mercurio-sysml-model",
+ "mercurio-sysml-runtime",
+ "mercurio-sysml-semantic-adapter",
  "mercurio-sysml-semantics",
- "mercurio-sysml-workspace",
+ "walkdir",
 ]
 
 [[package]]
@@ -2645,10 +2645,16 @@ name = "mercurio-sysml-core"
 version = "0.1.0"
 
 [[package]]
-name = "mercurio-sysml-model"
+name = "mercurio-sysml-runtime"
+version = "0.1.0"
+
+[[package]]
+name = "mercurio-sysml-semantic-adapter"
 version = "0.1.0"
 dependencies = [
  "mercurio-sysml-core",
+ "mercurio-sysml-runtime",
+ "mercurio-sysml-semantics",
 ]
 
 [[package]]
@@ -2656,17 +2662,9 @@ name = "mercurio-sysml-semantics"
 version = "0.1.0"
 dependencies = [
  "mercurio-sysml-core",
+ "salsa 0.16.1",
  "serde",
  "zip 2.4.2",
-]
-
-[[package]]
-name = "mercurio-sysml-workspace"
-version = "0.1.0"
-dependencies = [
- "mercurio-sysml-core",
- "mercurio-sysml-semantics",
- "salsa 0.16.1",
 ]
 
 [[package]]

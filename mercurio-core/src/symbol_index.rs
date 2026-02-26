@@ -257,14 +257,6 @@ mod tests {
         )
         .expect("load library symbols");
 
-        let action_symbols = query_symbols_by_metatype(
-            &state,
-            project_dir.to_string_lossy().to_string(),
-            "KerML::Action".to_string(),
-        )
-        .expect("query by metatype");
-        assert!(!action_symbols.is_empty());
-
         let mapping = query_symbol_metatype_mapping(
             &state,
             project_dir.to_string_lossy().to_string(),
@@ -275,6 +267,17 @@ mod tests {
         .expect("mapping exists");
         assert_eq!(mapping.symbol_qualified_name, "P");
         assert!(!mapping.mapping_source.is_empty());
+        let mapped_metatype = mapping
+            .resolved_metatype_qname
+            .clone()
+            .expect("resolved metatype");
+        let mapped_symbols = query_symbols_by_metatype(
+            &state,
+            project_dir.to_string_lossy().to_string(),
+            mapped_metatype,
+        )
+        .expect("query by mapped metatype");
+        assert!(!mapped_symbols.is_empty());
 
         let docs = query_stdlib_documentation_symbols(
             &state,

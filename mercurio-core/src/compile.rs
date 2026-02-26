@@ -1,4 +1,6 @@
 use mercurio_sysml_core::parser::Parser;
+use mercurio_sysml_pkg::project_ingest::{ingest_project_texts, ProjectDiagnostic};
+use mercurio_sysml_pkg::projection_map::{DIAG_AMBIGUOUS_REF, DIAG_UNRESOLVED_REF};
 use mercurio_sysml_semantics::defmap::{DefKind, build_defmap, DefInfo};
 use mercurio_sysml_semantics::hir::lower_defmap_with_cst;
 use mercurio_sysml_semantics::model_rel::{
@@ -588,29 +590,25 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
     }
 
     let stdlib_start = Instant::now();
-    let (stdlib_files, stdlib_metatype_index, stdlib_symbols, stdlib_cache_hit) =
-        if include_library_symbols {
-            let (
-                stdlib_entries,
-                stdlib_metatype_index,
-                stdlib_symbols,
-                stdlib_cache_hit,
-                _stdlib_signature,
-            ) = load_stdlib_snapshot(state, stdlib_path_for_log.as_deref())?;
-            let files = stdlib_entries
-                .iter()
-                .map(|(path, _)| path.clone())
-                .collect::<Vec<_>>();
-            (files, stdlib_metatype_index, stdlib_symbols, stdlib_cache_hit)
+    let (stdlib_files, stdlib_metatype_index, stdlib_symbols, stdlib_cache_hit) = {
+        let (
+            stdlib_entries,
+            stdlib_metatype_index,
+            stdlib_snapshot_symbols,
+            stdlib_cache_hit,
+            _stdlib_signature,
+        ) = load_stdlib_snapshot(state, stdlib_path_for_log.as_deref())?;
+        let files = stdlib_entries
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let symbols = if include_library_symbols {
+            stdlib_snapshot_symbols
         } else {
-            let files = collect_stdlib_files(stdlib_path_for_log.as_deref())?;
-            (
-                files,
-                Arc::new(MetatypeIndex::default()),
-                Arc::new(Vec::new()),
-                false,
-            )
+            Arc::new(Vec::new())
         };
+        (files, stdlib_metatype_index, symbols, stdlib_cache_hit)
+    };
     let stdlib_duration_ms = stdlib_start.elapsed().as_millis();
 
     let analysis_start = Instant::now();
@@ -619,37 +617,22 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
 
     let project_symbol_files = select_symbol_files(&files, target_path.as_deref());
     let symbol_spans = build_symbol_span_index(&project_symbol_files, &unsaved_map);
+    let project_sources = load_project_sources_for_ingest(&files, &unsaved_map)?;
+    let unresolved = match ingest_project_texts(project_sources.clone()) {
+        Ok(ingest) => collect_unresolved_from_project_diagnostics(ingest.diagnostics, &project_sources),
+        Err(_) => Vec::new(),
+    };
 
     let mut symbols = Vec::new();
     let mut seen = HashSet::new();
 
     let mut project_symbol_count = 0usize;
     let mut library_symbol_count = 0usize;
-    for symbol in project_decl_symbols(&project_symbol_files, &unsaved_map) {
-        let key = format!("{}|{}|{}", symbol.file_path, symbol.qualified_name, symbol.name);
-        if seen.insert(key) {
-            symbols.push(symbol);
-            project_symbol_count += 1;
-        }
-    }
-    for symbol in project_connection_end_symbols(&project_symbol_files, &unsaved_map) {
-        let key = format!("{}|{}|{}", symbol.file_path, symbol.qualified_name, symbol.name);
-        if seen.insert(key) {
-            symbols.push(symbol);
-            project_symbol_count += 1;
-        }
-    }
-    for symbol in project_import_symbols(&project_symbol_files, &unsaved_map) {
-        let key = format!("{}|{}|{}", symbol.file_path, symbol.qualified_name, symbol.name);
-        if seen.insert(key) {
-            symbols.push(symbol);
-            project_symbol_count += 1;
-        }
-    }
-    // Always run semantic projection for project files so delta compiles
-    // include nested members (for example attributes inside a part def).
-    // For delta mode this is scoped by `project_symbol_files` (target file),
-    // so the additional cost remains bounded.
+    // Delegate project symbol extraction to mercurio-sysml semantic projection.
+    // This keeps symbol and metatype semantics sourced from one authoritative path,
+    // including nested members (for example attributes inside a part definition).
+    // For delta mode this remains bounded because `project_symbol_files` is scoped
+    // to the changed target file.
     for element in semantic_elements_for_project(
         &project_symbol_files,
         &unsaved_map,
@@ -706,7 +689,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
         symbols,
         project_symbol_count,
         library_symbol_count,
-        unresolved: Vec::new(),
+        unresolved,
         library_path: stdlib_path_for_log
             .as_ref()
             .map(|path| path.to_string_lossy().to_string()),
@@ -719,25 +702,14 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
         stdlib_file_count: stdlib_files.len(),
         total_duration_ms,
     };
-    if include_library_symbols {
-        let _ = index_symbols_for_project(
-            state,
-            &root,
-            stdlib_path_for_log.as_deref(),
-            &response.symbols,
-            true,
-            false,
-        );
-    } else {
-        let _ = index_symbols_for_project(
-            state,
-            &root,
-            stdlib_path_for_log.as_deref(),
-            &response.symbols,
-            false,
-            false,
-        );
-    }
+    let _ = index_symbols_for_project(
+        state,
+        &root,
+        stdlib_path_for_log.as_deref(),
+        &response.symbols,
+        true,
+        false,
+    );
     Ok(response)
 }
 
@@ -1084,6 +1056,97 @@ fn unsaved_content_for_path<'a>(
     })
 }
 
+fn load_project_sources_for_ingest(
+    files: &[PathBuf],
+    unsaved_map: &HashMap<PathBuf, String>,
+) -> Result<Vec<(PathBuf, String)>, String> {
+    files.iter()
+        .map(|path| {
+            let source = unsaved_content_for_path(unsaved_map, path)
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| fs::read_to_string(path).map_err(|error| error.to_string()))?;
+            Ok((path.clone(), source))
+        })
+        .collect()
+}
+
+fn collect_unresolved_from_project_diagnostics(
+    diagnostics: Vec<ProjectDiagnostic>,
+    project_sources: &[(PathBuf, String)],
+) -> Vec<UnresolvedRefView> {
+    let source_by_path = project_sources
+        .iter()
+        .map(|(path, source)| (normalized_compare_key(path), source.as_str()))
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::<String>::new();
+    let mut out = Vec::<UnresolvedRefView>::new();
+
+    for diagnostic in diagnostics {
+        match diagnostic {
+            ProjectDiagnostic::Projection { file, diagnostic } => {
+                if diagnostic.code != DIAG_UNRESOLVED_REF && diagnostic.code != DIAG_AMBIGUOUS_REF {
+                    continue;
+                }
+                let key = normalized_compare_key(&file);
+                let text = source_by_path.get(&key).copied().unwrap_or("");
+                let (line, column) = offset_to_line_col(text, diagnostic.span_start as usize);
+                let file_path = file.to_string_lossy().to_string();
+                let message = format!(
+                    "{}: {}",
+                    diagnostic.code,
+                    diagnostic.detail
+                );
+                let dedupe = format!("{file_path}|{line}|{column}|{message}");
+                if seen.insert(dedupe) {
+                    out.push(UnresolvedRefView {
+                        file_path,
+                        message,
+                        line,
+                        column,
+                        code: Some(diagnostic.code.to_string()),
+                    });
+                }
+            }
+            ProjectDiagnostic::Resolution(diagnostic) => {
+                if diagnostic.code != DIAG_UNRESOLVED_REF && diagnostic.code != DIAG_AMBIGUOUS_REF {
+                    continue;
+                }
+                let key = normalized_compare_key(&diagnostic.file);
+                let text = source_by_path.get(&key).copied().unwrap_or("");
+                let (line, column) = find_text_line_col(text, &diagnostic.proxy_text)
+                    .unwrap_or((1, 1));
+                let file_path = diagnostic.file.to_string_lossy().to_string();
+                let message = format!(
+                    "{} '{}' ({})",
+                    diagnostic.code, diagnostic.proxy_text, diagnostic.detail
+                );
+                let dedupe = format!("{file_path}|{line}|{column}|{message}");
+                if seen.insert(dedupe) {
+                    out.push(UnresolvedRefView {
+                        file_path,
+                        message,
+                        line,
+                        column,
+                        code: Some(diagnostic.code.to_string()),
+                    });
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn find_text_line_col(text: &str, needle: &str) -> Option<(u32, u32)> {
+    let trimmed = needle.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    text.find(trimmed)
+        .map(|offset| offset_to_line_col(text, offset))
+}
+
 fn semantic_elements_for_project(
     project_files: &[PathBuf],
     unsaved_map: &HashMap<PathBuf, String>,
@@ -1130,163 +1193,29 @@ fn semantic_elements_for_project(
     })
 }
 
-fn project_import_symbols(
-    project_files: &[PathBuf],
-    unsaved_map: &HashMap<PathBuf, String>,
-) -> Vec<SymbolView> {
-    let mut out = Vec::new();
-    for file in project_files {
-        let source = unsaved_content_for_path(unsaved_map, file)
-            .cloned()
-            .or_else(|| fs::read_to_string(file).ok());
-        let Some(source) = source else {
-            continue;
-        };
-        let mut parser = Parser::new(&source);
-        let root = parser.parse_root();
-        if !parser.errors().is_empty() {
-            continue;
-        }
-        let defmap = build_defmap(&root, &source);
-        for import in &defmap.imports {
-            if let Some(symbol) = project_symbol_from_def(file, import, &source) {
-                out.push(symbol);
-            }
-        }
-    }
-    out
-}
-
-fn project_decl_symbols(
-    project_files: &[PathBuf],
-    unsaved_map: &HashMap<PathBuf, String>,
-) -> Vec<SymbolView> {
-    let mut out = Vec::new();
-    for file in project_files {
-        let source = unsaved_content_for_path(unsaved_map, file)
-            .cloned()
-            .or_else(|| fs::read_to_string(file).ok());
-        let Some(source) = source else {
-            continue;
-        };
-        let mut parser = Parser::new(&source);
-        let root = parser.parse_root();
-        let defmap = build_defmap(&root, &source);
-        if let Some(package) = defmap.package.as_ref() {
-            if let Some(symbol) = project_symbol_from_def(file, package, &source) {
-                out.push(symbol);
-            }
-        }
-        for def in &defmap.defs {
-            if let Some(symbol) = project_symbol_from_def(file, def, &source) {
-                out.push(symbol);
-            }
-        }
-        for dependency in &defmap.dependencies {
-            if let Some(symbol) = project_symbol_from_def(file, dependency, &source) {
-                out.push(symbol);
-            }
-        }
-    }
-    out
-}
-
-fn project_connection_end_symbols(
-    project_files: &[PathBuf],
-    unsaved_map: &HashMap<PathBuf, String>,
-) -> Vec<SymbolView> {
-    let mut out = Vec::new();
-    for file in project_files {
-        let source = unsaved_content_for_path(unsaved_map, file)
-            .cloned()
-            .or_else(|| fs::read_to_string(file).ok());
-        let Some(source) = source else {
-            continue;
-        };
-        let mut parser = Parser::new(&source);
-        let root = parser.parse_root();
-        if !parser.errors().is_empty() {
-            continue;
-        }
-        let defmap = build_defmap(&root, &source);
-        let hir = lower_defmap_with_cst(&defmap, &root, &source);
-        for def in &hir.defs {
-            if def.kind != DefKind::ConnectionDef {
-                continue;
-            }
-            let Some(def_name) = def.name.as_ref() else {
-                continue;
-            };
-            let parent_qname = if def.package_path.is_empty() {
-                def_name.clone()
-            } else {
-                format!("{}::{}", def.package_path.join("::"), def_name)
-            };
-            let def_span = span_to_line_col(def.span.start, def.span.end, &source);
-            for attr in &def.attributes {
-                if attr.name.trim().is_empty() {
-                    continue;
-                }
-                let attr_span = find_connection_end_symbol_span(def, &attr.name, &source)
-                    .or_else(|| find_ident_span_in_range(def.span.start, def.span.end, &attr.name, &source))
-                    .unwrap_or(def_span);
-                let qualified_name = format!("{parent_qname}::{}", attr.name);
-                out.push(SymbolView {
-                    file_path: file.to_string_lossy().to_string(),
-                    name: attr.name.clone(),
-                    short_name: None,
-                    qualified_name,
-                    kind: "OwnedEnd".to_string(),
-                    file: 0,
-                    start_line: attr_span.start_line,
-                    start_col: attr_span.start_col,
-                    end_line: attr_span.end_line,
-                    end_col: attr_span.end_col,
-                    expr_start_line: None,
-                    expr_start_col: None,
-                    expr_end_line: None,
-                    expr_end_col: None,
-                    short_name_start_line: None,
-                    short_name_start_col: None,
-                    short_name_end_line: None,
-                    short_name_end_col: None,
-                    doc: None,
-                    supertypes: Vec::new(),
-                    relationships: Vec::new(),
-                    type_refs: Vec::new(),
-                    is_public: true,
-                    properties: vec![
-                        PropertyItemView {
-                            name: "kind".to_string(),
-                            label: "kind".to_string(),
-                            value: PropertyValueView::Text {
-                                value: "OwnedEnd".to_string(),
-                            },
-                            hint: None,
-                            group: None,
-                        },
-                        PropertyItemView {
-                            name: "owner_kind".to_string(),
-                            label: "owner_kind".to_string(),
-                            value: PropertyValueView::Text {
-                                value: "ConnectionDef".to_string(),
-                            },
-                            hint: None,
-                            group: None,
-                        },
-                    ],
-                });
-            }
-        }
-    }
-    out
-}
-
 fn augment_owned_relationships(symbols: &mut [SymbolView]) {
+    fn is_owned_attribute_symbol(symbol: &SymbolView) -> bool {
+        if symbol.kind.to_ascii_lowercase().contains("attribute") {
+            return true;
+        }
+        symbol_metatype_qname(symbol)
+            .map(|metatype| metatype.to_ascii_lowercase().contains("attribute"))
+            .unwrap_or(false)
+    }
+
     let mut qname_to_index = HashMap::<String, usize>::new();
     for (idx, symbol) in symbols.iter().enumerate() {
         qname_to_index.entry(symbol.qualified_name.clone()).or_insert(idx);
     }
+    let is_attribute_by_qname = symbols
+        .iter()
+        .map(|symbol| {
+            (
+                symbol.qualified_name.clone(),
+                is_owned_attribute_symbol(symbol),
+            )
+        })
+        .collect::<HashMap<_, _>>();
 
     let mut relationships_by_parent = HashMap::<usize, Vec<RelationshipView>>::new();
     for symbol in symbols.iter() {
@@ -1356,6 +1285,25 @@ fn augment_owned_relationships(symbols: &mut [SymbolView]) {
                 Some("connection"),
             );
         }
+        let mut owned_attributes = Vec::<String>::new();
+        for rel in parent.relationships.iter().filter(|rel| rel.kind == "ownedMember") {
+            let Some(is_attribute) = is_attribute_by_qname.get(&rel.target) else {
+                continue;
+            };
+            if *is_attribute
+                && !owned_attributes.iter().any(|target| target == &rel.target)
+            {
+                owned_attributes.push(rel.target.clone());
+            }
+        }
+        if !owned_attributes.is_empty() {
+            upsert_list_property(
+                &mut parent.properties,
+                "ownedAttributes",
+                owned_attributes,
+                Some("ownership"),
+            );
+        }
     }
 }
 
@@ -1379,112 +1327,24 @@ fn upsert_number_property(
     });
 }
 
-fn find_connection_end_symbol_span(def: &mercurio_sysml_semantics::hir::HirDef, name: &str, source: &str) -> Option<SymbolSpan> {
-    if name.trim().is_empty() {
-        return None;
+fn upsert_list_property(
+    properties: &mut Vec<PropertyItemView>,
+    name: &str,
+    items: Vec<String>,
+    group: Option<&str>,
+) {
+    if let Some(property) = properties.iter_mut().find(|prop| prop.name == name) {
+        property.value = PropertyValueView::List { items };
+        property.group = group.map(|value| value.to_string());
+        return;
     }
-    let start = usize::try_from(def.span.start).ok()?.min(source.len());
-    let end = usize::try_from(def.span.end).ok()?.min(source.len());
-    if end <= start {
-        return None;
-    }
-    let block = &source[start..end];
-    let mut stmt_start = 0usize;
-    while stmt_start < block.len() {
-        let rel_end = block[stmt_start..]
-            .find(';')
-            .map(|idx| stmt_start + idx + 1)
-            .unwrap_or(block.len());
-        let statement = &block[stmt_start..rel_end];
-        if let Some((name_start, name_end)) = find_connection_end_name_span_in_statement(statement, name)
-        {
-            let abs_start = start + stmt_start + name_start;
-            let abs_end = start + stmt_start + name_end;
-            return Some(span_to_line_col(abs_start as u32, abs_end as u32, source));
-        }
-        if rel_end == block.len() {
-            break;
-        }
-        stmt_start = rel_end;
-    }
-    None
-}
-
-fn find_connection_end_name_span_in_statement(statement: &str, target_name: &str) -> Option<(usize, usize)> {
-    let bytes = statement.as_bytes();
-    let mut idx = 0usize;
-    let mut seen_end = false;
-    while let Some((token, token_start, token_end)) = next_ident_token(statement, idx) {
-        if token == "end" {
-            seen_end = true;
-            idx = token_end;
-            continue;
-        }
-        if seen_end && token == "item" {
-            let mut lookahead = token_end;
-            while lookahead < bytes.len() {
-                let ch = bytes[lookahead] as char;
-                if ch.is_ascii_alphanumeric() || ch == '_' {
-                    break;
-                }
-                lookahead += 1;
-            }
-            if let Some((name_token, name_start, name_end)) = next_ident_token(statement, lookahead) {
-                if name_token == target_name {
-                    return Some((name_start, name_end));
-                }
-            }
-            return None;
-        }
-        idx = token_end.max(token_start + 1);
-    }
-    None
-}
-
-fn next_ident_token(text: &str, from: usize) -> Option<(&str, usize, usize)> {
-    let bytes = text.as_bytes();
-    let mut start = from;
-    while start < bytes.len() {
-        let ch = bytes[start] as char;
-        if ch.is_ascii_alphabetic() || ch == '_' {
-            break;
-        }
-        start += 1;
-    }
-    if start >= bytes.len() {
-        return None;
-    }
-    let mut end = start + 1;
-    while end < bytes.len() {
-        let ch = bytes[end] as char;
-        if !(ch.is_ascii_alphanumeric() || ch == '_') {
-            break;
-        }
-        end += 1;
-    }
-    Some((&text[start..end], start, end))
-}
-
-fn find_ident_span_in_range(start: u32, end: u32, target_name: &str, source: &str) -> Option<SymbolSpan> {
-    if target_name.is_empty() {
-        return None;
-    }
-    let start_idx = usize::try_from(start).ok()?.min(source.len());
-    let end_idx = usize::try_from(end).ok()?.min(source.len());
-    if end_idx <= start_idx {
-        return None;
-    }
-    let slice = &source[start_idx..end_idx];
-    let mut cursor = 0usize;
-    while let Some((token, token_start, token_end)) = next_ident_token(slice, cursor) {
-        if token == target_name {
-            let abs_start = start_idx + token_start;
-            let abs_end = start_idx + token_end;
-            return Some(span_to_line_col(abs_start as u32, abs_end as u32, source));
-        }
-        cursor = token_end.max(token_start + 1);
-    }
-    None
+    properties.push(PropertyItemView {
+        name: name.to_string(),
+        label: name.to_string(),
+        value: PropertyValueView::List { items },
+        hint: None,
+        group: group.map(|value| value.to_string()),
+    });
 }
 
 fn stdlib_symbol_from_def(path: &Path, def: &DefInfo, source: &str) -> Option<StdlibSymbol> {
@@ -1505,49 +1365,6 @@ fn stdlib_symbol_from_def(path: &Path, def: &DefInfo, source: &str) -> Option<St
         start_col: span.start_col,
         end_line: span.end_line,
         end_col: span.end_col,
-    })
-}
-
-fn project_symbol_from_def(path: &Path, def: &DefInfo, source: &str) -> Option<SymbolView> {
-    let name = def.name.clone()?;
-    let qualified_name = if def.package_path.is_empty() {
-        name.clone()
-    } else {
-        format!("{}::{}", def.package_path.join("::"), name)
-    };
-    let kind = def_kind_label(def.kind).to_string();
-    let span = span_to_line_col(def.span.start, def.span.end, source);
-    Some(SymbolView {
-        file_path: path.to_string_lossy().to_string(),
-        name,
-        short_name: None,
-        qualified_name,
-        kind: kind.clone(),
-        file: 0,
-        start_line: span.start_line,
-        start_col: span.start_col,
-        end_line: span.end_line,
-        end_col: span.end_col,
-        expr_start_line: None,
-        expr_start_col: None,
-        expr_end_line: None,
-        expr_end_col: None,
-        short_name_start_line: None,
-        short_name_start_col: None,
-        short_name_end_line: None,
-        short_name_end_col: None,
-        doc: None,
-        supertypes: Vec::new(),
-        relationships: Vec::new(),
-        type_refs: Vec::new(),
-        is_public: true,
-        properties: vec![PropertyItemView {
-            name: "kind".to_string(),
-            label: "kind".to_string(),
-            value: PropertyValueView::Text { value: kind },
-            hint: None,
-            group: None,
-        }],
     })
 }
 
@@ -1651,6 +1468,48 @@ fn map_semantic_element_to_symbol(
         None
     }
 
+    fn is_list_like_emf_attr(key: &str) -> bool {
+        let norm = normalize_attr_key(key);
+        matches!(
+            norm.as_str(),
+            "emfownedelements"
+                | "elementownedelement"
+                | "emfownedattribute"
+                | "elementownedattribute"
+                | "ownedattribute"
+                | "ownedattributes"
+                | "ownedelement"
+                | "ownedelements"
+        )
+    }
+
+    fn property_value_from_semantic_attr(key: &str, raw: &str) -> PropertyValueView {
+        let value = raw.trim();
+        if is_list_like_emf_attr(key) {
+            let items = value
+                .split(',')
+                .map(|part| part.trim())
+                .filter(|part| !part.is_empty())
+                .map(|part| part.to_string())
+                .collect::<Vec<_>>();
+            if !items.is_empty() {
+                return PropertyValueView::List { items };
+            }
+        }
+        if value.eq_ignore_ascii_case("true") {
+            return PropertyValueView::Bool { value: true };
+        }
+        if value.eq_ignore_ascii_case("false") {
+            return PropertyValueView::Bool { value: false };
+        }
+        if let Ok(number) = value.parse::<u64>() {
+            return PropertyValueView::Number { value: number };
+        }
+        PropertyValueView::Text {
+            value: raw.to_string(),
+        }
+    }
+
     let qualified_name = semantic_attr(
         &element.attributes,
         &["emf::qualifiedName", "Element::qualifiedName"],
@@ -1693,10 +1552,8 @@ fn map_semantic_element_to_symbol(
         .filter_map(|key| {
             element.attributes.get(&key).map(|value| PropertyItemView {
                 name: key.clone(),
-                label: key,
-                value: PropertyValueView::Text {
-                    value: value.clone(),
-                },
+                label: key.clone(),
+                value: property_value_from_semantic_attr(&key, value),
                 hint: None,
                 group: None,
             })
@@ -2523,7 +2380,7 @@ standard library package KerML {
     }
 
     #[test]
-    fn compile_workspace_includes_project_import_symbols() {
+    fn compile_workspace_does_not_synthesize_project_import_symbols() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -2564,7 +2421,7 @@ standard library package KerML {
         )
         .expect("compile response");
 
-        assert!(response
+        assert!(!response
             .symbols
             .iter()
             .any(|symbol| symbol.kind == "Import" && symbol.file_path.ends_with("main.sysml")));
@@ -2573,7 +2430,7 @@ standard library package KerML {
     }
 
     #[test]
-    fn compile_workspace_connection_end_symbols_are_nested_under_connection_def() {
+    fn compile_workspace_does_not_synthesize_connection_end_symbols_locally() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -2614,61 +2471,10 @@ standard library package KerML {
         )
         .expect("compile response");
 
-        assert!(response
+        assert!(!response
             .symbols
             .iter()
-            .any(|symbol| symbol.kind == "ConnectionDef" && symbol.qualified_name.ends_with("Demo::ProductSelection")));
-        assert!(response
-            .symbols
-            .iter()
-            .any(|symbol| symbol.kind == "OwnedEnd" && symbol.qualified_name.ends_with("Demo::ProductSelection::cart")));
-        assert!(response
-            .symbols
-            .iter()
-            .any(|symbol| symbol.kind == "OwnedEnd" && symbol.qualified_name.ends_with("Demo::ProductSelection::selectedProduct")));
-        assert!(response
-            .symbols
-            .iter()
-            .any(|symbol| symbol.kind == "OwnedEnd" && symbol.qualified_name.ends_with("Demo::ProductSelection::account")));
-        let parent = response
-            .symbols
-            .iter()
-            .find(|symbol| symbol.kind == "ConnectionDef" && symbol.qualified_name.ends_with("Demo::ProductSelection"))
-            .expect("parent connection symbol");
-        assert_eq!(
-            parent
-                .relationships
-                .iter()
-                .filter(|rel| rel.kind == "ownedEnd")
-                .count(),
-            3
-        );
-        let cart = response
-            .symbols
-            .iter()
-            .find(|symbol| symbol.kind == "OwnedEnd" && symbol.qualified_name.ends_with("Demo::ProductSelection::cart"))
-            .expect("cart symbol");
-        assert_eq!(cart.start_line, 3);
-        assert_eq!(cart.start_col, 19);
-        let selected_product = response
-            .symbols
-            .iter()
-            .find(|symbol| {
-                symbol.kind == "OwnedEnd"
-                    && symbol
-                        .qualified_name
-                        .ends_with("Demo::ProductSelection::selectedProduct")
-            })
-            .expect("selectedProduct symbol");
-        assert_eq!(selected_product.start_line, 4);
-        assert_eq!(selected_product.start_col, 19);
-        let account = response
-            .symbols
-            .iter()
-            .find(|symbol| symbol.kind == "OwnedEnd" && symbol.qualified_name.ends_with("Demo::ProductSelection::account"))
-            .expect("account symbol");
-        assert_eq!(account.start_line, 5);
-        assert_eq!(account.start_col, 19);
+            .any(|symbol| symbol.kind == "OwnedEnd" && symbol.file_path.ends_with("main.sysml")));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2730,6 +2536,199 @@ standard library package KerML {
         }));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn augment_owned_relationships_adds_owned_attributes_property() {
+        fn symbol(kind: &str, qualified_name: &str, start_line: u32) -> SymbolView {
+            let name = qualified_name
+                .rsplit("::")
+                .next()
+                .unwrap_or(qualified_name)
+                .to_string();
+            SymbolView {
+                file_path: "main.sysml".to_string(),
+                name,
+                short_name: None,
+                qualified_name: qualified_name.to_string(),
+                kind: kind.to_string(),
+                file: 0,
+                start_line,
+                start_col: 1,
+                end_line: start_line,
+                end_col: 10,
+                expr_start_line: None,
+                expr_start_col: None,
+                expr_end_line: None,
+                expr_end_col: None,
+                short_name_start_line: None,
+                short_name_start_col: None,
+                short_name_end_line: None,
+                short_name_end_col: None,
+                doc: None,
+                supertypes: Vec::new(),
+                relationships: Vec::new(),
+                type_refs: Vec::new(),
+                is_public: true,
+                properties: Vec::new(),
+            }
+        }
+
+        let mut symbols = vec![
+            symbol("PartDef", "Demo::ScenarioState", 1),
+            symbol("AttributeUsage", "Demo::ScenarioState::speed", 2),
+            symbol("AttributeUsage", "Demo::ScenarioState::heading", 3),
+            symbol("PartDef", "Demo::ScenarioState::nestedPart", 4),
+        ];
+        augment_owned_relationships(&mut symbols);
+
+        let parent = symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "Demo::ScenarioState")
+            .expect("scenario state symbol");
+        let owned_attrs_prop = parent
+            .properties
+            .iter()
+            .find(|prop| prop.name == "ownedAttributes")
+            .expect("ownedAttributes property");
+        match &owned_attrs_prop.value {
+            PropertyValueView::List { items } => {
+                assert_eq!(
+                    items,
+                    &vec![
+                        "Demo::ScenarioState::speed".to_string(),
+                        "Demo::ScenarioState::heading".to_string()
+                    ]
+                );
+            }
+            _ => panic!("ownedAttributes should be a list"),
+        }
+    }
+
+    #[test]
+    fn augment_owned_relationships_detects_attribute_usage_via_metatype() {
+        fn symbol(
+            kind: &str,
+            qualified_name: &str,
+            start_line: u32,
+            metatype_qname: Option<&str>,
+        ) -> SymbolView {
+            let mut properties = Vec::new();
+            if let Some(metatype) = metatype_qname {
+                properties.push(PropertyItemView {
+                    name: "metatype_qname".to_string(),
+                    label: "metatype_qname".to_string(),
+                    value: PropertyValueView::Text {
+                        value: metatype.to_string(),
+                    },
+                    hint: None,
+                    group: None,
+                });
+            }
+            let name = qualified_name
+                .rsplit("::")
+                .next()
+                .unwrap_or(qualified_name)
+                .to_string();
+            SymbolView {
+                file_path: "main.sysml".to_string(),
+                name,
+                short_name: None,
+                qualified_name: qualified_name.to_string(),
+                kind: kind.to_string(),
+                file: 0,
+                start_line,
+                start_col: 1,
+                end_line: start_line,
+                end_col: 10,
+                expr_start_line: None,
+                expr_start_col: None,
+                expr_end_line: None,
+                expr_end_col: None,
+                short_name_start_line: None,
+                short_name_start_col: None,
+                short_name_end_line: None,
+                short_name_end_col: None,
+                doc: None,
+                supertypes: Vec::new(),
+                relationships: Vec::new(),
+                type_refs: Vec::new(),
+                is_public: true,
+                properties,
+            }
+        }
+
+        let mut symbols = vec![
+            symbol("PartDef", "Demo::ScenarioState", 1, None),
+            symbol(
+                "Usage",
+                "Demo::ScenarioState::speed",
+                2,
+                Some("sysml::AttributeUsage"),
+            ),
+            symbol(
+                "Usage",
+                "Demo::ScenarioState::sensor",
+                3,
+                Some("sysml::PartUsage"),
+            ),
+        ];
+        augment_owned_relationships(&mut symbols);
+
+        let parent = symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "Demo::ScenarioState")
+            .expect("scenario state symbol");
+        let owned_attrs_prop = parent
+            .properties
+            .iter()
+            .find(|prop| prop.name == "ownedAttributes")
+            .expect("ownedAttributes property");
+        match &owned_attrs_prop.value {
+            PropertyValueView::List { items } => {
+                assert_eq!(items, &vec!["Demo::ScenarioState::speed".to_string()]);
+            }
+            _ => panic!("ownedAttributes should be a list"),
+        }
+    }
+
+    #[test]
+    fn map_semantic_element_parses_emf_owned_elements_as_list_property() {
+        let mut attrs = HashMap::new();
+        attrs.insert("emf::name".to_string(), "ScenarioState".to_string());
+        attrs.insert(
+            "emf::qualifiedName".to_string(),
+            "Demo::ScenarioState".to_string(),
+        );
+        attrs.insert(
+            "emf::ownedElements".to_string(),
+            "Demo::ScenarioState::speed, Demo::ScenarioState::heading".to_string(),
+        );
+        let element = SemanticElementView {
+            name: "ScenarioState".to_string(),
+            qualified_name: "Demo::ScenarioState".to_string(),
+            metatype_qname: Some("sysml::PartDefinition".to_string()),
+            file_path: "main.sysml".to_string(),
+            attributes: attrs,
+        };
+        let symbol = map_semantic_element_to_symbol(element, &HashMap::new());
+        let owned_elements = symbol
+            .properties
+            .iter()
+            .find(|prop| prop.name == "emf::ownedElements")
+            .expect("emf::ownedElements property");
+        match &owned_elements.value {
+            PropertyValueView::List { items } => {
+                assert_eq!(
+                    items,
+                    &vec![
+                        "Demo::ScenarioState::speed".to_string(),
+                        "Demo::ScenarioState::heading".to_string()
+                    ]
+                );
+            }
+            _ => panic!("emf::ownedElements should be a list"),
+        }
     }
 
     #[test]
@@ -2839,6 +2838,51 @@ standard library package KerML {
             .map(|row| row.count)
             .sum::<usize>();
         assert!(total_categorized >= 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compile_response_includes_unresolved_refs_from_project_ingest() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_unresolved_project_ingest_{stamp}"));
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(
+            project_dir.join("a.sysml"),
+            "package A {\n  part def Wheel;\n}\n",
+        )
+        .expect("write a.sysml");
+        fs::write(
+            project_dir.join("b.sysml"),
+            "package B {\n  dependency from Missing to Wheel;\n}\n",
+        )
+        .expect("write b.sysml");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let response = compile_project_delta_sync(
+            &state,
+            project_dir.to_string_lossy().to_string(),
+            101,
+            true,
+            None,
+            Vec::new(),
+            |_| {},
+        )
+        .expect("compile response");
+
+        assert!(!response.unresolved.is_empty());
+        assert!(response
+            .unresolved
+            .iter()
+            .any(|issue| issue.message.contains("unresolved_ref")));
+        assert!(response
+            .unresolved
+            .iter()
+            .any(|issue| issue.file_path.ends_with("b.sysml")));
 
         let _ = fs::remove_dir_all(root);
     }

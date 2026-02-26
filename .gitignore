@@ -24,3 +24,4 @@ mercurio-application-ui/public/monaco
 *.njsproj
 *.sln
 *.sw?
+/mercurio-application-ui/.npm-cache/

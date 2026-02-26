@@ -1,4 +1,18 @@
 import type { DragEvent, MutableRefObject, ReactElement } from "react";
+import { memo, useEffect, useState } from "react";
+import {
+  ReactFlow,
+  Background,
+  Controls,
+  MiniMap,
+  NodeResizeControl,
+  applyNodeChanges,
+  type Edge,
+  type Node,
+  type NodeChange,
+  type NodeProps,
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
 import type { DiagramLayout, DiagramViewport } from "../types";
 import { DIAGRAM_TYPE_OPTIONS, type DiagramType } from "../diagrams/model";
 
@@ -10,6 +24,20 @@ type DiagramViewProps = {
   diagramViewport: DiagramViewport;
   paletteGhost: null | { x: number; y: number; type: string };
   palettePos: { x: number; y: number };
+  flowNodes: Node[];
+  flowEdges: Edge[];
+  onFlowNodesChange: (changes: NodeChange[]) => void;
+  onFlowNodeClick: (id: string) => void;
+  onFlowNodeDoubleClick: (id: string) => void;
+  onFlowNodeDragStop: (id: string, x: number, y: number) => void;
+  onSelectInTree: (id: string) => void;
+  onSelectInText: (id: string) => void;
+  onExpandTypeFromSelection: () => void;
+  canExpandTypeFromSelection: boolean;
+  onDeleteSelectedFlowNode: () => void;
+  canDeleteSelectedFlowNode: boolean;
+  snapToGrid: boolean;
+  onToggleSnapToGrid: () => void;
   diagramBodyRef: MutableRefObject<HTMLDivElement | null>;
   diagramPanRef: MutableRefObject<null | { x: number; y: number; startX: number; startY: number }>;
   diagramPanPendingRef: MutableRefObject<{ x: number; y: number } | null>;
@@ -35,52 +63,74 @@ type DiagramViewProps = {
   renderTypeIcon: (kind: string, variant: "model" | "diagram") => ReactElement;
 };
 
-export function DiagramView({
-  activeDiagramPath,
-  diagramLayout,
-  diagramScale,
-  diagramOffset,
-  diagramViewport,
-  paletteGhost,
-  palettePos,
-  diagramBodyRef,
-  diagramPanRef,
-  diagramPanPendingRef,
-  diagramPanRafRef,
-  diagramViewportRef,
-  paletteDragRef,
-  paletteCreateRef,
-  diagramDropActive,
-  diagramType,
-  onDiagramTypeChange,
-  onSwitchToText,
-  onAutoLayout,
-  onZoomIn,
-  onZoomOut,
-  onReset,
-  onDiagramDrop,
-  onDiagramDragOver,
-  onDiagramDragLeave,
-  setDiagramOffset,
-  setPaletteGhost,
-  renderDiagramLayout,
-  renderMinimapLayout,
-  renderTypeIcon,
-}: DiagramViewProps) {
+const SemanticNode = memo(function SemanticNode({ data, selected }: NodeProps) {
+  const typeText = String(data?.kind || "element");
+  const labelText = String(data?.label || "(unnamed)");
+  const isPackage = !!data?.isPackage;
+  const kindKey = String(data?.kindKey || "");
+  const isPartDef = kindKey === "part-def";
+  return (
+    <div
+      className={`flow-semantic-node ${selected ? "selected" : ""} ${isPackage ? "flow-package-node" : ""} ${
+        isPartDef ? "flow-partdef-node" : ""
+      }`}
+    >
+      <NodeResizeControl
+        className="flow-node-resize-corner"
+        minWidth={isPackage ? 320 : 220}
+        minHeight={isPackage ? 120 : 66}
+        position="bottom-right"
+        style={{ display: selected ? "block" : "none" }}
+      />
+      {isPackage ? <div className="flow-package-tab" /> : null}
+      <div className="flow-semantic-header">
+        <span className="flow-semantic-name">{labelText}</span>
+        <span className="flow-semantic-type">{typeText}</span>
+      </div>
+      {isPartDef ? <div className="flow-partdef-divider" /> : null}
+    </div>
+  );
+});
+
+const nodeTypes = {
+  semantic: SemanticNode,
+};
+
+export function DiagramView(props: DiagramViewProps) {
+  const [nodeMenu, setNodeMenu] = useState<null | { id: string; x: number; y: number }>(null);
+  const [localNodes, setLocalNodes] = useState<Node[]>(props.flowNodes);
+
+  useEffect(() => {
+    const onWindowClick = () => setNodeMenu(null);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setNodeMenu(null);
+    };
+    window.addEventListener("click", onWindowClick);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("click", onWindowClick);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, []);
+
+  useEffect(() => {
+    setLocalNodes(props.flowNodes);
+  }, [props.flowNodes]);
+
   return (
     <div
       className="diagram-surface"
-      onDragOver={onDiagramDragOver}
-      onDragEnter={onDiagramDragOver}
-      onDragLeave={onDiagramDragLeave}
-      onDrop={onDiagramDrop}
+      onDragOver={props.onDiagramDragOver}
+      onDragEnter={props.onDiagramDragOver}
+      onDragLeave={props.onDiagramDragLeave}
+      onDrop={props.onDiagramDrop}
     >
       <div className="diagram-header">
         <span>Diagram view</span>
         <div className="diagram-controls">
           <select
-            value={diagramType}
-            onChange={(event) => onDiagramTypeChange(event.target.value as DiagramType)}
+            value={props.diagramType}
+            onChange={(event) => props.onDiagramTypeChange(event.target.value as DiagramType)}
             title="Diagram type"
           >
             {DIAGRAM_TYPE_OPTIONS.map((option) => (
@@ -92,7 +142,7 @@ export function DiagramView({
           <button
             type="button"
             className="ghost toggle-btn"
-            onClick={onSwitchToText}
+            onClick={props.onSwitchToText}
             title="Switch to text"
           >
             Text
@@ -100,174 +150,114 @@ export function DiagramView({
           <button
             type="button"
             className="ghost"
-            onClick={onAutoLayout}
+            onClick={props.onExpandTypeFromSelection}
+            disabled={!props.canExpandTypeFromSelection}
+            title="Expand type relationship from selected element"
           >
-            Auto-layout
+            Expand Type
           </button>
-          <button type="button" className="ghost" onClick={onZoomIn}>+</button>
-          <button type="button" className="ghost" onClick={onZoomOut}>-</button>
           <button
             type="button"
             className="ghost"
-            onClick={onReset}
+            onClick={props.onDeleteSelectedFlowNode}
+            disabled={!props.canDeleteSelectedFlowNode}
+            title="Remove selected element from this view"
           >
-            Reset
+            Delete
+          </button>
+          <button
+            type="button"
+            className="ghost"
+            onClick={props.onToggleSnapToGrid}
+            title={props.snapToGrid ? "Disable snap and hide grid" : "Enable snap and show grid"}
+          >
+            {props.snapToGrid ? "Snap: On" : "Snap: Off"}
           </button>
         </div>
       </div>
       <div
-        className={`diagram-body ${diagramDropActive ? "drop-active" : ""}`}
-        ref={diagramBodyRef}
-        onDragOver={onDiagramDragOver}
-        onDragEnter={onDiagramDragOver}
-        onDragLeave={onDiagramDragLeave}
-        onDrop={onDiagramDrop}
-        onPointerDown={(event) => {
-          const target = event.target as HTMLElement | null;
-          if (target?.closest(".diagram-node") || target?.closest(".diagram-viewport")) return;
-          diagramPanRef.current = {
-            x: diagramOffset.x,
-            y: diagramOffset.y,
-            startX: event.clientX,
-            startY: event.clientY,
-          };
-          (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-        }}
-        onPointerMove={(event) => {
-          if (!diagramPanRef.current) return;
-          const deltaX = event.clientX - diagramPanRef.current.startX;
-          const deltaY = event.clientY - diagramPanRef.current.startY;
-          diagramPanPendingRef.current = {
-            x: diagramPanRef.current.x + deltaX,
-            y: diagramPanRef.current.y + deltaY,
-          };
-          if (diagramPanRafRef.current == null) {
-            diagramPanRafRef.current = window.requestAnimationFrame(() => {
-              if (diagramPanPendingRef.current) {
-                setDiagramOffset(diagramPanPendingRef.current);
-              }
-              diagramPanPendingRef.current = null;
-              diagramPanRafRef.current = null;
-            });
-          }
-        }}
-        onPointerUp={() => {
-          diagramPanRef.current = null;
-        }}
+        className={`diagram-body ${props.diagramDropActive ? "drop-active" : ""}`}
+        ref={props.diagramBodyRef}
+        onDragOver={props.onDiagramDragOver}
+        onDragEnter={props.onDiagramDragOver}
+        onDragLeave={props.onDiagramDragLeave}
+        onDrop={props.onDiagramDrop}
       >
-        {diagramLayout ? (
-          <>
-            {diagramDropActive ? <div className="diagram-drop-indicator">Drop to add element</div> : null}
-            <div
-              className="diagram-canvas"
-              onDragOver={onDiagramDragOver}
-              onDragEnter={onDiagramDragOver}
-              onDragLeave={onDiagramDragLeave}
-              onDrop={onDiagramDrop}
-              style={{
-                transform: `translate(${diagramOffset.x}px, ${diagramOffset.y}px) scale(${diagramScale})`,
+        {props.diagramDropActive ? <div className="diagram-drop-indicator">Drop to add element</div> : null}
+        <div
+          className="diagram-reactflow"
+          onDragOver={props.onDiagramDragOver}
+          onDragEnter={props.onDiagramDragOver}
+          onDragLeave={props.onDiagramDragLeave}
+          onDrop={props.onDiagramDrop}
+        >
+          <ReactFlow
+            nodes={localNodes}
+            edges={props.flowEdges}
+            nodeTypes={nodeTypes}
+            onNodesChange={(changes) => {
+              setLocalNodes((prev) => applyNodeChanges(changes, prev));
+              props.onFlowNodesChange(changes);
+            }}
+            onNodeClick={(_, node) => props.onFlowNodeClick(node.id)}
+            onNodeDoubleClick={(_, node) => props.onFlowNodeDoubleClick(node.id)}
+            onNodeDragStop={(_, node) => props.onFlowNodeDragStop(node.id, node.position.x, node.position.y)}
+            onNodeContextMenu={(event, node) => {
+              event.preventDefault();
+              event.stopPropagation();
+              setNodeMenu({ id: node.id, x: event.clientX, y: event.clientY });
+            }}
+            onDragOver={props.onDiagramDragOver}
+            onDrop={props.onDiagramDrop}
+            minZoom={0.2}
+            maxZoom={2}
+            proOptions={{ hideAttribution: true }}
+            nodesDraggable
+            nodesConnectable={false}
+            elementsSelectable
+            snapToGrid={props.snapToGrid}
+            snapGrid={[20, 20]}
+          >
+            {props.snapToGrid ? <Background gap={20} /> : null}
+            <MiniMap pannable zoomable />
+            <Controls />
+          </ReactFlow>
+        </div>
+        {props.paletteGhost ? (
+          <div
+            className="diagram-ghost"
+            style={{ left: `${props.paletteGhost.x}px`, top: `${props.paletteGhost.y}px` }}
+          >
+            {props.renderTypeIcon(props.paletteGhost.type, "diagram")}
+            <span className="diagram-ghost-label">{props.paletteGhost.type}</span>
+          </div>
+        ) : null}
+        {nodeMenu ? (
+          <div
+            className="context-menu"
+            style={{ left: nodeMenu.x, top: nodeMenu.y }}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button
+              type="button"
+              onClick={() => {
+                props.onSelectInTree(nodeMenu.id);
+                setNodeMenu(null);
               }}
             >
-              {renderDiagramLayout(diagramLayout)}
-            </div>
-            {paletteGhost ? (
-              <div
-                className="diagram-ghost"
-                style={{ left: `${paletteGhost.x}px`, top: `${paletteGhost.y}px` }}
-              >
-                {renderTypeIcon(paletteGhost.type, "diagram")}
-              </div>
-            ) : null}
-            <div
-              className="diagram-palette"
-              style={{ left: `${palettePos.x}px`, top: `${palettePos.y}px` }}
+              Select in Tree
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                props.onSelectInText(nodeMenu.id);
+                setNodeMenu(null);
+              }}
             >
-              <div
-                className="diagram-palette-header"
-                onPointerDown={(event) => {
-                  event.stopPropagation();
-                  paletteDragRef.current = {
-                    startX: event.clientX,
-                    startY: event.clientY,
-                    baseX: palettePos.x,
-                    baseY: palettePos.y,
-                  };
-                  (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-                }}
-              >
-                Palette
-              </div>
-              <button
-                type="button"
-                className="diagram-palette-item"
-                onPointerDown={(event) => {
-                  event.stopPropagation();
-                  paletteCreateRef.current = { type: "package", name: "Package", startX: event.clientX, startY: event.clientY };
-                  setPaletteGhost({ x: event.clientX, y: event.clientY, type: "package" });
-                  (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-                }}
-              >
-                {renderTypeIcon("package", "diagram")}
-                <span>Package</span>
-              </button>
-            </div>
-            <div className="diagram-minimap">
-              {diagramLayout ? (
-                <div className="diagram-minimap-canvas">
-                  <div
-                    className="diagram-minimap-scale"
-                    style={{
-                      transform: `scale(${140 / Math.max(diagramLayout.width * diagramScale, 1)}, ${100 / Math.max(diagramLayout.height * diagramScale, 1)})`,
-                    }}
-                  >
-                    {renderMinimapLayout(diagramLayout)}
-                  </div>
-                </div>
-              ) : null}
-              <div
-                className="diagram-viewport"
-                style={{
-                  left: `${diagramViewport.x}px`,
-                  top: `${diagramViewport.y}px`,
-                  width: `${diagramViewport.width}px`,
-                  height: `${diagramViewport.height}px`,
-                }}
-                onPointerDown={(event) => {
-                  event.stopPropagation();
-                  diagramViewportRef.current = {
-                    startX: event.clientX,
-                    startY: event.clientY,
-                    baseX: diagramViewport.x,
-                    baseY: diagramViewport.y,
-                  };
-                  (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-                }}
-                onPointerMove={(event) => {
-                  if (!diagramViewportRef.current || !diagramLayout || !diagramBodyRef.current) return;
-                  const deltaX = event.clientX - diagramViewportRef.current.startX;
-                  const deltaY = event.clientY - diagramViewportRef.current.startY;
-                  const nextX = Math.min(140 - diagramViewport.width, Math.max(0, diagramViewportRef.current.baseX + deltaX));
-                  const nextY = Math.min(100 - diagramViewport.height, Math.max(0, diagramViewportRef.current.baseY + deltaY));
-                  const canvasWidth = diagramLayout.width * diagramScale;
-                  const canvasHeight = diagramLayout.height * diagramScale;
-                  const miniScaleX = 140 / Math.max(canvasWidth, 1);
-                  const miniScaleY = 100 / Math.max(canvasHeight, 1);
-                  setDiagramOffset({
-                    x: -nextX / miniScaleX,
-                    y: -nextY / miniScaleY,
-                  });
-                }}
-                onPointerUp={() => {
-                  diagramViewportRef.current = null;
-                }}
-              />
-            </div>
-          </>
-        ) : (
-          <div className="diagram-placeholder">
-            No diagram content for {activeDiagramPath ? activeDiagramPath.split(/[\\/]/).pop() : "file"}.
+              Select in Text
+            </button>
           </div>
-        )}
+        ) : null}
       </div>
     </div>
   );

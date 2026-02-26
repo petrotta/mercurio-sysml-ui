@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use mercurio_sysml_semantics::semantic_contract::{SemanticElementView, SemanticQuery};
-use mercurio_sysml_workspace::workspace::{Workspace, WorkspaceFileKind};
+use mercurio_sysml_semantics::workspace::{Workspace, WorkspaceFileKind};
 
 use crate::files::resolve_under_root;
 use crate::project::load_project_config;

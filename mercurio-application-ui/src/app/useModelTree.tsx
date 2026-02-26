@@ -52,6 +52,43 @@ export function useModelTree({
   libraryLoadErrors,
   libraryKindFilter,
 }: UseModelTreeOptions) {
+  const propertyText = (value: SymbolView["properties"][number]["value"]): string | null => {
+    if ("type" in value && value.type === "text") return value.value ?? null;
+    return null;
+  };
+
+  const simplifyMetatypeLabel = (raw: string): string => {
+    let label = (raw || "").trim();
+    if (!label) return "";
+    if (label.includes("::")) {
+      const parts = label.split("::").filter(Boolean);
+      label = parts[parts.length - 1] || label;
+    }
+    if (label.endsWith("Definition")) {
+      return label.slice(0, -"Definition".length) || label;
+    }
+    if (label.endsWith("Usage")) {
+      return label.slice(0, -"Usage".length) || label;
+    }
+    return label;
+  };
+
+  const symbolMetatypeLabel = (symbol: SymbolView): string | null => {
+    const direct = (symbol as SymbolView & { metatype_qname?: string | null }).metatype_qname || "";
+    const directLabel = simplifyMetatypeLabel(direct);
+    if (directLabel) return directLabel;
+    for (const prop of symbol.properties || []) {
+      const name = (prop.name || "").toLowerCase();
+      if (name !== "metatype_qname" && name !== "emf::metatype" && name !== "element::metatype") {
+        continue;
+      }
+      const text = propertyText(prop.value) || "";
+      const label = simplifyMetatypeLabel(text);
+      if (label) return label;
+    }
+    return null;
+  };
+
   const buildSymbolTree = (list: SymbolView[]) => {
     const symbolQname = (symbol: SymbolView) => {
       const qualified = (symbol.qualified_name || "").trim();
@@ -219,10 +256,16 @@ export function useModelTree({
     const walk = (node: SymbolNode, depth: number, isTop: boolean, pathKey: string) => {
       const displayName = isTop && node.name === "root" && rootLabel ? rootLabel : node.name;
       const nodeId = `${rootKey}::${node.fullName || pathKey}`;
+      const isFileContainerRow = depth === 0 && !!rootLabel && node.symbols.length === 0;
+      const metatypeLabels = Array.from(
+        new Set(node.symbols.map((symbol) => symbolMetatypeLabel(symbol)).filter(Boolean) as string[]),
+      );
+      const fallbackKinds = Array.from(new Set(node.symbols.map((symbol) => symbol.kind).filter(Boolean)));
       const kindLabel =
-        Array.from(new Set(node.symbols.map((symbol) => symbol.kind).filter(Boolean))).join(" ") ||
-        (node.children.size ? "Package" : "");
-      const kindKey = getKindKey(node.symbols[0]?.kind || "");
+        metatypeLabels.join(" ") ||
+        fallbackKinds.join(" ") ||
+        (isFileContainerRow ? "File" : node.children.size ? "Package" : "");
+      const kindKey = isFileContainerRow ? "file" : getKindKey(node.symbols[0]?.kind || "");
       const hasChildren = node.children.size > 0;
       const expandedState = collapseAll ? false : expanded[nodeId] ?? defaultExpanded;
       const isVirtualRoot = node.name === "root" && node.symbols.length === 0;
