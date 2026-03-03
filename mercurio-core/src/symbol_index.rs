@@ -1,5 +1,6 @@
 use mercurio_symbol_index::{SymbolIndexStore, SymbolMetatypeMappingRecord, SymbolRecord};
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 use crate::CoreState;
 
@@ -40,6 +41,14 @@ pub struct SymbolMetatypeMappingView {
     pub mapping_source: String,
     pub confidence: f32,
     pub diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexedSemanticElementView {
+    pub name: String,
+    pub qualified_name: String,
+    pub file_path: String,
+    pub attributes: BTreeMap<String, String>,
 }
 
 fn to_view(record: SymbolRecord) -> IndexedSymbolView {
@@ -188,6 +197,71 @@ pub fn query_symbol_metatype_mapping(
     Ok(store
         .symbol_mapping(&project_root, &symbol_qualified_name, file_path.as_deref())
         .map(to_mapping_view))
+}
+
+pub fn query_project_semantic_element_by_qualified_name(
+    state: &CoreState,
+    project_root: String,
+    qualified_name: String,
+    file_path: Option<String>,
+) -> Result<Option<IndexedSemanticElementView>, String> {
+    let target = qualified_name.trim();
+    if target.is_empty() {
+        return Ok(None);
+    }
+    let store = state
+        .symbol_index
+        .lock()
+        .map_err(|_| "Symbol index lock poisoned".to_string())?;
+    let symbol = if let Some(path) = file_path.as_deref() {
+        store
+            .project_symbols(&project_root, Some(path))
+            .into_iter()
+            .find(|entry| entry.qualified_name == target)
+            .or_else(|| store.project_symbol(&project_root, target, None))
+    } else {
+        store.project_symbol(&project_root, target, None)
+    };
+    let Some(symbol) = symbol else {
+        return Ok(None);
+    };
+
+    let mapping = store
+        .symbol_mapping(&project_root, &symbol.qualified_name, Some(&symbol.file_path))
+        .or_else(|| store.symbol_mapping(&project_root, &symbol.qualified_name, None));
+
+    let mut attributes = BTreeMap::<String, String>::new();
+    attributes.insert("emf::qualifiedName".to_string(), symbol.qualified_name.clone());
+    attributes.insert("symbol::name".to_string(), symbol.name.clone());
+    attributes.insert("symbol::kind".to_string(), symbol.kind.clone());
+    attributes.insert(
+        "symbol::span".to_string(),
+        format!(
+            "{}:{}-{}:{}",
+            symbol.start_line, symbol.start_col, symbol.end_line, symbol.end_col
+        ),
+    );
+    if let Some(value) = symbol.metatype_qname.clone().or_else(|| {
+        mapping
+            .as_ref()
+            .and_then(|entry| entry.resolved_metatype_qname.clone())
+    }) {
+        attributes.insert("element::metatype".to_string(), value.clone());
+        attributes.insert("semantic.metatype_qname".to_string(), value);
+    }
+    if let Some(doc) = symbol.doc_text.clone() {
+        let trimmed = doc.trim();
+        if !trimmed.is_empty() {
+            attributes.insert("documentation".to_string(), trimmed.to_string());
+        }
+    }
+
+    Ok(Some(IndexedSemanticElementView {
+        name: symbol.name,
+        qualified_name: symbol.qualified_name,
+        file_path: symbol.file_path,
+        attributes,
+    }))
 }
 
 #[cfg(test)]
@@ -396,6 +470,110 @@ mod tests {
         )
         .expect("query indexed library symbols");
         assert!(!indexed_library.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_project_semantic_element_by_qualified_name_uses_index() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_semantic_qname_lookup_{stamp}"));
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(project_dir.join("main.sysml"), "package P { action def DoThing; }\n")
+            .expect("write project file");
+        fs::write(
+            project_dir.join(".project"),
+            "{\"name\":\"lookup\",\"src\":[\"*.sysml\"]}",
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let project_root = project_dir.to_string_lossy().to_string();
+        let _ = compile_project_delta_sync(
+            &state,
+            project_root.clone(),
+            77,
+            true,
+            None,
+            Vec::new(),
+            |_| {},
+        )
+        .expect("compile");
+
+        let found = query_project_semantic_element_by_qualified_name(
+            &state,
+            project_root.clone(),
+            "P".to_string(),
+            None,
+        )
+        .expect("query by qname")
+        .expect("semantic row exists");
+        assert_eq!(found.qualified_name, "P");
+        assert_eq!(
+            found.attributes.get("emf::qualifiedName").map(|value| value.as_str()),
+            Some("P")
+        );
+
+        let missing = query_project_semantic_element_by_qualified_name(
+            &state,
+            project_root,
+            "DoesNotExist".to_string(),
+            None,
+        )
+        .expect("query missing");
+        assert!(missing.is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_project_semantic_element_prefers_requested_file_path() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_semantic_qname_file_lookup_{stamp}"));
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        let left = project_dir.join("left.sysml");
+        let right = project_dir.join("right.sysml");
+        fs::write(&left, "package P { action def LeftAction; }\n").expect("write left file");
+        fs::write(&right, "package P { action def RightAction; }\n").expect("write right file");
+        fs::write(
+            project_dir.join(".project"),
+            "{\"name\":\"lookup\",\"src\":[\"*.sysml\"]}",
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let project_root = project_dir.to_string_lossy().to_string();
+        let _ = compile_project_delta_sync(
+            &state,
+            project_root.clone(),
+            91,
+            true,
+            None,
+            Vec::new(),
+            |_| {},
+        )
+        .expect("compile");
+
+        let right_row = query_project_semantic_element_by_qualified_name(
+            &state,
+            project_root,
+            "P".to_string(),
+            Some(right.to_string_lossy().to_string()),
+        )
+        .expect("query by qname with file")
+        .expect("semantic row exists");
+        assert_eq!(
+            normalized_compare_key(Path::new(&right_row.file_path)),
+            normalized_compare_key(&right)
+        );
 
         let _ = fs::remove_dir_all(root);
     }

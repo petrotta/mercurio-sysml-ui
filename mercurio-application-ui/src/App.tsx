@@ -1,4513 +1,1090 @@
-﻿import "./style.css";
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getName, getTauriVersion, getVersion } from "@tauri-apps/api/app";
-import { invoke } from "@tauri-apps/api/core";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import "./style.css";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import MonacoEditor, { loader, type OnMount } from "@monaco-editor/react";
-import { listen } from "@tauri-apps/api/event";
-import {
-  AI_CHAT_KEY,
-  AI_ENDPOINTS_KEY,
-  PROJECT_DESCRIPTOR_TAB,
-  PROJECT_LOCATION_KEY,
-  ROOT_STORAGE_KEY,
-  THEME_KEY,
-  TRACK_TEXT_KEY,
-  FILTER_MODEL_FILES_KEY,
-  MODEL_SHOW_FILES_KEY,
-} from "./app/constants";
-import { loadRecents, saveRecents } from "./app/storage";
-import { useEditorState } from "./app/editorState";
-import { AiView } from "./app/components/AiView";
-import { ModelPane } from "./app/components/ModelPane";
-import { ModelHeader } from "./app/components/ModelHeader";
-import { EditorPane } from "./app/components/EditorPane";
-import { ProjectTree } from "./app/components/ProjectTree";
-import { DataView } from "./app/components/DataView";
-import { ProjectModelPaneView } from "./app/components/ProjectModelView";
-import { DescriptorView } from "./app/components/DescriptorView";
-import { DiagramView } from "./app/components/DiagramView";
-import { TerminalPane } from "./app/components/TerminalPane";
-import { AstStatus } from "./app/components/AstStatus";
-import { CompileToastPanel } from "./app/components/CompileToast";
-import { Modal } from "./app/components/Modal";
-import { NextStepsFloating } from "./app/components/NextStepsFloating";
-import { AppCoreModals } from "./app/components/AppCoreModals";
-import { getKindKey, renderTypeIcon } from "./app/diagramIcons";
-import { useModelTracking } from "./app/useModelTracking";
-import { useDiagramView } from "./app/useDiagramView";
-import { useModelTree } from "./app/useModelTree";
-import { useModelTreeSelection } from "./app/useModelTreeSelection";
-import { createModelRowRenderer } from "./app/modelRowRenderer";
-import { useModelGroups } from "./app/useModelGroups";
-import { useTabs } from "./app/useTabs";
-import { useEditorNavigation } from "./app/useEditorNavigation";
-import { useCompileRunner } from "./app/useCompileRunner";
-import { useAstLoader } from "./app/useAstLoader";
-import { readFileText } from "./app/fileOps";
+import { open } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { ROOT_STORAGE_KEY, THEME_KEY } from "./app/constants";
 import { useProjectTree } from "./app/useProjectTree";
-import { callTool, runAgent } from "./app/agentClient";
+import { readFileText } from "./app/fileOps";
+import { useCompileRunner } from "./app/useCompileRunner";
+import { useSemanticSelection } from "./app/useSemanticSelection";
+import { CombinedPropertiesPane } from "./app/components/CombinedPropertiesPane";
 import { parseErrorLocation } from "./app/parseErrors";
-import { isPathWithin } from "./app/pathUtils";
-import type {
-  FileEntry,
-  ModelRow,
-  OpenTab,
-  ProjectModelView,
-  StdlibMetamodelView,
-  SymbolView,
-} from "./app/types";
+import type { FileEntry, SymbolView } from "./app/types";
 
 loader.config({ paths: { vs: "/monaco/vs" } });
 
-type TerminalTabState = {
-  id: string;
-  title: string;
-  input: string;
-  lines: string[];
-  history: string[];
-  historyIndex: number | null;
+type TextSelection = {
+  startLine: number;
+  startCol: number;
+  endLine: number;
+  endCol: number;
 };
 
-type GotoSymbolCandidate = {
-  name: string;
-  qualified_name: string;
-  file_path: string;
+type HarnessRun = {
+  id: number;
+  kind: "project" | "file";
+  ok: boolean;
+  durationMs: number;
+  at: string;
 };
+
+const MAX_SYMBOL_ROWS = 1200;
+const FILE_SYMBOL_RENDER_LIMIT = 300;
+const SYSML_LANGUAGE_ID = "mercurio-sysml";
+let sysmlLanguageRegistered = false;
+
+function normalizePath(path: string | null | undefined): string {
+  return (path || "").replace(/\//g, "\\").toLowerCase();
+}
+
+function symbolIdentity(symbol: SymbolView): string {
+  return `${normalizePath(symbol.file_path)}|${symbol.qualified_name || symbol.name}|${symbol.start_line}|${symbol.start_col}`;
+}
+
+function compareSymbols(a: SymbolView, b: SymbolView): number {
+  const lineDelta = (a.start_line || 0) - (b.start_line || 0);
+  if (lineDelta !== 0) return lineDelta;
+  const colDelta = (a.start_col || 0) - (b.start_col || 0);
+  if (colDelta !== 0) return colDelta;
+  const nameDelta = (a.name || "").localeCompare(b.name || "");
+  if (nameDelta !== 0) return nameDelta;
+  return (a.kind || "").localeCompare(b.kind || "");
+}
+
+function fileExtension(path: string | null | undefined): string {
+  const value = path || "";
+  const idx = value.lastIndexOf(".");
+  return idx >= 0 ? value.slice(idx).toLowerCase() : "";
+}
+
+function editorLanguageForPath(path: string | null | undefined): string {
+  const ext = fileExtension(path);
+  if (ext === ".sysml" || ext === ".kerml") return SYSML_LANGUAGE_ID;
+  if (ext === ".json") return "json";
+  if (ext === ".yaml" || ext === ".yml") return "yaml";
+  if (ext === ".xml") return "xml";
+  if (ext === ".md" || ext === ".markdown") return "markdown";
+  if (ext === ".rs") return "rust";
+  if (ext === ".ts") return "typescript";
+  if (ext === ".tsx") return "typescript";
+  if (ext === ".js") return "javascript";
+  if (ext === ".jsx") return "javascript";
+  if (ext === ".toml") return "ini";
+  return "plaintext";
+}
+
+function ensureSysmlLanguage(monaco: Parameters<OnMount>[1]): void {
+  if (sysmlLanguageRegistered) return;
+  monaco.languages.register({
+    id: SYSML_LANGUAGE_ID,
+    extensions: [".sysml", ".kerml"],
+    aliases: ["SysML", "KerML"],
+  });
+  monaco.languages.setLanguageConfiguration(SYSML_LANGUAGE_ID, {
+    comments: {
+      lineComment: "//",
+      blockComment: ["/*", "*/"],
+    },
+    brackets: [
+      ["{", "}"],
+      ["[", "]"],
+      ["(", ")"],
+    ],
+    autoClosingPairs: [
+      { open: "{", close: "}" },
+      { open: "[", close: "]" },
+      { open: "(", close: ")" },
+      { open: "\"", close: "\"" },
+    ],
+  });
+  monaco.languages.setMonarchTokensProvider(SYSML_LANGUAGE_ID, {
+    keywords: [
+      "package", "private", "public", "import", "part", "attribute", "port", "item",
+      "action", "state", "transition", "connection", "connector", "interface", "enum",
+      "requirement", "constraint", "allocation", "satisfy", "verify", "perform", "flow",
+      "return", "if", "then", "else", "for", "while", "true", "false", "null",
+      "specializes", "redefines", "subsets", "extends", "abstract",
+    ],
+    operators: ["=", ":", "::", "->", ".", ",", ";", "+", "-", "*", "/", "%", "<", ">", "<=", ">="],
+    symbols: /[=><!~?:&|+\-*\/\^%]+/,
+    tokenizer: {
+      root: [
+        [/[a-zA-Z_][\w-]*/, {
+          cases: {
+            "@keywords": "keyword",
+            "@default": "identifier",
+          },
+        }],
+        [/[{}()[\]]/, "@brackets"],
+        [/@symbols/, {
+          cases: {
+            "@operators": "operator",
+            "@default": "",
+          },
+        }],
+        [/\d+(\.\d+)?/, "number"],
+        [/".*?"/, "string"],
+        [/'[^']*'/, "string"],
+        [/\/\/.*$/, "comment"],
+        [/\/\*/, "comment", "@comment"],
+      ],
+      comment: [
+        [/[^/*]+/, "comment"],
+        [/\*\//, "comment", "@pop"],
+        [/./, "comment"],
+      ],
+    },
+  });
+  sysmlLanguageRegistered = true;
+}
+
+function isSemanticSource(path: string | null | undefined): boolean {
+  const value = (path || "").toLowerCase();
+  return value.endsWith(".sysml") || value.endsWith(".kerml");
+}
+
+function symbolSelection(symbol: SymbolView): TextSelection {
+  const startLine = Math.max(1, symbol.start_line || 1);
+  const startCol = Math.max(1, symbol.start_col || 1);
+  const endLine = Math.max(startLine, symbol.end_line || symbol.start_line || 1);
+  let endCol = Math.max(1, symbol.end_col || symbol.start_col || 1);
+  if (endLine === startLine && endCol <= startCol) {
+    endCol = startCol + 1;
+  }
+  return { startLine, startCol, endLine, endCol };
+}
 
 export function App() {
-  void getCurrentWindow();
-  const [openMenu, setOpenMenu] = useState<string | null>(null);
-  const [showSettings, setShowSettings] = useState(false);
-  const [settingsTab, setSettingsTab] = useState<"theme" | "ai" | "stdlib">("theme");
-  const [settingsStdlibVersions, setSettingsStdlibVersions] = useState<string[]>([]);
-  const [settingsDefaultStdlib, setSettingsDefaultStdlib] = useState("");
-  const [settingsStdlibBusy, setSettingsStdlibBusy] = useState(false);
-  const [settingsStdlibStatus, setSettingsStdlibStatus] = useState("");
+  const [rootPath, setRootPath] = useState<string>(() => window.localStorage?.getItem(ROOT_STORAGE_KEY) || "");
+  const [rootInput, setRootInput] = useState<string>(() => window.localStorage?.getItem(ROOT_STORAGE_KEY) || "");
+  const [treeError, setTreeError] = useState("");
   const [appTheme, setAppTheme] = useState<"dark" | "light">(
     (window.localStorage?.getItem(THEME_KEY) as "dark" | "light") || "dark",
   );
-  const [leftWidth, setLeftWidth] = useState(240);
-  const [rightWidth, setRightWidth] = useState(320);
-  const [leftCollapsed, setLeftCollapsed] = useState(false);
-  const [rightCollapsed, setRightCollapsed] = useState(false);
-  const leftStoredWidthRef = useRef(240);
-  const rightStoredWidthRef = useRef(320);
-  const draggingRef = useRef<null | "left" | "right" | "model" | "modelProps">(null);
-  const startRef = useRef({ x: 0, y: 0, left: 240, right: 320, model: 260, modelProps: 320 });
-  const [rootPath, setRootPath] = useState<string>(() => window.localStorage?.getItem(ROOT_STORAGE_KEY) || "");
-  const [recentProjects, setRecentProjects] = useState<string[]>(() => loadRecents());
-  const { treeEntries, expanded, refreshRoot, toggleExpand } = useProjectTree();
+  const [activeFilePath, setActiveFilePath] = useState<string | null>(null);
+  const [dirty, setDirty] = useState(false);
+  const [cursorPos, setCursorPos] = useState<{ line: number; col: number } | null>(null);
+  const [symbolQuery, setSymbolQuery] = useState("");
+  const [showCurrentFileOnly, setShowCurrentFileOnly] = useState(true);
+  const [selectedSymbol, setSelectedSymbol] = useState<SymbolView | null>(null);
+  const [semanticSelectedQname, setSemanticSelectedQname] = useState("");
+  const [harnessRuns, setHarnessRuns] = useState<HarnessRun[]>([]);
+  const [harnessRunning, setHarnessRunning] = useState(false);
+  const [expandedFileSymbols, setExpandedFileSymbols] = useState<Record<string, boolean>>({});
+  const [expandedLibraryFiles, setExpandedLibraryFiles] = useState<Record<string, boolean>>({});
+
   const {
-    editorValueRef,
-    editorChangeTick,
-    cursorPos,
-    updateCursorPos,
-    onEditorChange,
-    activeDoc,
-    setActiveEditorDoc,
-    updateDocContent,
-    queuePendingEditorContent,
-    clearPendingEditorContent,
-    consumePendingEditorContent,
-    markSaved,
-    getDoc,
-    currentFilePathRef,
-  } = useEditorState();
-  const [openTabs, setOpenTabs] = useState<OpenTab[]>([]);
-  const [activeTabPath, setActiveTabPath] = useState<string | null>(null);
-  const activeTabPathRef = useRef<string | null>(null);
-  const [descriptorViewMode, setDescriptorViewMode] = useState<"view" | "json">("view");
-  const suppressDirtyRef = useRef(false);
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; entry: FileEntry; scope: "root" | "node" } | null>(null);
-  const [modelContextMenu, setModelContextMenu] = useState<{
-    x: number;
-    y: number;
-    filePath: string | null;
-    label: string;
-    section: "project" | "library";
-    loadError?: string;
-  } | null>(null);
-  const [modelOptionsMenu, setModelOptionsMenu] = useState<{ x: number; y: number } | null>(null);
-  const [astViewOpen, setAstViewOpen] = useState(false);
-  const [astViewTitle, setAstViewTitle] = useState("");
-  const { astState: astViewState, loadForPath: loadAstViewForPath } = useAstLoader();
-  const [tabMenu, setTabMenu] = useState<{ x: number; y: number; path: string } | null>(null);
-  const [tabOverflowOpen, setTabOverflowOpen] = useState(false);
-  const [showUsageNodes, setShowUsageNodes] = useState(true);
-  const [showAstSplit, setShowAstSplit] = useState(false);
+    treeEntries,
+    expanded,
+    refreshRoot,
+    toggleExpand,
+  } = useProjectTree();
+
   const {
-    astState: astSplitState,
-    setAstState: setAstSplitState,
-    loadForContent: loadAstSplitForContent,
-    clearTimer: clearAstSplitTimer,
-  } = useAstLoader();
-  const [showAbout, setShowAbout] = useState(false);
-  const [stdlibMetamodelLoadingState, setStdlibMetamodelLoadingState] = useState(false);
-  const [stdlibMetamodelErrorState, setStdlibMetamodelErrorState] = useState("");
-  const [stdlibMetamodel, setStdlibMetamodel] = useState<StdlibMetamodelView | null>(null);
-  const [projectModelView, setProjectModelView] = useState<ProjectModelView | null>(null);
-  const [projectModelLoading, setProjectModelLoading] = useState(false);
-  const [projectModelError, setProjectModelError] = useState("");
-  const [projectModelFocusQuery, setProjectModelFocusQuery] = useState("");
-  const [aboutVersion, setAboutVersion] = useState<string | null>(null);
-  const [aboutBuild, setAboutBuild] = useState<string | null>(null);
-  const astEditorRef = useRef<Parameters<OnMount>[0] | null>(null);
-  const astScrollSyncRef = useRef<{ dispose: () => void } | null>(null);
-  const astCursorSyncRef = useRef<{ dispose: () => void } | null>(null);
-  const [hasProjectDescriptor, setHasProjectDescriptor] = useState(false);
-  const [gitInfo, setGitInfo] = useState<{
-    repo_root: string;
-    branch: string;
-    ahead: number;
-    behind: number;
-    clean: boolean;
-    remote_url?: string | null;
-  } | null>(null);
-  const [gitStatus, setGitStatus] = useState<{
-    staged: string[];
-    unstaged: string[];
-    untracked: string[];
-  } | null>(null);
-  const [showGitDialog, setShowGitDialog] = useState(false);
-  const [gitStatusBusy, setGitStatusBusy] = useState(false);
-  const [gitStatusError, setGitStatusError] = useState("");
-  const [gitCommitMessage, setGitCommitMessage] = useState("");
-  const [gitCommitBusy, setGitCommitBusy] = useState(false);
-  const [gitCommitError, setGitCommitError] = useState("");
-  const [gitCommitSelection, setGitCommitSelection] = useState<Record<string, boolean>>({});
-  const [gitPushBusy, setGitPushBusy] = useState(false);
-  const [gitPushError, setGitPushError] = useState("");
-  const [gitBranches, setGitBranches] = useState<string[]>([]);
-  const [gitCurrentBranch, setGitCurrentBranch] = useState("");
-  const [gitCreateBranchName, setGitCreateBranchName] = useState("");
-  const [gitCreateBranchCheckout, setGitCreateBranchCheckout] = useState(true);
-  const [gitCheckoutBranchName, setGitCheckoutBranchName] = useState("");
-  const [gitBranchBusy, setGitBranchBusy] = useState(false);
-  const [gitBranchError, setGitBranchError] = useState("");
-  const [showGitBranchDialog, setShowGitBranchDialog] = useState(false);
-  const [projectDescriptor, setProjectDescriptor] = useState<{
-    name?: string | null;
-    author?: string | null;
-    description?: string | null;
-    organization?: string | null;
-    default_library: boolean;
-    stdlib?: string | null;
-    library?: { path: string } | string | null;
-    src?: string[];
-    import_entries?: string[];
-    raw_json?: string;
-  } | null>(null);
-  const [showProjectProperties, setShowProjectProperties] = useState(false);
-  const [projectPropertiesBusy, setProjectPropertiesBusy] = useState(false);
-  const [projectPropertiesError, setProjectPropertiesError] = useState("");
-  const [projectPropertiesDraft, setProjectPropertiesDraft] = useState({
-    name: "",
-    author: "",
-    description: "",
-    organization: "",
-    src: [] as string[],
-    import_entries: [] as string[],
-  });
-  const [projectFileInput, setProjectFileInput] = useState("");
-  const [projectLibraryInput, setProjectLibraryInput] = useState("");
-  const [projectStdlibMode, setProjectStdlibMode] = useState<"default" | "version" | "custom">("default");
-  const [projectStdlibVersion, setProjectStdlibVersion] = useState("");
-  const [projectStdlibPath, setProjectStdlibPath] = useState("");
-  const [projectStdlibVersions, setProjectStdlibVersions] = useState<string[]>([]);
-  const [showNewFile, setShowNewFile] = useState(false);
-  const [newFileName, setNewFileName] = useState("");
-  const [newFileParent, setNewFileParent] = useState<string>("");
-  const [newFileType, setNewFileType] = useState("sysml");
-  const [showExport, setShowExport] = useState(false);
-  const [exportFormat, setExportFormat] = useState<"jsonld" | "kpar" | "xmi">("jsonld");
-  const [exportIncludeStdlib, setExportIncludeStdlib] = useState(true);
-  const [exportPath, setExportPath] = useState("");
-  const [exportBusy, setExportBusy] = useState(false);
-  const [exportAfterBuild, setExportAfterBuild] = useState(false);
-  const [showNewProject, setShowNewProject] = useState(false);
-  const [showOpenProject, setShowOpenProject] = useState(false);
-  const [showGotoDialog, setShowGotoDialog] = useState(false);
-  const [gotoQuery, setGotoQuery] = useState("");
-  const [gotoLoading, setGotoLoading] = useState(false);
-  const [gotoError, setGotoError] = useState("");
-  const [gotoCandidates, setGotoCandidates] = useState<GotoSymbolCandidate[]>([]);
-  const [gotoSelectedIndex, setGotoSelectedIndex] = useState(0);
-  const [openProjectPath, setOpenProjectPath] = useState("");
-  const [newProjectLocation, setNewProjectLocation] = useState("");
-  const [newProjectName, setNewProjectName] = useState("");
-  const [newProjectFolder, setNewProjectFolder] = useState("");
-  const [newProjectAuthor, setNewProjectAuthor] = useState("");
-  const [newProjectDescription, setNewProjectDescription] = useState("");
-  const [newProjectOrganization, setNewProjectOrganization] = useState("");
-  const [newProjectFolderStatus, setNewProjectFolderStatus] = useState("");
-  const [newProjectFolderAvailable, setNewProjectFolderAvailable] = useState(false);
-  const [newProjectDefaultLib, setNewProjectDefaultLib] = useState(true);
-  const [newProjectBusy, setNewProjectBusy] = useState(false);
-  const [newProjectError, setNewProjectError] = useState("");
-  const [centerView, setCenterView] = useState<"file" | "diagram" | "ai" | "data" | "project-model">("file");
-  // cursorPos is managed by useEditorState
-  const [aiInput, setAiInput] = useState("");
-  const [aiHistoryIndex, setAiHistoryIndex] = useState<number | null>(null);
-  const [aiMessages, setAiMessages] = useState<Array<{
-    role: "user" | "assistant";
-    text: string;
-    raw?: string;
-    pendingId?: number;
-    steps?: Array<{ kind: string; detail: string }>;
-    nextSteps?: Array<{ id: string; label: string; recommended: boolean; action: string }>;
-  }>>([]);
-  const [aiFloatingSteps, setAiFloatingSteps] = useState<Array<{ id: string; label: string; recommended: boolean; action: string }>>([]);
-  const [aiFloatingPos, setAiFloatingPos] = useState<{ x: number; y: number }>(() => ({
-    x: window.innerWidth - 280,
-    y: window.innerHeight - 380,
-  }));
-  const aiFloatingDragRef = useRef<null | { startX: number; startY: number; baseX: number; baseY: number }>(null);
-  const lastAiProjectRef = useRef<string | null>(null);
-  const [aiEndpoints, setAiEndpoints] = useState<Array<{
-    id: string;
-    name: string;
-    url: string;
-    type: "chat" | "embeddings";
-    provider: "openai" | "anthropic";
-    model: string;
-    token: string;
-  }>>(() => {
-    try {
-      const raw = window.localStorage?.getItem(AI_ENDPOINTS_KEY);
-      const parsed = raw ? JSON.parse(raw) : [];
-      if (!Array.isArray(parsed)) return [];
-      return parsed.map((item: any) => ({
-        ...item,
-        provider: item?.provider === "anthropic" ? "anthropic" : "openai",
-      }));
-    } catch {
-      return [];
-    }
-  });
-  const [selectedChatEndpoint, setSelectedChatEndpoint] = useState<string | null>(
-    () => window.localStorage?.getItem(AI_CHAT_KEY) || null,
-  );
-  const [endpointDraft, setEndpointDraft] = useState<{
-    id?: string;
-    name: string;
-    url: string;
-    type: "chat" | "embeddings";
-    provider: "openai" | "anthropic";
-    model: string;
-    token: string;
-  }>({ name: "", url: "", type: "chat", provider: "openai", model: "", token: "" });
-  const [endpointTestStatus, setEndpointTestStatus] = useState<Record<string, string>>({});
-  const aiRequestRef = useRef(0);
-  const {
+    compileStatus,
     setCompileStatus,
     compileRunId,
     compileToast,
-    setCompileToast,
     runCompile,
     cancelCompile,
-    runBackgroundCompile,
-    runBackgroundCompileWithUnsaved,
-    cancelBackgroundCompile,
-    backgroundCompileEnabled,
-    setBackgroundCompileEnabled,
-    backgroundCompileActive,
     symbols,
     unresolved,
-    libraryPath,
-    libraryFiles,
-    libraryLoadingFiles,
-    libraryLoadErrors,
-    libraryBulkLoading,
-    loadedLibraryFileCount,
-    libraryIndexedSymbolCount,
-    loadLibrarySymbolsForFile,
-    loadAllLibrarySymbols,
-    retryFailedLibraryLoads,
-    cancelLibrarySymbolLoading,
-    stdlibFileCount,
-    projectSymbolsLoaded,
     parsedFiles,
     parseErrorPaths,
-    setEditorParseError,
   } = useCompileRunner({ rootPath });
-  const [dataExcludeStdlib, setDataExcludeStdlib] = useState(true);
-  const [showTerminal, setShowTerminal] = useState(false);
-  const [terminalHeight, setTerminalHeight] = useState(180);
-  const [terminalTabs, setTerminalTabs] = useState<TerminalTabState[]>([
-    { id: "term-1", title: "Terminal 1", input: "", lines: [], history: [], historyIndex: null },
-  ]);
-  const [activeTerminalTabId, setActiveTerminalTabId] = useState<string | null>("term-1");
-  const terminalTabCounterRef = useRef(1);
-  const terminalResizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
-  const [selectedSymbol, setSelectedSymbol] = useState<SymbolView | null>(null);
-  const [selectedNodeSymbols, setSelectedNodeSymbols] = useState<SymbolView[] | null>(null);
-  const [modelTreeHeight, setModelTreeHeight] = useState(260);
-  const [collapseAllModel, setCollapseAllModel] = useState(false);
-  const [rightPaneTab, setRightPaneTab] = useState<"semantic" | "file_editor">("semantic");
-  const [showPropertiesPane, setShowPropertiesPane] = useState(true);
-  const [showFilePropertiesPane, setShowFilePropertiesPane] = useState(true);
-  const propertiesDock: "bottom" | "right" = "bottom";
-  const [modelPropertiesWidth, setModelPropertiesWidth] = useState(320);
-  const [trackText, setTrackText] = useState(() => {
-    try {
-      return window.localStorage?.getItem(TRACK_TEXT_KEY) === "true";
-    } catch {
-      return false;
-    }
+
+  const {
+    selectedSemanticRow,
+    selectedSemanticLoading,
+    selectedSemanticError,
+  } = useSemanticSelection({
+    rootPath,
+    semanticSelectedQname,
+    selectedSymbol,
   });
-  const [modelExpanded, setModelExpanded] = useState<Record<string, boolean>>({});
-  const [modelSectionOpen, setModelSectionOpen] = useState({ project: true, library: true, errors: true });
-  const [fileModelExpanded, setFileModelExpanded] = useState<Record<string, boolean>>({});
-  const [fileModelSectionOpen, setFileModelSectionOpen] = useState({ project: true, library: false, errors: false });
-  const [showOnlyModelFiles, setShowOnlyModelFiles] = useState(() => {
-    try {
-      return window.localStorage?.getItem(FILTER_MODEL_FILES_KEY) === "true";
-    } catch {
-      return false;
-    }
-  });
-  const [modelShowFiles, setModelShowFiles] = useState(() => {
-    try {
-      const stored = window.localStorage?.getItem(MODEL_SHOW_FILES_KEY);
-      return stored !== "false";
-    } catch {
-      return true;
-    }
-  });
-  const modelTreeRef = useRef<HTMLDivElement | null>(null);
-  const fileModelTreeRef = useRef<HTMLDivElement | null>(null);
-  const modelPaneContainerRef = useRef<HTMLDivElement | null>(null);
-  const rightPaneHeaderRef = useRef<HTMLDivElement | null>(null);
-  const [modelPaneHeight, setModelPaneHeight] = useState(0);
-  const [rightPaneHeaderHeight, setRightPaneHeaderHeight] = useState(0);
-  const draggedFileSymbolRef = useRef<SymbolView | null>(null);
-  const [fileDropIndicator, setFileDropIndicator] = useState<{
-    key: string;
-    position: "before" | "after";
-  } | null>(null);
-  const navReqRef = useRef(0);
-  const pendingNavRef = useRef<{
-    path: string;
-    name?: string;
-    selection?: { startLine: number; startCol: number; endLine: number; endCol: number };
-  } | null>(null);
-  const lastCompiledContentRef = useRef<Record<string, string>>({});
+
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
-  const cursorListenerRef = useRef<null | { dispose: () => void }>(null);
-  const parseReqRef = useRef(0);
-  const gotoInputRef = useRef<HTMLInputElement | null>(null);
-    const editorOptions: Parameters<typeof MonacoEditor>[0]["options"] = {
-      minimap: { enabled: false },
-      fontSize: 14,
-      fontFamily: "IBM Plex Mono, Consolas, 'Courier New', monospace",
-      wordWrap: "on" as const,
-      selectionHighlight: false,
-      occurrencesHighlight: "off",
-      automaticLayout: true,
-    };
-  const fsChangeTimerRef = useRef<number | null>(null);
-  const activeTabMeta = useMemo(
-    () => openTabs.find((tab) => tab.path === activeTabPath) || null,
-    [openTabs, activeTabPath],
-  );
-  const activeEditorPath = useMemo(() => {
-    if (!activeTabMeta) return null;
-    if (activeTabMeta.path === PROJECT_DESCRIPTOR_TAB) return null;
-    if (
-      activeTabMeta.kind === "ai" ||
-      activeTabMeta.kind === "data" ||
-      activeTabMeta.kind === "diagram" ||
-      activeTabMeta.kind === "project-model"
-    ) {
-      return null;
-    }
-    return activeTabMeta.path;
-  }, [activeTabMeta]);
-  const activeDiagramPath = useMemo(() => {
-    if (activeTabMeta?.kind === "diagram") return activeTabMeta.sourcePath || null;
-    return null;
-  }, [activeTabMeta]);
-  const activeTerminalTab = useMemo(
-    () => terminalTabs.find((tab) => tab.id === activeTerminalTabId) || null,
-    [terminalTabs, activeTerminalTabId],
-  );
-
-  const updateActiveTerminalTab = (updater: (tab: TerminalTabState) => TerminalTabState) => {
-    if (!activeTerminalTabId) return;
-    setTerminalTabs((prev) =>
-      prev.map((tab) => (tab.id === activeTerminalTabId ? updater(tab) : tab)),
-    );
-  };
-
-  const ensureTerminalTab = () => {
-    setTerminalTabs((prev) => {
-      if (prev.length) return prev;
-      terminalTabCounterRef.current = 1;
-      return [{ id: "term-1", title: "Terminal 1", input: "", lines: [], history: [], historyIndex: null }];
-    });
-    setActiveTerminalTabId((prev) => prev || "term-1");
-  };
+  const cursorListenerRef = useRef<{ dispose: () => void } | null>(null);
+  const suppressDirtyRef = useRef(false);
+  const dirtyRef = useRef(false);
+  const fileOpenReqRef = useRef(0);
+  const contentRef = useRef("");
+  const harnessRunIdRef = useRef(0);
+  const harnessActiveRef = useRef(false);
+  const cursorFlushTimerRef = useRef<number | undefined>(undefined);
+  const pendingCursorRef = useRef<{ line: number; col: number } | null>(null);
 
   useEffect(() => {
-    document.body.classList.toggle("theme-light", appTheme === "light");
+    dirtyRef.current = dirty;
+  }, [dirty]);
+
+  useEffect(() => {
     window.localStorage?.setItem(THEME_KEY, appTheme);
-    if (monacoRef.current) {
-      monacoRef.current.editor.setTheme(appTheme === "light" ? "vs" : "vs-dark");
+    document.body.classList.toggle("theme-light", appTheme === "light");
+    const monaco = monacoRef.current;
+    if (monaco) {
+      monaco.editor.setTheme(appTheme === "light" ? "vs" : "vs-dark");
     }
   }, [appTheme]);
 
-
-  useEffect(() => {
-    activeTabPathRef.current = activeTabPath;
-  }, [activeTabPath]);
-
-  useEffect(() => {
-    currentFilePathRef.current = activeDoc.path;
-  }, [activeDoc, currentFilePathRef]);
-
-  useEffect(() => {
-    if (!showAstSplit) return;
-    if (!activeEditorPath) {
-      setAstSplitState({ content: "", error: "No active file.", loading: false });
-      return;
-    }
-    const lower = activeEditorPath.toLowerCase();
-    if (!lower.endsWith(".sysml") && !lower.endsWith(".kerml")) {
-      setAstSplitState({ content: "", error: "AST is only available for .sysml and .kerml files.", loading: false });
-      return;
-    }
-    const content = editorValueRef.current;
-    loadAstSplitForContent(activeEditorPath, content);
-    return () => {
-      clearAstSplitTimer();
-    };
-  }, [showAstSplit, activeEditorPath, editorChangeTick, loadAstSplitForContent, setAstSplitState, clearAstSplitTimer]);
-
-  const attachAstSync = () => {
-    const editor = editorRef.current;
-    const astEditor = astEditorRef.current;
-    if (!showAstSplit || !editor || !astEditor) return;
-    if (astScrollSyncRef.current) {
-      astScrollSyncRef.current.dispose();
-      astScrollSyncRef.current = null;
-    }
-    if (astCursorSyncRef.current) {
-      astCursorSyncRef.current.dispose();
-      astCursorSyncRef.current = null;
-    }
-    const syncScroll = () => {
-      const scrollTop = editor.getScrollTop();
-      const scrollHeight = editor.getScrollHeight();
-      const layout = editor.getLayoutInfo();
-      const maxEditor = Math.max(1, scrollHeight - layout.height);
-      const ratio = scrollTop / maxEditor;
-      const astScrollHeight = astEditor.getScrollHeight();
-      const astLayout = astEditor.getLayoutInfo();
-      const maxAst = Math.max(1, astScrollHeight - astLayout.height);
-      astEditor.setScrollTop(ratio * maxAst);
-    };
-    astScrollSyncRef.current = editor.onDidScrollChange(syncScroll);
-    astCursorSyncRef.current = editor.onDidChangeCursorPosition((event) => {
-      const model = editor.getModel();
-      const astModel = astEditor.getModel();
-      if (!model || !astModel) return;
-      const lineCount = model.getLineCount();
-      const astLineCount = astModel.getLineCount();
-      if (lineCount <= 0 || astLineCount <= 0) return;
-      const ratio = event.position.lineNumber / lineCount;
-      const astLine = Math.max(1, Math.min(astLineCount, Math.round(ratio * astLineCount)));
-      astEditor.revealLineInCenter(astLine);
-    });
-    syncScroll();
-  };
-
-  useEffect(() => {
-    if (!showAstSplit) return;
-    attachAstSync();
-    return () => {
-      astScrollSyncRef.current?.dispose();
-      astScrollSyncRef.current = null;
-      astCursorSyncRef.current?.dispose();
-      astCursorSyncRef.current = null;
-    };
-  }, [showAstSplit]);
-
-  useEffect(() => {
-    const editor = editorRef.current;
-    if (!editor) return;
-    const raf = window.requestAnimationFrame(() => {
-      editor.layout();
-      astEditorRef.current?.layout();
-      attachAstSync();
-    });
-    return () => window.cancelAnimationFrame(raf);
-  }, [showAstSplit]);
-
-  useEffect(() => {
-    const onDocClick = (event: globalThis.MouseEvent) => {
-      const target = event.target as HTMLElement | null;
-      if (!target || !target.closest(".menu-button") && !target.closest(".menu-dropdown")) {
-        setOpenMenu(null);
-      }
-      if (!target || !target.closest(".context-menu")) {
-        setContextMenu(null);
-        setModelContextMenu(null);
-        setModelOptionsMenu(null);
-      }
-      if (!target || !target.closest(".tab-menu")) {
-        setTabMenu(null);
-      }
-      if (!target || !target.closest(".tab-overflow")) {
-        setTabOverflowOpen(false);
-      }
-    };
-    document.addEventListener("click", onDocClick);
-    return () => document.removeEventListener("click", onDocClick);
-  }, []);
-
-  useEffect(() => {
-    if (!showTerminal) return;
-    ensureTerminalTab();
-  }, [showTerminal]);
-
-  useEffect(() => {
-    const onPointerMove = (event: PointerEvent) => {
-      const drag = terminalResizeRef.current;
-      if (!drag) return;
-      const delta = drag.startY - event.clientY;
-      const next = Math.max(120, Math.min(520, drag.startHeight + delta));
-      setTerminalHeight(next);
-    };
-    const onPointerUp = () => {
-      terminalResizeRef.current = null;
-    };
-    window.addEventListener("pointermove", onPointerMove);
-    window.addEventListener("pointerup", onPointerUp);
-    return () => {
-      window.removeEventListener("pointermove", onPointerMove);
-      window.removeEventListener("pointerup", onPointerUp);
-    };
-  }, []);
-
-  useEffect(() => {
-    const unlistenPromise = listen<string>("menu-action", (event) => {
-      if (event.payload === "about") {
-        setShowAbout(true);
-      } else if (event.payload === "compile-workspace") {
-        void runCompile();
-      } else if (event.payload === "build-options") {
-        openBuildOptions();
-      } else if (event.payload === "toggle-project") {
-        setLeftCollapsed((prev) => {
-          if (!prev) {
-            leftStoredWidthRef.current = leftWidth;
-          } else {
-            setLeftWidth(leftStoredWidthRef.current || 240);
-          }
-          return !prev;
-        });
-      } else if (event.payload === "toggle-terminal") {
-        toggleTerminal();
-      }
-    });
-    return () => {
-      unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
-    };
-  }, [leftWidth, runCompile]);
-
-  useEffect(() => {
-    let active = true;
-    const loadAbout = async () => {
-      try {
-        const [version, tauriVersion, appName] = await Promise.all([
-          getVersion(),
-          getTauriVersion(),
-          getName(),
-        ]);
-        if (!active) return;
-        setAboutVersion(`${appName} ${version}`);
-        setAboutBuild(`Tauri ${tauriVersion}`);
-      } catch {
-        if (!active) return;
-        setAboutVersion(null);
-        setAboutBuild(null);
-      }
-    };
-    void loadAbout();
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  useEffect(() => {
-    window.localStorage?.setItem(AI_ENDPOINTS_KEY, JSON.stringify(aiEndpoints));
-  }, [aiEndpoints]);
-
-  useEffect(() => {
-    if (!showSettings) return;
-    setSettingsTab("theme");
-    setSettingsStdlibStatus("");
-    void (async () => {
-      try {
-        const [versions, selected] = await Promise.all([
-          callTool<string[]>("stdlib.list_versions@v1", {}),
-          callTool<string | null>("stdlib.get_default@v1", {}),
-        ]);
-        const nextVersions = Array.isArray(versions) ? versions : [];
-        setSettingsStdlibVersions(nextVersions);
-        setSettingsDefaultStdlib(selected || "");
-      } catch (error) {
-        setSettingsStdlibStatus(`Failed to load stdlib settings: ${String(error)}`);
-        setSettingsStdlibVersions([]);
-        setSettingsDefaultStdlib("");
-      }
-    })();
-  }, [showSettings]);
-
-  useEffect(() => {
-    window.localStorage?.setItem(TRACK_TEXT_KEY, trackText ? "true" : "false");
-  }, [trackText]);
-
-  useEffect(() => {
-    window.localStorage?.setItem(FILTER_MODEL_FILES_KEY, showOnlyModelFiles ? "true" : "false");
-  }, [showOnlyModelFiles]);
-
-  useEffect(() => {
-    window.localStorage?.setItem(MODEL_SHOW_FILES_KEY, modelShowFiles ? "true" : "false");
-  }, [modelShowFiles]);
-
-  useEffect(() => {
-    if (selectedChatEndpoint) {
-      window.localStorage?.setItem(AI_CHAT_KEY, selectedChatEndpoint);
-    } else {
-      window.localStorage?.removeItem(AI_CHAT_KEY);
-    }
-  }, [selectedChatEndpoint]);
-
-
-  const rememberProjectLocation = (path: string) => {
-    if (!path) return;
-    window.localStorage?.setItem(PROJECT_LOCATION_KEY, path);
-  };
-
-  const getDefaultProjectLocation = async () => {
-    const stored = window.localStorage?.getItem(PROJECT_LOCATION_KEY);
-    if (stored) return stored;
-    try {
-      const base = await invoke<string>("get_user_projects_root");
-      return base || "";
-    } catch {
-      return "";
-    }
-  };
-
-  const slugifyProjectName = (name: string) => {
-    return (name || "")
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/(^-|-$)/g, "");
-  };
-
-  const openNewProjectDialog = async () => {
-    setNewProjectName("");
-    setNewProjectFolder("");
-    setNewProjectAuthor("");
-    setNewProjectDescription("");
-    setNewProjectOrganization("");
-    setNewProjectFolderStatus("");
-    setNewProjectFolderAvailable(false);
-    setNewProjectDefaultLib(true);
-    setNewProjectError("");
-    setNewProjectLocation(await getDefaultProjectLocation());
-    setShowNewProject(true);
-    setTimeout(() => {
-      const input = document.querySelector<HTMLInputElement>("#new-project-name");
-      input?.focus();
-    }, 0);
-  };
-
-  const openNewFileDialog = (parent?: string) => {
-    setNewFileName("");
-    setNewFileType("sysml");
-    const normRoot = rootPath ? rootPath.replace(/[\\/]+/g, "\\").toLowerCase() : "";
-    const normParent = parent ? parent.replace(/[\\/]+/g, "\\").toLowerCase() : "";
-    const nextParent = normRoot && normParent && normParent.startsWith(normRoot) ? parent! : rootPath || "";
-    setNewFileParent(nextParent);
-    setShowNewFile(true);
-  };
-
-  const updateNewProjectFolderStatus = async (forceError = false) => {
-    const location = newProjectLocation.trim();
-    const folder = newProjectFolder.trim();
-    if (!location || !folder) {
-      setNewProjectFolderStatus("");
-      setNewProjectFolderAvailable(false);
-      return;
-    }
-    if (forceError) {
-      setNewProjectFolderStatus("Folder already exists");
-      setNewProjectFolderAvailable(false);
-      return;
-    }
-    try {
-      const projectPath = `${location}\\${folder}`.replace(/[\\/]+/g, "\\");
-      const exists = await invoke<boolean>("path_exists", { path: projectPath });
-      setNewProjectFolderStatus(exists ? "Folder already exists" : "Folder available");
-      setNewProjectFolderAvailable(!exists);
-    } catch {
-      setNewProjectFolderStatus("");
-      setNewProjectFolderAvailable(false);
-    }
-  };
-
-  useEffect(() => {
-    if (!showNewProject) return;
-    const timer = window.setTimeout(() => {
-      void updateNewProjectFolderStatus();
-    }, 200);
-    return () => window.clearTimeout(timer);
-  }, [showNewProject, newProjectLocation, newProjectFolder]);
-
-  const createNewProject = async () => {
-    if (newProjectBusy) return;
-    const location = newProjectLocation.trim();
-    const name = newProjectName.trim();
-    const folder = newProjectFolder.trim();
-    if (!location || !name || !folder) {
-      setNewProjectError("Enter location, project name, and folder name.");
-      return;
-    }
-    const projectPath = `${location}\\${folder}`.replace(/[\\/]+/g, "\\");
-    try {
-      setNewProjectBusy(true);
-      setNewProjectError("");
-      const exists = await invoke<boolean>("path_exists", { path: projectPath });
-      if (exists) {
-        setNewProjectError("Project folder already exists.");
-        setNewProjectFolderStatus("Folder already exists");
-        setNewProjectFolderAvailable(false);
-        setNewProjectBusy(false);
-        return;
-      }
-      const descriptor = await invoke<{
-        name?: string | null;
-        author?: string | null;
-        description?: string | null;
-        organization?: string | null;
-        default_library: boolean;
-        stdlib?: string | null;
-        library?: { path: string } | string | null;
-        src?: string[];
-        import_entries?: string[];
-        raw_json?: string;
-      }>("create_project_descriptor", {
-        payload: {
-          root: projectPath,
-          name,
-          author: newProjectAuthor.trim() || null,
-          description: newProjectDescription.trim() || null,
-          organization: newProjectOrganization.trim() || null,
-          use_default_library: newProjectDefaultLib,
-        },
-      });
-      setProjectDescriptor(descriptor || null);
-      setHasProjectDescriptor(!!descriptor);
-      rememberProjectLocation(location);
-      setShowNewProject(false);
-      setNewProjectBusy(false);
-      try {
-        await openProject(projectPath);
-      } catch (error) {
-        setNewProjectError(`Open project failed: ${String(error)}`);
-      }
-      setCompileStatus("Project created");
-    } catch (error) {
-      setNewProjectBusy(false);
-      setNewProjectError(`Create project failed: ${String(error)}`);
-    }
-  };
-
-  const loadStdlibMetamodel = useCallback(async () => {
-    if (!rootPath) {
-      setStdlibMetamodelErrorState("Select a project root first.");
-      setStdlibMetamodel(null);
-      return;
-    }
-    setStdlibMetamodelLoadingState(true);
-    setStdlibMetamodelErrorState("");
-    try {
-      const payload = await callTool<StdlibMetamodelView>("core.get_stdlib_metamodel@v1", {
-        root: rootPath,
-      });
-      setStdlibMetamodel(payload);
-    } catch (error) {
-      setStdlibMetamodelErrorState(`Failed to load metamodel: ${String(error)}`);
-      setStdlibMetamodel(null);
-    } finally {
-      setStdlibMetamodelLoadingState(false);
-    }
-  }, [rootPath]);
-
-  const loadProjectModel = async () => {
-    if (!rootPath) {
-      setProjectModelError("Select a project root first.");
-      setProjectModelView(null);
-      return;
-    }
-    setProjectModelLoading(true);
-    setProjectModelError("");
-    try {
-      const payload = await callTool<ProjectModelView>("core.get_project_model@v1", { root: rootPath });
-      setProjectModelView(payload);
-    } catch (error) {
-      setProjectModelError(`Failed to load project model: ${String(error)}`);
-      setProjectModelView(null);
-    } finally {
-      setProjectModelLoading(false);
-    }
-  };
-
-  const loadProjectModelAndMaybeStdlib = async (includeLibrary = true) => {
-    if (includeLibrary) {
-      await Promise.all([loadProjectModel(), loadStdlibMetamodel()]);
-      return;
-    }
-    await loadProjectModel();
-  };
-
-  useEffect(() => {
-    const onMove = (event: PointerEvent) => {
-      if (!draggingRef.current) return;
-      const delta = event.clientX - startRef.current.x;
-      if (draggingRef.current === "left") {
-        setLeftWidth(Math.max(200, Math.min(420, startRef.current.left + delta)));
-      } else if (draggingRef.current === "right") {
-        const rightDelta = event.clientX - startRef.current.x;
-        setRightWidth(Math.max(200, Math.min(900, startRef.current.right - rightDelta)));
-      } else if (draggingRef.current === "model") {
-        const deltaY = event.clientY - startRef.current.y;
-        setModelTreeHeight(Math.max(140, Math.min(520, startRef.current.model + deltaY)));
-      } else if (draggingRef.current === "modelProps") {
-        const deltaX = event.clientX - startRef.current.x;
-        setModelPropertiesWidth(Math.max(220, Math.min(720, startRef.current.modelProps - deltaX)));
-      }
-    };
-    const onUp = () => {
-      draggingRef.current = null;
-      document.body.classList.remove("dragging");
-    };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-    return () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-    };
-    }, []);
-
-  useEffect(() => {
-    const onMove = (event: PointerEvent) => {
-      if (!aiFloatingDragRef.current) return;
-      const deltaX = event.clientX - aiFloatingDragRef.current.startX;
-      const deltaY = event.clientY - aiFloatingDragRef.current.startY;
-      const nextX = aiFloatingDragRef.current.baseX + deltaX;
-      const nextY = aiFloatingDragRef.current.baseY + deltaY;
-      const maxX = Math.max(0, window.innerWidth - 280);
-      const maxY = Math.max(0, window.innerHeight - 160);
-      setAiFloatingPos({
-        x: Math.min(Math.max(0, nextX), maxX),
-        y: Math.min(Math.max(0, nextY), maxY),
-      });
-    };
-    const onUp = () => {
-      aiFloatingDragRef.current = null;
-    };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-    return () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-    };
-  }, []);
-
   useEffect(() => {
     if (!rootPath) {
-      setProjectDescriptor(null);
-      setHasProjectDescriptor(false);
-      setGitInfo(null);
-      return;
-    }
-    invoke<{
-      name?: string | null;
-      author?: string | null;
-      description?: string | null;
-      organization?: string | null;
-      default_library: boolean;
-      stdlib?: string | null;
-      library?: { path: string } | string | null;
-      src?: string[];
-      import_entries?: string[];
-      raw_json?: string;
-    } | null>("get_project_descriptor", { root: rootPath })
-        .then((descriptor) => {
-          setProjectDescriptor(descriptor || null);
-          setHasProjectDescriptor(!!descriptor);
-        })
-        .catch(() => {
-          setProjectDescriptor(null);
-          setHasProjectDescriptor(false);
-        });
-    void refreshGitInfo(rootPath);
-  }, [rootPath]);
-
-  useEffect(() => {
-    if (!rootPath) return;
-    void runBackgroundCompile(rootPath);
-  }, [rootPath, backgroundCompileEnabled, activeEditorPath]);
-
-  useEffect(() => {
-    if (!showGotoDialog) return;
-    gotoInputRef.current?.focus();
-    gotoInputRef.current?.select();
-  }, [showGotoDialog]);
-
-  useEffect(() => {
-    if (!showGotoDialog) return;
-    if (!rootPath) {
-      setGotoCandidates([]);
-      setGotoError("Open a project folder first.");
-      setGotoLoading(false);
+      setTreeError("");
       return;
     }
     let active = true;
-    setGotoLoading(true);
-    setGotoError("");
-    type SemanticElementResult = {
-      name: string;
-      qualified_name: string;
-      file_path: string;
-      attributes?: Record<string, string>;
-    };
-    void callTool<SemanticElementResult[]>("core.query_semantic@v1", {
-      root: rootPath,
-      query: {
-        metatype: null,
-        metatype_is_a: null,
-        predicates: [],
-      },
-    })
-      .then((rows) => {
-        if (!active) return;
-        const dedup = new Map<string, GotoSymbolCandidate>();
-        for (const row of rows || []) {
-          const qname =
-            (row.qualified_name || "").trim() ||
-            (row.attributes?.["emf::qualifiedName"] || "").trim();
-          const name =
-            (row.name || "").trim() ||
-            (row.attributes?.["emf::name"] || "").trim() ||
-            qname.split("::").pop() ||
-            "Unnamed";
-          const filePath = (row.file_path || "").trim();
-          if (!qname || !filePath) continue;
-          const key = `${qname}|${filePath}`.toLowerCase();
-          if (dedup.has(key)) continue;
-          dedup.set(key, { name, qualified_name: qname, file_path: filePath });
-        }
-        setGotoCandidates(
-          Array.from(dedup.values()).sort((a, b) => a.qualified_name.localeCompare(b.qualified_name)),
-        );
-      })
-      .catch((error) => {
-        if (!active) return;
-        setGotoCandidates([]);
-        setGotoError(`Failed to load symbols: ${String(error)}`);
-      })
-      .finally(() => {
-        if (!active) return;
-        setGotoLoading(false);
-      });
+    setTreeError("");
+    void refreshRoot(rootPath).catch((error) => {
+      if (!active) return;
+      setTreeError(`Failed to load project tree: ${String(error)}`);
+    });
     return () => {
       active = false;
     };
-  }, [showGotoDialog, rootPath]);
+  }, [rootPath, refreshRoot]);
 
   useEffect(() => {
-    if (!rootPath) {
-      setStdlibMetamodel(null);
-      return;
-    }
-    void loadStdlibMetamodel();
-  }, [rootPath, loadStdlibMetamodel]);
-
-  useEffect(() => {
-    if (activeTabMeta?.kind !== "project-model") return;
-    if (!rootPath) return;
-    void loadProjectModelAndMaybeStdlib(false);
-  }, [activeTabMeta?.kind, rootPath]);
-
-  useEffect(() => {
-    if (!modelPaneContainerRef.current) return;
-    const observer = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (!entry) return;
-      setModelPaneHeight(Math.round(entry.contentRect.height));
-    });
-    observer.observe(modelPaneContainerRef.current);
-    return () => observer.disconnect();
-  }, [rightCollapsed]);
-
-  useEffect(() => {
-    if (!rightPaneHeaderRef.current) return;
-    const observer = new ResizeObserver((entries) => {
-      const entry = entries[0];
-      if (!entry) return;
-      setRightPaneHeaderHeight(Math.round(entry.contentRect.height));
-    });
-    observer.observe(rightPaneHeaderRef.current);
-    return () => observer.disconnect();
-  }, [rightPaneTab, rightCollapsed]);
-
-
-  const startDrag = (side: "left" | "right" | "model" | "modelProps", event: React.PointerEvent) => {
-    event.preventDefault();
-    if (event.currentTarget && "setPointerCapture" in event.currentTarget) {
-      (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-    }
-    if (side === "left" && leftCollapsed) {
-      setLeftCollapsed(false);
-      setLeftWidth(leftStoredWidthRef.current || 240);
-    }
-    if (side === "right" && rightCollapsed) {
-      setRightCollapsed(false);
-      setRightWidth(rightStoredWidthRef.current || 320);
-    }
-    draggingRef.current = side;
-    startRef.current = {
-      x: event.clientX,
-      y: event.clientY,
-      left: leftWidth,
-      right: rightWidth,
-      model: modelTreeHeight,
-      modelProps: modelPropertiesWidth,
-    };
-    document.body.classList.add("dragging");
-  };
-
-  const refreshGitInfo = async (path: string) => {
-    if (!path) {
-      setGitInfo(null);
-      return;
-    }
-    try {
-      const info = await invoke<{
-        repo_root: string;
-        branch: string;
-        ahead: number;
-        behind: number;
-        clean: boolean;
-        remote_url?: string | null;
-      } | null>("detect_git_repo", { root: path });
-      setGitInfo(info || null);
-    } catch {
-      setGitInfo(null);
-    }
-  };
-
-  const openProject = async (path: string) => {
-    if (!path) return;
-    if (compileRunId) {
-      await cancelCompile();
-    }
-    await cancelBackgroundCompile();
-    closeAllTabs();
+    setActiveFilePath(null);
     setSelectedSymbol(null);
-    setCenterView("file");
-    setDescriptorViewMode("view");
-    setProjectDescriptor(null);
-    setHasProjectDescriptor(false);
-    setProjectModelView(null);
-    setProjectModelError("");
-    setProjectModelFocusQuery("");
-    setGitInfo(null);
-    setGitStatus(null);
-    setRootPath(path);
-    window.localStorage?.setItem(ROOT_STORAGE_KEY, path);
-    const next = [path, ...recentProjects.filter((p) => p !== path)].slice(0, 8);
-    setRecentProjects(next);
-    saveRecents(next);
-    await refreshRoot(path);
-    void refreshGitInfo(path);
-  };
-
-  const chooseProject = () => {
-    setOpenProjectPath("");
-    setShowOpenProject(true);
-  };
-
-  const browseOpenProject = async () => {
-    const selected = await open({ directory: true, multiple: false });
-    if (typeof selected === "string" && selected) {
-      setOpenProjectPath(selected);
+    setSemanticSelectedQname("");
+    setExpandedFileSymbols({});
+    setExpandedLibraryFiles({});
+    contentRef.current = "";
+    dirtyRef.current = false;
+    setDirty(false);
+    if (editorRef.current) {
+      suppressDirtyRef.current = true;
+      editorRef.current.setValue("");
     }
-  };
-
-  const confirmOpenProject = async () => {
-    const path = openProjectPath.trim();
-    if (!path) return;
-    await openProject(path);
-    setShowOpenProject(false);
-  };
-
-  const { navigateTo, applyEditorSelection } = useEditorNavigation({
-    centerView,
-    setCenterView,
-    activeDocPath: activeDoc.path,
-    getDoc,
-    setActiveEditorDoc,
-    queuePendingEditorContent,
-    editorValueRef,
-    suppressDirtyRef,
-    editorRef,
-    currentFilePathRef,
-    activeTabPathRef,
-    navReqRef,
-    pendingNavRef,
-    setActiveTabPath,
-    setOpenTabs,
-  });
-  const filteredGotoCandidates = useMemo(() => {
-    const raw = gotoQuery.trim().toLowerCase();
-    const baseline = gotoCandidates;
-    if (!raw) {
-      return baseline.slice(0, 300);
-    }
-    const starts: GotoSymbolCandidate[] = [];
-    const contains: GotoSymbolCandidate[] = [];
-    for (const item of baseline) {
-      const qn = item.qualified_name.toLowerCase();
-      const nm = item.name.toLowerCase();
-      if (qn.startsWith(raw) || nm.startsWith(raw)) {
-        starts.push(item);
-      } else if (qn.includes(raw) || nm.includes(raw)) {
-        contains.push(item);
-      }
-    }
-    return [...starts, ...contains].slice(0, 300);
-  }, [gotoCandidates, gotoQuery]);
-  const selectedGotoCandidate =
-    filteredGotoCandidates[Math.max(0, Math.min(gotoSelectedIndex, filteredGotoCandidates.length - 1))] || null;
+  }, [rootPath]);
 
   useEffect(() => {
-    setGotoSelectedIndex(0);
-  }, [gotoQuery, gotoCandidates.length, showGotoDialog]);
+    return () => {
+      if (cursorListenerRef.current) {
+        cursorListenerRef.current.dispose();
+        cursorListenerRef.current = null;
+      }
+      if (cursorFlushTimerRef.current !== undefined) {
+        window.clearTimeout(cursorFlushTimerRef.current);
+        cursorFlushTimerRef.current = undefined;
+      }
+    };
+  }, []);
 
-  const openGotoCandidate = useCallback(
-    async (candidate: GotoSymbolCandidate | null) => {
-      if (!candidate) return;
-      setShowGotoDialog(false);
-      setGotoQuery("");
-      setGotoSelectedIndex(0);
-      await navigateTo({
-        path: candidate.file_path,
-        name: candidate.file_path.split(/[\\/]/).pop() || candidate.name || candidate.qualified_name,
-      });
-    },
-    [navigateTo],
-  );
-
-  const handleGotoInputKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
-    if (event.key === "ArrowDown") {
-      event.preventDefault();
-      if (!filteredGotoCandidates.length) return;
-      setGotoSelectedIndex((prev) => Math.min(filteredGotoCandidates.length - 1, prev + 1));
-      return;
-    }
-    if (event.key === "ArrowUp") {
-      event.preventDefault();
-      if (!filteredGotoCandidates.length) return;
-      setGotoSelectedIndex((prev) => Math.max(0, prev - 1));
-      return;
-    }
-    if (event.key === "Enter") {
-      event.preventDefault();
-      if (!selectedGotoCandidate) return;
-      void openGotoCandidate(selectedGotoCandidate);
-      return;
-    }
-    if (event.key === "Escape") {
-      event.preventDefault();
-      setShowGotoDialog(false);
-      return;
-    }
-  };
-  const {
-    selectTab,
-    openAiViewTab,
-    openDataViewTab,
-    openProjectModelViewTab,
-    openDiagramViewTab,
-    reorderTabs,
-    closeTab,
-    closeAllTabs,
-    closeOtherTabs,
-  } = useTabs({
-    openTabs,
-    setOpenTabs,
-    activeTabPath,
-    setActiveTabPath,
-    activeTabPathRef,
-    setCenterView,
-    setActiveEditorDoc,
-    setDescriptorViewMode,
-    setProjectDescriptor,
-    setHasProjectDescriptor,
-    clearPendingEditorContent,
-    editorRef,
-    suppressDirtyRef,
-    navReqRef,
-    pendingNavRef,
-    selectedSymbol,
-    setSelectedSymbol,
-    navigateTo,
-  });
-
-  const openFile = async (entry: FileEntry) => {
-    if (entry.is_dir) {
-      void toggleExpand(entry);
-      return;
-    }
-    if (entry.path.toLowerCase().endsWith(".diagram")) {
-      openDiagramViewTab(entry.path);
-      return;
-    }
-    await navigateTo({ path: entry.path, name: entry.name });
-  };
-
-  const showContext = (event: ReactMouseEvent, entry: FileEntry) => {
-    event.preventDefault();
-    event.stopPropagation();
-    setContextMenu({ x: event.clientX, y: event.clientY, entry, scope: "node" });
-    setModelContextMenu(null);
-    setModelOptionsMenu(null);
-  };
-
-  const showRootContext = (event: ReactMouseEvent) => {
-    if (!rootPath) return;
-    event.preventDefault();
-    event.stopPropagation();
-    setContextMenu({
-      x: event.clientX,
-      y: event.clientY,
-      scope: "root",
-      entry: { name: rootPath.split(/[\\/]/).pop() || rootPath, path: rootPath, is_dir: true },
+  const applySelection = useCallback((selection: TextSelection | null | undefined) => {
+    if (!selection || !editorRef.current) return;
+    editorRef.current.setSelection({
+      startLineNumber: selection.startLine,
+      startColumn: selection.startCol,
+      endLineNumber: selection.endLine,
+      endColumn: selection.endCol,
     });
-    setModelContextMenu(null);
-    setModelOptionsMenu(null);
-  };
+    editorRef.current.revealLineInCenter(selection.startLine);
+    editorRef.current.focus();
+  }, []);
 
-  const showModelContext = (
-    event: ReactMouseEvent,
-    payload: { filePath: string | null; label: string; section: "project" | "library"; loadError?: string },
+  const openFilePath = useCallback(async (
+    path: string,
+    selection?: TextSelection,
+    options?: { preserveSymbolSelection?: boolean },
   ) => {
-    event.preventDefault();
-    event.stopPropagation();
-    setModelContextMenu({
-      x: event.clientX,
-      y: event.clientY,
-      filePath: payload.filePath,
-      label: payload.label,
-      section: payload.section,
-      loadError: payload.loadError,
-    });
-    setModelOptionsMenu(null);
-    setContextMenu(null);
-  };
-
-  const showModelOptions = (event: ReactMouseEvent<HTMLButtonElement>) => {
-    event.preventDefault();
-    event.stopPropagation();
-    const rect = event.currentTarget.getBoundingClientRect();
-    setModelOptionsMenu({ x: Math.round(rect.left), y: Math.round(rect.bottom + 4) });
-    setModelContextMenu(null);
-    setContextMenu(null);
-  };
-
-  const openAstView = async (filePath: string, label: string) => {
-    setAstViewTitle(label);
-    setAstViewOpen(true);
-    await loadAstViewForPath(filePath);
-  };
-
-  const handleContextAction = async (action: string) => {
-    const entry = contextMenu?.entry;
-    if (!entry || !rootPath) return;
-    if (action === "new-file") {
-      openNewFileDialog(entry.is_dir ? entry.path : rootPath);
-    } else if (action === "show-in-explorer") {
-      await invoke("open_in_explorer", { path: entry.path });
-    } else if (action === "open-project") {
-      if (entry.is_dir) {
-        await openProject(entry.path);
-      }
-    } else if (action === "new-folder") {
-      const name = window.prompt("Folder name:");
-      if (!name) return;
-      const parent = entry.is_dir ? entry.path : rootPath;
-      await invoke("create_dir", { root: rootPath, parent, name });
-      await refreshRoot(rootPath);
-    } else if (action === "rename") {
-      const name = window.prompt("New name:", entry.name);
-      if (!name) return;
-      await invoke("rename_path", { root: rootPath, path: entry.path, new_name: name });
-      await refreshRoot(rootPath);
+    if (!path) return;
+    if (dirtyRef.current && activeFilePath && normalizePath(activeFilePath) !== normalizePath(path)) {
+      const proceed = window.confirm("Discard unsaved changes in the current file?");
+      if (!proceed) return;
     }
-    setContextMenu(null);
-  };
+    const reqId = ++fileOpenReqRef.current;
+    try {
+      const text = await readFileText(path);
+      if (reqId !== fileOpenReqRef.current) return;
+      setActiveFilePath(path);
+      if (!options?.preserveSymbolSelection) {
+        setSelectedSymbol(null);
+        setSemanticSelectedQname("");
+      }
+      contentRef.current = text;
+      dirtyRef.current = false;
+      setDirty(false);
+      if (editorRef.current) {
+        suppressDirtyRef.current = true;
+        editorRef.current.setValue(text);
+        if (selection) {
+          applySelection(selection);
+        } else {
+          editorRef.current.setPosition({ lineNumber: 1, column: 1 });
+          editorRef.current.revealLine(1);
+        }
+      }
+    } catch (error) {
+      setCompileStatus(`Open failed: ${String(error)}`);
+    }
+  }, [activeFilePath, applySelection, setCompileStatus]);
 
-  const openProjectProperties = async () => {
-    if (!rootPath) {
-      setCompileStatus("Open a project folder first.");
+  const openEntry = useCallback(async (entry: FileEntry) => {
+    if (entry.is_dir) {
+      await toggleExpand(entry);
       return;
     }
-    setProjectPropertiesError("");
-    setProjectPropertiesBusy(true);
+    await openFilePath(entry.path);
+  }, [toggleExpand, openFilePath]);
+
+  const saveActiveFile = useCallback(async (): Promise<boolean> => {
+    if (!activeFilePath) return false;
     try {
-      const [descriptor, stdlibVersions] = await Promise.all([
-        invoke<{
-          name?: string | null;
-          author?: string | null;
-          description?: string | null;
-          organization?: string | null;
-          default_library: boolean;
-          stdlib?: string | null;
-          library?: { path: string } | string | null;
-          src?: string[];
-          import_entries?: string[];
-          raw_json?: string;
-        }>("ensure_project_descriptor", { root: rootPath }),
-        callTool<string[]>("stdlib.list_versions@v1", {}),
-      ]);
-      setProjectDescriptor(descriptor || null);
-      setHasProjectDescriptor(!!descriptor);
-      setProjectPropertiesDraft({
-        name: descriptor?.name || "",
-        author: descriptor?.author || "",
-        description: descriptor?.description || "",
-        organization: descriptor?.organization || "",
-        src: descriptor?.src || [],
-        import_entries: descriptor?.import_entries || [],
-      });
-      const library = descriptor?.library;
-      if (library && typeof library === "object" && "path" in library) {
-        setProjectStdlibMode("custom");
-        setProjectStdlibPath(library.path || "");
-        setProjectStdlibVersion("");
-      } else if (typeof library === "string" && library.trim() && library.trim().toLowerCase() !== "default") {
-        setProjectStdlibMode("custom");
-        setProjectStdlibPath(library.trim());
-        setProjectStdlibVersion("");
-      } else if (descriptor?.stdlib && descriptor.stdlib.trim() && descriptor.stdlib.trim().toLowerCase() !== "default") {
-        setProjectStdlibMode("version");
-        setProjectStdlibVersion(descriptor.stdlib);
-        setProjectStdlibPath("");
-      } else {
-        setProjectStdlibMode("default");
-        setProjectStdlibVersion("");
-        setProjectStdlibPath("");
-      }
-      setProjectStdlibVersions(Array.isArray(stdlibVersions) ? stdlibVersions : []);
-      setShowProjectProperties(true);
-    } catch (error) {
-      setProjectPropertiesError(`Project properties failed: ${String(error)}`);
-      setShowProjectProperties(true);
-    } finally {
-      setProjectPropertiesBusy(false);
-    }
-  };
-
-  const openGitDialog = async () => {
-    setShowGitDialog(true);
-    setGitCommitError("");
-    setGitPushError("");
-    setGitCommitMessage("");
-    setGitCommitSelection({});
-    if (!gitInfo) {
-      setGitStatus(null);
-      setGitStatusBusy(false);
-      setGitStatusError("No git repository detected.");
-      return;
-    }
-    setGitStatusBusy(true);
-    setGitStatusError("");
-    try {
-      const status = await invoke<{
-        staged: string[];
-        unstaged: string[];
-        untracked: string[];
-      }>("git_status", { repoRoot: gitInfo.repo_root });
-      setGitStatus(status);
-      setGitCommitSelection((prev) => {
-        if (Object.keys(prev).length) return prev;
-        const next: Record<string, boolean> = {};
-        status.staged.forEach((path) => {
-          next[path] = true;
-        });
-        return next;
-      });
-    } catch (error) {
-      setGitStatus(null);
-      setGitStatusError(`Failed to load git status: ${String(error)}`);
-    } finally {
-      setGitStatusBusy(false);
-    }
-  };
-
-  const copyRepoUrl = async () => {
-    if (!gitInfo?.remote_url) return;
-    try {
-      await navigator.clipboard.writeText(gitInfo.remote_url);
-    } catch {
-      // No-op for now.
-    }
-  };
-
-  const refreshGitBranches = async () => {
-    if (!gitInfo) return;
-    try {
-      const branches = await invoke<{ current: string; branches: string[] }>("git_list_branches", { repoRoot: gitInfo.repo_root });
-      setGitCurrentBranch(branches.current || "");
-      setGitBranches(branches.branches || []);
-      setGitCheckoutBranchName((prev) => prev || branches.current || "");
-    } catch (error) {
-      setGitBranchError(`Failed to load branches: ${String(error)}`);
-    }
-  };
-
-  const openGitBranchDialog = async () => {
-    setGitBranchError("");
-    setGitCreateBranchName("");
-    setGitCreateBranchCheckout(true);
-    setShowGitBranchDialog(true);
-    await refreshGitBranches();
-  };
-
-  const runGitCreateBranch = async () => {
-    if (!gitInfo || gitBranchBusy) return;
-    const name = gitCreateBranchName.trim();
-    if (!name) {
-      setGitBranchError("Branch name is required.");
-      return;
-    }
-    setGitBranchBusy(true);
-    setGitBranchError("");
-    try {
-      await invoke("git_create_branch", { repoRoot: gitInfo.repo_root, name, checkout: gitCreateBranchCheckout });
-      await refreshGitBranches();
-      await refreshGitInfo(gitInfo.repo_root);
-      if (gitCreateBranchCheckout) {
-        setGitCheckoutBranchName(name);
-      }
-      setGitCreateBranchName("");
-      setCompileStatus("Branch created");
-    } catch (error) {
-      setGitBranchError(`Create branch failed: ${String(error)}`);
-    } finally {
-      setGitBranchBusy(false);
-    }
-  };
-
-  const runGitCheckoutBranch = async () => {
-    if (!gitInfo || gitBranchBusy) return;
-    const name = gitCheckoutBranchName.trim();
-    if (!name) {
-      setGitBranchError("Select a branch to checkout.");
-      return;
-    }
-    setGitBranchBusy(true);
-    setGitBranchError("");
-    try {
-      await invoke("git_checkout_branch", { repoRoot: gitInfo.repo_root, name });
-      await refreshGitBranches();
-      await refreshGitInfo(gitInfo.repo_root);
-      setCompileStatus("Checked out branch");
-    } catch (error) {
-      setGitBranchError(`Checkout failed: ${String(error)}`);
-    } finally {
-      setGitBranchBusy(false);
-    }
-  };
-
-
-  const toggleCommitSelection = (path: string) => {
-    setGitCommitSelection((prev) => ({ ...prev, [path]: !prev[path] }));
-  };
-
-  const [gitCommitSectionsOpen, setGitCommitSectionsOpen] = useState({
-    changes: true,
-    unversioned: true,
-  });
-
-  const toggleCommitAll = (section: "changes" | "unversioned", checked: boolean) => {
-    if (!gitStatus) return;
-    const paths = section === "changes"
-      ? [...gitStatus.staged, ...gitStatus.unstaged]
-      : [...gitStatus.untracked];
-    setGitCommitSelection((prev) => {
-      const next = { ...prev };
-      paths.forEach((path) => {
-        next[path] = checked;
-      });
-      return next;
-    });
-  };
-
-  const stageCommitSelection = async () => {
-    if (!gitInfo || !gitStatus) return false;
-    const selected = Object.entries(gitCommitSelection)
-      .filter(([, value]) => value)
-      .map(([path]) => path);
-    if (!selected.length) {
-      setGitCommitError("Select files to commit.");
-      return false;
-    }
-    const stagedSet = new Set(gitStatus.staged);
-    const toUnstage = gitStatus.staged.filter((path) => !gitCommitSelection[path]);
-    const toStage = selected.filter((path) => !stagedSet.has(path));
-    try {
-      if (toUnstage.length) {
-        await invoke("git_unstage_paths", { repoRoot: gitInfo.repo_root, paths: toUnstage });
-      }
-      if (toStage.length) {
-        await invoke("git_stage_paths", { repoRoot: gitInfo.repo_root, paths: toStage });
-      }
-      const status = await invoke<{
-        staged: string[];
-        unstaged: string[];
-        untracked: string[];
-      }>("git_status", { repoRoot: gitInfo.repo_root });
-      setGitStatus(status);
+      await invoke("write_file", { path: activeFilePath, content: contentRef.current });
+      dirtyRef.current = false;
+      setDirty(false);
+      setCompileStatus(`Saved ${activeFilePath.split(/[\\/]/).pop() || activeFilePath}`);
       return true;
     } catch (error) {
-      setGitCommitError(`Stage failed: ${String(error)}`);
+      setCompileStatus(`Save failed: ${String(error)}`);
       return false;
     }
-  };
+  }, [activeFilePath, setCompileStatus]);
 
-  const runGitCommitFlow = async (pushAfter: boolean) => {
-    if (!gitInfo || gitCommitBusy || gitPushBusy) return;
-    const message = gitCommitMessage.trim();
-    if (!message) {
-      setGitCommitError("Commit message is required.");
-      return;
-    }
-    setGitCommitBusy(true);
-    setGitPushBusy(pushAfter);
-    setGitCommitError("");
-    setGitPushError("");
-    try {
-      const ok = await stageCommitSelection();
-      if (!ok) {
-        return;
-      }
-      await invoke<string>("git_commit", { repoRoot: gitInfo.repo_root, message });
-      if (pushAfter) {
-        await invoke("git_push", { repoRoot: gitInfo.repo_root });
-      }
-      await refreshGitInfo(gitInfo.repo_root);
-      const status = await invoke<{
-        staged: string[];
-        unstaged: string[];
-        untracked: string[];
-      }>("git_status", { repoRoot: gitInfo.repo_root });
-      setGitStatus(status);
-      setShowGitDialog(false);
-      setGitCommitMessage("");
-      setCompileStatus(pushAfter ? "Commit and push complete" : "Commit created");
-    } catch (error) {
-      if (pushAfter) {
-        setGitPushError(`Commit/push failed: ${String(error)}`);
-      } else {
-        setGitCommitError(`Commit failed: ${String(error)}`);
-      }
-    } finally {
-      setGitCommitBusy(false);
-      setGitPushBusy(false);
-    }
-  };
-
-  const addProjectFile = () => {
-    const value = projectFileInput.trim();
-    if (!value) return;
-    setProjectPropertiesDraft((prev) => ({
-      ...prev,
-      src: prev.src.includes(value) ? prev.src : [...prev.src, value],
-    }));
-    setProjectFileInput("");
-  };
-
-  const removeProjectFile = (value: string) => {
-    setProjectPropertiesDraft((prev) => ({
-      ...prev,
-      src: prev.src.filter((entry) => entry !== value),
-    }));
-  };
-
-  const addProjectLibrary = () => {
-    const value = projectLibraryInput.trim();
-    if (!value) return;
-    setProjectPropertiesDraft((prev) => ({
-      ...prev,
-      import_entries: prev.import_entries.includes(value) ? prev.import_entries : [...prev.import_entries, value],
-    }));
-    setProjectLibraryInput("");
-  };
-
-  const removeProjectLibrary = (value: string) => {
-    setProjectPropertiesDraft((prev) => ({
-      ...prev,
-      import_entries: prev.import_entries.filter((entry) => entry !== value),
-    }));
-  };
-
-  const saveProjectProperties = async () => {
-    if (!rootPath) return;
-    setProjectPropertiesError("");
-    if (projectStdlibMode === "version" && !projectStdlibVersion.trim()) {
-      setProjectPropertiesError("Select a stdlib version.");
-      return;
-    }
-    if (projectStdlibMode === "custom" && !projectStdlibPath.trim()) {
-      setProjectPropertiesError("Enter a stdlib path.");
-      return;
-    }
-    setProjectPropertiesBusy(true);
-    try {
-      const trimmedName = projectPropertiesDraft.name.trim();
-      const trimmedAuthor = projectPropertiesDraft.author.trim();
-      const trimmedDescription = projectPropertiesDraft.description.trim();
-      const trimmedOrganization = projectPropertiesDraft.organization.trim();
-      const stdlibPayload =
-        projectStdlibMode === "default"
-          ? "default"
-          : projectStdlibMode === "version"
-            ? projectStdlibVersion.trim()
-            : null;
-      const libraryPayload =
-        projectStdlibMode === "custom" ? { path: projectStdlibPath.trim() } : null;
-      const descriptor = await invoke<{
-        name?: string | null;
-        author?: string | null;
-        description?: string | null;
-        organization?: string | null;
-        default_library: boolean;
-        stdlib?: string | null;
-        library?: { path: string } | string | null;
-        src?: string[];
-        import_entries?: string[];
-        raw_json?: string;
-      }>("update_project_descriptor", {
-        payload: {
-          root: rootPath,
-          name: trimmedName || null,
-          author: trimmedAuthor || null,
-          description: trimmedDescription || null,
-          organization: trimmedOrganization || null,
-          src: projectPropertiesDraft.src,
-          import_entries: projectPropertiesDraft.import_entries,
-          stdlib: stdlibPayload,
-          library: libraryPayload,
-        },
-      });
-      setProjectDescriptor(descriptor || null);
-      setHasProjectDescriptor(!!descriptor);
-      setShowProjectProperties(false);
-    } catch (error) {
-      setProjectPropertiesError(String(error));
-    } finally {
-      setProjectPropertiesBusy(false);
-    }
-  };
-
-  const createNewFile = async () => {
-    if (!rootPath || !newFileName) return;
-    const normRoot = rootPath.replace(/[\\/]+/g, "\\").toLowerCase();
-    const parentCandidate = newFileParent || rootPath;
-    const normParentCandidate = parentCandidate.replace(/[\\/]+/g, "\\").toLowerCase();
-    const parent = normParentCandidate.startsWith(normRoot) ? parentCandidate : rootPath;
-    const trimmed = newFileName.trim();
-      const baseName = trimmed.split(/[\\/]/).pop() || trimmed;
-      const extension =
-        newFileType === "diagram" ? ".diagram" : newFileType === "kerml" ? ".kerml" : ".sysml";
-      const finalName = baseName.toLowerCase().endsWith(extension) ? baseName : `${baseName}${extension}`;
-      const normalizedParent = parent.replace(/[\\/]+$/, "");
-      const createdPath = `${normalizedParent}\\${finalName}`;
-      if (newFileType === "diagram") {
-        await invoke<string>("create_file", { root: rootPath, parent, name: finalName });
-        await invoke("write_diagram", {
-          root: rootPath,
-          path: createdPath,
-          diagram: { version: 1, diagram_type: "bdd", nodes: [], offsets: {}, sizes: {} },
-        });
-      } else {
-        await invoke("create_file", { root: rootPath, parent, name: finalName });
-      }
-      setShowNewFile(false);
-      setNewFileName("");
-      await refreshRoot(rootPath);
-      await navigateTo({ path: createdPath, name: finalName });
+  const addHarnessRun = useCallback((kind: "project" | "file", ok: boolean, durationMs: number) => {
+    harnessRunIdRef.current += 1;
+    const run: HarnessRun = {
+      id: harnessRunIdRef.current,
+      kind,
+      ok,
+      durationMs,
+      at: new Date().toLocaleTimeString(),
     };
-
-  const getDefaultBuildPath = (format: "jsonld" | "kpar" | "xmi") => {
-    if (!rootPath) return "";
-    const folder = `${rootPath}\\build`;
-    const ext = format;
-    return `${folder}\\model.${ext}`;
-  };
-
-  const openBuildOptions = () => {
-    setExportFormat("jsonld");
-    setExportIncludeStdlib(true);
-    setExportAfterBuild(false);
-    setExportPath(getDefaultBuildPath("jsonld"));
-    setShowExport(true);
-  };
-
-  const runExportModel = async () => {
-    if (!rootPath || !exportPath) {
-      setCompileStatus("Export requires a project root and output path");
-      return;
-    }
-    if (rootPath && exportPath.startsWith(rootPath)) {
-      const buildDir = `${rootPath}\\build`;
-      if (exportPath.toLowerCase().startsWith(buildDir.toLowerCase())) {
-        await invoke("create_dir", { root: rootPath, parent: rootPath, name: "build" }).catch(() => {});
-      }
-    }
-    try {
-      setExportBusy(true);
-      await invoke("export_compiled_model", {
-        payload: {
-          root: rootPath,
-          output: exportPath,
-          format: exportFormat,
-          include_stdlib: exportIncludeStdlib,
-        },
-      });
-      setCompileStatus("Export complete");
-      setShowExport(false);
-    } catch (error) {
-      setCompileStatus(`Export failed: ${error}`);
-    } finally {
-      setExportBusy(false);
-    }
-  };
-
-  const runBuildWithOptions = async () => {
-    if (!rootPath) {
-      setCompileStatus("Build requires a project root");
-      return;
-    }
-    const ok = await runCompile();
-    if (exportAfterBuild) {
-      if (!exportPath) {
-        setCompileStatus("Export after build requires an output path");
-        return;
-      }
-      if (ok) {
-        await runExportModel();
-      }
-    }
-  };
-
-  useEffect(() => {
-    if (rootPath) {
-      void refreshRoot(rootPath);
-      void runBackgroundCompile(rootPath);
-    }
+    setHarnessRuns((prev) => [run, ...prev].slice(0, 16));
   }, []);
 
-  useEffect(() => {
-    if (!rootPath) return;
-    void invoke("set_watch_root", { root: rootPath }).catch(() => {});
-  }, [rootPath]);
-
-  useEffect(() => {
-    const unlistenPromise = listen<{ path: string; kind: string }>("fs-changed", async (event) => {
-      if (!rootPath) return;
-      const changedPath = event?.payload?.path;
-      if (changedPath) {
-        const cached = getDoc(changedPath);
-        if (cached && !cached.dirty) {
-          try {
-            const content = await readFileText(changedPath);
-            updateDocContent(changedPath, content || "", false);
-            if (currentFilePathRef.current === changedPath && editorRef.current && centerView === "file") {
-              suppressDirtyRef.current = true;
-              editorRef.current.setValue(content || "");
-            }
-          } catch {
-            // ignore
-          }
-        }
-      }
-      if (fsChangeTimerRef.current) {
-        window.clearTimeout(fsChangeTimerRef.current);
-      }
-      fsChangeTimerRef.current = window.setTimeout(() => {
-        fsChangeTimerRef.current = null;
-        void refreshRoot(rootPath);
-        void runBackgroundCompile(rootPath);
-      }, 200);
-    });
-    return () => {
-      if (fsChangeTimerRef.current) {
-        window.clearTimeout(fsChangeTimerRef.current);
-        fsChangeTimerRef.current = null;
-      }
-      unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
-    };
-  }, [rootPath]);
-
-  useEffect(() => {
-  }, [compileRunId]);
-
-
-
-
-
-  const handleEditorMount: OnMount = (editorInstance, monaco) => {
-    editorRef.current = editorInstance;
-    monacoRef.current = monaco;
-    if (cursorListenerRef.current) {
-      cursorListenerRef.current.dispose();
-      cursorListenerRef.current = null;
-    }
-    cursorListenerRef.current = editorInstance.onDidChangeCursorPosition((event) => {
-      updateCursorPos(event.position.lineNumber, event.position.column);
-    });
-    const initialPos = editorInstance.getPosition();
-    if (initialPos) {
-      updateCursorPos(initialPos.lineNumber, initialPos.column);
-    }
-    const pendingEditorContent = consumePendingEditorContent(currentFilePathRef.current);
-    if (pendingEditorContent != null) {
-      editorInstance.setValue(pendingEditorContent);
-    }
-    if (pendingNavRef.current && pendingNavRef.current.path === currentFilePathRef.current) {
-      applyEditorSelection(pendingNavRef.current.selection);
-      editorInstance.focus();
-      pendingNavRef.current = null;
-    }
-    if (monaco.languages.getLanguages().some((lang) => lang.id === "sysml")) return;
-    monaco.languages.register({ id: "sysml" });
-    monaco.languages.setMonarchTokensProvider("sysml", {
-      keywords: [
-        "package",
-        "import",
-        "part",
-        "item",
-        "action",
-        "port",
-        "attribute",
-        "connection",
-        "interface",
-        "allocation",
-        "requirement",
-        "constraint",
-        "state",
-        "calculation",
-        "usecase",
-        "analysis",
-        "concern",
-        "view",
-        "viewpoint",
-        "rendering",
-        "enum",
-        "definition",
-        "def",
-        "usage",
-        "alias",
-        "private",
-        "public",
-        "specializes",
-        "subsets",
-        "redefines",
-        "satisfies",
-        "perform",
-        "performs",
-        "exhibits",
-        "include",
-        "assert",
-        "verify",
-      ],
-      typeKeywords: ["Boolean", "Integer", "Real", "String", "Natural"],
-      operators: [":", "::", "=", "->", "<-", ":>", ":>>", "::>"],
-      tokenizer: {
-        root: [
-          [/[a-zA-Z_][\w$]*/, {
-            cases: {
-              "@keywords": "keyword",
-              "@typeKeywords": "type",
-              "@default": "identifier",
-            },
-          }],
-          { include: "@whitespace" },
-          [/\d+\.?\d*/, "number"],
-          [/\"([^\"\\]|\\.)*$/, "string.invalid"],
-          [/\"/, { token: "string.quote", bracket: "@open", next: "@string" }],
-          [/[{}()[\]]/, "@brackets"],
-          [/[;,.]/, "delimiter"],
-          [/(::>|\:>>|\:>|\:\:|->|<-|=|:)/, "operator"],
-        ],
-        whitespace: [
-          [/[ \t\r\n]+/, "white"],
-          [/\/\/.*$/, "comment"],
-          [/\/\*/, { token: "comment", next: "@comment" }],
-        ],
-        comment: [
-          [/[^/*]+/, "comment"],
-          [/\*\//, { token: "comment", next: "@pop" }],
-          [/[/\*]/, "comment"],
-        ],
-        string: [
-          [/[^\\"]+/, "string"],
-          [/\\./, "string.escape"],
-          [/\"/, { token: "string.quote", bracket: "@close", next: "@pop" }],
-        ],
-      },
-    });
-
-    // Ensure Ctrl+/ toggles line comments.
-    editorInstance.addAction({
-      id: "toggle-line-comment",
-      label: "Toggle Line Comment",
-      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Slash],
-      run: () => editorInstance.getAction("editor.action.commentLine")?.run(),
-    });
-    monaco.editor.setTheme(appTheme === "light" ? "vs" : "vs-dark");
-    editorInstance.focus();
-  };
-
-  useEffect(() => {
-    if (!activeEditorPath) return;
-    const monaco = monacoRef.current;
-    const editor = editorRef.current;
-    if (!monaco || !editor) return;
-    const model = editor.getModel();
-    if (!model) return;
-    const reqId = ++parseReqRef.current;
-    const timer = window.setTimeout(() => {
-      invoke<{
-        path: string;
-        errors: Array<{ message: string; line: number; column: number; kind: string }>;
-      }>("get_parse_errors_for_content", { path: activeEditorPath, content: editorValueRef.current })
-        .then((payload) => {
-          if (reqId !== parseReqRef.current) return;
-          const markers = (payload?.errors || []).map((err) => ({
-            severity: monaco.MarkerSeverity.Error,
-            message: err.message,
-            startLineNumber: err.line || 1,
-            startColumn: err.column || 1,
-            endLineNumber: err.line || 1,
-            endColumn: (err.column || 1) + 1,
-          }));
-          monaco.editor.setModelMarkers(model, "sysml-parse", markers);
-          setEditorParseError(activeEditorPath, markers.length > 0);
-        })
-        .catch(() => {
-          if (reqId !== parseReqRef.current) return;
-          monaco.editor.setModelMarkers(model, "sysml-parse", []);
-          setEditorParseError(activeEditorPath, false);
-        });
-    }, 450);
-    return () => window.clearTimeout(timer);
-  }, [editorChangeTick, activeEditorPath, setEditorParseError]);
-
-  useEffect(() => {
-    if (!rootPath || !activeEditorPath) return;
-    const content = editorValueRef.current;
-    if (lastCompiledContentRef.current[activeEditorPath] === content) return;
-    const timer = window.setTimeout(() => {
-      void runBackgroundCompileWithUnsaved(rootPath, activeEditorPath, content).then((started) => {
-        if (started) {
-          lastCompiledContentRef.current[activeEditorPath] = content;
-        }
-      });
-    }, 800);
-    return () => window.clearTimeout(timer);
-  }, [editorChangeTick, activeEditorPath, rootPath]);
-
-  const selectSymbolInEditor = async (symbol: SymbolView) => {
-    if (!symbol || !symbol.file_path) return;
-    const startLine = Math.max(1, symbol.start_line || 1);
-    const startCol = Math.max(1, symbol.start_col || 1);
-    let endLine = Math.max(startLine, symbol.end_line || symbol.start_line || 1);
-    let endCol = Math.max(1, symbol.end_col || symbol.start_col || 1);
-    if (endLine === startLine && endCol < startCol) {
-      endCol = startCol;
-    }
-    if (endLine === startLine && endCol === startCol) {
-      endCol = startCol + 1;
-    }
-    await navigateTo({
-      path: symbol.file_path,
-      name: symbol.file_path.split(/[\\/]/).pop() || "Untitled",
-      selection: {
-        startLine,
-        startCol,
-        endLine,
-        endCol,
-      },
-    });
-  };
-
-  const openQualifiedNameInSource = useCallback(
-    async (qualifiedName: string) => {
-      const qname = qualifiedName.trim();
-      if (!qname) return;
-      if (!rootPath) {
-        setCompileStatus("Open a project folder first.");
-        return;
-      }
-      type SemanticQueryPayload = {
-        metatype?: string | null;
-        metatype_is_a?: string | null;
-        predicates: Array<{ name: string; equals: string }>;
-      };
-      type SemanticElementResult = {
-        file_path: string;
-      };
-      try {
-        const query: SemanticQueryPayload = {
-          metatype: null,
-          metatype_is_a: null,
-          predicates: [{ name: "qualified_name", equals: qname }],
-        };
-        const matches = await callTool<SemanticElementResult[]>("core.query_semantic@v1", {
-          root: rootPath,
-          query,
-        });
-        const first = Array.isArray(matches) ? matches.find((item) => item?.file_path) || null : null;
-        if (!first?.file_path) {
-          setCompileStatus(`No source found for ${qname}`);
-          return;
-        }
-        await navigateTo({
-          path: first.file_path,
-          name: first.file_path.split(/[\\/]/).pop() || qname,
-        });
-      } catch (error) {
-        setCompileStatus(`Lookup failed for ${qname}: ${String(error)}`);
-      }
-    },
-    [navigateTo, rootPath, setCompileStatus],
-  );
-
-  const evaluateTerminalExpression = async (rawExpr: string): Promise<string> => {
-    if (!rawExpr.trim()) return "Error = missing expression";
-    if (!rootPath) return "Error = no project root selected";
-    try {
-      const value = await invoke<string>("eval_expression", { root: rootPath, expression: rawExpr });
-      return `Result = ${value}`;
-    } catch (error) {
-      return `Error = ${String(error)}`;
-    }
-  };
-
-  const normalizeTerminalRef = (value: string) => value.trim().replace(/\./g, "::");
-
-  const appendTerminalLines = (next: string[]) => {
-    updateActiveTerminalTab((tab) => ({ ...tab, lines: [...tab.lines, ...next].slice(-300) }));
-  };
-
-  const toggleTerminal = () => {
-    setShowTerminal((prev) => {
-      const next = !prev;
-      if (next) ensureTerminalTab();
-      return next;
-    });
-  };
-
-  const inspectByType = (raw: string): string[] => {
-    const needle = raw.trim().toLowerCase();
-    if (!needle) return ["Error = missing type query"];
-    const projectSymbols = symbols.filter((symbol) => !isPathWithin(symbol.file_path, libraryPath));
-    const matches = projectSymbols.filter((symbol) => {
-      const kind = (symbol.kind || "").toLowerCase();
-      if (kind === needle) return true;
-      const metatype = (symbol.properties || []).find(
-        (prop) => prop.name === "metatype_qname" && prop.value?.type === "text",
-      );
-      if (metatype && metatype.value.type === "text") {
-        const value = (metatype.value.value || "").toLowerCase();
-        return value.endsWith(needle) || value.includes(needle);
-      }
+  const compileProject = useCallback(async (): Promise<boolean> => {
+    if (!rootPath) {
+      setCompileStatus("Compile requires a project root");
       return false;
-    });
-    if (!matches.length) return [`Result = no symbols for type '${raw.trim()}'`];
-    const lines = [`Result = ${matches.length} symbols`];
-    matches.slice(0, 20).forEach((symbol) => {
-      lines.push(
-        `- ${symbol.kind} ${symbol.qualified_name} @ ${symbol.file_path}:${symbol.start_line || 0}`,
-      );
-    });
-    if (matches.length > 20) {
-      lines.push(`... ${matches.length - 20} more`);
     }
-    return lines;
-  };
+    const start = typeof performance !== "undefined" ? performance.now() : Date.now();
+    const ok = await runCompile();
+    const elapsed = (typeof performance !== "undefined" ? performance.now() : Date.now()) - start;
+    addHarnessRun("project", ok, elapsed);
+    return ok;
+  }, [rootPath, runCompile, setCompileStatus, addHarnessRun]);
 
-  const inspectSymbol = (raw: string): string[] => {
-    const query = normalizeTerminalRef(raw);
-    if (!query) return ["Error = missing symbol query"];
-    const projectSymbols = symbols.filter((symbol) => !isPathWithin(symbol.file_path, libraryPath));
-    let symbol = projectSymbols.find((item) => (item.qualified_name || "").trim() === query);
-    if (!symbol) {
-      symbol = projectSymbols.find((item) => (item.name || "").trim() === query);
+  const compileActiveFile = useCallback(async (): Promise<boolean> => {
+    if (!rootPath) {
+      setCompileStatus("Compile requires a project root");
+      return false;
     }
-    if (!symbol) {
-      const partial = projectSymbols.filter((item) => {
-        const qn = (item.qualified_name || "").trim();
-        return qn.endsWith(`::${query}`) || qn.includes(query);
-      });
-      if (!partial.length) return [`Result = symbol '${raw.trim()}' not found`];
-      const lines = [`Result = ${partial.length} matches`];
-      partial.slice(0, 20).forEach((item) => {
-        lines.push(`- ${item.kind} ${item.qualified_name} @ ${item.file_path}:${item.start_line || 0}`);
-      });
-      if (partial.length > 20) lines.push(`... ${partial.length - 20} more`);
-      return lines;
+    if (!activeFilePath || !isSemanticSource(activeFilePath)) {
+      return compileProject();
     }
-    const lines = [
-      `Result = ${symbol.kind} ${symbol.qualified_name}`,
-      `file = ${symbol.file_path}`,
-      `span = ${symbol.start_line || 0}:${symbol.start_col || 0} - ${symbol.end_line || 0}:${symbol.end_col || 0}`,
-    ];
-    const properties = symbol.properties || [];
-    if (properties.length) {
-      lines.push("properties:");
-      properties.slice(0, 16).forEach((prop) => {
-        const value =
-          prop.value.type === "text"
-            ? prop.value.value
-            : prop.value.type === "number"
-              ? String(prop.value.value)
-              : prop.value.type === "bool"
-                ? String(prop.value.value)
-                : `[${prop.value.items.join(", ")}]`;
-        lines.push(`- ${prop.name} = ${value}`);
-      });
-      if (properties.length > 16) lines.push(`... ${properties.length - 16} more properties`);
-    }
-    const rels = symbol.relationships || [];
-    if (rels.length) {
-      lines.push("relationships:");
-      rels.slice(0, 12).forEach((rel) => {
-        lines.push(`- ${rel.kind} -> ${rel.resolved_target || rel.target}`);
-      });
-      if (rels.length > 12) lines.push(`... ${rels.length - 12} more relationships`);
-    }
-    return lines;
-  };
-
-  const runTerminalCommand = async () => {
-    const command = (activeTerminalTab?.input || "").trim();
-    if (!command) return;
-    updateActiveTerminalTab((tab) => ({
-      ...tab,
-      history: [...tab.history, command].slice(-200),
-      historyIndex: null,
-      input: "",
-    }));
-    appendTerminalLines([`> ${command}`]);
-    if (command.toLowerCase().startsWith("eval ")) {
-      const expr = command.slice(5);
-      const result = await evaluateTerminalExpression(expr);
-      appendTerminalLines([result]);
-      return;
-    }
-    if (command.toLowerCase().startsWith("inspect ")) {
-      const rest = command.slice(8).trim();
-      if (rest.toLowerCase().startsWith("type ")) {
-        appendTerminalLines(inspectByType(rest.slice(5)));
-      } else {
-        appendTerminalLines(inspectSymbol(rest));
-      }
-      return;
-    }
-    appendTerminalLines(["Error = unknown command (try: eval A.x or inspect A.x or inspect type Usage)"]);
-  };
-
-  const autocompleteTerminalEval = () => {
-    const trimmed = (activeTerminalTab?.input || "").trim().toLowerCase();
-    if (trimmed === "e" || trimmed === "ev" || trimmed === "eva" || trimmed === "eval") {
-      updateActiveTerminalTab((tab) => ({ ...tab, input: "eval " }));
-    }
-  };
-
-  const terminalHistoryUp = () => {
-    updateActiveTerminalTab((tab) => {
-      if (!tab.history.length) return tab;
-      if (tab.historyIndex == null) {
-        const nextIndex = tab.history.length - 1;
-        return { ...tab, historyIndex: nextIndex, input: tab.history[nextIndex] || "" };
-      }
-      const nextIndex = Math.max(0, tab.historyIndex - 1);
-      return { ...tab, historyIndex: nextIndex, input: tab.history[nextIndex] || "" };
-    });
-  };
-
-  const terminalHistoryDown = () => {
-    updateActiveTerminalTab((tab) => {
-      if (!tab.history.length || tab.historyIndex == null) return tab;
-      const lastIndex = tab.history.length - 1;
-      if (tab.historyIndex >= lastIndex) {
-        return { ...tab, historyIndex: null, input: "" };
-      }
-      const nextIndex = tab.historyIndex + 1;
-      return { ...tab, historyIndex: nextIndex, input: tab.history[nextIndex] || "" };
-    });
-  };
-
-  const createTerminalTab = () => {
-    terminalTabCounterRef.current += 1;
-    const id = `term-${terminalTabCounterRef.current}`;
-    const next: TerminalTabState = {
-      id,
-      title: `Terminal ${terminalTabCounterRef.current}`,
-      input: "",
-      lines: [],
-      history: [],
-      historyIndex: null,
-    };
-    setTerminalTabs((prev) => [...prev, next]);
-    setActiveTerminalTabId(id);
-    setShowTerminal(true);
-  };
-
-  const closeTerminalTab = (id: string) => {
-    setTerminalTabs((prev) => {
-      const idx = prev.findIndex((tab) => tab.id === id);
-      if (idx < 0) return prev;
-      const next = prev.filter((tab) => tab.id !== id);
-      if (!next.length) {
-        setShowTerminal(false);
-        setActiveTerminalTabId(null);
-        return next;
-      }
-      if (activeTerminalTabId === id) {
-        const fallback = next[Math.max(0, idx - 1)]?.id || next[0].id;
-        setActiveTerminalTabId(fallback);
-      }
-      return next;
-    });
-  };
-
-
-  const saveActiveTab = async () => {
-    if (!activeEditorPath) return;
-    await invoke("write_file", { path: activeEditorPath, content: editorValueRef.current });
-    setOpenTabs((prev) => prev.map((tab) => (tab.path === activeEditorPath ? { ...tab, dirty: false } : tab)));
-    markSaved();
-  };
-
-  useEffect(() => {
-    if (!activeEditorPath) return;
-    if (suppressDirtyRef.current) {
-      suppressDirtyRef.current = false;
-      setOpenTabs((prev) =>
-        prev.map((tab) =>
-          tab.path === activeEditorPath ? { ...tab, dirty: false } : tab,
-        ),
-      );
-      return;
-    }
-    const isDirty = activeDoc.path === activeEditorPath ? activeDoc.dirty : false;
-    setOpenTabs((prev) =>
-      prev.map((tab) =>
-        tab.path === activeEditorPath ? { ...tab, dirty: isDirty } : tab,
-      ),
-    );
-  }, [editorChangeTick, activeEditorPath, activeDoc]);
+    const start = typeof performance !== "undefined" ? performance.now() : Date.now();
+    const ok = await runCompile(activeFilePath);
+    const elapsed = (typeof performance !== "undefined" ? performance.now() : Date.now()) - start;
+    addHarnessRun("file", ok, elapsed);
+    return ok;
+  }, [rootPath, activeFilePath, runCompile, compileProject, setCompileStatus, addHarnessRun]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      const key = event.key.toLowerCase();
-      const isBuild = (event.ctrlKey || event.metaKey) && key === "b";
-      const isSave = (event.ctrlKey || event.metaKey) && key === "s";
-      const isTerminalToggle = (event.ctrlKey || event.metaKey) && key === "t";
-      const isGoto = (event.ctrlKey || event.metaKey) && key === "g";
-      if (event.key === "Escape") {
-        if (aiFloatingSteps.length) {
-          setAiFloatingSteps([]);
-          return;
-        }
-        if (openMenu) {
-          setOpenMenu(null);
-          return;
-        }
-        if (contextMenu) {
-          setContextMenu(null);
-          return;
-        }
-        if (tabMenu) {
-          setTabMenu(null);
-          return;
-        }
-        if (activeTabPath === PROJECT_DESCRIPTOR_TAB) {
-          closeTab(PROJECT_DESCRIPTOR_TAB);
-          return;
-        }
-        if (showSettings) {
-          setShowSettings(false);
-          return;
-        }
-        if (showProjectProperties) {
-          setShowProjectProperties(false);
-          return;
-        }
-        if (showExport) {
-          setShowExport(false);
-          return;
-        }
-        if (showNewFile) {
-          setShowNewFile(false);
-          return;
-        }
-        if (showOpenProject) {
-          setShowOpenProject(false);
-          return;
-        }
-        if (showNewProject) {
-          setShowNewProject(false);
-          return;
-        }
-        if (showGotoDialog) {
-          setShowGotoDialog(false);
-          return;
-        }
+      const lowered = event.key.toLowerCase();
+      if ((event.ctrlKey || event.metaKey) && lowered === "s") {
+        event.preventDefault();
+        void saveActiveFile();
         return;
       }
-      if (isGoto) {
+      if (event.key === "F5") {
         event.preventDefault();
-        setShowGotoDialog(true);
-        return;
-      }
-      if (isBuild) {
-        event.preventDefault();
-        runCompile();
-        return;
-      }
-      if (isSave) {
-        event.preventDefault();
-        void saveActiveTab();
-        return;
-      }
-      if (isTerminalToggle) {
-        event.preventDefault();
-        toggleTerminal();
-        return;
-      }
-      if (event.key === "F10") {
-        event.preventDefault();
-        if (activeTabPath === PROJECT_DESCRIPTOR_TAB) {
-          setDescriptorViewMode((prev) => (prev === "view" ? "json" : "view"));
-          return;
-        }
-        if (activeTabMeta?.kind === "diagram") {
-          if (activeTabMeta.sourcePath) {
-            void navigateTo({ path: activeTabMeta.sourcePath });
-          }
-          return;
-        }
-        if (!activeEditorPath) return;
-        if (!activeEditorPath.toLowerCase().endsWith(".diagram")) return;
-        if (editorRef.current) {
-          queuePendingEditorContent(activeEditorPath, editorValueRef.current);
-        }
-        openDiagramViewTab(activeEditorPath);
+        void compileProject();
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeTabPath, activeTabMeta, activeEditorPath, aiFloatingSteps.length, contextMenu, openMenu, showExport, showGotoDialog, showNewFile, showNewProject, showOpenProject, showProjectProperties, showSettings, tabMenu]);
+  }, [saveActiveFile, compileProject]);
 
-  const resetEndpointDraft = () => {
-    setEndpointDraft({ name: "", url: "", type: "chat", provider: "openai", model: "", token: "" });
-  };
-
-  const saveEndpointDraft = () => {
-    const name = endpointDraft.name.trim();
-    const url = endpointDraft.url.trim();
-    if (!name || !url) return;
-    setAiEndpoints((prev) => {
-      if (endpointDraft.id) {
-        return prev.map((endpoint) =>
-          endpoint.id === endpointDraft.id
-            ? {
-                ...endpoint,
-                name,
-                url,
-                type: endpointDraft.type,
-                provider: endpointDraft.provider,
-                model: endpointDraft.model.trim(),
-                token: endpointDraft.token,
-              }
-            : endpoint,
-        );
-      }
-      const id = crypto.randomUUID();
-      return [
-        ...prev,
-        {
-          id,
-          name,
-          url,
-          type: endpointDraft.type,
-          provider: endpointDraft.provider,
-          model: endpointDraft.model.trim(),
-          token: endpointDraft.token,
-        },
-      ];
-    });
-    resetEndpointDraft();
-  };
-
-  const editEndpoint = (endpointId: string) => {
-    const endpoint = aiEndpoints.find((item) => item.id === endpointId);
-    if (!endpoint) return;
-    setEndpointDraft({ ...endpoint });
-  };
-
-  const deleteEndpoint = (endpointId: string) => {
-    setAiEndpoints((prev) => prev.filter((item) => item.id !== endpointId));
-    setEndpointTestStatus((prev) => {
-      const next = { ...prev };
-      delete next[endpointId];
-      return next;
-    });
-    if (selectedChatEndpoint === endpointId) setSelectedChatEndpoint(null);
-  };
-
-  const testEndpoint = async (endpointId: string) => {
-    const endpoint = aiEndpoints.find((item) => item.id === endpointId);
-    if (!endpoint) return;
-    if (!endpoint.url || !endpoint.url.trim()) {
-      setEndpointTestStatus((prev) => ({ ...prev, [endpointId]: "fail: missing url" }));
-      return;
-    }
-    setEndpointTestStatus((prev) => ({ ...prev, [endpointId]: "testing..." }));
+  const runHarness = useCallback(async (iterations: number) => {
+    if (harnessActiveRef.current) return;
+    harnessActiveRef.current = true;
+    setHarnessRunning(true);
     try {
-      const response = await invoke<{ ok: boolean; status?: number; detail?: string }>("ai_test_endpoint", {
-        payload: {
-          url: endpoint.url || "",
-          type: endpoint.type,
-          provider: endpoint.provider,
-          model: endpoint.model || null,
-          token: endpoint.token || null,
-        },
-      });
-      if (!response?.ok) {
-        const status = response?.status ? ` ${response.status}` : "";
-        const detail = response?.detail ? ` ${response.detail}` : "";
-        setEndpointTestStatus((prev) => ({ ...prev, [endpointId]: `fail:${status}${detail}`.trim() }));
-        return;
+      for (let i = 0; i < iterations; i += 1) {
+        // Keep loop deterministic: always compile full project for repeatability.
+        await compileProject();
       }
-      setEndpointTestStatus((prev) => ({ ...prev, [endpointId]: "pass" }));
-    } catch (error) {
-      setEndpointTestStatus((prev) => ({ ...prev, [endpointId]: `fail: ${String(error)}` }));
-    }
-  };
-
-  const saveDefaultStdlibSelection = async () => {
-    setSettingsStdlibBusy(true);
-    setSettingsStdlibStatus("Saving...");
-    try {
-      const selected = settingsDefaultStdlib.trim();
-      const saved = await callTool<string | null>("stdlib.set_default@v1", {
-        stdlib: selected ? selected : null,
-      });
-      setSettingsDefaultStdlib(saved || "");
-      setSettingsStdlibStatus("Saved default stdlib.");
-    } catch (error) {
-      setSettingsStdlibStatus(`Failed to save stdlib setting: ${String(error)}`);
     } finally {
-      setSettingsStdlibBusy(false);
+      harnessActiveRef.current = false;
+      setHarnessRunning(false);
     }
-  };
+  }, [compileProject]);
 
-  const sendAiMessage = async (text: string) => {
-    const endpoint = selectedChatEndpoint ? aiEndpoints.find((item) => item.id === selectedChatEndpoint) : null;
-    const requestId = ++aiRequestRef.current;
-    setAiMessages((prev) => [
-      ...prev,
-      { role: "user", text, raw: text },
-      { role: "assistant", text: "...", raw: "...", pendingId: requestId },
-    ]);
-    setAiInput("");
-    setAiHistoryIndex(null);
-    if (!endpoint) {
-      setAiMessages((prev) =>
-        prev.map((msg) =>
-          msg.pendingId === requestId ? { ...msg, text: "No chat endpoint selected.", pendingId: undefined } : msg,
-        ),
-      );
-      return;
-    }
-    if (!endpoint.url || !endpoint.url.trim()) {
-      setAiMessages((prev) =>
-        prev.map((msg) =>
-          msg.pendingId === requestId ? { ...msg, text: "Chat endpoint is missing a URL.", pendingId: undefined } : msg,
-        ),
-      );
-      return;
-    }
-    const buildModelContext = () => {
-      const activePath = activeEditorPath || activeDoc.path || "";
-      const projectSymbols = symbols.filter((symbol) => !isPathWithin(symbol.file_path, libraryPath));
-      const activeSymbols = activePath
-        ? projectSymbols.filter((symbol) => symbol.file_path === activePath).slice(0, 40)
-        : [];
-      const unresolvedTop = unresolved.slice(0, 20);
-      const snippet =
-        activePath && activeDoc.path === activePath
-          ? editorValueRef.current.slice(0, 8000)
-          : "";
-      const symbolLines = activeSymbols.map(
-        (symbol) =>
-          `- ${symbol.kind} ${symbol.qualified_name} @ ${symbol.file_path}:${symbol.start_line ?? 0}`,
-      );
-      const unresolvedLines = unresolvedTop.map(
-        (item) => `- ${item.file_path}:${item.line ?? 0}:${item.column ?? 0} ${item.message}`,
-      );
-      return [
-        `root: ${rootPath || "unknown"}`,
-        `active_file: ${activePath || "none"}`,
-        `symbol_count: ${projectSymbols.length}`,
-        "",
-        "active_file_symbols:",
-        ...(symbolLines.length ? symbolLines : ["- none"]),
-        "",
-        "unresolved_top:",
-        ...(unresolvedLines.length ? unresolvedLines : ["- none"]),
-        "",
-        "active_file_content:",
-        snippet || "(not loaded)",
-      ].join("\n");
-    };
+  const projectSymbols = useMemo(
+    () => symbols.filter((symbol) => symbol.source_scope !== "library"),
+    [symbols],
+  );
 
-      const history = aiMessages.filter((msg) => msg.text !== "...");
-      const contextTextRaw = buildModelContext();
-      const clampText = (value: string, limit: number) => {
-        if (value.length <= limit) return value;
-        return value.slice(0, limit) + "\n... (truncated)";
-      };
-      const contextText = clampText(contextTextRaw, 12000);
-      const historyTrimmed = history.slice(-12);
-      const projectNote =
-        rootPath && lastAiProjectRef.current !== rootPath
-          ? [{ role: "user" as const, text: `Project changed to: ${rootPath}` }]
-          : [];
-    lastAiProjectRef.current = rootPath || null;
-      const messages = [
-        {
-          role: "user" as const,
-          text:
-            "Model context (read-only). Use it as ground truth when answering about this workspace:\n\n" +
-            contextText,
-        },
-        ...projectNote,
-        ...historyTrimmed.map((msg) => ({ role: msg.role, text: msg.raw ?? msg.text })),
-        { role: "user" as const, text },
-      ];
-    try {
-      const response = await runAgent({
-        url: endpoint.url,
-        provider: endpoint.provider,
-        model: endpoint.model || null,
-        token: endpoint.token || null,
-        root: rootPath || null,
-        enable_tools: true,
-        messages: messages.map((msg) => ({ role: msg.role, content: msg.text })),
-      });
-        const content = response?.message || "";
-        const extractFirstJsonObject = (text: string) => {
-          let inString = false;
-          let escape = false;
-          let depth = 0;
-          let start = -1;
-          for (let i = 0; i < text.length; i += 1) {
-            const ch = text[i];
-            if (escape) {
-              escape = false;
-              continue;
-            }
-            if (ch === "\\") {
-              escape = true;
-              continue;
-            }
-            if (ch === "\"") {
-              inString = !inString;
-              continue;
-            }
-            if (inString) continue;
-            if (ch === "{") {
-              if (depth === 0) start = i;
-              depth += 1;
-            } else if (ch === "}") {
-              depth = Math.max(0, depth - 1);
-              if (depth === 0 && start >= 0) {
-                return text.slice(start, i + 1);
-              }
-            }
-          }
-          return null;
-        };
+  const librarySymbols = useMemo(
+    () => symbols.filter((symbol) => symbol.source_scope === "library"),
+    [symbols],
+  );
 
-        const fixLooseJson = (value: string) => value.replace(/\\(?![\\/"bfnrtu])/g, "\\\\");
-
-        const parseAgentJson = (text: string) => {
-          if (!text) return null;
-          let candidate = text.trim();
-          if (candidate.startsWith("```")) {
-            candidate = candidate.replace(/^```[a-zA-Z]*\s*/, "");
-            candidate = candidate.replace(/```\s*$/, "");
-            candidate = candidate.trim();
-          }
-          const extracted = extractFirstJsonObject(candidate);
-          if (extracted) {
-            candidate = extracted;
-          }
-          try {
-            const parsed = JSON.parse(candidate);
-            return parsed && typeof parsed === "object" ? parsed : null;
-          } catch {
-            try {
-              const fixed = fixLooseJson(candidate);
-              const parsed = JSON.parse(fixed);
-              return parsed && typeof parsed === "object" ? parsed : null;
-            } catch {
-              return null;
-            }
-          }
-        };
-        const parsedAgent = parseAgentJson(content);
-        const parseSteps = (value: unknown) => {
-          if (!Array.isArray(value)) return undefined;
-          const mapped = value
-            .map((step: any, index: number) => ({
-              id: typeof step?.id === "string" && step.id.trim() ? step.id : String(index + 1),
-              label: typeof step?.label === "string" ? step.label : "",
-              recommended: Boolean(step?.recommended),
-              action: typeof step?.action === "string" ? step.action : "",
-            }))
-            .filter((step: { label: string; action: string }) => step.label || step.action);
-          return mapped.length ? mapped : undefined;
-        };
-        const extractSummaryAndSteps = (
-          value: any,
-        ): {
-          summary?: string;
-          steps?: Array<{ id: string; label: string; recommended: boolean; action: string }>;
-        } => {
-          if (!value || typeof value !== "object") return {};
-          if (typeof value.summary === "string") {
-            return { summary: value.summary, steps: parseSteps(value.next_steps) };
-          }
-          if (typeof value.action === "string" && value.action === "final") {
-            const nested =
-              typeof value.content === "string" ? parseAgentJson(value.content) : value.content;
-            return extractSummaryAndSteps(nested);
-          }
-          return {};
-        };
-        const extractedFromResponse = extractSummaryAndSteps(response?.final_response);
-        const extractedFromContent = extractSummaryAndSteps(parsedAgent);
-        let nextSteps =
-          extractedFromResponse.steps ||
-          extractedFromContent.steps;
-        let nextText =
-          extractedFromResponse.summary ||
-          extractedFromContent.summary ||
-          (response?.final_error ? `Agent error: ${response.final_error}` : undefined) ||
-          content ||
-          "No response.";
-        const extractedFromText = extractSummaryAndSteps(parseAgentJson(nextText));
-        if (extractedFromText.summary) {
-          nextText = extractedFromText.summary;
-          if (!nextSteps) {
-            nextSteps = extractedFromText.steps;
-          }
-        }
-        const toolEdits = (response?.steps || [])
-          .filter((step) => step.kind === "tool" && typeof step.detail === "string")
-          .map((step) => step.detail);
-        if (toolEdits.length && rootPath) {
-          const rootBase = rootPath.replace(/[\\/]+$/, "");
-          const resolveToolPath = (rawPath: string) => {
-            const trimmed = rawPath.trim();
-            if (!trimmed) return null;
-            if (/^[A-Za-z]:[\\/]/.test(trimmed) || trimmed.startsWith("\\\\")) {
-              return trimmed;
-            }
-            const cleaned = trimmed.replace(/^[\\/]+/, "");
-            return `${rootBase}\\${cleaned}`;
-          };
-          const touched = new Set<string>();
-          for (const detail of toolEdits) {
-            if (detail.startsWith("write_file:")) {
-              const resolved = resolveToolPath(detail.slice("write_file:".length));
-              if (resolved) touched.add(resolved);
-            } else if (detail.startsWith("apply_patch:")) {
-              const resolved = resolveToolPath(detail.slice("apply_patch:".length));
-              if (resolved) touched.add(resolved);
-            }
-          }
-          if (touched.size) {
-            await Promise.all(
-              Array.from(touched).map(async (path) => {
-                try {
-                  const content = await readFileText(path);
-                  updateDocContent(path, content || "", false);
-                  if (currentFilePathRef.current === path && editorRef.current && centerView === "file") {
-                    suppressDirtyRef.current = true;
-                    editorRef.current.setValue(content || "");
-                  }
-                } catch {
-                  // ignore tool sync errors
-                }
-              }),
-            );
-          }
-        }
-      setAiMessages((prev) =>
-        prev.map((msg) =>
-          msg.pendingId === requestId
-            ? {
-                ...msg,
-                text: nextText,
-                raw: content || nextText,
-                pendingId: undefined,
-                steps: Array.isArray(response?.steps) ? response.steps : [],
-                nextSteps,
-              }
-            : msg,
-        ),
-      );
-      if (nextSteps && nextSteps.length) {
-        setAiFloatingSteps(nextSteps);
-      }
-    } catch (error) {
-      setAiMessages((prev) =>
-        prev.map((msg) =>
-          msg.pendingId === requestId ? { ...msg, text: `Error: ${String(error)}`, pendingId: undefined } : msg,
-        ),
-      );
-    }
-  };
-
-    const cycleAiHistory = (direction: "up" | "down") => {
-      const history = aiMessages.filter((msg) => msg.role === "user").map((msg) => msg.text);
-      if (!history.length) return;
-      let nextIndex = aiHistoryIndex ?? history.length;
-    if (direction === "up") {
-      nextIndex = Math.max(0, nextIndex - 1);
-    } else {
-      nextIndex = Math.min(history.length, nextIndex + 1);
-    }
-    if (nextIndex === history.length) {
-      setAiHistoryIndex(null);
-      setAiInput("");
-      return;
-    }
-    setAiHistoryIndex(nextIndex);
-    setAiInput(history[nextIndex] || "");
-  };
-
-    const runAiNextStep = (step: { id: string; label: string; recommended: boolean; action: string }) => {
-      const content = step.action || step.label;
-      if (!content.trim()) return;
-      setAiInput(content);
-      void sendAiMessage(content);
-    };
-
-    const clearAiMessages = () => {
-      setAiMessages([]);
-      setAiFloatingSteps([]);
-      setAiHistoryIndex(null);
-    };
-
-  const deferredSymbols = useDeferredValue(symbols);
-  const deferredUnresolved = useDeferredValue(unresolved);
-  const projectTreeSymbols = useMemo(() => deferredSymbols, [deferredSymbols]);
-  const normalizeModelPath = useCallback((value: string | null | undefined) => {
-    return (value || "").replace(/\//g, "\\").toLowerCase();
-  }, []);
-  const activeFileTreeSymbols = useMemo(() => {
-    const activeKey = normalizeModelPath(activeEditorPath);
-    if (!activeKey) return [] as SymbolView[];
-    return deferredSymbols.filter(
-      (symbol) =>
-        symbol.source_scope !== "library" &&
-        normalizeModelPath(symbol.file_path) === activeKey,
-    );
-  }, [deferredSymbols, activeEditorPath, normalizeModelPath]);
-  const activeFileUnresolved = useMemo(() => {
-    const activeKey = normalizeModelPath(activeEditorPath);
-    if (!activeKey) return [];
-    return deferredUnresolved.filter((issue) => normalizeModelPath(issue.file_path) === activeKey);
-  }, [deferredUnresolved, activeEditorPath, normalizeModelPath]);
-
-  useEffect(() => {
-    if (rightPaneTab !== "file_editor") {
-      setFileDropIndicator(null);
-    }
-  }, [rightPaneTab]);
-
-  useEffect(() => {
-    if (!selectedSymbol) return;
-    if (!deferredSymbols.length) {
-      setSelectedSymbol(null);
-      return;
-    }
-    const match = deferredSymbols.find((symbol) => {
-      if (selectedSymbol.qualified_name && symbol.qualified_name) {
-        return symbol.qualified_name === selectedSymbol.qualified_name;
-      }
-      return symbol.file_path === selectedSymbol.file_path && symbol.name === selectedSymbol.name;
-    });
-    setSelectedSymbol(match || null);
-  }, [deferredSymbols, selectedSymbol]);
-
-  const {
-    projectGroups,
-    libraryGroups,
-    projectCounts,
-    libraryCounts,
-    errorCounts,
-    dataViewSymbols,
-    dataViewSymbolKindCounts,
-  } = useModelGroups({
-    deferredSymbols: projectTreeSymbols,
-    deferredUnresolved,
-    rootPath,
-    libraryPath,
-    libraryFilePaths: libraryFiles,
-    projectFilePaths: parsedFiles,
-    stdlibFileCount,
-    librarySymbolCount: libraryIndexedSymbolCount,
-    dataExcludeStdlib,
-  });
-
-  const { modelRows } = useModelTree({
-    projectGroups,
-    libraryGroups,
-    deferredUnresolved,
-    modelExpanded,
-    collapseAllModel,
-    modelSectionOpen,
-    projectCounts,
-    libraryCounts,
-    errorCounts,
-    projectSymbolsLoaded,
-    getKindKey,
-    showUsages: showUsageNodes,
-    modelShowFiles,
-    defaultExpanded: false,
-    libraryLoadingFilePaths: libraryLoadingFiles,
-    libraryLoadErrors,
-    libraryKindFilter: null,
-  });
-
-  const {
-    projectGroups: fileProjectGroups,
-    libraryGroups: fileLibraryGroups,
-    projectCounts: fileProjectCounts,
-    libraryCounts: fileLibraryCounts,
-    errorCounts: fileErrorCounts,
-  } = useModelGroups({
-    deferredSymbols: activeFileTreeSymbols,
-    deferredUnresolved: activeFileUnresolved,
-    rootPath,
-    libraryPath: null,
-    libraryFilePaths: [],
-    stdlibFileCount: 0,
-    librarySymbolCount: 0,
-    dataExcludeStdlib: true,
-  });
-
-  const { modelRows: fileModelRows } = useModelTree({
-    projectGroups: fileProjectGroups,
-    libraryGroups: [],
-    deferredUnresolved: activeFileUnresolved,
-    modelExpanded: fileModelExpanded,
-    collapseAllModel,
-    modelSectionOpen: fileModelSectionOpen,
-    projectCounts: fileProjectCounts,
-    libraryCounts: fileLibraryCounts,
-    errorCounts: fileErrorCounts,
-    projectSymbolsLoaded: !!activeEditorPath,
-    getKindKey,
-    showUsages: true,
-    modelShowFiles: false,
-    defaultExpanded: true,
-    libraryLoadingFilePaths: [],
-    libraryLoadErrors: {},
-    libraryKindFilter: null,
-  });
-  const fileEditorModelRows = useMemo<ModelRow[]>(() => {
-    const symbolRows = fileModelRows.filter((row) => row.type === "symbol");
-    if (symbolRows.length) return symbolRows;
-    return [
-      {
-        type: "empty",
-        key: "empty-file-editor",
-        text: activeEditorPath ? "No symbols in current file." : "No active file.",
-      },
-    ];
-  }, [fileModelRows, activeEditorPath]);
-  const pendingLibraryFiles = Math.max(0, libraryFiles.length - loadedLibraryFileCount);
-  const failedLibraryFiles = Object.keys(libraryLoadErrors).length;
-
-  const paneGap = 10;
-  const availableModelPaneHeight =
-    modelPaneHeight > 0 ? Math.max(120, modelPaneHeight - rightPaneHeaderHeight - paneGap) : modelTreeHeight;
-  const semanticTreeHeight =
-    showPropertiesPane && propertiesDock === "bottom"
-      ? modelTreeHeight
-      : Math.max(modelTreeHeight, availableModelPaneHeight);
-  const fileTreeHeight = showFilePropertiesPane
-    ? Math.min(modelTreeHeight, availableModelPaneHeight)
-    : availableModelPaneHeight;
-  const effectiveModelTreeHeight = rightPaneTab === "file_editor" ? fileTreeHeight : semanticTreeHeight;
-
-  const {
-    modelListRef,
-    modelSectionIndent,
-    modelListHeight,
-    modelCursorIndex,
-    setModelCursorIndex,
-    findSelectedSymbolIndex,
-    syncModelTreeToSymbol,
-    handleModelTreeKeyDown,
-    getModelRowHeight,
-  } = useModelTreeSelection({
-    modelRows,
-    modelTreeHeight: effectiveModelTreeHeight,
-    setModelSectionOpen,
-    setModelExpanded,
-    selectedSymbol,
-    setSelectedSymbol,
-    setSelectedNodeSymbols,
-    selectSymbolInEditor,
-    navigateTo,
-    onRequestLibraryFileSymbols: (filePath) => {
-      void loadLibrarySymbolsForFile(filePath);
-    },
-    projectGroups,
-    libraryGroups,
-  });
-
-  const {
-    modelListRef: fileModelListRef,
-    modelSectionIndent: fileModelSectionIndent,
-    modelListHeight: fileModelListHeight,
-    modelCursorIndex: fileModelCursorIndex,
-    setModelCursorIndex: setFileModelCursorIndex,
-    findSelectedSymbolIndex: findSelectedFileSymbolIndex,
-    syncModelTreeToSymbol: syncFileModelTreeToSymbol,
-    handleModelTreeKeyDown: handleFileModelTreeKeyDown,
-    getModelRowHeight: getFileModelRowHeight,
-  } = useModelTreeSelection({
-    modelRows: fileEditorModelRows,
-    modelTreeHeight: effectiveModelTreeHeight,
-    setModelSectionOpen: setFileModelSectionOpen,
-    setModelExpanded: setFileModelExpanded,
-    selectedSymbol,
-    setSelectedSymbol,
-    setSelectedNodeSymbols,
-    selectSymbolInEditor,
-    navigateTo,
-    onRequestLibraryFileSymbols: () => {},
-    projectGroups: fileProjectGroups,
-    libraryGroups: fileLibraryGroups,
-  });
-
-  const {
-    diagramType,
-    setDiagramType,
-    snapToGrid,
-    setSnapToGrid,
-    diagramScale,
-    setDiagramScale,
-    diagramOffset,
-    setDiagramOffset,
-    diagramPanRef,
-    diagramBodyRef,
-    diagramViewportRef,
-    diagramViewport,
-    diagramPanRafRef,
-    diagramPanPendingRef,
-    diagramLayout,
-    diagramDropActive,
-    flowNodes,
-    flowEdges,
-    handleFlowNodesChange,
-    handleFlowNodeClick,
-    handleFlowNodeDoubleClick,
-    handleFlowNodeDragStop,
-    handleExpandTypeFromSelection,
-    canExpandTypeFromSelection,
-    canDeleteSelectedFlowNode,
-    handleDeleteSelectedFlowNode,
-    palettePos,
-    paletteGhost,
-    paletteDragRef,
-    paletteCreateRef,
-    renderDiagramLayout,
-    renderMinimapLayout,
-    requestDiagramLayout,
-    setDiagramNodeOffsets,
-    setDiagramNodeSizes,
-    setPaletteGhost,
-    handleDiagramDrop,
-    handleDiagramDragOver,
-    handleDiagramDragLeave,
-  } = useDiagramView({
-    activeDiagramPath,
-    symbols,
-    getKindKey,
-    renderTypeIcon,
-    rootPath,
-    setCompileStatus,
-  });
-
-  const { trackCandidate } = useModelTracking({
-    symbols,
-    activeEditorPath,
-    cursorPos,
-    enabled: trackText,
-    onTrack: (symbol) => {
-      setSelectedSymbol(symbol);
-      setSelectedNodeSymbols([symbol]);
-      if (rightPaneTab === "file_editor") {
-        syncFileModelTreeToSymbol(symbol);
+  const symbolsByFile = useMemo(() => {
+    const map = new Map<string, SymbolView[]>();
+    for (const symbol of projectSymbols) {
+      const key = normalizePath(symbol.file_path);
+      const bucket = map.get(key);
+      if (bucket) {
+        bucket.push(symbol);
       } else {
-        syncModelTreeToSymbol(symbol);
-      }
-    },
-  });
-
-  const reorderActiveFileSymbol = useCallback((
-    source: SymbolView,
-    target: SymbolView,
-    position: "before" | "after",
-  ) => {
-    const editor = editorRef.current;
-    if (!editor || !activeEditorPath) return;
-    if (normalizeModelPath(source.file_path) !== normalizeModelPath(activeEditorPath)) return;
-    if (normalizeModelPath(target.file_path) !== normalizeModelPath(activeEditorPath)) return;
-    if ((source.qualified_name || source.name) === (target.qualified_name || target.name)) return;
-    const model = editor.getModel();
-    if (!model) return;
-    const text = model.getValue();
-    const lines = text.split(/\r?\n/);
-    const toLineIndex = (line: number | undefined) => Math.max(0, (line || 1) - 1);
-    const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const findAnchorLine = (symbol: SymbolView) => {
-      const name = (symbol.name || "").trim();
-      const preferred = toLineIndex(symbol.start_line);
-      if (preferred < lines.length) {
-        if (!name || lines[preferred]?.includes(name)) return preferred;
-      }
-      if (name) {
-        const pattern = new RegExp(`\\b${escapeRegExp(name)}\\b`);
-        const hit = lines.findIndex((line) => pattern.test(line));
-        if (hit >= 0) return hit;
-      }
-      return preferred;
-    };
-    const expandRangeEnd = (start: number, fallbackEnd: number) => {
-      let end = Math.max(start, fallbackEnd);
-      let depth = 0;
-      let seenOpen = false;
-      for (let i = start; i < lines.length; i += 1) {
-        const current = lines[i] || "";
-        const opens = (current.match(/{/g) || []).length;
-        const closes = (current.match(/}/g) || []).length;
-        if (opens > 0) seenOpen = true;
-        depth += opens - closes;
-        end = i;
-        if (seenOpen && depth <= 0) {
-          break;
-        }
-        if (!seenOpen && i > start && current.trim() === "") {
-          end = i - 1;
-          break;
-        }
-      }
-      return Math.max(start, end);
-    };
-    const start = findAnchorLine(source);
-    const fallbackEnd = Math.max(start, toLineIndex(source.end_line || source.start_line));
-    const end = expandRangeEnd(start, fallbackEnd);
-    const targetStart = findAnchorLine(target);
-    if (start >= lines.length || targetStart >= lines.length) return;
-    const sliceEnd = Math.min(lines.length, end + 1);
-    const moving = lines.slice(start, sliceEnd);
-    if (!moving.length) return;
-    const remaining = [...lines.slice(0, start), ...lines.slice(sliceEnd)];
-    let insertAt = targetStart + (position === "after" ? 1 : 0);
-    if (targetStart > start) {
-      insertAt = Math.max(0, targetStart - (sliceEnd - start));
-      if (position === "after") {
-        insertAt = Math.min(remaining.length, insertAt + 1);
+        map.set(key, [symbol]);
       }
     }
-    insertAt = Math.min(insertAt, remaining.length);
-    const updated = [...remaining.slice(0, insertAt), ...moving, ...remaining.slice(insertAt)].join("\n");
-    editor.executeEdits("file-tree-reorder", [
-      {
-        range: model.getFullModelRange(),
-        text: updated,
-        forceMoveMarkers: true,
-      },
-    ]);
-    editor.pushUndoStop();
-    setCompileStatus("File tree: reordered symbol block");
-    setFileDropIndicator(null);
-  }, [activeEditorPath, normalizeModelPath, setCompileStatus]);
+    for (const bucket of map.values()) {
+      bucket.sort(compareSymbols);
+    }
+    return map;
+  }, [projectSymbols]);
 
-  const renderModelRow = useMemo(
-    () =>
-      createModelRowRenderer({
-        modelCursorIndex,
-        modelSectionOpen,
-        modelSectionIndent,
-        modelTreeRef,
-        handleModelTreeKeyDown,
-        onModelContextMenu: showModelContext,
-        setModelCursorIndex,
-        setModelSectionOpen,
-        setModelExpanded,
-        selectedSymbol,
-        setSelectedSymbol,
-        setSelectedNodeSymbols,
-        selectSymbolInEditor,
-        navigateTo,
-        renderTypeIcon,
-        onRequestLibraryFileSymbols: (filePath) => {
-          void loadLibrarySymbolsForFile(filePath);
-        },
-        onRetryLibraryFileSymbols: (filePath) => {
-          void loadLibrarySymbolsForFile(filePath);
-        },
-        onDragStartSymbol: () => {},
-        openOnClick: trackText,
-      }),
-    [
-      modelCursorIndex,
-      modelSectionOpen,
-      modelSectionIndent,
-      handleModelTreeKeyDown,
-      showModelContext,
-      selectedSymbol,
-      setSelectedSymbol,
-      setSelectedNodeSymbols,
-      selectSymbolInEditor,
-      navigateTo,
-      renderTypeIcon,
-      loadLibrarySymbolsForFile,
-      trackText,
-    ],
+  const librarySymbolsByFile = useMemo(() => {
+    const map = new Map<string, SymbolView[]>();
+    for (const symbol of librarySymbols) {
+      const key = normalizePath(symbol.file_path);
+      const bucket = map.get(key);
+      if (bucket) {
+        bucket.push(symbol);
+      } else {
+        map.set(key, [symbol]);
+      }
+    }
+    for (const bucket of map.values()) {
+      bucket.sort(compareSymbols);
+    }
+    return map;
+  }, [librarySymbols]);
+
+  const libraryFilePaths = useMemo(() => {
+    return Array.from(librarySymbolsByFile.values())
+      .map((bucket) => bucket[0]?.file_path)
+      .filter((value): value is string => !!value)
+      .sort((a, b) => a.localeCompare(b));
+  }, [librarySymbolsByFile]);
+
+  const selectedSymbolId = useMemo(
+    () => (selectedSymbol ? symbolIdentity(selectedSymbol) : ""),
+    [selectedSymbol],
   );
 
-  const renderFileModelRow = useMemo(
-    () =>
-      createModelRowRenderer({
-        modelCursorIndex: fileModelCursorIndex,
-        modelSectionOpen: fileModelSectionOpen,
-        modelSectionIndent: fileModelSectionIndent,
-        modelTreeRef: fileModelTreeRef,
-        handleModelTreeKeyDown: handleFileModelTreeKeyDown,
-        onModelContextMenu: showModelContext,
-        setModelCursorIndex: setFileModelCursorIndex,
-        setModelSectionOpen: setFileModelSectionOpen,
-        setModelExpanded: setFileModelExpanded,
-        selectedSymbol,
-        setSelectedSymbol,
-        setSelectedNodeSymbols,
-        selectSymbolInEditor,
-        navigateTo,
-        renderTypeIcon,
-        onRequestLibraryFileSymbols: () => {},
-        onRetryLibraryFileSymbols: () => {},
-        openOnClick: trackText,
-        onDragStartSymbol: (symbol) => {
-          draggedFileSymbolRef.current = symbol;
-        },
-        setDropIndicator: (key, position) => {
-          if (!key || !position) {
-            setFileDropIndicator(null);
-            return;
-          }
-          setFileDropIndicator({ key, position });
-        },
-        isDropIndicator: (key, position) =>
-          fileDropIndicator?.key === key && fileDropIndicator?.position === position,
-        getDraggedSymbol: () => draggedFileSymbolRef.current,
-        onDropSymbolOnSymbol: (source, target, position) => {
-          reorderActiveFileSymbol(source, target, position);
-          draggedFileSymbolRef.current = null;
-        },
-      }),
-    [
-      fileModelCursorIndex,
-      fileModelSectionOpen,
-      fileModelSectionIndent,
-      handleFileModelTreeKeyDown,
-      showModelContext,
-      selectedSymbol,
-      setSelectedSymbol,
-      setSelectedNodeSymbols,
-      selectSymbolInEditor,
-      navigateTo,
-      renderTypeIcon,
-      fileDropIndicator,
-      reorderActiveFileSymbol,
-      trackText,
-    ],
+  const activeFileSymbols = useMemo(() => {
+    if (!activeFilePath) return [] as SymbolView[];
+    return symbolsByFile.get(normalizePath(activeFilePath)) || [];
+  }, [activeFilePath, symbolsByFile]);
+
+  const filteredSymbols = useMemo(() => {
+    const query = symbolQuery.trim().toLowerCase();
+    const activeKey = normalizePath(activeFilePath);
+    let source = projectSymbols;
+    if (showCurrentFileOnly && activeKey) {
+      source = source.filter((symbol) => normalizePath(symbol.file_path) === activeKey);
+    }
+    if (!query) return source.slice(0, MAX_SYMBOL_ROWS);
+    return source
+      .filter((symbol) => {
+        return (
+          symbol.name.toLowerCase().includes(query) ||
+          symbol.kind.toLowerCase().includes(query) ||
+          symbol.qualified_name.toLowerCase().includes(query) ||
+          symbol.file_path.toLowerCase().includes(query)
+        );
+      })
+      .slice(0, MAX_SYMBOL_ROWS);
+  }, [projectSymbols, showCurrentFileOnly, activeFilePath, symbolQuery]);
+
+  const selectSymbol = useCallback(async (symbol: SymbolView) => {
+    setSelectedSymbol(symbol);
+    setSemanticSelectedQname(symbol.qualified_name || "");
+    await openFilePath(symbol.file_path, symbolSelection(symbol), { preserveSymbolSelection: true });
+  }, [openFilePath]);
+
+  const selectQualifiedName = useCallback((qualifiedName: string) => {
+    const target = projectSymbols.find((symbol) => symbol.qualified_name === qualifiedName)
+      || symbols.find((symbol) => symbol.qualified_name === qualifiedName);
+    if (!target) return;
+    void selectSymbol(target);
+  }, [projectSymbols, selectSymbol, symbols]);
+
+  const openParseError = useCallback((path: string, message: string) => {
+    const loc = parseErrorLocation(message);
+    const selection: TextSelection | undefined = loc
+      ? {
+          startLine: loc.line,
+          startCol: loc.col,
+          endLine: loc.line,
+          endCol: loc.col + 1,
+        }
+      : undefined;
+    void openFilePath(path, selection);
+  }, [openFilePath]);
+
+  const toggleProjectFileSymbols = useCallback((filePath: string) => {
+    const key = normalizePath(filePath);
+    setExpandedFileSymbols((prev) => ({ ...prev, [key]: !prev[key] }));
+  }, []);
+
+  const toggleLibraryFileSymbols = useCallback((filePath: string) => {
+    const key = normalizePath(filePath);
+    setExpandedLibraryFiles((prev) => ({ ...prev, [key]: !prev[key] }));
+  }, []);
+
+  const editorLanguage = useMemo(
+    () => editorLanguageForPath(activeFilePath),
+    [activeFilePath],
   );
 
-    return (
-      <div
-        className="app-shell"
-        style={{
-          ["--left-width" as string]: `${leftCollapsed ? 0 : leftWidth}px`,
-          ["--right-width" as string]: `${rightCollapsed ? 0 : rightWidth}px`,
-          ["--split-left-width" as string]: `${leftCollapsed ? 16 : 6}px`,
-          ["--split-right-width" as string]: `${rightCollapsed ? 16 : 6}px`,
-        }}
-      >
-      <header className="titlebar" data-tauri-drag-region>
-        <div className="titlebar-left">
-          <span className="app-mark" aria-hidden="true" />
-          <nav className="menu-row" aria-label="App menu">
-            <div className="menu-item">
-              <button type="button" className="menu-button" onClick={() => setOpenMenu(openMenu === "File" ? null : "File")}>File</button>
-                {openMenu === "File" ? (
-                  <div className="menu-dropdown" data-tauri-drag-region="false">
-                    <button type="button" onClick={openNewProjectDialog}>New Project</button>
-                    <button type="button" onClick={chooseProject}>Open Project</button>
-                    <button type="button" onClick={() => { setOpenMenu(null); void openProjectProperties(); }}>Project Properties</button>
-                    <div className="menu-divider" />
-                    <button type="button" onClick={() => { void invoke("window_close"); }}>Exit</button>
-                  </div>
-                ) : null}
-            </div>
-            <div className="menu-item">
-              <button type="button" className="menu-button" onClick={() => setOpenMenu(openMenu === "Edit" ? null : "Edit")}>Edit</button>
-              {openMenu === "Edit" ? (
-            <div className="menu-dropdown" data-tauri-drag-region="false">
-              <button type="button">Undo</button>
-              <button type="button">Redo</button>
-              <div className="menu-divider" />
-              <button type="button">Find</button>
-            </div>
-              ) : null}
-            </div>
-            <div className="menu-item">
-              <button type="button" className="menu-button" onClick={() => setOpenMenu(openMenu === "View" ? null : "View")}>View</button>
-              {openMenu === "View" ? (
-            <div className="menu-dropdown" data-tauri-drag-region="false">
-              <button type="button">Project Panel</button>
-              <button type="button">Model Panel</button>
-              <div className="menu-divider" />
-              <div className="menu-header">Debug</div>
+  const handleEditorMount: OnMount = (editorInstance, monaco) => {
+    editorRef.current = editorInstance;
+    monacoRef.current = monaco;
+    ensureSysmlLanguage(monaco);
+    monaco.editor.setTheme(appTheme === "light" ? "vs" : "vs-dark");
+    editorInstance.updateOptions({
+      minimap: { enabled: false },
+      wordWrap: "off",
+      scrollBeyondLastLine: false,
+      renderLineHighlight: "line",
+      fontSize: 13,
+      automaticLayout: true,
+    });
+    if (cursorListenerRef.current) {
+      cursorListenerRef.current.dispose();
+      cursorListenerRef.current = null;
+    }
+    const flushCursor = () => {
+      cursorFlushTimerRef.current = undefined;
+      const pending = pendingCursorRef.current;
+      if (!pending) return;
+      setCursorPos((prev) => {
+        if (prev?.line === pending.line && prev?.col === pending.col) {
+          return prev;
+        }
+        return pending;
+      });
+    };
+    cursorListenerRef.current = editorInstance.onDidChangeCursorPosition((event) => {
+      pendingCursorRef.current = { line: event.position.lineNumber, col: event.position.column };
+      if (cursorFlushTimerRef.current !== undefined) return;
+      cursorFlushTimerRef.current = window.setTimeout(flushCursor, 60);
+    });
+    suppressDirtyRef.current = true;
+    editorInstance.setValue(contentRef.current || "");
+  };
+
+  const renderTree = useCallback((entries: FileEntry[], depth = 0): ReactNode => {
+    return entries.map((entry) => {
+      const key = entry.path;
+      const isDir = entry.is_dir;
+      const isOpen = !!expanded[entry.path];
+      const fileKey = normalizePath(entry.path);
+      const active = !isDir && normalizePath(activeFilePath) === fileKey;
+      const hasParseError = parseErrorPaths.has(fileKey);
+      const fileSymbols = isDir ? [] : (symbolsByFile.get(fileKey) || []);
+      const symbolCount = fileSymbols.length;
+      const isSymbolOpen = !isDir && !!expandedFileSymbols[fileKey];
+      const shownSymbols = isSymbolOpen ? fileSymbols.slice(0, FILE_SYMBOL_RENDER_LIMIT) : [];
+
+      return (
+        <div key={key}>
+          <div
+            className={`simple-tree-row ${active ? "active" : ""}`}
+            style={{ paddingLeft: `${8 + depth * 14}px` }}
+          >
+            {isDir ? (
               <button
                 type="button"
+                className="ghost simple-tree-toggle"
                 onClick={() => {
-                  setOpenMenu(null);
-                  setShowAstSplit((prev) => !prev);
+                  void toggleExpand(entry);
                 }}
+                title={isOpen ? "Collapse" : "Expand"}
               >
-                {showAstSplit ? "✓ " : ""}AST Split
+                {isOpen ? "v" : ">"}
               </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setOpenMenu(null);
-                  toggleTerminal();
-                }}
-              >
-                {showTerminal ? "✓ " : ""}View Terminal
-              </button>
-              <div className="menu-divider" />
-              <button type="button" onClick={() => { setOpenMenu(null); openAiViewTab(); }}>Agent</button>
-              <button type="button" onClick={() => { setOpenMenu(null); openDataViewTab(); }}>Data Analysis View</button>
-              <button type="button" onClick={() => { setOpenMenu(null); openProjectModelViewTab(); }}>Project Model View</button>
-              <button
-                type="button"
-                onClick={() => {
-                  setOpenMenu(null);
-                  if (activeEditorPath && activeEditorPath.toLowerCase().endsWith(".diagram")) {
-                    if (editorRef.current) {
-                      queuePendingEditorContent(activeEditorPath, editorValueRef.current);
-                    }
-                    openDiagramViewTab(activeEditorPath);
-                  }
-                }}
-                disabled={!activeEditorPath || !activeEditorPath.toLowerCase().endsWith(".diagram")}
-              >
-                Diagram View
-              </button>
-              <div className="menu-divider" />
-              <button type="button" onClick={() => { setShowSettings(true); setOpenMenu(null); }}>Settings</button>
-              <button type="button">Logs</button>
-            </div>
+            ) : (
+              symbolCount > 0 ? (
+                <button
+                  type="button"
+                  className="ghost simple-tree-toggle"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    toggleProjectFileSymbols(entry.path);
+                  }}
+                  title={isSymbolOpen ? "Hide symbols" : "Show symbols"}
+                >
+                  {isSymbolOpen ? "v" : ">"}
+                </button>
+              ) : (
+                <span className="simple-tree-toggle-placeholder" />
+              )
+            )}
+            <button
+              type="button"
+              className="ghost simple-tree-entry"
+              onClick={() => {
+                void openEntry(entry);
+              }}
+              title={entry.path}
+            >
+              <span className={`simple-tree-icon ${isDir ? "dir" : "file"}`}>{isDir ? "DIR" : "FILE"}</span>
+              <span className="simple-tree-label">{entry.name}</span>
+              {!isDir && symbolCount > 0 ? <span className="simple-tree-count">{symbolCount}</span> : null}
+              {!isDir && hasParseError ? <span className="simple-tree-error">error</span> : null}
+            </button>
+          </div>
+          {isDir && isOpen && expanded[entry.path]?.length
+            ? renderTree(expanded[entry.path], depth + 1)
+            : null}
+          {!isDir && isSymbolOpen && shownSymbols.length ? (
+            <div className="simple-tree-symbols">
+              {shownSymbols.map((symbol) => {
+                const symbolId = symbolIdentity(symbol);
+                const selected = selectedSymbolId === symbolId;
+                return (
+                  <button
+                    key={symbolId}
+                    type="button"
+                    className={`ghost simple-tree-symbol-row ${selected ? "active" : ""}`}
+                    style={{ paddingLeft: `${30 + depth * 14}px` }}
+                    onClick={() => {
+                      void selectSymbol(symbol);
+                    }}
+                    title={`${symbol.qualified_name}\n${symbol.file_path}`}
+                  >
+                    <span className="simple-tree-symbol-kind">{symbol.kind || "?"}</span>
+                    <span className="simple-tree-symbol-name">{symbol.name || "<anonymous>"}</span>
+                    <span className="simple-tree-symbol-line">L{symbol.start_line || 1}</span>
+                  </button>
+                );
+              })}
+              {fileSymbols.length > FILE_SYMBOL_RENDER_LIMIT ? (
+                <div
+                  className="simple-tree-symbol-more muted"
+                  style={{ paddingLeft: `${30 + depth * 14}px` }}
+                >
+                  +{fileSymbols.length - FILE_SYMBOL_RENDER_LIMIT} more symbols
+                </div>
               ) : null}
             </div>
-            <div className="menu-item">
-              <button type="button" className="menu-button" onClick={() => setOpenMenu(openMenu === "Collab" ? null : "Collab")}>Collab</button>
-              {openMenu === "Collab" ? (
-            <div className="menu-dropdown" data-tauri-drag-region="false">
-              <button type="button" onClick={() => { setOpenMenu(null); void openGitDialog(); }} disabled={!gitInfo}>Collab...</button>
-              <button type="button" onClick={() => { setOpenMenu(null); void openGitBranchDialog(); }} disabled={!gitInfo}>Branches...</button>
-              <button type="button" disabled>Model Changes</button>
-              <div className="menu-divider" />
-              <button
-                type="button"
-                disabled={!gitInfo?.repo_root}
-                onClick={() => {
-                  setOpenMenu(null);
-                  if (gitInfo?.repo_root) {
-                    void invoke("open_in_explorer", { path: gitInfo.repo_root });
-                  }
-                }}
-              >
-                Open Repo Folder
-              </button>
-              <button type="button" onClick={() => { setOpenMenu(null); void copyRepoUrl(); }} disabled={!gitInfo?.remote_url}>
-                Copy Repo URL
-              </button>
-            </div>
-              ) : null}
-            </div>
-            <div className="menu-item">
-              <button type="button" className="menu-button" onClick={() => setOpenMenu(openMenu === "Build" ? null : "Build")}>Build</button>
-              {openMenu === "Build" ? (
-            <div className="menu-dropdown" data-tauri-drag-region="false">
-              <button type="button" onClick={() => { setOpenMenu(null); void runCompile(); }}>Build</button>
-              <button type="button" onClick={() => { setOpenMenu(null); openBuildOptions(); }}>Show Build Options</button>
-            </div>
-              ) : null}
-            </div>
-            <div className="menu-item">
-              <button type="button" className="menu-button" onClick={() => setOpenMenu(openMenu === "Help" ? null : "Help")}>Help</button>
-              {openMenu === "Help" ? (
-            <div className="menu-dropdown" data-tauri-drag-region="false">
-              <button type="button" onClick={() => { setOpenMenu(null); setShowAbout(true); }}>About</button>
-            </div>
-              ) : null}
-            </div>
-          </nav>
+          ) : null}
         </div>
-        <div className="titlebar-center" />
-        <div className="titlebar-right" data-tauri-drag-region="false">
+      );
+    });
+  }, [
+    expanded,
+    activeFilePath,
+    parseErrorPaths,
+    symbolsByFile,
+    expandedFileSymbols,
+    toggleExpand,
+    openEntry,
+    toggleProjectFileSymbols,
+    selectedSymbolId,
+    selectSymbol,
+  ]);
+
+  const renderLibraryTree = useCallback((): ReactNode => {
+    return libraryFilePaths.map((libraryFilePath) => {
+      const fileKey = normalizePath(libraryFilePath);
+      const fileSymbols = librarySymbolsByFile.get(fileKey) || [];
+      const isOpen = !!expandedLibraryFiles[fileKey];
+      const shownSymbols = isOpen ? fileSymbols.slice(0, FILE_SYMBOL_RENDER_LIMIT) : [];
+      const displayName = libraryFilePath.split(/[\\/]/).pop() || libraryFilePath;
+
+      return (
+        <div key={libraryFilePath}>
+          <div className="simple-tree-row library">
             <button
               type="button"
-              className="titlebar-btn minimize"
-              data-tauri-drag-region="false"
-              aria-label="Minimize"
-              onClick={() => { void invoke("window_minimize"); }}
+              className="ghost simple-tree-toggle"
+              onClick={() => {
+                toggleLibraryFileSymbols(libraryFilePath);
+              }}
+              title={isOpen ? "Hide symbols" : "Show symbols"}
             >
-              <span className="titlebar-icon" aria-hidden="true" />
+              {isOpen ? "v" : ">"}
             </button>
             <button
               type="button"
-              className="titlebar-btn maximize"
-              data-tauri-drag-region="false"
-              aria-label="Maximize"
-              onClick={() => { void invoke("window_toggle_maximize"); }}
+              className="ghost simple-tree-entry"
+              onClick={() => {
+                const first = fileSymbols[0];
+                if (first) {
+                  void selectSymbol(first);
+                }
+              }}
+              title={libraryFilePath}
             >
-              <span className="titlebar-icon" aria-hidden="true" />
+              <span className="simple-tree-icon file">LIB</span>
+              <span className="simple-tree-label">{displayName}</span>
+              <span className="simple-tree-count">{fileSymbols.length}</span>
             </button>
-            <button
-              type="button"
-              className="titlebar-btn close"
-              data-tauri-drag-region="false"
-              aria-label="Close"
-              onClick={() => { void invoke("window_close"); }}
-            >
-              <span className="titlebar-icon" aria-hidden="true" />
-            </button>
+          </div>
+          {isOpen && shownSymbols.length ? (
+            <div className="simple-tree-symbols">
+              {shownSymbols.map((symbol) => {
+                const symbolId = symbolIdentity(symbol);
+                const selected = selectedSymbolId === symbolId;
+                return (
+                  <button
+                    key={symbolId}
+                    type="button"
+                    className={`ghost simple-tree-symbol-row ${selected ? "active" : ""}`}
+                    style={{ paddingLeft: "30px" }}
+                    onClick={() => {
+                      void selectSymbol(symbol);
+                    }}
+                    title={`${symbol.qualified_name}\n${symbol.file_path}`}
+                  >
+                    <span className="simple-tree-symbol-kind">{symbol.kind || "?"}</span>
+                    <span className="simple-tree-symbol-name">{symbol.name || "<anonymous>"}</span>
+                    <span className="simple-tree-symbol-line">L{symbol.start_line || 1}</span>
+                  </button>
+                );
+              })}
+              {fileSymbols.length > FILE_SYMBOL_RENDER_LIMIT ? (
+                <div className="simple-tree-symbol-more muted" style={{ paddingLeft: "30px" }}>
+                  +{fileSymbols.length - FILE_SYMBOL_RENDER_LIMIT} more symbols
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      );
+    });
+  }, [
+    libraryFilePaths,
+    librarySymbolsByFile,
+    expandedLibraryFiles,
+    toggleLibraryFileSymbols,
+    selectedSymbolId,
+    selectSymbol,
+  ]);
+
+  const harnessMaxDuration = useMemo(
+    () => Math.max(1, ...harnessRuns.map((run) => run.durationMs)),
+    [harnessRuns],
+  );
+
+  const activeFileName = activeFilePath?.split(/[\\/]/).pop() || "No file selected";
+  const rootDisplayName = rootPath ? (rootPath.split(/[\\/]/).pop() || rootPath) : "No project";
+
+  const minimizeWindow = useCallback(() => {
+    void getCurrentWindow().minimize().catch(() => {});
+  }, []);
+
+  const toggleMaximizeWindow = useCallback(() => {
+    void getCurrentWindow().toggleMaximize().catch(() => {});
+  }, []);
+
+  const closeWindow = useCallback(() => {
+    void getCurrentWindow().close().catch(() => {});
+  }, []);
+
+  return (
+    <div className="app-shell simple-ui-shell">
+      <header className="native-titlebar">
+        <div className="native-titlebar-left" data-tauri-drag-region>
+          <span className="app-mark">
+            <img src="/app-icon.png" alt="Mercurio" className="app-mark-image" />
+          </span>
+          <span className="native-titlebar-name">Mercurio SysML</span>
+          <span className="native-titlebar-root muted">{rootDisplayName}</span>
+        </div>
+        <div className="native-titlebar-center" data-tauri-drag-region>{activeFileName}</div>
+        <div className="native-titlebar-right">
+          <button type="button" className="ghost native-window-btn" onClick={minimizeWindow} title="Minimize" aria-label="Minimize window">-</button>
+          <button type="button" className="ghost native-window-btn" onClick={toggleMaximizeWindow} title="Maximize" aria-label="Maximize or restore window">[]</button>
+          <button type="button" className="ghost native-window-btn close" onClick={closeWindow} title="Close" aria-label="Close window">X</button>
         </div>
       </header>
-      <main className={`content ${rightCollapsed ? "right-collapsed" : "right-open"}`}>
-          {leftCollapsed ? <div className="panel-spacer" /> : (
-            <section className="panel sidebar">
-              <div className="project-actions inline">
-                <button
-                  type="button"
-                  className="ghost collapse-btn"
-                  onClick={() => {
-                    leftStoredWidthRef.current = leftWidth;
-                    setLeftCollapsed(true);
-                  }}
-                  title="Collapse project"
-                >
-                  {"<<"}
-                </button>
-                <button type="button" className="icon-button" onClick={chooseProject} aria-label="Open Project" title="Open Project" />
-                <select className="recent-select" value="" onChange={(e) => openProject(e.target.value)} aria-label="Open recent" title="Open recent">
-                  <option value="">Recent</option>
-                  {recentProjects.map((path) => (
-                    <option key={path} value={path}>{path}</option>
-                  ))}
-                </select>
-                <button
-                  type="button"
-                  className={`ghost ${showOnlyModelFiles ? "active" : ""}`}
-                  onClick={() => setShowOnlyModelFiles((prev) => !prev)}
-                  title={showOnlyModelFiles ? "Show all files" : "Filter to .sysml/.kerml"}
-                  aria-label="Filter SysML/KerML"
-                >
-                  <span className="icon-filter" aria-hidden="true" />
-                </button>
-            </div>
-          <div className="project-root">
+      <header className="titlebar simple-ui-titlebar">
+        <div className="simple-ui-root-picker">
+          <button type="button" className="ghost" onClick={() => void (async () => {
+            const selected = await open({ directory: true, multiple: false });
+            if (typeof selected !== "string") return;
+            setRootInput(selected);
+            setRootPath(selected);
+            window.localStorage?.setItem(ROOT_STORAGE_KEY, selected);
+          })()}>
+            Open Root
+          </button>
+          <input
+            value={rootInput}
+            onChange={(event) => setRootInput(event.target.value)}
+            placeholder="Project root path"
+            onKeyDown={(event) => {
+              if (event.key !== "Enter") return;
+              const next = rootInput.trim();
+              setRootPath(next);
+              if (next) {
+                window.localStorage?.setItem(ROOT_STORAGE_KEY, next);
+              }
+            }}
+          />
+          <button
+            type="button"
+            className="ghost"
+            onClick={() => {
+              const next = rootInput.trim();
+              setRootPath(next);
+              if (next) {
+                window.localStorage?.setItem(ROOT_STORAGE_KEY, next);
+              }
+            }}
+          >
+            Apply
+          </button>
+          <button
+            type="button"
+            className="ghost"
+            disabled={!rootPath}
+            onClick={() => {
+              if (!rootPath) return;
+              void refreshRoot(rootPath).catch((error) => {
+                setTreeError(`Failed to refresh project tree: ${String(error)}`);
+              });
+            }}
+          >
+            Refresh Tree
+          </button>
+        </div>
+        <div className="simple-ui-status">{compileStatus}</div>
+        <div className="simple-ui-actions">
+          <button
+            type="button"
+            className={`ghost ${appTheme === "light" ? "active" : ""}`}
+            onClick={() => setAppTheme((prev) => (prev === "light" ? "dark" : "light"))}
+          >
+            Theme: {appTheme}
+          </button>
+          <button type="button" className="ghost" onClick={() => void saveActiveFile()} disabled={!activeFilePath || !dirty}>
+            Save
+          </button>
+          <button type="button" className="ghost" onClick={() => void compileActiveFile()} disabled={!rootPath || !!compileRunId}>
+            Compile File
+          </button>
+          <button type="button" onClick={() => void compileProject()} disabled={!rootPath || !!compileRunId}>
+            Compile Project
+          </button>
+          {compileRunId ? (
+            <button type="button" className="ghost" onClick={() => void cancelCompile()}>
+              Cancel
+            </button>
+          ) : null}
+        </div>
+      </header>
+
+      <main className="simple-ui-main">
+        <aside className="panel simple-ui-left">
+          <div className="panel-header">
+            <strong>Project Files</strong>
+            {treeError ? <span className="error">{treeError}</span> : null}
+          </div>
+          <div className="simple-ui-scroll">
             {rootPath ? (
               <>
-                <span className="project-root-name">{rootPath.split(/[\\/]/).pop()}</span>
-                <span className="project-root-path">{rootPath}</span>
-                {!hasProjectDescriptor ? <span className="project-root-hint">No .project file</span> : null}
+                <div className="simple-tree-section">
+                  {treeEntries.length ? renderTree(treeEntries) : <div className="muted">No files in root.</div>}
+                </div>
+                <div className="simple-tree-section">
+                  <div className="simple-tree-subheader">
+                    <strong>Library Files</strong>
+                    <span className="simple-tree-count">{libraryFilePaths.length}</span>
+                  </div>
+                  {libraryFilePaths.length ? (
+                    renderLibraryTree()
+                  ) : (
+                    <div className="muted">No library files indexed.</div>
+                  )}
+                </div>
               </>
             ) : (
-              "No project selected"
+              <div className="muted">Select a project root to begin.</div>
             )}
           </div>
-            <ProjectTree
-              treeEntries={treeEntries}
-              expanded={expanded}
-              onOpenFile={openFile}
-              onContextMenu={showContext}
-              onRootContextMenu={showRootContext}
-              showOnlyModelFiles={showOnlyModelFiles}
-              parseErrorPaths={parseErrorPaths}
-            />
-            </section>
-          )}
-          <div
-            className={`splitter ${leftCollapsed ? "collapsed" : ""}`}
-            onPointerDown={leftCollapsed ? undefined : (event) => startDrag("left", event)}
-          >
-            {leftCollapsed ? (
-              <button
-                type="button"
-                className="splitter-toggle"
-                onClick={() => {
-                  setLeftCollapsed(false);
-                  setLeftWidth(leftStoredWidthRef.current || 240);
-                }}
-                title="Restore project"
-              >
-                {">>"}
-              </button>
-            ) : null}
-          </div>
-          <EditorPane
-            openTabs={openTabs}
-            activeTabPath={activeTabPath}
-            tabOverflowOpen={tabOverflowOpen}
-            onSetTabOverflowOpen={setTabOverflowOpen}
-            onSelectTab={(path) => {
-              void selectTab(path);
-            }}
-            onCloseTab={closeTab}
-            onReorderTabs={reorderTabs}
-            onTabContextMenu={(path, x, y) => {
-              setActiveTabPath(path);
-              setTabMenu({ x, y, path });
-            }}
-          >
-            {activeTabMeta?.kind === "ai" ? (
-                    <AiView
-                      aiMessages={aiMessages}
-                      aiInput={aiInput}
-                      onInputChange={setAiInput}
-                      onRunStep={runAiNextStep}
-                      onCycleHistory={cycleAiHistory}
-                      onClear={clearAiMessages}
-                      onSend={() => {
-                        const text = aiInput.trim();
-                        if (!text) return;
-                        void sendAiMessage(text);
-                    }}
-                  />
-              ) : activeTabMeta?.kind === "data" ? (
-                <DataView
-                  dataExcludeStdlib={dataExcludeStdlib}
-                  onToggleExcludeStdlib={setDataExcludeStdlib}
-                  rootPath={rootPath}
-                  libraryPath={libraryPath}
-                  projectCounts={projectCounts}
-                  libraryCounts={libraryCounts}
-                  errorCounts={errorCounts}
-                  dataViewSymbols={dataViewSymbols}
-                  dataViewSymbolKindCounts={dataViewSymbolKindCounts}
-                />
-              ) : activeTabMeta?.kind === "project-model" ? (
-                <ProjectModelPaneView
-                  rootPath={rootPath}
-                  model={projectModelView}
-                  library={stdlibMetamodel}
-                  loading={projectModelLoading}
-                  libraryLoading={stdlibMetamodelLoadingState}
-                  error={projectModelError}
-                  libraryError={stdlibMetamodelErrorState}
-                  focusQuery={projectModelFocusQuery}
-                  onRefresh={() => {
-                    void loadProjectModelAndMaybeStdlib();
-                  }}
-                />
-              ) : !activeTabPath ? (
-                <div className="editor-placeholder">
-                  <div className="welcome-screen">
-                      <div className="welcome-title">Welcome to Mercurio</div>
-                      <div className="welcome-subtitle">Open a project or create a new one to get started.</div>
-                      <div className="welcome-actions">
-                        <button type="button" className="ghost" onClick={openNewProjectDialog}>New Project</button>
-                        <button type="button" className="ghost" onClick={chooseProject}>Open Project</button>
-                      </div>
-                      <div className="welcome-hint">Tip: Open a .diagram file to view diagrams.</div>
-                    </div>
-                  </div>
-              ) : activeTabPath === PROJECT_DESCRIPTOR_TAB ? (
-                <DescriptorView
-                  descriptorViewMode={descriptorViewMode}
-                  projectDescriptor={projectDescriptor}
-                />
-              ) : activeTabMeta?.kind !== "diagram" ? (
-                <>
-                  <div className="editor-toolbar">
-                    <div className="editor-toolbar-group">
-                      <button
-                        type="button"
-                        className={`ghost icon-track ${trackText ? "active" : ""}`}
-                        onClick={() => setTrackText((prev) => !prev)}
-                        title={trackText ? "Stop tracking text" : "Track text"}
-                        aria-pressed={trackText}
-                        aria-label="Track text"
-                      />
-                    </div>
-                    {trackCandidate ? null : (
-                      <div className="editor-toolbar-group">
-                        <span className="muted">No symbol near cursor</span>
-                      </div>
-                    )}
-                </div>
-                  <div className={`editor-body ${showAstSplit ? "editor-split" : ""}`}>
-                    <div className="editor-pane">
-                      <MonacoEditor
-                        defaultValue=""
-                        onChange={(value) => {
-                          const next = value ?? "";
-                          if (suppressDirtyRef.current) {
-                            suppressDirtyRef.current = false;
-                            return;
-                          }
-                          onEditorChange(next);
-                        }}
-                        language="sysml"
-                        theme={appTheme === "light" ? "vs" : "vs-dark"}
-                        onMount={handleEditorMount}
-                        options={editorOptions}
-                      />
-                    </div>
-                    {showAstSplit ? (
-                      <div className="ast-pane">
-                        <div className="ast-pane-header">AST (read-only)</div>
-                        <AstStatus state={astSplitState}>
-                          <MonacoEditor
-                            value={astSplitState.content || ""}
-                            language="plaintext"
-                            theme={appTheme === "light" ? "vs" : "vs-dark"}
-                            onMount={(editorInstance) => {
-                              astEditorRef.current = editorInstance;
-                              editorInstance.updateOptions({
-                                readOnly: true,
-                                domReadOnly: true,
-                                minimap: { enabled: false },
-                                wordWrap: "off",
-                                scrollBeyondLastLine: false,
-                                renderLineHighlight: "none",
-                              });
-                              editorInstance.layout();
-                              attachAstSync();
-                            }}
-                            options={{
-                              readOnly: true,
-                              domReadOnly: true,
-                              minimap: { enabled: false },
-                              wordWrap: "off",
-                              scrollBeyondLastLine: false,
-                              renderLineHighlight: "none",
-                              fontSize: editorOptions?.fontSize,
-                              lineNumbers: "on",
-                            }}
-                          />
-                        </AstStatus>
-                      </div>
-                    ) : null}
-                  </div>
-                </>
-            ) : (
-              <DiagramView
-                activeDiagramPath={activeDiagramPath}
-                diagramLayout={diagramLayout}
-                diagramScale={diagramScale}
-                diagramOffset={diagramOffset}
-                diagramViewport={diagramViewport}
-                paletteGhost={paletteGhost}
-                palettePos={palettePos}
-                flowNodes={flowNodes}
-                flowEdges={flowEdges}
-                onFlowNodesChange={handleFlowNodesChange}
-                onFlowNodeClick={handleFlowNodeClick}
-                onFlowNodeDoubleClick={handleFlowNodeDoubleClick}
-                onFlowNodeDragStop={handleFlowNodeDragStop}
-                onSelectInTree={(qualifiedName) => {
-                  const symbol = symbols.find((item) => item.qualified_name === qualifiedName) || null;
-                  if (!symbol) return;
-                  setSelectedSymbol(symbol);
-                  setSelectedNodeSymbols([symbol]);
-                  syncModelTreeToSymbol(symbol);
-                }}
-                onSelectInText={(qualifiedName) => {
-                  const symbol = symbols.find((item) => item.qualified_name === qualifiedName) || null;
-                  if (!symbol) return;
-                  setSelectedSymbol(symbol);
-                  setSelectedNodeSymbols([symbol]);
-                  void selectSymbolInEditor(symbol);
-                }}
-                onExpandTypeFromSelection={handleExpandTypeFromSelection}
-                canExpandTypeFromSelection={canExpandTypeFromSelection}
-                onDeleteSelectedFlowNode={handleDeleteSelectedFlowNode}
-                canDeleteSelectedFlowNode={canDeleteSelectedFlowNode}
-                snapToGrid={snapToGrid}
-                onToggleSnapToGrid={() => setSnapToGrid((prev) => !prev)}
-                diagramBodyRef={diagramBodyRef}
-                diagramPanRef={diagramPanRef}
-                diagramPanPendingRef={diagramPanPendingRef}
-                diagramPanRafRef={diagramPanRafRef}
-                diagramViewportRef={diagramViewportRef}
-                paletteDragRef={paletteDragRef}
-                paletteCreateRef={paletteCreateRef}
-                diagramDropActive={diagramDropActive}
-                diagramType={diagramType}
-                onDiagramTypeChange={setDiagramType}
-                onSwitchToText={() => {
-                  if (activeDiagramPath) {
-                    void navigateTo({ path: activeDiagramPath });
-                  } else {
-                    setCenterView("file");
-                  }
-                }}
-                onAutoLayout={() => {
-                  setDiagramNodeOffsets({});
-                  setDiagramNodeSizes({});
-                  setDiagramOffset({ x: 0, y: 0 });
-                  requestDiagramLayout();
-                }}
-                onZoomIn={() => setDiagramScale((s) => Math.min(2.0, s + 0.1))}
-                onZoomOut={() => setDiagramScale((s) => Math.max(0.4, s - 0.1))}
-                onReset={() => {
-                  setDiagramScale(1);
-                  setDiagramOffset({ x: 0, y: 0 });
-                }}
-                onDiagramDrop={handleDiagramDrop}
-                onDiagramDragOver={handleDiagramDragOver}
-                onDiagramDragLeave={handleDiagramDragLeave}
-                setDiagramOffset={setDiagramOffset}
-                setPaletteGhost={setPaletteGhost}
-                renderDiagramLayout={renderDiagramLayout}
-                renderMinimapLayout={renderMinimapLayout}
-                renderTypeIcon={renderTypeIcon}
-              />
-            )}
-            <TerminalPane
-              open={showTerminal}
-              height={terminalHeight}
-              tabs={terminalTabs.map((tab) => ({ id: tab.id, title: tab.title }))}
-              activeTabId={activeTerminalTabId}
-              onSelectTab={setActiveTerminalTabId}
-              onNewTab={createTerminalTab}
-              onCloseTab={closeTerminalTab}
-              onResizeStart={(event) => {
-                terminalResizeRef.current = { startY: event.clientY, startHeight: terminalHeight };
-              }}
-              lines={activeTerminalTab?.lines || []}
-              input={activeTerminalTab?.input || ""}
-              onInputChange={(value) => {
-                updateActiveTerminalTab((tab) => ({ ...tab, input: value, historyIndex: null }));
-              }}
-              onSubmit={() => {
-                void runTerminalCommand();
-              }}
-              onClose={() => setShowTerminal(false)}
-              onAutocompleteEval={autocompleteTerminalEval}
-              onHistoryUp={terminalHistoryUp}
-              onHistoryDown={terminalHistoryDown}
-              onClear={() => {
-                updateActiveTerminalTab((tab) => ({ ...tab, lines: [] }));
-              }}
-            />
-          </EditorPane>
-          <>
-          <div
-            className={`splitter ${rightCollapsed ? "collapsed" : ""}`}
-            onPointerDown={rightCollapsed ? undefined : (event) => startDrag("right", event)}
-            title={rightCollapsed ? "Model pane collapsed" : "Resize model pane"}
-          />
-          {rightCollapsed ? null : (
-            <section className="panel sidebar right-pane" ref={modelPaneContainerRef}>
-              <div className="panel-header" ref={rightPaneHeaderRef}>
-                <div className="right-pane-toolbar">
-                  <ModelHeader
-                    collapseAll={collapseAllModel}
-                    libraryStatus=""
-                    onCollapseAll={() => setCollapseAllModel(true)}
-                    onExpandAll={() => setCollapseAllModel(false)}
-                    onOpenOptions={showModelOptions}
-                  />
-                  <div className="right-pane-actions">
-                    <button
-                      type="button"
-                      className={`ghost icon-properties ${(rightPaneTab === "file_editor" ? showFilePropertiesPane : showPropertiesPane) ? "active" : ""}`}
-                      onClick={() => {
-                        if (rightPaneTab === "file_editor") {
-                          setShowFilePropertiesPane((prev) => !prev);
-                          return;
-                        }
-                        setShowPropertiesPane((prev) => !prev);
-                      }}
-                      title={(rightPaneTab === "file_editor" ? showFilePropertiesPane : showPropertiesPane) ? "Hide Properties" : "Show Properties"}
-                      aria-label={(rightPaneTab === "file_editor" ? showFilePropertiesPane : showPropertiesPane) ? "Hide Properties" : "Show Properties"}
-                    >
-                    </button>
-                    <button
-                      type="button"
-                      className={`ghost icon-mode ${rightPaneTab === "file_editor" ? "file-only" : "project"}`}
-                      onClick={() => setRightPaneTab((prev) => (prev === "semantic" ? "file_editor" : "semantic"))}
-                      title={rightPaneTab === "semantic" ? "Switch to File Only" : "Switch to Project"}
-                      aria-label={rightPaneTab === "semantic" ? "Switch to File Only" : "Switch to Project"}
-                    />
-                  </div>
-                </div>
+        </aside>
+
+        <section className="panel editor simple-ui-center">
+          <div className="panel-header simple-editor-header">
+            <div className="simple-editor-title">{activeFileName}{dirty ? " *" : ""}</div>
+            <div className="simple-editor-meta">
+              <span>Symbols in file: {activeFileSymbols.length}</span>
+              <span>Parsed files: {parsedFiles.length}</span>
+              <span>Unresolved: {unresolved.length}</span>
             </div>
-            <ModelPane
-              rootPath={rootPath}
-              modelTreeHeight={effectiveModelTreeHeight}
-              showPropertiesPane={rightPaneTab === "file_editor" ? showFilePropertiesPane : showPropertiesPane}
-              propertiesDock={rightPaneTab === "file_editor" ? "bottom" : propertiesDock}
-              modelPropertiesWidth={modelPropertiesWidth}
-              modelTreeRef={rightPaneTab === "file_editor" ? fileModelTreeRef : modelTreeRef}
-              modelListRef={rightPaneTab === "file_editor" ? fileModelListRef : modelListRef}
-              modelRows={rightPaneTab === "file_editor" ? fileEditorModelRows : modelRows}
-              modelListHeight={rightPaneTab === "file_editor" ? fileModelListHeight : modelListHeight}
-              getModelRowHeight={rightPaneTab === "file_editor" ? getFileModelRowHeight : getModelRowHeight}
-              renderModelRow={rightPaneTab === "file_editor" ? renderFileModelRow : renderModelRow}
-              handleModelTreeKeyDown={rightPaneTab === "file_editor" ? handleFileModelTreeKeyDown : handleModelTreeKeyDown}
-              onModelTreeFocus={() => {
-                if (rightPaneTab === "file_editor") {
-                  if (fileModelCursorIndex != null || !fileEditorModelRows.length) return;
-                  const selectedIndex = findSelectedFileSymbolIndex();
-                  setFileModelCursorIndex(selectedIndex >= 0 ? selectedIndex : 0);
+          </div>
+          <div className="editor-host" id="monaco-root">
+            <MonacoEditor
+              defaultValue=""
+              onChange={(value) => {
+                if (suppressDirtyRef.current) {
+                  suppressDirtyRef.current = false;
                   return;
                 }
-                if (modelCursorIndex != null || !modelRows.length) return;
-                const selectedIndex = findSelectedSymbolIndex();
-                setModelCursorIndex(selectedIndex >= 0 ? selectedIndex : 0);
+                contentRef.current = value ?? "";
+                if (!dirtyRef.current) {
+                  dirtyRef.current = true;
+                  setDirty(true);
+                }
               }}
-              startDrag={startDrag}
-              selectedSymbol={selectedSymbol}
-              selectedSymbols={selectedNodeSymbols}
-              onOpenInProjectModel={(symbol) => {
-                setProjectModelFocusQuery(symbol.qualified_name || symbol.name || symbol.kind);
-                openProjectModelViewTab();
+              language={editorLanguage}
+              theme={appTheme === "light" ? "vs" : "vs-dark"}
+              onMount={handleEditorMount}
+              options={{
+                minimap: { enabled: false },
+                wordWrap: "off",
+                scrollBeyondLastLine: false,
+                renderLineHighlight: "line",
+                fontSize: 13,
+                automaticLayout: true,
               }}
-              onOpenQualifiedNameInSource={openQualifiedNameInSource}
             />
-            </section>
-          )}
-          </>
-      </main>
-        {tabMenu ? (
-          <div className="context-menu tab-menu" style={{ left: tabMenu.x, top: tabMenu.y }}>
-            <button
-              type="button"
-              onClick={() => {
-                closeTab(tabMenu.path);
-                setTabMenu(null);
-              }}
-            >
-              Close
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                closeOtherTabs(tabMenu.path);
-                setTabMenu(null);
-              }}
-              disabled={openTabs.length <= 1}
-            >
-              Close Others
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                closeAllTabs();
-                setTabMenu(null);
-              }}
-              disabled={!openTabs.length}
-            >
-              Close All
-            </button>
           </div>
-        ) : null}
-        {contextMenu ? (
-          <div className="context-menu" style={{ left: contextMenu.x, top: contextMenu.y }}>
-            {contextMenu.scope === "root" ? (
-              <>
-                <button type="button" onClick={() => handleContextAction("new-file")}>New file</button>
-                <button type="button" onClick={() => handleContextAction("new-folder")}>New folder</button>
-              </>
+          <div className="simple-harness">
+            <div className="panel-header">
+              <strong>Graphical Test Harness</strong>
+              <div className="simple-harness-actions">
+                <button type="button" className="ghost" disabled={!rootPath || harnessRunning} onClick={() => void runHarness(1)}>
+                  Run 1x
+                </button>
+                <button type="button" className="ghost" disabled={!rootPath || harnessRunning} onClick={() => void runHarness(5)}>
+                  Run 5x
+                </button>
+                {harnessRunning ? <span className="muted">running...</span> : null}
+              </div>
+            </div>
+            <div className="simple-harness-runs">
+              {harnessRuns.length ? (
+                harnessRuns.map((run) => {
+                  const width = `${Math.max(6, Math.round((run.durationMs / harnessMaxDuration) * 100))}%`;
+                  return (
+                    <div key={run.id} className="simple-harness-row">
+                      <span>{run.at}</span>
+                      <span>{run.kind}</span>
+                      <span className={run.ok ? "ok" : "error"}>{run.ok ? "ok" : "fail"}</span>
+                      <span>{Math.round(run.durationMs)} ms</span>
+                      <div className="simple-harness-bar">
+                        <div className={`simple-harness-bar-fill ${run.ok ? "ok" : "error"}`} style={{ width }} />
+                      </div>
+                    </div>
+                  );
+                })
+              ) : (
+                <div className="muted">No runs yet.</div>
+              )}
+            </div>
+          </div>
+        </section>
+
+        <aside className="panel simple-ui-right">
+          <div className="panel-header simple-symbols-header">
+            <strong>Semantic Symbols</strong>
+            <label className="inline-checkbox">
+              <input
+                type="checkbox"
+                checked={showCurrentFileOnly}
+                onChange={(event) => setShowCurrentFileOnly(event.target.checked)}
+              />
+              <span>current file</span>
+            </label>
+          </div>
+          <div className="simple-symbols-controls">
+            <input
+              value={symbolQuery}
+              onChange={(event) => setSymbolQuery(event.target.value)}
+              placeholder="Filter name, kind, qname"
+            />
+            <div className="muted">{filteredSymbols.length} shown of {projectSymbols.length} project symbols</div>
+          </div>
+          <div className="simple-ui-scroll simple-symbol-list">
+            {filteredSymbols.map((symbol) => {
+              const selected =
+                !!selectedSymbol
+                && normalizePath(selectedSymbol.file_path) === normalizePath(symbol.file_path)
+                && (selectedSymbol.qualified_name || selectedSymbol.name) === (symbol.qualified_name || symbol.name);
+              return (
+                <button
+                  key={`${symbol.file_path}|${symbol.qualified_name}|${symbol.start_line}|${symbol.start_col}`}
+                  type="button"
+                  className={`simple-symbol-row ${selected ? "active" : ""}`}
+                  onClick={() => {
+                    void selectSymbol(symbol);
+                  }}
+                  title={`${symbol.qualified_name}\n${symbol.file_path}`}
+                >
+                  <span className="simple-symbol-kind">{symbol.kind || "?"}</span>
+                  <span className="simple-symbol-name">{symbol.name || "<anonymous>"}</span>
+                  <span className="simple-symbol-qname">{symbol.qualified_name || "-"}</span>
+                </button>
+              );
+            })}
+            {!filteredSymbols.length ? <div className="muted">No symbols match the current filter.</div> : null}
+          </div>
+
+          <div className="panel-header"><strong>Properties</strong></div>
+          <div className="simple-ui-scroll simple-properties-host">
+            <CombinedPropertiesPane
+              selectedSymbols={selectedSymbol ? [selectedSymbol] : null}
+              selectedSemanticRow={selectedSemanticRow}
+              selectedSemanticLoading={selectedSemanticLoading}
+              selectedSemanticError={selectedSemanticError}
+              onSelectQualifiedName={selectQualifiedName}
+              expressionRecords={[]}
+            />
+          </div>
+
+          <div className="panel-header"><strong>Parse Errors</strong></div>
+          <div className="simple-ui-scroll simple-error-list">
+            {compileToast.parseErrors.length ? (
+              compileToast.parseErrors.slice(0, 30).map((entry) => (
+                <div key={entry.path} className="simple-error-group">
+                  <button
+                    type="button"
+                    className="ghost simple-error-path"
+                    onClick={() => {
+                      const first = entry.errors[0] || "";
+                      openParseError(entry.path, first);
+                    }}
+                    title={entry.path}
+                  >
+                    {entry.path}
+                  </button>
+                  {entry.errors.slice(0, 3).map((message, idx) => (
+                    <button
+                      key={`${entry.path}:${idx}`}
+                      type="button"
+                      className="ghost simple-error-message"
+                      onClick={() => openParseError(entry.path, message)}
+                      title={message}
+                    >
+                      {message}
+                    </button>
+                  ))}
+                </div>
+              ))
             ) : (
-              <>
-                {contextMenu.entry.is_dir ? (
-                  <>
-                    <button type="button" onClick={() => handleContextAction("new-file")}>New file</button>
-                    <button type="button" onClick={() => handleContextAction("new-folder")}>New folder</button>
-                    <button type="button" onClick={() => handleContextAction("open-project")}>Open As Project</button>
-                  </>
-                ) : null}
-                <button type="button" onClick={() => handleContextAction("show-in-explorer")}>Show in Explorer</button>
-                <button type="button" onClick={() => handleContextAction("rename")}>Rename</button>
-              </>
+              <div className="muted">No parse errors from latest compile.</div>
             )}
           </div>
-        ) : null}
-        {modelOptionsMenu ? (
-          <div className="context-menu" style={{ left: modelOptionsMenu.x, top: modelOptionsMenu.y }}>
-            <button
-              type="button"
-              onClick={() => {
-                setTrackText((prev) => !prev);
-                setModelOptionsMenu(null);
-              }}
-            >
-              {trackText ? "✓ " : ""}Track To Selection
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setModelShowFiles((prev) => !prev);
-                setModelOptionsMenu(null);
-              }}
-            >
-              {modelShowFiles ? "Hide File Groups" : "Show File Groups"}
-            </button>
-            <button
-              type="button"
-              disabled={!pendingLibraryFiles || libraryBulkLoading}
-              onClick={() => {
-                void loadAllLibrarySymbols();
-                setModelOptionsMenu(null);
-              }}
-            >
-              {libraryBulkLoading
-                ? "Loading Library Symbols..."
-                : `Load All Library Symbols (${loadedLibraryFileCount}/${libraryFiles.length})`}
-            </button>
-            <button
-              type="button"
-              disabled={!libraryBulkLoading}
-              onClick={() => {
-                cancelLibrarySymbolLoading();
-                setModelOptionsMenu(null);
-              }}
-            >
-              Cancel Library Load
-            </button>
-            <button
-              type="button"
-              disabled={!failedLibraryFiles || libraryBulkLoading}
-              onClick={() => {
-                void retryFailedLibraryLoads();
-                setModelOptionsMenu(null);
-              }}
-            >
-              Retry Failed Library Loads{failedLibraryFiles ? ` (${failedLibraryFiles})` : ""}
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setShowUsageNodes((prev) => !prev);
-                setModelOptionsMenu(null);
-              }}
-            >
-              {showUsageNodes ? "Hide Usages" : "Show Usages"}
-            </button>
-          </div>
-        ) : null}
-        {modelContextMenu ? (
-          <div className="context-menu" style={{ left: modelContextMenu.x, top: modelContextMenu.y }}>
-            <button
-              type="button"
-              disabled={!modelContextMenu.filePath}
-              onClick={() => {
-                if (!modelContextMenu.filePath) return;
-                void openAstView(modelContextMenu.filePath, modelContextMenu.label);
-                setModelContextMenu(null);
-              }}
-            >
-              Show AST
-            </button>
-            <button
-              type="button"
-              disabled={modelContextMenu.section !== "library" || !modelContextMenu.filePath}
-              onClick={() => {
-                if (!modelContextMenu.filePath || modelContextMenu.section !== "library") return;
-                void loadLibrarySymbolsForFile(modelContextMenu.filePath);
-                setModelContextMenu(null);
-              }}
-            >
-              Retry Library File Load
-            </button>
-            {modelContextMenu.section === "library" && modelContextMenu.loadError ? (
-              <div className="context-meta">Last load error: {modelContextMenu.loadError}</div>
-            ) : null}
-          </div>
-        ) : null}
-        <AppCoreModals
-          showGotoDialog={showGotoDialog}
-          setShowGotoDialog={setShowGotoDialog}
-          gotoInputRef={gotoInputRef}
-          gotoQuery={gotoQuery}
-          setGotoQuery={setGotoQuery}
-          handleGotoInputKeyDown={handleGotoInputKeyDown}
-          gotoLoading={gotoLoading}
-          gotoError={gotoError}
-          filteredGotoCandidates={filteredGotoCandidates}
-          gotoSelectedIndex={gotoSelectedIndex}
-          setGotoSelectedIndex={setGotoSelectedIndex}
-          openGotoCandidate={openGotoCandidate}
-          selectedGotoCandidate={selectedGotoCandidate}
-          showNewFile={showNewFile}
-          setShowNewFile={setShowNewFile}
-          newFileName={newFileName}
-          setNewFileName={setNewFileName}
-          newFileType={newFileType}
-          setNewFileType={setNewFileType}
-          newFileParent={newFileParent}
-          rootPath={rootPath}
-          createNewFile={createNewFile}
-          showNewProject={showNewProject}
-          setShowNewProject={setShowNewProject}
-          newProjectLocation={newProjectLocation}
-          setNewProjectLocation={setNewProjectLocation}
-          updateNewProjectFolderStatus={updateNewProjectFolderStatus}
-          onBrowseNewProjectLocation={async () => {
-            const selected = await open({ directory: true, multiple: false, defaultPath: newProjectLocation || undefined });
-            if (typeof selected === "string" && selected) {
-              setNewProjectLocation(selected);
-              void updateNewProjectFolderStatus();
-            }
-          }}
-          newProjectName={newProjectName}
-          setNewProjectName={setNewProjectName}
-          slugifyProjectName={slugifyProjectName}
-          setNewProjectFolder={setNewProjectFolder}
-          newProjectAuthor={newProjectAuthor}
-          setNewProjectAuthor={setNewProjectAuthor}
-          newProjectOrganization={newProjectOrganization}
-          setNewProjectOrganization={setNewProjectOrganization}
-          newProjectDescription={newProjectDescription}
-          setNewProjectDescription={setNewProjectDescription}
-          newProjectFolder={newProjectFolder}
-          newProjectFolderStatus={newProjectFolderStatus}
-          newProjectDefaultLib={newProjectDefaultLib}
-          setNewProjectDefaultLib={setNewProjectDefaultLib}
-          newProjectError={newProjectError}
-          newProjectBusy={newProjectBusy}
-          newProjectFolderAvailable={newProjectFolderAvailable}
-          createNewProject={createNewProject}
-          showOpenProject={showOpenProject}
-          setShowOpenProject={setShowOpenProject}
-          openProjectPath={openProjectPath}
-          setOpenProjectPath={setOpenProjectPath}
-          browseOpenProject={browseOpenProject}
-          recentProjects={recentProjects}
-          confirmOpenProject={confirmOpenProject}
-          showExport={showExport}
-          setShowExport={setShowExport}
-          runBuildWithOptions={runBuildWithOptions}
-          exportAfterBuild={exportAfterBuild}
-          setExportAfterBuild={setExportAfterBuild}
-          exportFormat={exportFormat}
-          setExportFormat={setExportFormat}
-          exportPath={exportPath}
-          setExportPath={setExportPath}
-          getDefaultBuildPath={getDefaultBuildPath}
-          onBrowseExportPath={async () => {
-            const selected = await save({
-              defaultPath: exportPath || undefined,
-              filters: [
-                exportFormat === "jsonld"
-                  ? { name: "JSON-LD", extensions: ["jsonld"] }
-                  : exportFormat === "kpar"
-                    ? { name: "KPAR", extensions: ["kpar"] }
-                    : { name: "XMI", extensions: ["xmi"] },
-              ],
-            });
-            if (typeof selected === "string" && selected) {
-              setExportPath(selected);
-            }
-          }}
-          exportIncludeStdlib={exportIncludeStdlib}
-          setExportIncludeStdlib={setExportIncludeStdlib}
-          exportBusy={exportBusy}
-          showSettings={showSettings}
-          setShowSettings={setShowSettings}
-          appTheme={appTheme}
-          setAppTheme={setAppTheme}
-          settingsTab={settingsTab}
-          setSettingsTab={setSettingsTab}
-          aiEndpoints={aiEndpoints}
-          endpointTestStatus={endpointTestStatus}
-          editEndpoint={editEndpoint}
-          deleteEndpoint={deleteEndpoint}
-          selectedChatEndpoint={selectedChatEndpoint}
-          setSelectedChatEndpoint={setSelectedChatEndpoint}
-          testEndpoint={testEndpoint}
-          endpointDraft={endpointDraft}
-          setEndpointDraft={setEndpointDraft}
-          resetEndpointDraft={resetEndpointDraft}
-          saveEndpointDraft={saveEndpointDraft}
-          settingsDefaultStdlib={settingsDefaultStdlib}
-          setSettingsDefaultStdlib={setSettingsDefaultStdlib}
-          settingsStdlibVersions={settingsStdlibVersions}
-          settingsStdlibStatus={settingsStdlibStatus}
-          settingsStdlibBusy={settingsStdlibBusy}
-          saveDefaultStdlibSelection={saveDefaultStdlibSelection}
-          showAbout={showAbout}
-          setShowAbout={setShowAbout}
-          aboutVersion={aboutVersion}
-          aboutBuild={aboutBuild}
-          astViewOpen={astViewOpen}
-          setAstViewOpen={setAstViewOpen}
-          astViewTitle={astViewTitle}
-          astViewState={astViewState}
-        />
-      {showProjectProperties ? (
-        <Modal open={showProjectProperties} onClose={() => setShowProjectProperties(false)} cardClassName="modal-wide" ariaLabelledBy="project-properties-title">
-            <div className="modal-header">
-              <h3 id="project-properties-title">Project Properties</h3>
-            </div>
-            <div className="modal-body">
-              <div className="project-properties">
-                <div className="project-properties-grid">
-                  <label className="field">
-                    <span className="field-label">Name</span>
-                    <input
-                      value={projectPropertiesDraft.name}
-                      onChange={(event) => setProjectPropertiesDraft((prev) => ({ ...prev, name: event.target.value }))}
-                    />
-                  </label>
-                  <label className="field">
-                    <span className="field-label">Author</span>
-                    <input
-                      value={projectPropertiesDraft.author}
-                      onChange={(event) => setProjectPropertiesDraft((prev) => ({ ...prev, author: event.target.value }))}
-                    />
-                  </label>
-                  <label className="field">
-                    <span className="field-label">Organization</span>
-                    <input
-                      value={projectPropertiesDraft.organization}
-                      onChange={(event) => setProjectPropertiesDraft((prev) => ({ ...prev, organization: event.target.value }))}
-                    />
-                  </label>
-                  <label className="field">
-                    <span className="field-label">Description</span>
-                    <input
-                      value={projectPropertiesDraft.description}
-                      onChange={(event) => setProjectPropertiesDraft((prev) => ({ ...prev, description: event.target.value }))}
-                    />
-                  </label>
-                </div>
-                <div className="project-properties-section">
-                  <div className="project-properties-title">Files</div>
-                  <div className="project-properties-list">
-                    {projectPropertiesDraft.src.length ? (
-                      projectPropertiesDraft.src.map((entry) => (
-                        <div key={entry} className="project-properties-item">
-                          <span>{entry}</span>
-                          <button type="button" className="ghost" onClick={() => removeProjectFile(entry)}>Remove</button>
-                        </div>
-                      ))
-                    ) : (
-                      <div className="muted">No files configured.</div>
-                    )}
-                  </div>
-                  <div className="field-inline">
-                    <input
-                      value={projectFileInput}
-                      onChange={(event) => setProjectFileInput(event.target.value)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") {
-                          event.preventDefault();
-                          addProjectFile();
-                        }
-                      }}
-                      placeholder="**/*.sysml"
-                    />
-                    <button type="button" className="ghost" onClick={addProjectFile}>Add</button>
-                  </div>
-                </div>
-                <div className="project-properties-section">
-                  <div className="project-properties-title">Libraries</div>
-                  <div className="project-properties-list">
-                    {projectPropertiesDraft.import_entries.length ? (
-                      projectPropertiesDraft.import_entries.map((entry) => (
-                        <div key={entry} className="project-properties-item">
-                          <span>{entry}</span>
-                          <button type="button" className="ghost" onClick={() => removeProjectLibrary(entry)}>Remove</button>
-                        </div>
-                      ))
-                    ) : (
-                      <div className="muted">No libraries configured.</div>
-                    )}
-                  </div>
-                  <div className="field-inline">
-                    <input
-                      value={projectLibraryInput}
-                      onChange={(event) => setProjectLibraryInput(event.target.value)}
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") {
-                          event.preventDefault();
-                          addProjectLibrary();
-                        }
-                      }}
-                      placeholder="**/*.sysmlx"
-                    />
-                    <button type="button" className="ghost" onClick={addProjectLibrary}>Add</button>
-                  </div>
-                </div>
-                <div className="project-properties-section">
-                  <div className="project-properties-title">Stdlib</div>
-                  <label className="field">
-                    <span className="field-label">Selection</span>
-                    <select
-                      value={projectStdlibMode}
-                      onChange={(event) => setProjectStdlibMode(event.target.value as "default" | "version" | "custom")}
-                    >
-                      <option value="default">Use default</option>
-                      <option value="version">Pick version</option>
-                      <option value="custom">Custom path</option>
-                    </select>
-                  </label>
-                  {projectStdlibMode === "version" ? (
-                    <label className="field">
-                      <span className="field-label">Version</span>
-                      <select
-                        value={projectStdlibVersion}
-                        onChange={(event) => setProjectStdlibVersion(event.target.value)}
-                      >
-                        <option value="">Select version</option>
-                        {projectStdlibVersions.map((version) => (
-                          <option key={version} value={version}>{version}</option>
-                        ))}
-                      </select>
-                    </label>
-                  ) : null}
-                  {projectStdlibMode === "custom" ? (
-                    <label className="field">
-                      <span className="field-label">Path</span>
-                      <input
-                        value={projectStdlibPath}
-                        onChange={(event) => setProjectStdlibPath(event.target.value)}
-                        placeholder="C:\\path\\to\\stdlib"
-                      />
-                    </label>
-                  ) : null}
-                </div>
-                {projectPropertiesError ? <div className="field-hint error">{projectPropertiesError}</div> : null}
-              </div>
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="ghost" onClick={() => setShowProjectProperties(false)}>Cancel</button>
-              <button type="button" onClick={saveProjectProperties} disabled={projectPropertiesBusy}>Save</button>
-            </div>
-        </Modal>
-      ) : null}
-      {showGitDialog ? (
-        <Modal open={showGitDialog} onClose={() => setShowGitDialog(false)} cardClassName="modal-wide git-collab-modal" ariaLabelledBy="git-dialog-title">
-            <div className="modal-header">
-              <h3 id="git-dialog-title">Collab</h3>
-            </div>
-            <div className="modal-body">
-              {gitInfo ? (
-                <div className="field">
-                  <div className="field-label">Repo</div>
-                  <div className="field-inline">
-                    <span>{gitInfo.repo_root.replace(/^\\\\\\?\\/, "")}</span>
-                  </div>
-                  <div className="field-hint">
-                    Branch: {gitInfo.branch} - Ahead {gitInfo.ahead} - Behind {gitInfo.behind} - {gitInfo.clean ? "Clean" : "Has changes"}
-                  </div>
-                  {gitInfo.remote_url ? (
-                    <div className="field-hint">Remote: {gitInfo.remote_url}</div>
-                  ) : null}
-                </div>
-              ) : (
-                <div className="muted">No git repository detected.</div>
-              )}
-              {gitStatusBusy ? (
-                <div className="muted">Loading status...</div>
-              ) : null}
-              {gitStatusError ? (
-                <div className="field-hint error">{gitStatusError}</div>
-              ) : null}
-              <div className="git-changes-scroll">
-                {gitStatus ? (
-                  <div className="project-properties-section">
-                    <div className="project-properties-title">Select files</div>
-                    <div className="commit-tree">
-                      <div className="commit-header">
-                        <input
-                          type="checkbox"
-                          checked={
-                            gitStatus.staged.length + gitStatus.unstaged.length > 0 &&
-                            [...gitStatus.staged, ...gitStatus.unstaged].every((path) => gitCommitSelection[path])
-                          }
-                          onChange={(event) => toggleCommitAll("changes", event.target.checked)}
-                        />
-                        <button
-                          type="button"
-                          className="commit-toggle"
-                          onClick={() => setGitCommitSectionsOpen((prev) => ({ ...prev, changes: !prev.changes }))}
-                          aria-expanded={gitCommitSectionsOpen.changes}
-                        >
-                          {gitCommitSectionsOpen.changes ? "v" : ">"}
-                        </button>
-                        <span>Changes</span>
-                        <span>{gitStatus.staged.length + gitStatus.unstaged.length}</span>
-                      </div>
-                      {gitCommitSectionsOpen.changes ? (
-                        <div className="commit-list">
-                          {[
-                            ...gitStatus.staged.map((path) => ({ path, state: "staged" as const })),
-                            ...gitStatus.unstaged.map((path) => ({ path, state: "unstaged" as const })),
-                          ].map(({ path, state }) => (
-                            <label key={`change-${path}`} className="commit-row">
-                              <input
-                                type="checkbox"
-                                checked={!!gitCommitSelection[path]}
-                                onChange={() => toggleCommitSelection(path)}
-                              />
-                              <span>{path}</span>
-                              <span className="muted">{state}</span>
-                            </label>
-                          ))}
-                        </div>
-                      ) : null}
-                      <div className="commit-header">
-                        <input
-                          type="checkbox"
-                          checked={
-                            gitStatus.untracked.length > 0 &&
-                            gitStatus.untracked.every((path) => gitCommitSelection[path])
-                          }
-                          onChange={(event) => toggleCommitAll("unversioned", event.target.checked)}
-                        />
-                        <button
-                          type="button"
-                          className="commit-toggle"
-                          onClick={() => setGitCommitSectionsOpen((prev) => ({ ...prev, unversioned: !prev.unversioned }))}
-                          aria-expanded={gitCommitSectionsOpen.unversioned}
-                        >
-                          {gitCommitSectionsOpen.unversioned ? "v" : ">"}
-                        </button>
-                        <span>Unversioned</span>
-                        <span>{gitStatus.untracked.length}</span>
-                      </div>
-                      {gitCommitSectionsOpen.unversioned ? (
-                        <div className="commit-list">
-                          {gitStatus.untracked.map((path) => (
-                            <label key={`unversioned-${path}`} className="commit-row">
-                              <input
-                                type="checkbox"
-                                checked={!!gitCommitSelection[path]}
-                                onChange={() => toggleCommitSelection(path)}
-                              />
-                              <span>{path}</span>
-                              <span className="muted">untracked</span>
-                            </label>
-                          ))}
-                        </div>
-                      ) : null}
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-              <label className="field field-commit-message">
-                <span className="field-label">Commit message</span>
-                <textarea
-                  value={gitCommitMessage}
-                  onChange={(event) => setGitCommitMessage(event.target.value)}
-                  placeholder="Describe your changes"
-                  rows={3}
-                />
-              </label>
-              {gitCommitError ? <div className="field-hint error">{gitCommitError}</div> : null}
-              {gitPushError ? <div className="field-hint error">{gitPushError}</div> : null}
-              {gitBranchError ? <div className="field-hint error">{gitBranchError}</div> : null}
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="ghost" onClick={() => setShowGitDialog(false)}>Close</button>
-              <button type="button" onClick={() => runGitCommitFlow(false)} disabled={!gitInfo || gitCommitBusy || gitPushBusy}>Commit</button>
-              <button type="button" onClick={() => runGitCommitFlow(true)} disabled={!gitInfo || gitCommitBusy || gitPushBusy}>Commit &amp; Push</button>
-            </div>
-        </Modal>
-      ) : null}
-      {showGitBranchDialog ? (
-        <Modal open={showGitBranchDialog} onClose={() => setShowGitBranchDialog(false)} ariaLabelledBy="git-branch-title">
-            <div className="modal-header">
-              <h3 id="git-branch-title">Branches</h3>
-            </div>
-            <div className="modal-body">
-              {gitInfo ? (
-                <div className="field">
-                  <div className="field-hint">Repo: {gitInfo.repo_root}</div>
-                  {gitCurrentBranch ? (
-                    <div className="field-hint">Current branch: {gitCurrentBranch}</div>
-                  ) : null}
-                </div>
-              ) : (
-                <div className="muted">No git repository detected.</div>
-              )}
-              <div className="project-properties-section">
-                <div className="project-properties-title">Create branch</div>
-                <div className="field-inline">
-                  <input
-                    value={gitCreateBranchName}
-                    onChange={(event) => setGitCreateBranchName(event.target.value)}
-                    placeholder="new-branch-name"
-                  />
-                  <label className="inline-checkbox">
-                    <input
-                      type="checkbox"
-                      checked={gitCreateBranchCheckout}
-                      onChange={(event) => setGitCreateBranchCheckout(event.target.checked)}
-                    />
-                    <span>Checkout</span>
-                  </label>
-                  <button type="button" className="ghost" onClick={runGitCreateBranch} disabled={!gitInfo || gitBranchBusy}>Create</button>
-                </div>
-              </div>
-              <div className="project-properties-section">
-                <div className="project-properties-title">Checkout branch</div>
-                <div className="field-inline">
-                  <select
-                    value={gitCheckoutBranchName}
-                    onChange={(event) => setGitCheckoutBranchName(event.target.value)}
-                  >
-                    <option value="">Select branch</option>
-                    {gitBranches.map((branch) => (
-                      <option key={branch} value={branch}>
-                        {branch === gitCurrentBranch ? `${branch} (current)` : branch}
-                      </option>
-                    ))}
-                  </select>
-                  <button type="button" className="ghost" onClick={runGitCheckoutBranch} disabled={!gitInfo || gitBranchBusy}>Checkout</button>
-                  <button type="button" className="ghost" onClick={refreshGitBranches} disabled={!gitInfo || gitBranchBusy}>Refresh</button>
-                </div>
-              </div>
-              {gitBranchError ? <div className="field-hint error">{gitBranchError}</div> : null}
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="ghost" onClick={() => setShowGitBranchDialog(false)}>Close</button>
-            </div>
-        </Modal>
-      ) : null}
-        <NextStepsFloating
-          steps={aiFloatingSteps}
-          pos={aiFloatingPos}
-          onStartDrag={(event) => {
-            aiFloatingDragRef.current = {
-              startX: event.clientX,
-              startY: event.clientY,
-              baseX: aiFloatingPos.x,
-              baseY: aiFloatingPos.y,
-            };
-            (event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
-          }}
-          onClose={() => setAiFloatingSteps([])}
-          onRunStep={runAiNextStep}
-        />
-        <footer className="statusbar">
-          <div className="status-left" />
-          <div className="status-right">
-            {errorCounts.symbolCount ? (
-              <span className="status-error-badge">{errorCounts.symbolCount}</span>
-            ) : null}
-            {cursorPos && activeEditorPath ? (
-              <span className="status-cursor">Ln {cursorPos.line}, Col {cursorPos.col}</span>
-            ) : null}
-            <span
-              className={`status-compile-indicator ${backgroundCompileActive ? "active" : ""} ${backgroundCompileEnabled ? "" : "disabled"}`}
-              title={backgroundCompileEnabled ? "Background compile enabled (right-click to disable)" : "Background compile disabled (right-click to enable)"}
-              onContextMenu={(event) => {
-                event.preventDefault();
-                setBackgroundCompileEnabled((prev) => !prev);
-              }}
-            >
-              BG
-            </span>
-            {compileRunId ? (
-              <button type="button" className="ghost" onClick={cancelCompile}>Cancel compile</button>
-            ) : null}
-          </div>
+        </aside>
+      </main>
+
+      <footer className="statusbar">
+        <div className="status-left">
+          <span>Root: {rootPath || "<none>"}</span>
+        </div>
+        <div className="status-right">
+          {cursorPos && activeFilePath ? <span>Ln {cursorPos.line}, Col {cursorPos.col}</span> : null}
+          <span>Project symbols: {projectSymbols.length}</span>
+          <span>Unresolved: {unresolved.length}</span>
+        </div>
       </footer>
-      {compileToast.open ? (
-        <CompileToastPanel
-          compileToast={compileToast}
-          onClose={() => setCompileToast((prev) => ({ ...prev, open: false }))}
-          parseErrorLocation={parseErrorLocation}
-          onNavigate={(path, loc) => {
-            void navigateTo({
-              path,
-              name: path.split(/[\\/]/).pop() || "Untitled",
-              selection: loc
-                ? {
-                    startLine: loc.line,
-                    startCol: loc.col,
-                    endLine: loc.line,
-                    endCol: loc.col + 1,
-                  }
-                : undefined,
-            });
-          }}
-        />
-      ) : null}
     </div>
   );
 }
-
-

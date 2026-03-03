@@ -18,7 +18,7 @@ export type AiEndpoint = {
   token: string;
 };
 
-export type TabKind = "file" | "descriptor" | "diagram" | "ai" | "data" | "project-model";
+export type TabKind = "file" | "descriptor" | "diagram" | "explore-diagram" | "ai" | "data" | "project-model" | "stdlib-graph";
 
 export type OpenTab = {
   path: string;
@@ -72,6 +72,23 @@ export type SymbolView = {
   relationships?: SymbolRelationship[];
 };
 
+export type IndexedSymbolView = {
+  id: string;
+  project_root: string;
+  library_key?: string | null;
+  scope: string;
+  name: string;
+  qualified_name: string;
+  kind: string;
+  metatype_qname?: string | null;
+  file_path: string;
+  start_line: number;
+  start_col: number;
+  end_line: number;
+  end_col: number;
+  doc_text?: string | null;
+};
+
 export type ParseTreeNodeView = {
   id: string;
   parent_id?: string | null;
@@ -101,7 +118,7 @@ export type SymbolNode = {
 };
 
 export type ModelRow =
-  | { type: "section"; key: string; section: "project" | "library" | "errors"; label: string; countLabel: string }
+  | { type: "section"; key: string; section: "project" | "library" | "imports" | "errors"; label: string; countLabel: string }
   | {
       type: "symbol";
       key: string;
@@ -177,11 +194,48 @@ export type MetamodelTypeView = {
   attributes: MetamodelAttributeView[];
 };
 
+export type StdlibCacheSummary = {
+  path: string;
+  signature: string;
+  file_count: number;
+};
+
+export type PhaseTimingView = {
+  phase: string;
+  duration_ms: number;
+};
+
+export type StdlibMetamodelDiagnostics = {
+  resolved_stdlib_path?: string | null;
+  cache_key: string;
+  cache_hit: boolean;
+  snapshot_hit: boolean;
+  cache_lookup_error?: string | null;
+  stdlib_cache_snapshot_error?: string | null;
+  metamodel_cache_store_error?: string | null;
+  failure_reason?: string | null;
+  duplicate_qualified_names: string[];
+  cache_entries: StdlibCacheSummary[];
+  phase_timings: PhaseTimingView[];
+  expression_records_error?: string | null;
+};
+
+export type ExpressionRecordView = {
+  owner_id: number;
+  qualified_name: string;
+  feature?: string | null;
+  expression: string;
+};
+
+export type StdlibExpressionRecordView = ExpressionRecordView;
+
 export type StdlibMetamodelView = {
   stdlib_path?: string | null;
   stdlib_cache_hit: boolean;
   type_count: number;
   types: MetamodelTypeView[];
+  expression_records: StdlibExpressionRecordView[];
+  diagnostics: StdlibMetamodelDiagnostics;
 };
 
 export type ProjectModelAttributeView = {
@@ -211,6 +265,7 @@ export type ProjectModelElementView = {
   direct_specializations: string[];
   indirect_specializations: string[];
   documentation?: string | null;
+  owned_elements_qnames?: string[];
   attributes: ProjectModelAttributeView[];
   diagnostics: string[];
 };
@@ -221,6 +276,7 @@ export type ProjectModelView = {
   project_cache_hit: boolean;
   element_count: number;
   elements: ProjectModelElementView[];
+  expression_records?: ExpressionRecordView[];
   diagnostics: string[];
 };
 
@@ -254,4 +310,11 @@ export type SymbolMetatypeMappingView = {
   mapping_source: string;
   confidence: number;
   diagnostic?: string | null;
+};
+
+export type SemanticElementResult = {
+  name: string;
+  qualified_name: string;
+  file_path: string;
+  attributes?: Record<string, string>;
 };

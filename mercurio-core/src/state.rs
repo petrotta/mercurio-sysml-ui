@@ -1,5 +1,5 @@
 use mercurio_symbol_index::{InMemorySymbolIndex, SqliteSymbolIndexStore, SymbolIndex};
-use mercurio_sysml_semantics::stdlib::MetatypeIndex;
+use mercurio_sysml_pkg::compile_support::StdlibSnapshotCacheEntry;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -29,13 +29,7 @@ pub(crate) struct StdlibSymbol {
     pub(crate) end_col: u32,
 }
 
-pub(crate) struct StdlibCache {
-    pub(crate) path: PathBuf,
-    pub(crate) signature: String,
-    pub(crate) files: Vec<(PathBuf, String)>,
-    pub(crate) metatype_index: Arc<MetatypeIndex>,
-    pub(crate) symbols: Arc<Vec<StdlibSymbol>>,
-}
+pub(crate) type StdlibCache = StdlibSnapshotCacheEntry<StdlibSymbol>;
 
 #[derive(Default)]
 pub(crate) struct WorkspaceState {

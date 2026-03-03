@@ -63,9 +63,15 @@ pub const MIGRATION_0004_SYMBOL_PROPERTIES: &str = r#"
 ALTER TABLE symbols ADD COLUMN properties_json TEXT;
 "#;
 
+pub const MIGRATION_0005_PROJECT_QNAME_INDEX: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_symbols_project_qname
+  ON symbols(project_root, scope, qualified_name, file_path);
+"#;
+
 pub const MIGRATIONS: &[(&str, &str)] = &[
     ("0001_init", MIGRATION_0001_INIT),
     ("0002_stdlib_meta", MIGRATION_0002_STDLIB_META),
     ("0003_symbol_mappings", MIGRATION_0003_SYMBOL_MAPPINGS),
     ("0004_symbol_properties", MIGRATION_0004_SYMBOL_PROPERTIES),
+    ("0005_project_qname_index", MIGRATION_0005_PROJECT_QNAME_INDEX),
 ];
