@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { clearSemanticElementCache, querySemanticElementByQualifiedName } from "./services/semanticApi";
+import {
+  clearSemanticElementCache,
+  querySemanticElementByQualifiedName,
+} from "./services/semanticApi";
 import type { SemanticElementResult, SymbolView } from "./types";
 
 type UseSemanticSelectionArgs = {
@@ -22,53 +25,63 @@ export function useSemanticSelection({
   const [selectedSemanticRow, setSelectedSemanticRow] = useState<SemanticElementResult | null>(null);
   const [selectedSemanticLoading, setSelectedSemanticLoading] = useState(false);
   const [selectedSemanticError, setSelectedSemanticError] = useState("");
-  const requestKeyRef = useRef("");
+  const requestSeqRef = useRef(0);
+  const lastRequestKeyRef = useRef("");
 
   useEffect(() => {
-    requestKeyRef.current = "";
     clearSemanticElementCache(rootPath || undefined);
   }, [rootPath]);
 
   useEffect(() => {
     const qname = (semanticSelectedQname || selectedSymbol?.qualified_name || "").trim();
     const filePath = selectedSymbol?.file_path || null;
+    const requestKey = `${(rootPath || "").toLowerCase()}\u0000${(filePath || "").toLowerCase()}\u0000${qname.toLowerCase()}`;
     if (!rootPath || !qname) {
-      requestKeyRef.current = "";
+      requestSeqRef.current += 1;
+      lastRequestKeyRef.current = "";
       setSelectedSemanticRow(null);
       setSelectedSemanticError("");
       setSelectedSemanticLoading(false);
       return;
     }
-    const requestKey = `${rootPath}\u0000${qname}\u0000${(filePath || "").toLowerCase()}`;
-    if (requestKeyRef.current === requestKey) {
+    if (requestKey === lastRequestKeyRef.current) {
       return;
     }
-    requestKeyRef.current = requestKey;
-    let active = true;
+    lastRequestKeyRef.current = requestKey;
+    const requestSeq = ++requestSeqRef.current;
     setSelectedSemanticLoading(true);
     setSelectedSemanticError("");
     const timer = window.setTimeout(() => {
       void querySemanticElementByQualifiedName(rootPath, qname, filePath)
         .then((payload) => {
-          if (!active) return;
+          if (requestSeqRef.current !== requestSeq) return;
           setSelectedSemanticRow(payload || null);
+          if (!payload) {
+            setSelectedSemanticError("No semantic row in EMF cache. Run Compile to refresh.");
+          } else {
+            setSelectedSemanticError("");
+          }
         })
         .catch((error) => {
-          if (!active) return;
+          if (requestSeqRef.current !== requestSeq) return;
           setSelectedSemanticRow(null);
           setSelectedSemanticError(`Failed to load semantic element: ${String(error)}`);
         })
         .finally(() => {
-          if (!active) return;
+          if (requestSeqRef.current !== requestSeq) return;
           setSelectedSemanticLoading(false);
         });
-    }, 50);
+    }, 150);
     
     return () => {
-      active = false;
       window.clearTimeout(timer);
     };
-  }, [rootPath, semanticSelectedQname, selectedSymbol?.qualified_name, selectedSymbol?.file_path]);
+  }, [
+    rootPath,
+    semanticSelectedQname,
+    selectedSymbol?.qualified_name,
+    selectedSymbol?.file_path,
+  ]);
 
   return {
     selectedSemanticRow,

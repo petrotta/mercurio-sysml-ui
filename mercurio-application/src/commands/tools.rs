@@ -6,7 +6,9 @@ use tauri::command;
 
 use mercurio_core::{
     query_library_symbols as core_query_library_symbols,
+    load_library_symbols_sync as core_load_library_symbols_sync,
     query_project_symbols as core_query_project_symbols,
+    query_project_symbols_for_files as core_query_project_symbols_for_files,
     query_project_semantic_element_by_qualified_name as core_query_project_semantic_element_by_qualified_name,
     get_project_element_attributes as core_get_project_element_attributes,
     get_project_model as core_get_project_model, query_semantic as core_query_semantic,
@@ -70,6 +72,19 @@ fn arg_optional_string(args: &Value, key: &str) -> Option<String> {
 
 fn arg_bool(args: &Value, key: &str, default: bool) -> bool {
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+}
+
+fn arg_string_list(args: &Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|entry| entry.as_str())
+                .map(|entry| entry.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 fn arg_usize(args: &Value, key: &str, default: usize) -> usize {
@@ -213,8 +228,14 @@ fn canonical_tool_name(tool: &str) -> String {
         "query_project_symbols" | "core.query_project_symbols" => {
             "core.query_project_symbols@v1".to_string()
         }
+        "query_project_symbols_for_files" | "core.query_project_symbols_for_files" => {
+            "core.query_project_symbols_for_files@v1".to_string()
+        }
         "query_library_symbols" | "core.query_library_symbols" => {
             "core.query_library_symbols@v1".to_string()
+        }
+        "load_library_symbols" | "core.load_library_symbols" => {
+            "core.load_library_symbols@v1".to_string()
         }
         "query_semantic_element" | "core.query_semantic_element" => {
             "core.query_semantic_element@v1".to_string()
@@ -238,6 +259,11 @@ fn canonical_tool_name(tool: &str) -> String {
 
 pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Value, String> {
     let tool = canonical_tool_name(tool);
+    let _background_job = core.try_start_background_job(
+        "tool",
+        Some(tool.clone()),
+        None,
+    );
     match tool.as_str() {
         "fs.read_file@v1" => {
             let root = root_from_args(&args)?;
@@ -309,6 +335,24 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
             .map_err(|e| e.to_string())?
             .and_then(|rows| serde_json::to_value(rows).map_err(|e| e.to_string()))
         }
+        "core.query_project_symbols_for_files@v1" => {
+            let root = arg_string(&args, "root")?;
+            let file_paths = arg_string_list(&args, "file_paths");
+            let offset = args
+                .get("offset")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok());
+            let limit = args
+                .get("limit")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok());
+            tauri::async_runtime::spawn_blocking(move || {
+                core_query_project_symbols_for_files(&core, root, file_paths, offset, limit)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|rows| serde_json::to_value(rows).map_err(|e| e.to_string()))
+        }
         "core.query_library_symbols@v1" => {
             let root = arg_string(&args, "root")?;
             let file_path = arg_optional_string(&args, "file_path");
@@ -322,6 +366,17 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
                 .and_then(|value| usize::try_from(value).ok());
             tauri::async_runtime::spawn_blocking(move || {
                 core_query_library_symbols(&core, root, file_path, offset, limit)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|rows| serde_json::to_value(rows).map_err(|e| e.to_string()))
+        }
+        "core.load_library_symbols@v1" => {
+            let root = arg_string(&args, "root")?;
+            let file_path = arg_optional_string(&args, "file_path").map(PathBuf::from);
+            let include_symbols = arg_bool(&args, "include_symbols", true);
+            tauri::async_runtime::spawn_blocking(move || {
+                core_load_library_symbols_sync(&core, root, file_path, include_symbols)
             })
             .await
             .map_err(|e| e.to_string())?

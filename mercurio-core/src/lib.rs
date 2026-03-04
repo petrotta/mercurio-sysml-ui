@@ -16,10 +16,12 @@ pub use project::{
 };
 
 mod workspace;
+mod workspace_ir_cache;
 
 mod compile;
 pub use compile::{
-    cancel_compile, compile_project_delta_sync, compile_workspace_sync, load_library_symbols_sync,
+    cancel_compile, compile_project_delta_sync, compile_project_delta_sync_with_options,
+    compile_workspace_sync, load_library_symbols_sync,
     query_semantic_symbols,
     CompileFileResult, CompileProgressPayload, CompileRequest, CompileResponse,
     LibrarySymbolsRequest, LibrarySymbolsResponse,
@@ -35,7 +37,9 @@ pub use settings::{
 };
 
 mod state;
-pub use state::CoreState;
+pub use state::{
+    BackgroundCancelSummary, BackgroundJobView, BackgroundJobsSnapshot, CacheClearSummary, CoreState,
+};
 
 mod stdlib;
 pub use stdlib::{
@@ -45,7 +49,6 @@ pub use stdlib::{
 
 mod project_model;
 mod project_model_seed;
-mod project_model_transform;
 pub use project_model::{
     get_project_element_attributes, get_project_model, ProjectElementAttributesView,
     ProjectElementInheritedAttributeView, ProjectModelAttributeView, ProjectModelElementView,
@@ -55,6 +58,7 @@ pub use project_model::{
 mod symbol_index;
 pub use symbol_index::{
     query_library_summary, query_library_symbols, query_project_symbols, query_stdlib_documentation_symbols,
+    query_project_symbols_for_files,
     query_project_semantic_element_by_qualified_name,
     query_symbol_metatype_mapping, query_symbols_by_metatype, IndexedSymbolView,
     IndexedSemanticElementView, LibraryIndexSummaryView, SymbolMetatypeMappingView,

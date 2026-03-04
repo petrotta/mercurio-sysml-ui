@@ -11,15 +11,25 @@ use zip::ZipArchive;
 
 mod commands;
 
-use commands::{call_tool, list_dir, read_file, write_file};
+use commands::{
+    call_tool, list_dir, read_file, window_close, window_minimize, window_toggle_maximize,
+    write_file,
+};
 
 use mercurio_core::{
+    BackgroundCancelSummary,
+    BackgroundJobsSnapshot,
     cancel_compile as core_cancel_compile,
-    compile_project_delta_sync as core_compile_project_delta_sync,
+    CacheClearSummary,
+    compile_project_delta_sync_with_options as core_compile_project_delta_sync_with_options,
     ensure_mercurio_paths,
+    ensure_project_descriptor,
+    LibraryConfig,
     list_stdlib_versions_from_root,
+    load_project_descriptor,
     load_app_settings,
     save_app_settings,
+    write_project_descriptor,
     AppSettings,
     CompileRequest,
     CompileResponse,
@@ -132,17 +142,29 @@ async fn compile_project_delta(
     state: tauri::State<'_, AppState>,
     payload: CompileRequest,
 ) -> Result<CompileResponse, String> {
-    let (root, run_id, allow_parse_errors, target_path, unsaved) = payload.into_parts();
+    let (root, run_id, allow_parse_errors, include_symbols, target_path, unsaved) =
+        payload.into_parts();
+    let root_for_log = root.clone();
+    let target_for_log = target_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| "<project>".to_string());
+    let unsaved_count = unsaved.len();
+    eprintln!(
+        "[compile] start run_id={} root={} target={} include_symbols={} unsaved={}",
+        run_id, root_for_log, target_for_log, include_symbols, unsaved_count
+    );
     let core = state.core.clone();
     let app_handle = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        core_compile_project_delta_sync(
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        core_compile_project_delta_sync_with_options(
             &core,
             root,
             run_id,
             allow_parse_errors,
             target_path,
             unsaved,
+            include_symbols,
             |progress| {
                 let _ = app_handle.emit_to(
                     EventTarget::webview_window("main"),
@@ -153,12 +175,118 @@ async fn compile_project_delta(
         )
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    match &result {
+        Ok(response) => {
+            eprintln!(
+                "[compile] done run_id={} ok={} parse_failed={} parsed_files={} unresolved={} total_ms={} parse_ms={} analysis_ms={} stdlib_ms={}",
+                run_id,
+                response.ok,
+                response.parse_failed,
+                response.parsed_files.len(),
+                response.unresolved.len(),
+                response.total_duration_ms,
+                response.parse_duration_ms,
+                response.analysis_duration_ms,
+                response.stdlib_duration_ms,
+            );
+        }
+        Err(error) => {
+            eprintln!("[compile] error run_id={} error={}", run_id, error);
+        }
+    }
+    result
 }
 
 #[tauri::command]
 fn cancel_compile(state: tauri::State<'_, AppState>, run_id: u64) -> Result<(), String> {
+    eprintln!("[compile] cancel requested run_id={}", run_id);
     core_cancel_compile(&state.core, run_id)
+}
+
+#[tauri::command]
+fn get_background_jobs(state: tauri::State<'_, AppState>) -> Result<BackgroundJobsSnapshot, String> {
+    state.core.background_jobs_snapshot()
+}
+
+#[tauri::command]
+fn cancel_background_jobs(
+    state: tauri::State<'_, AppState>,
+) -> Result<BackgroundCancelSummary, String> {
+    let summary = state.core.cancel_background_jobs()?;
+    eprintln!(
+        "[jobs] cancel requested active={} cancelable={} compile_cancel_requests={}",
+        summary.active_jobs, summary.cancelable_jobs, summary.compile_cancel_requests
+    );
+    Ok(summary)
+}
+
+#[tauri::command]
+fn clear_all_caches(
+    state: tauri::State<'_, AppState>,
+    root: Option<String>,
+) -> Result<CacheClearSummary, String> {
+    let summary = state
+        .core
+        .clear_runtime_caches_for_root(root.as_deref())?;
+    eprintln!(
+        "[cache] cleared workspace_snapshot={} metamodel={} parsed_files={} mtimes={} canceled={} symbol_index_cleared={} project_ir_deleted={}",
+        summary.workspace_snapshot_entries,
+        summary.metamodel_entries,
+        summary.parsed_file_entries,
+        summary.file_mtime_entries,
+        summary.canceled_compile_entries,
+        summary.symbol_index_cleared,
+        summary.project_ir_cache_deleted,
+    );
+    Ok(summary)
+}
+
+#[tauri::command]
+fn set_project_stdlib_path(
+    state: tauri::State<'_, AppState>,
+    root: String,
+    stdlib_path: String,
+) -> Result<String, String> {
+    let root_path = PathBuf::from(root.trim());
+    if root_path.as_os_str().is_empty() {
+        return Err("Project root is required".to_string());
+    }
+    if !root_path.exists() || !root_path.is_dir() {
+        return Err(format!(
+            "Project root does not exist or is not a directory: {}",
+            root_path.display()
+        ));
+    }
+
+    let mut selected_path = PathBuf::from(stdlib_path.trim());
+    if selected_path.as_os_str().is_empty() {
+        return Err("Stdlib path is required".to_string());
+    }
+    if !selected_path.exists() || !selected_path.is_dir() {
+        return Err(format!(
+            "Stdlib path does not exist or is not a directory: {}",
+            selected_path.display()
+        ));
+    }
+    if let Ok(canonical) = selected_path.canonicalize() {
+        selected_path = canonical;
+    }
+
+    // Ensure descriptor exists so path updates are always persisted in project config.
+    let _ = ensure_project_descriptor(&root_path)?;
+    let mut descriptor = load_project_descriptor(&root_path)?
+        .ok_or_else(|| "Failed to load project descriptor".to_string())?;
+    descriptor.config.library = Some(LibraryConfig::Path {
+        path: selected_path.to_string_lossy().to_string(),
+    });
+    descriptor.config.stdlib = None;
+    let _ = write_project_descriptor(&root_path, &descriptor)?;
+
+    let root_key = root_path.to_string_lossy().to_string();
+    let _ = state.core.clear_runtime_caches_for_root(Some(root_key.as_str()));
+
+    Ok(selected_path.to_string_lossy().to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -209,23 +337,56 @@ pub fn run() {
             let open_file = MenuItemBuilder::with_id("file.open_file", "Open File...")
                 .accelerator("Ctrl+O")
                 .build(app)?;
-            let compile = MenuItemBuilder::with_id("build.compile", "Build")
+            let save = MenuItemBuilder::with_id("file.save", "Save")
+                .accelerator("Ctrl+S")
+                .build(app)?;
+            let compile_project =
+                MenuItemBuilder::with_id("build.compile_project", "Compile Project")
                 .accelerator("Ctrl+B")
                 .build(app)?;
+            let compile_file = MenuItemBuilder::with_id("build.compile_file", "Compile Active File")
+                .accelerator("Ctrl+Shift+B")
+                .build(app)?;
+            let clear_caches = MenuItemBuilder::with_id("build.clear_caches", "Clear Caches")
+                .accelerator("Ctrl+Shift+K")
+                .build(app)?;
+            let select_stdlib_path =
+                MenuItemBuilder::with_id("settings.select_stdlib_path", "Select Stdlib Path...")
+                    .build(app)?;
+            let toggle_theme = MenuItemBuilder::with_id("settings.theme_toggle", "Toggle Theme")
+                .accelerator("Ctrl+Alt+T")
+                .build(app)?;
+            let light_theme = MenuItemBuilder::with_id("settings.theme_light", "Light Theme").build(app)?;
+            let dark_theme = MenuItemBuilder::with_id("settings.theme_dark", "Dark Theme").build(app)?;
             let about = MenuItemBuilder::with_id("help.about", "About").build(app)?;
 
             let file_menu = SubmenuBuilder::new(app, "File")
                 .item(&open_folder)
                 .item(&open_file)
+                .item(&save)
                 .separator()
                 .item(&PredefinedMenuItem::close_window(app, None)?)
                 .build()?;
-            let build_menu = SubmenuBuilder::new(app, "Build").item(&compile).build()?;
+            let build_menu = SubmenuBuilder::new(app, "Build")
+                .item(&compile_project)
+                .item(&compile_file)
+                .separator()
+                .item(&clear_caches)
+                .build()?;
+            let settings_menu = SubmenuBuilder::new(app, "Settings")
+                .item(&select_stdlib_path)
+                .separator()
+                .item(&toggle_theme)
+                .separator()
+                .item(&light_theme)
+                .item(&dark_theme)
+                .build()?;
             let help_menu = SubmenuBuilder::new(app, "Help").item(&about).build()?;
 
             MenuBuilder::new(app)
                 .item(&file_menu)
                 .item(&build_menu)
+                .item(&settings_menu)
                 .item(&help_menu)
                 .build()
         })
@@ -233,7 +394,14 @@ pub fn run() {
             let action = match event.id().as_ref() {
                 "file.open_folder" => Some("open-folder"),
                 "file.open_file" => Some("open-file"),
-                "build.compile" => Some("compile-workspace"),
+                "file.save" => Some("save-active"),
+                "build.compile_project" => Some("compile-workspace"),
+                "build.compile_file" => Some("compile-file"),
+                "build.clear_caches" => Some("clear-caches"),
+                "settings.select_stdlib_path" => Some("select-stdlib-path"),
+                "settings.theme_toggle" => Some("theme-toggle"),
+                "settings.theme_light" => Some("theme-light"),
+                "settings.theme_dark" => Some("theme-dark"),
                 "help.about" => Some("about"),
                 _ => None,
             };
@@ -245,8 +413,15 @@ pub fn run() {
             list_dir,
             read_file,
             write_file,
+            window_minimize,
+            window_toggle_maximize,
+            window_close,
             compile_project_delta,
             cancel_compile,
+            get_background_jobs,
+            cancel_background_jobs,
+            clear_all_caches,
+            set_project_stdlib_path,
             call_tool,
         ])
         .run(tauri::generate_context!())

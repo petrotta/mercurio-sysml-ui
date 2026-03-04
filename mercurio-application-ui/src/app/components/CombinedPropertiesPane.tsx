@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { ExpressionRecordView, SemanticElementResult, SymbolView } from "../types";
+import type { SemanticElementResult, SymbolView } from "../types";
 
 type CombinedPropertiesPaneProps = {
   selectedSymbols: SymbolView[] | null;
@@ -7,7 +7,6 @@ type CombinedPropertiesPaneProps = {
   selectedSemanticLoading?: boolean;
   selectedSemanticError?: string;
   onSelectQualifiedName?: (qualifiedName: string) => void;
-  expressionRecords?: ExpressionRecordView[];
 };
 
 function rawText(value: unknown): string {
@@ -21,14 +20,6 @@ function rawText(value: unknown): string {
     }
   }
   return String(value);
-}
-
-function isTypeScopedSemanticKey(key: string): boolean {
-  if (!key) return false;
-  const delim = key.includes("::") ? "::" : key.includes(".") ? "." : "";
-  if (!delim) return false;
-  const prefix = key.split(delim)[0] || "";
-  return /^[A-Z][A-Za-z0-9_]*$/.test(prefix);
 }
 
 function asQualifiedName(value: unknown): string | null {
@@ -50,7 +41,6 @@ export function CombinedPropertiesPane({
   selectedSemanticLoading = false,
   selectedSemanticError = "",
   onSelectQualifiedName,
-  expressionRecords = [],
 }: CombinedPropertiesPaneProps) {
   const [propKeyColPercent, setPropKeyColPercent] = useState(38);
   const propColDragActiveRef = useRef(false);
@@ -85,9 +75,7 @@ export function CombinedPropertiesPane({
     section("semantic", "Semantics");
     if (selectedSemanticRow) {
       const attrs = selectedSemanticRow.attributes || {};
-      const keys = Object.keys(attrs)
-        .filter((key) => isTypeScopedSemanticKey(key) || /expression/i.test(key))
-        .sort((a, b) => a.localeCompare(b));
+      const keys = Object.keys(attrs).sort((a, b) => a.localeCompare(b));
       if (!keys.length) {
         out.push({ key: "s-empty", label: "semantic.type_attributes", value: "-", qname: null });
       } else {
@@ -100,61 +88,6 @@ export function CombinedPropertiesPane({
           });
         }
       }
-
-      const qnameCandidates = new Set<string>();
-      const selectedQname = (selectedSemanticRow.qualified_name || "").trim();
-      if (selectedQname) qnameCandidates.add(selectedQname);
-      const likelyMetatypeKeys = [
-        "metatype_qname",
-        "emf::metatype",
-        "element::metatype",
-        "semantic.metatype_qname",
-      ];
-      for (const key of likelyMetatypeKeys) {
-        const value = asQualifiedName(attrs[key]);
-        if (value) qnameCandidates.add(value);
-      }
-      for (const [key, value] of Object.entries(attrs)) {
-        if (!/metatype/i.test(key)) continue;
-        const qname = asQualifiedName(value);
-        if (qname) qnameCandidates.add(qname);
-      }
-      const qnameCandidateList = Array.from(qnameCandidates.values());
-      const matchingExpressions = expressionRecords.filter((record) => {
-        const ownerQname = (record.qualified_name || "").trim();
-        if (!ownerQname) return false;
-        if (qnameCandidates.has(ownerQname)) return true;
-        return qnameCandidateList.some(
-          (candidate) =>
-            ownerQname.startsWith(`${candidate}::`) ||
-            candidate.startsWith(`${ownerQname}::`),
-        );
-      });
-      section("expressions", "Expressions");
-      if (!matchingExpressions.length) {
-        out.push({ key: "expr-empty", label: "expression.records", value: "-", qname: null });
-      } else {
-        matchingExpressions.forEach((record, idx) => {
-          out.push({
-            key: `expr-${idx}-owner`,
-            label: `expression.${idx}.owner`,
-            value: rawText(record.qualified_name),
-            qname: asQualifiedName(record.qualified_name),
-          });
-          out.push({
-            key: `expr-${idx}-feature`,
-            label: `expression.${idx}.feature`,
-            value: rawText(record.feature),
-            qname: null,
-          });
-          out.push({
-            key: `expr-${idx}-text`,
-            label: `expression.${idx}.text`,
-            value: rawText(record.expression),
-            qname: null,
-          });
-        });
-      }
     } else {
       out.push({
         key: "s-loading",
@@ -166,7 +99,7 @@ export function CombinedPropertiesPane({
       });
     }
     return out;
-  }, [symbol, selectedSemanticRow, selectedSemanticLoading, selectedSemanticError, expressionRecords]);
+  }, [symbol, selectedSemanticRow, selectedSemanticLoading, selectedSemanticError]);
 
   if (!rows.length) {
     return <div className="muted">Select an element to view properties.</div>;

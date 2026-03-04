@@ -1,22 +1,30 @@
 use mercurio_sysml_core::parser::Parser;
 use mercurio_sysml_pkg::compile_support::{
-    PreparedScope, ProjectedPropertyValue, ProjectedSemanticSymbol, RawIndexSymbol,
-    StdlibSymbolRow, build_stdlib_snapshot as build_stdlib_snapshot_rows,
+    PreparedScope, ProjectedPropertyValue, ProjectedSemanticSymbol,
+    RawIndexSymbol, StdlibSymbolRow, WorkspaceFileSelectionScope, WorkspaceSemanticInput,
+    build_compile_workspace_files,
+    build_stdlib_snapshot_with_progress as build_stdlib_snapshot_rows_with_progress,
+    filter_out_library_files,
+    build_workspace_semantic_elements,
     build_canonical_symbol_rows_by_file,
     group_prepared_symbols_by_file,
+    collect_stdlib_files,
+    stdlib_signature_key,
     load_stdlib_snapshot_with_cache,
     is_library_symbol_path,
     map_semantic_element_to_projected_symbol,
     normalized_compare_key as normalized_compare_key_shared,
     prepare_symbols_for_index,
+    select_workspace_files,
+    workspace_semantic_cache_key,
 };
 use mercurio_sysml_pkg::project_ingest::ingest_project_texts;
 use mercurio_sysml_pkg::semantic_projection::{
     SymbolSpan, UnresolvedRef, collect_unresolved_from_project_diagnostics,
-    load_project_sources_for_ingest, semantic_elements_for_project,
+    load_project_sources_for_ingest,
 };
+use mercurio_sysml_pkg::workspace_file::WorkspaceFileScope;
 use mercurio_sysml_semantics::stdlib::MetatypeIndex;
-use mercurio_sysml_semantics::semantic_contract::SemanticElementView;
 use mercurio_symbol_index::{SymbolIndexStore, SymbolRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -27,10 +35,14 @@ use std::time::{Instant, SystemTime};
 
 use crate::project::load_project_config;
 use crate::symbol_index::query_project_symbols;
-use crate::state::StdlibSymbol;
+use crate::state::{StdlibCache, StdlibSymbol, WorkspaceSnapshotCacheEntry};
 use crate::stdlib::resolve_stdlib_path;
+use crate::workspace_ir_cache::persist_workspace_ir_cache;
 use crate::workspace::{collect_model_files, collect_project_files};
 use crate::CoreState;
+
+#[cfg(test)]
+use mercurio_sysml_semantics::semantic_contract::SemanticElementView;
 
 pub use crate::state::CompileFileResult;
 
@@ -46,7 +58,7 @@ pub struct CompileResponse {
     pub unresolved: Vec<UnresolvedRefView>,
     pub library_path: Option<String>,
     pub parse_failed: bool,
-    pub stdlib_cache_hit: bool,
+    pub workspace_snapshot_hit: bool,
     pub parsed_files: Vec<String>,
     pub parse_duration_ms: u128,
     pub analysis_duration_ms: u128,
@@ -61,7 +73,7 @@ pub struct LibrarySymbolsResponse {
     pub symbols: Vec<SymbolView>,
     pub library_files: Vec<String>,
     pub library_path: Option<String>,
-    pub stdlib_cache_hit: bool,
+    pub workspace_snapshot_hit: bool,
     pub stdlib_duration_ms: u128,
     pub stdlib_file_count: usize,
     pub total_duration_ms: u128,
@@ -185,6 +197,8 @@ pub struct CompileRequest {
     pub run_id: u64,
     #[serde(default)]
     pub allow_parse_errors: bool,
+    #[serde(default = "default_include_symbols")]
+    pub include_symbols: bool,
     #[serde(default)]
     pub unsaved: Vec<UnsavedFileInput>,
     #[serde(default, alias = "file", alias = "path")]
@@ -192,7 +206,7 @@ pub struct CompileRequest {
 }
 
 impl CompileRequest {
-    pub fn into_parts(self) -> (String, u64, bool, Option<PathBuf>, Vec<UnsavedFile>) {
+    pub fn into_parts(self) -> (String, u64, bool, bool, Option<PathBuf>, Vec<UnsavedFile>) {
         let unsaved = self
             .unsaved
             .into_iter()
@@ -206,6 +220,7 @@ impl CompileRequest {
             self.root,
             self.run_id,
             self.allow_parse_errors,
+            self.include_symbols,
             target_path,
             unsaved,
         )
@@ -352,6 +367,7 @@ pub fn compile_workspace_sync<F: Fn(CompileProgressPayload)>(
         target_path,
         unsaved,
         true,
+        true,
         emit_progress,
     )
 }
@@ -365,6 +381,28 @@ pub fn compile_project_delta_sync<F: Fn(CompileProgressPayload)>(
     unsaved: Vec<UnsavedFile>,
     emit_progress: F,
 ) -> Result<CompileResponse, String> {
+    compile_project_delta_sync_with_options(
+        state,
+        root,
+        run_id,
+        allow_parse_errors,
+        target_path,
+        unsaved,
+        true,
+        emit_progress,
+    )
+}
+
+pub fn compile_project_delta_sync_with_options<F: Fn(CompileProgressPayload)>(
+    state: &CoreState,
+    root: String,
+    run_id: u64,
+    allow_parse_errors: bool,
+    target_path: Option<PathBuf>,
+    unsaved: Vec<UnsavedFile>,
+    include_symbols: bool,
+    emit_progress: F,
+) -> Result<CompileResponse, String> {
     compile_workspace_sync_internal(
         state,
         root,
@@ -373,6 +411,7 @@ pub fn compile_project_delta_sync<F: Fn(CompileProgressPayload)>(
         target_path,
         unsaved,
         false,
+        include_symbols,
         emit_progress,
     )
 }
@@ -385,6 +424,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
     target_path: Option<PathBuf>,
     unsaved: Vec<UnsavedFile>,
     include_library_symbols: bool,
+    include_symbols: bool,
     emit_progress: F,
 ) -> Result<CompileResponse, String> {
     let compile_start = Instant::now();
@@ -392,6 +432,18 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
     if !root_path.exists() {
         return Err("Root path does not exist".to_string());
     }
+    let compile_target = target_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| "<project>".to_string());
+    let _background_job = state.try_start_background_job(
+        "compile",
+        Some(format!(
+            "run_id={} target={} include_symbols={}",
+            run_id, compile_target, include_symbols
+        )),
+        Some(run_id),
+    );
 
     let default_stdlib = state
         .settings
@@ -451,11 +503,11 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
     if files.is_empty() {
         collect_model_files(&root_path, &mut files)?;
     }
-    files = filter_out_stdlib_files(files, stdlib_path_for_log.as_deref());
+    files = filter_out_library_files(files, stdlib_path_for_log.as_deref());
     if files.is_empty() {
         let mut fallback = Vec::new();
         collect_model_files(&root_path, &mut fallback)?;
-        files = filter_out_stdlib_files(fallback, stdlib_path_for_log.as_deref());
+        files = filter_out_library_files(fallback, stdlib_path_for_log.as_deref());
     }
     if let Some(target) = target_path.as_ref() {
         let should_include_target = target.exists()
@@ -471,6 +523,12 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
     }
     files.sort();
     files.dedup();
+    emit_progress(
+        "parsing",
+        Some(format!("queued {} project files", files.len())),
+        None,
+        Some(files.len()),
+    );
 
     let mut workspace = state
         .workspace
@@ -590,7 +648,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
                 .as_ref()
                 .map(|path| path.to_string_lossy().to_string()),
             parse_failed: true,
-            stdlib_cache_hit: false,
+            workspace_snapshot_hit: false,
             parsed_files,
             parse_duration_ms,
             analysis_duration_ms,
@@ -600,15 +658,81 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
         });
     }
 
-    let stdlib_start = Instant::now();
-    let (stdlib_files, stdlib_metatype_index, stdlib_symbols, stdlib_cache_hit) = {
+    let use_stdlib_snapshot = include_library_symbols || include_symbols;
+    let (
+        stdlib_files,
+        stdlib_metatype_index,
+        stdlib_symbols,
+        workspace_snapshot_hit,
+        stdlib_signature,
+        stdlib_duration_ms,
+    ) = if use_stdlib_snapshot {
+        emit_progress(
+            "stdlib",
+            Some("loading stdlib snapshot".to_string()),
+            None,
+            None,
+        );
+        let stdlib_start = Instant::now();
+        let mut in_flight_stdlib_file: Option<(usize, usize, PathBuf, Instant)> = None;
         let (
             stdlib_entries,
             stdlib_metatype_index,
             stdlib_snapshot_symbols,
-            stdlib_cache_hit,
-            _stdlib_signature,
-        ) = load_stdlib_snapshot(state, stdlib_path_for_log.as_deref())?;
+            workspace_snapshot_hit,
+            stdlib_signature,
+        ) = load_stdlib_snapshot(
+            state,
+            stdlib_path_for_log.as_deref(),
+            |index, total, path| {
+                if total == 0 {
+                    return;
+                }
+                if let Some((prev_index, prev_total, prev_path, started_at)) =
+                    in_flight_stdlib_file.take()
+                {
+                    emit_progress(
+                        "stdlib",
+                        Some(format!(
+                            "parsed stdlib {}/{} in {} ms: {}",
+                            prev_index,
+                            prev_total,
+                            started_at.elapsed().as_millis(),
+                            prev_path.to_string_lossy()
+                        )),
+                        Some(prev_index),
+                        Some(prev_total),
+                    );
+                }
+                in_flight_stdlib_file =
+                    Some((index, total, path.to_path_buf(), Instant::now()));
+                emit_progress(
+                    "stdlib",
+                    Some(format!(
+                        "parsing stdlib {}/{}: {}",
+                        index,
+                        total,
+                        path.to_string_lossy()
+                    )),
+                    Some(index),
+                    Some(total),
+                );
+            },
+        )?;
+        if let Some((index, total, path, started_at)) = in_flight_stdlib_file.take() {
+            emit_progress(
+                "stdlib",
+                Some(format!(
+                    "parsed stdlib {}/{} in {} ms: {}",
+                    index,
+                    total,
+                    started_at.elapsed().as_millis(),
+                    path.to_string_lossy()
+                )),
+                Some(index),
+                Some(total),
+            );
+        }
         let files = stdlib_entries
             .iter()
             .map(|(path, _)| path.clone())
@@ -618,24 +742,71 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
         } else {
             Arc::new(Vec::new())
         };
-        (files, stdlib_metatype_index, symbols, stdlib_cache_hit)
+        let stdlib_duration_ms = stdlib_start.elapsed().as_millis();
+        emit_progress(
+            "stdlib",
+            Some(format!(
+                "loaded {} stdlib files (snapshot_hit={})",
+                files.len(),
+                workspace_snapshot_hit
+            )),
+            Some(files.len()),
+            Some(files.len()),
+        );
+        (
+            files,
+            stdlib_metatype_index,
+            symbols,
+            workspace_snapshot_hit,
+            stdlib_signature,
+            stdlib_duration_ms,
+        )
+    } else {
+        emit_progress(
+            "stdlib",
+            Some("skipped stdlib snapshot (fast project mode)".to_string()),
+            Some(0),
+            Some(0),
+        );
+        (
+            Vec::new(),
+            Arc::new(MetatypeIndex::default()),
+            Arc::new(Vec::new()),
+            false,
+            String::new(),
+            0,
+        )
     };
-    let stdlib_duration_ms = stdlib_start.elapsed().as_millis();
 
     let analysis_start = Instant::now();
     check_cancel()?;
-    emit_progress("analysis", None, None, None);
+    emit_progress("analysis", Some("starting semantic analysis".to_string()), None, None);
 
-    let project_symbol_files = select_symbol_files(&files, target_path.as_deref());
+    let workspace_files = build_compile_workspace_files(&files, &stdlib_files);
+    let project_symbol_files = select_workspace_files(
+        &workspace_files,
+        WorkspaceFileSelectionScope::Project,
+        target_path.as_deref(),
+    );
     let symbol_spans = build_symbol_span_seed_from_index(state, &root, &project_symbol_files);
     let unresolved_files = if include_library_symbols {
         files.clone()
     } else {
         project_symbol_files.clone()
     };
+    emit_progress(
+        "analysis",
+        Some(format!(
+            "collecting unresolved references ({} files)",
+            unresolved_files.len()
+        )),
+        Some(0),
+        Some(unresolved_files.len()),
+    );
     let unresolved = if unresolved_files.is_empty() {
         Vec::new()
     } else {
+        check_cancel()?;
         let project_sources = load_project_sources_for_ingest(&unresolved_files, &unsaved_map)?;
         match ingest_project_texts(project_sources.clone()) {
             Ok(ingest) => collect_unresolved_from_project_diagnostics(ingest.diagnostics, &project_sources)
@@ -659,32 +830,124 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
             Err(_) => Vec::new(),
         }
     };
+    emit_progress(
+        "analysis",
+        Some(format!("unresolved references collected: {}", unresolved.len())),
+        Some(unresolved.len()),
+        Some(unresolved.len()),
+    );
 
     let mut symbols = Vec::new();
+    let mut project_index_symbols = Vec::<RawIndexSymbol>::new();
     let mut seen = HashSet::new();
 
     let mut project_symbol_count = 0usize;
     let mut library_symbol_count = 0usize;
-    // Delegate project symbol extraction to mercurio-sysml semantic projection.
-    // This keeps symbol and metatype semantics sourced from one authoritative path,
-    // including nested members (for example attributes inside a part definition).
-    // For delta mode this remains bounded because `project_symbol_files` is scoped
-    // to the changed target file.
-    for element in semantic_elements_for_project(
-        &project_symbol_files,
-        &unsaved_map,
-        stdlib_metatype_index.as_ref(),
-        stdlib_files.len(),
-    ) {
+    let project_semantic_inputs = load_project_sources_for_ingest(&project_symbol_files, &unsaved_map)?
+        .into_iter()
+        .map(|(path, source)| WorkspaceSemanticInput {
+            path,
+            source,
+            scope: WorkspaceFileScope::Project,
+        })
+        .collect::<Vec<_>>();
+    let semantic_pipeline = if use_stdlib_snapshot {
+        "project-semantic-v2"
+    } else {
+        "project-semantic-fast-v2"
+    };
+    let semantic_cache_key = workspace_semantic_cache_key(
+        &root,
+        &project_semantic_inputs,
+        &stdlib_signature,
+        semantic_pipeline,
+    );
+    let semantic_elements = if let Ok(cache) = state.workspace_snapshot_cache.lock() {
+        cache.get(&semantic_cache_key).and_then(|entry| match entry {
+            WorkspaceSnapshotCacheEntry::ProjectSemantic(elements) => Some(elements.clone()),
+            WorkspaceSnapshotCacheEntry::Stdlib(_) => None,
+        })
+    } else {
+        None
+    };
+    let semantic_elements = if let Some(cached) = semantic_elements {
+        emit_progress(
+            "analysis",
+            Some(format!(
+                "semantic cache hit ({} elements)",
+                cached.len()
+            )),
+            Some(cached.len()),
+            Some(cached.len()),
+        );
+        cached
+    } else {
+        emit_progress(
+            "analysis",
+            Some(format!(
+                "building semantic elements ({} files)",
+                project_semantic_inputs.len()
+            )),
+            Some(0),
+            Some(project_semantic_inputs.len()),
+        );
+        let computed = Arc::new(build_workspace_semantic_elements(
+            &project_semantic_inputs,
+            stdlib_metatype_index.as_ref(),
+            stdlib_files.len(),
+        ));
+        if let Ok(mut cache) = state.workspace_snapshot_cache.lock() {
+            clear_project_semantic_cache_for_root(&mut cache, &root);
+            cache.insert(
+                semantic_cache_key.clone(),
+                WorkspaceSnapshotCacheEntry::ProjectSemantic(computed.clone()),
+            );
+        }
+        computed
+    };
+    let semantic_total = semantic_elements.len();
+    emit_progress(
+        "analysis",
+        Some(format!("projecting semantic symbols ({} elements)", semantic_total)),
+        Some(0),
+        Some(semantic_total),
+    );
+    for (semantic_index, element) in semantic_elements.iter().cloned().enumerate() {
+        if semantic_index % 500 == 0 {
+            check_cancel()?;
+            emit_progress(
+                "analysis",
+                Some(format!(
+                    "projecting semantic symbols {}/{}",
+                    semantic_index + 1,
+                    semantic_total
+                )),
+                Some(semantic_index + 1),
+                Some(semantic_total),
+            );
+        }
+        let projected = map_semantic_element_to_projected_symbol(element, &symbol_spans);
         let key = format!(
             "{}|{}|{}",
-            element.file_path, element.qualified_name, element.name
+            projected.file_path, projected.qualified_name, projected.name
         );
         if seen.insert(key) {
-            symbols.push(map_semantic_element_to_symbol(element, &symbol_spans));
+            project_index_symbols.push(map_projected_semantic_symbol_to_raw_index(&projected));
+            if include_symbols {
+                symbols.push(map_projected_semantic_symbol(projected));
+            }
             project_symbol_count += 1;
         }
     }
+    emit_progress(
+        "analysis",
+        Some(format!(
+            "project symbols projected: {}",
+            project_symbol_count
+        )),
+        Some(project_symbol_count),
+        Some(project_symbol_count),
+    );
     if include_library_symbols {
         for symbol in stdlib_symbols.iter().map(map_stdlib_symbol_to_symbol_view) {
             let key = format!(
@@ -692,16 +955,26 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
                 symbol.file_path, symbol.qualified_name, symbol.name
             );
             if seen.insert(key) {
-                symbols.push(symbol);
+                if include_symbols {
+                    symbols.push(symbol);
+                }
                 library_symbol_count += 1;
             }
         }
     }
-    augment_owned_relationships(&mut symbols);
+    if include_symbols {
+        augment_owned_relationships(&mut symbols);
+    }
 
     let mut symbol_counts = HashMap::<String, usize>::new();
-    for symbol in &symbols {
-        *symbol_counts.entry(symbol.file_path.clone()).or_insert(0) += 1;
+    if include_symbols {
+        for symbol in &symbols {
+            *symbol_counts.entry(symbol.file_path.clone()).or_insert(0) += 1;
+        }
+    } else {
+        for symbol in &project_index_symbols {
+            *symbol_counts.entry(symbol.file_path.clone()).or_insert(0) += 1;
+        }
     }
     for file in &mut file_results {
         file.symbol_count = symbol_counts.get(&file.path).copied().unwrap_or(0);
@@ -718,12 +991,13 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
         stdlib_duration_ms,
         total_duration_ms,
     );
+    let response_symbols = if include_symbols { symbols } else { Vec::new() };
     let response = CompileResponse {
         ok: file_results.iter().all(|f| f.ok),
         files: file_results,
         parse_error_categories,
         performance_warnings,
-        symbols,
+        symbols: response_symbols,
         project_symbol_count,
         library_symbol_count,
         unresolved,
@@ -731,7 +1005,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
             .as_ref()
             .map(|path| path.to_string_lossy().to_string()),
         parse_failed: false,
-        stdlib_cache_hit,
+        workspace_snapshot_hit,
         parsed_files,
         parse_duration_ms,
         analysis_duration_ms,
@@ -739,25 +1013,45 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
         stdlib_file_count: stdlib_files.len(),
         total_duration_ms,
     };
-    let _ = index_symbols_for_project(
-        state,
-        &root,
-        stdlib_path_for_log.as_deref(),
-        &response.symbols,
-        true,
-        false,
-    );
-    Ok(response)
-}
-
-fn filter_out_stdlib_files(files: Vec<PathBuf>, stdlib_path: Option<&Path>) -> Vec<PathBuf> {
-    match stdlib_path {
-        None => files,
-        Some(stdlib_root) => files
-            .into_iter()
-            .filter(|file| !is_library_symbol_path(&file.to_string_lossy(), Some(stdlib_root)))
-            .collect(),
+    if include_symbols {
+        emit_progress(
+            "indexing",
+            Some(format!("indexing {} symbols", response.symbols.len())),
+            Some(response.symbols.len()),
+            Some(response.symbols.len()),
+        );
+        let _ = index_symbols_for_project(
+            state,
+            &root,
+            stdlib_path_for_log.as_deref(),
+            &response.symbols,
+            true,
+            false,
+        );
+    } else {
+        emit_progress(
+            "indexing",
+            Some(format!("indexing {} raw symbols", project_index_symbols.len())),
+            Some(project_index_symbols.len()),
+            Some(project_index_symbols.len()),
+        );
+        let _ = index_raw_symbols_for_project(
+            state,
+            &root,
+            stdlib_path_for_log.as_deref(),
+            project_index_symbols,
+            true,
+            false,
+        );
     }
+    let persist_signature = if stdlib_signature.is_empty() {
+        None
+    } else {
+        Some(stdlib_signature.as_str())
+    };
+    let _ = persist_workspace_ir_cache(state, &root, persist_signature);
+    emit_progress("complete", Some("compile done".to_string()), None, None);
+    Ok(response)
 }
 
 pub fn load_library_symbols_sync(
@@ -771,6 +1065,18 @@ pub fn load_library_symbols_sync(
     if !root_path.exists() {
         return Err("Root path does not exist".to_string());
     }
+    let load_target = target_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| "<all-library-files>".to_string());
+    let _background_job = state.try_start_background_job(
+        "library-load",
+        Some(format!(
+            "target={} include_symbols={}",
+            load_target, include_symbols
+        )),
+        None,
+    );
 
     let default_stdlib = state
         .settings
@@ -794,87 +1100,130 @@ pub fn load_library_symbols_sync(
     );
 
     let stdlib_start = Instant::now();
-    let (
-        stdlib_entries,
-        _stdlib_metatype_index,
-        stdlib_snapshot_symbols,
-        _stdlib_snapshot_hit,
-        stdlib_signature,
-    ) = load_stdlib_snapshot(state, stdlib_path_for_log.as_deref())?;
-    let stdlib_files = stdlib_entries
-        .iter()
-        .map(|(path, _)| path.clone())
-        .collect::<Vec<_>>();
+    let stdlib_files = collect_stdlib_files(stdlib_path_for_log.as_deref())?;
     let library_files = stdlib_files
         .iter()
         .map(|path| path.to_string_lossy().to_string())
         .collect::<Vec<_>>();
-    let symbols = if include_symbols {
-        let selected_files = select_symbol_files(&stdlib_files, target_path.as_deref());
-        let selected = selected_files
-            .iter()
-            .map(|path| normalized_compare_key(path))
-            .collect::<HashSet<_>>();
-        stdlib_snapshot_symbols
-            .iter()
-            .cloned()
-            .into_iter()
-            .filter(|symbol| {
-                target_path.is_none()
-                    || selected.contains(&normalized_compare_key(Path::new(&symbol.file_path)))
-            })
-            .map(|symbol| map_stdlib_symbol_to_symbol_view(&symbol))
-            .collect::<Vec<_>>()
+    let stdlib_signature = if stdlib_files.is_empty() {
+        String::new()
     } else {
-        Vec::new()
+        stdlib_signature_key(&stdlib_files)?
     };
-    let stdlib_cache_hit = !stdlib_signature.is_empty()
-        && stdlib_path_for_log.as_ref().is_some_and(|path| {
-            let key = normalized_compare_key(path);
-            state
-                .symbol_index
-                .lock()
-                .ok()
-                .map(|store| store.is_stdlib_index_fresh(&root, &key, &stdlib_signature))
-                .unwrap_or(false)
-        });
     let stdlib_file_count = stdlib_files.len();
-    let stdlib_duration_ms = stdlib_start.elapsed().as_millis();
-
     let library_path_text = stdlib_path_for_log
         .as_ref()
         .map(|path| path.to_string_lossy().to_string());
     let library_key = stdlib_path_for_log
         .as_ref()
         .map(|path| normalized_compare_key(path));
-    let can_mark_freshness = target_path.is_none() && !stdlib_signature.is_empty();
-    let should_index_stdlib = if let Some(key) = library_key.as_ref() {
-        if !include_symbols {
-            false
-        } else if can_mark_freshness {
+    let index_fresh = if let (Some(key), false) = (library_key.as_ref(), stdlib_signature.is_empty())
+    {
+        let store = state
+            .symbol_index
+            .lock()
+            .map_err(|_| "Symbol index lock poisoned".to_string())?;
+        store.is_stdlib_index_fresh(&root, key, &stdlib_signature)
+    } else {
+        false
+    };
+
+    let mut workspace_snapshot_hit = index_fresh;
+    let symbols = if !include_symbols {
+        Vec::new()
+    } else if index_fresh {
+        let target_file = target_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string());
+        let indexed = {
             let store = state
                 .symbol_index
                 .lock()
                 .map_err(|_| "Symbol index lock poisoned".to_string())?;
-            !store.is_stdlib_index_fresh(&root, key, &stdlib_signature)
-        } else {
-            include_symbols
-        }
+            store.library_symbols(&root, target_file.as_deref())
+        };
+        indexed
+            .iter()
+            .map(map_index_symbol_record_to_symbol_view)
+            .collect::<Vec<_>>()
     } else {
-        include_symbols
-    };
-    let response = LibrarySymbolsResponse {
-        ok: true,
-        symbols,
-        library_files,
-        library_path: library_path_text,
-        stdlib_cache_hit,
-        stdlib_duration_ms,
-        stdlib_file_count,
-        total_duration_ms: start.elapsed().as_millis(),
-    };
-    if should_index_stdlib {
-        let symbols_for_index = response.symbols.clone();
+        let trace_stdlib = std::env::var("MERCURIO_STDLIB_TRACE")
+            .ok()
+            .map(|value| {
+                let normalized = value.trim().to_ascii_lowercase();
+                matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false);
+        let mut in_flight_stdlib_file: Option<(usize, usize, PathBuf, Instant)> = None;
+        let (
+            stdlib_entries,
+            _stdlib_metatype_index,
+            stdlib_snapshot_symbols,
+            snapshot_hit,
+            _snapshot_signature,
+        ) = load_stdlib_snapshot(
+            state,
+            stdlib_path_for_log.as_deref(),
+            |index, total, path| {
+                if !trace_stdlib || total == 0 {
+                    return;
+                }
+                if let Some((prev_index, prev_total, prev_path, started_at)) =
+                    in_flight_stdlib_file.take()
+                {
+                    eprintln!(
+                        "[stdlib-load] parsed {}/{} in {} ms: {}",
+                        prev_index,
+                        prev_total,
+                        started_at.elapsed().as_millis(),
+                        prev_path.to_string_lossy()
+                    );
+                }
+                in_flight_stdlib_file = Some((index, total, path.to_path_buf(), Instant::now()));
+                eprintln!(
+                    "[stdlib-load] parsing {}/{}: {}",
+                    index,
+                    total,
+                    path.to_string_lossy()
+                );
+            },
+        )?;
+        if trace_stdlib {
+            if let Some((index, total, path, started_at)) = in_flight_stdlib_file.take() {
+                eprintln!(
+                    "[stdlib-load] parsed {}/{} in {} ms: {}",
+                    index,
+                    total,
+                    started_at.elapsed().as_millis(),
+                    path.to_string_lossy()
+                );
+            }
+        }
+        workspace_snapshot_hit = snapshot_hit;
+        let stdlib_entry_files = stdlib_entries
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let selected_files = select_workspace_files(
+            &build_compile_workspace_files(&[], &stdlib_entry_files),
+            WorkspaceFileSelectionScope::Library,
+            target_path.as_deref(),
+        );
+        let selected = selected_files
+            .iter()
+            .map(|path| normalized_compare_key(path))
+            .collect::<HashSet<_>>();
+        let resolved = stdlib_snapshot_symbols
+            .iter()
+            .cloned()
+            .filter(|symbol| {
+                target_path.is_none()
+                    || selected.contains(&normalized_compare_key(Path::new(&symbol.file_path)))
+            })
+            .map(|symbol| map_stdlib_symbol_to_symbol_view(&symbol))
+            .collect::<Vec<_>>();
+
+        let symbols_for_index = resolved.clone();
         let _ = index_symbols_for_project(
             state,
             &root,
@@ -883,18 +1232,40 @@ pub fn load_library_symbols_sync(
             true,
             false,
         );
-        if let (Some(key), true) = (library_key.as_ref(), can_mark_freshness) {
+        if let Some(key) = library_key.as_ref() {
             if let Ok(mut store) = state.symbol_index.lock() {
-                store.mark_stdlib_indexed(&root, key, &stdlib_signature);
+                if !stdlib_signature.is_empty() {
+                    store.mark_stdlib_indexed(&root, key, &stdlib_signature);
+                }
             }
         }
-    }
+        resolved
+    };
+    let stdlib_duration_ms = stdlib_start.elapsed().as_millis();
+
+    let response = LibrarySymbolsResponse {
+        ok: true,
+        symbols,
+        library_files,
+        library_path: library_path_text,
+        workspace_snapshot_hit,
+        stdlib_duration_ms,
+        stdlib_file_count,
+        total_duration_ms: start.elapsed().as_millis(),
+    };
+    let persist_signature = if stdlib_signature.is_empty() {
+        None
+    } else {
+        Some(stdlib_signature.as_str())
+    };
+    let _ = persist_workspace_ir_cache(state, &root, persist_signature);
     Ok(response)
 }
 
-fn load_stdlib_snapshot(
+fn load_stdlib_snapshot<F>(
     state: &CoreState,
     stdlib_path: Option<&Path>,
+    mut on_progress: F,
 ) -> Result<
     (
         Vec<(PathBuf, String)>,
@@ -904,17 +1275,53 @@ fn load_stdlib_snapshot(
         String,
     ),
     String,
-> {
+>
+where
+    F: FnMut(usize, usize, &Path),
+{
+    let mut stdlib_cache = {
+        let cache = state
+            .workspace_snapshot_cache
+            .lock()
+            .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
+        cache
+            .iter()
+            .filter_map(|(key, entry)| match entry {
+                WorkspaceSnapshotCacheEntry::Stdlib(value) => Some((key.clone(), value.clone())),
+                WorkspaceSnapshotCacheEntry::ProjectSemantic(_) => None,
+            })
+            .collect::<HashMap<String, StdlibCache>>()
+    };
+    let result = load_stdlib_snapshot_with_cache(stdlib_path, &mut stdlib_cache, |entries| {
+        build_stdlib_snapshot_with_progress(entries, |index, total, path| {
+            on_progress(index, total, path);
+        })
+    })?;
     let mut cache = state
-        .stdlib_cache
+        .workspace_snapshot_cache
         .lock()
-        .map_err(|_| "Stdlib cache lock poisoned".to_string())?;
-    load_stdlib_snapshot_with_cache(stdlib_path, &mut cache, build_stdlib_snapshot)
+        .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
+    cache.retain(|_, entry| !matches!(entry, WorkspaceSnapshotCacheEntry::Stdlib(_)));
+    for (key, value) in stdlib_cache {
+        cache.insert(key, WorkspaceSnapshotCacheEntry::Stdlib(value));
+    }
+    Ok(result)
 }
 
-fn build_stdlib_snapshot(entries: &[(PathBuf, String)]) -> (MetatypeIndex, Vec<StdlibSymbol>) {
-    let (index, symbols) = build_stdlib_snapshot_rows(entries);
+fn build_stdlib_snapshot_with_progress<F>(
+    entries: &[(PathBuf, String)],
+    on_progress: F,
+) -> (MetatypeIndex, Vec<StdlibSymbol>)
+where
+    F: FnMut(usize, usize, &Path),
+{
+    let (index, symbols) = build_stdlib_snapshot_rows_with_progress(entries, on_progress);
     (index, symbols.into_iter().map(map_stdlib_symbol_row).collect())
+}
+
+#[cfg(test)]
+fn build_stdlib_snapshot(entries: &[(PathBuf, String)]) -> (MetatypeIndex, Vec<StdlibSymbol>) {
+    build_stdlib_snapshot_with_progress(entries, |_index, _total, _path| {})
 }
 
 fn map_stdlib_symbol_row(row: StdlibSymbolRow) -> StdlibSymbol {
@@ -930,14 +1337,22 @@ fn map_stdlib_symbol_row(row: StdlibSymbolRow) -> StdlibSymbol {
     }
 }
 
-fn select_symbol_files(candidates: &[PathBuf], target_path: Option<&Path>) -> Vec<PathBuf> {
-    match target_path {
-        None => candidates.to_vec(),
-        Some(target) => candidates
-            .iter()
-            .filter(|candidate| same_path(candidate, target))
-            .cloned()
-            .collect(),
+fn clear_project_semantic_cache_for_root(
+    cache: &mut HashMap<String, WorkspaceSnapshotCacheEntry>,
+    project_root: &str,
+) {
+    let prefix = format!("project-semantic|{}|", project_root);
+    let to_remove = cache
+        .iter()
+        .filter_map(|(key, entry)| match entry {
+            WorkspaceSnapshotCacheEntry::ProjectSemantic(_) if key.starts_with(&prefix) => {
+                Some(key.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for key in to_remove {
+        cache.remove(&key);
     }
 }
 
@@ -949,19 +1364,14 @@ fn build_symbol_span_seed_from_index(
     if files.is_empty() {
         return HashMap::new();
     }
-    let file_keys = files
-        .iter()
-        .map(|path| normalized_compare_key(path))
-        .collect::<HashSet<_>>();
     let Ok(store) = state.symbol_index.lock() else {
         return HashMap::new();
     };
-    store
-        .project_symbols(project_root, None)
-        .into_iter()
-        .filter(|symbol| file_keys.contains(&normalized_compare_key(Path::new(&symbol.file_path))))
-        .map(|symbol| {
-            (
+    let mut out = HashMap::new();
+    for file in files {
+        let file_path = file.to_string_lossy().to_string();
+        for symbol in store.project_symbols(project_root, Some(&file_path)) {
+            out.insert(
                 symbol_key(&symbol.file_path, &symbol.qualified_name),
                 SymbolSpan {
                     start_line: symbol.start_line,
@@ -969,9 +1379,10 @@ fn build_symbol_span_seed_from_index(
                     end_line: symbol.end_line,
                     end_col: symbol.end_col,
                 },
-            )
-        })
-        .collect()
+            );
+        }
+    }
+    out
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -1185,12 +1596,41 @@ fn map_stdlib_symbol_to_symbol_view(symbol: &StdlibSymbol) -> SymbolView {
     }
 }
 
-fn map_semantic_element_to_symbol(
-    element: SemanticElementView,
-    symbol_spans: &HashMap<String, SymbolSpan>,
-) -> SymbolView {
-    let projected = map_semantic_element_to_projected_symbol(element, symbol_spans);
-    map_projected_semantic_symbol(projected)
+fn map_index_symbol_record_to_symbol_view(symbol: &SymbolRecord) -> SymbolView {
+    SymbolView {
+        file_path: symbol.file_path.clone(),
+        name: symbol.name.clone(),
+        short_name: None,
+        qualified_name: symbol.qualified_name.clone(),
+        kind: symbol.kind.clone(),
+        file: 0,
+        start_line: symbol.start_line,
+        start_col: symbol.start_col,
+        end_line: symbol.end_line,
+        end_col: symbol.end_col,
+        expr_start_line: None,
+        expr_start_col: None,
+        expr_end_line: None,
+        expr_end_col: None,
+        short_name_start_line: None,
+        short_name_start_col: None,
+        short_name_end_line: None,
+        short_name_end_col: None,
+        doc: symbol.doc_text.clone(),
+        supertypes: Vec::new(),
+        relationships: Vec::new(),
+        type_refs: Vec::new(),
+        is_public: true,
+        properties: vec![PropertyItemView {
+            name: "kind".to_string(),
+            label: "kind".to_string(),
+            value: PropertyValueView::Text {
+                value: symbol.kind.clone(),
+            },
+            hint: None,
+            group: None,
+        }],
+    }
 }
 
 fn map_projected_semantic_symbol(symbol: ProjectedSemanticSymbol) -> SymbolView {
@@ -1253,6 +1693,34 @@ fn map_projected_property_value(value: ProjectedPropertyValue) -> PropertyValueV
     }
 }
 
+fn projected_symbol_metatype_qname(symbol: &ProjectedSemanticSymbol) -> Option<String> {
+    symbol.properties.iter().find_map(|item| {
+        if item.name != "metatype_qname" {
+            return None;
+        }
+        match &item.value {
+            ProjectedPropertyValue::Text { value } if !value.trim().is_empty() => Some(value.clone()),
+            _ => None,
+        }
+    })
+}
+
+fn map_projected_semantic_symbol_to_raw_index(symbol: &ProjectedSemanticSymbol) -> RawIndexSymbol {
+    RawIndexSymbol {
+        file_path: symbol.file_path.clone(),
+        name: symbol.name.clone(),
+        qualified_name: symbol.qualified_name.clone(),
+        kind: symbol.kind.clone(),
+        metatype_qname: projected_symbol_metatype_qname(symbol),
+        start_line: symbol.start_line,
+        start_col: symbol.start_col,
+        end_line: symbol.end_line,
+        end_col: symbol.end_col,
+        doc_text: symbol.doc.clone(),
+        properties_json: None,
+    }
+}
+
 fn symbol_metatype_qname(symbol: &SymbolView) -> Option<String> {
     for property in &symbol.properties {
         if property.name != "metatype_qname" {
@@ -1275,7 +1743,6 @@ fn index_symbols_for_project(
     rebuild_mappings: bool,
     non_blocking_lock: bool,
 ) -> Result<(), String> {
-    let library_key = library_path.map(|path| normalized_compare_key(path));
     let raw = symbols
         .iter()
         .map(|symbol| RawIndexSymbol {
@@ -1296,6 +1763,25 @@ fn index_symbols_for_project(
             .ok(),
         })
         .collect::<Vec<_>>();
+    index_raw_symbols_for_project(
+        state,
+        project_root,
+        library_path,
+        raw,
+        rebuild_mappings,
+        non_blocking_lock,
+    )
+}
+
+fn index_raw_symbols_for_project(
+    state: &CoreState,
+    project_root: &str,
+    library_path: Option<&Path>,
+    raw: Vec<RawIndexSymbol>,
+    rebuild_mappings: bool,
+    non_blocking_lock: bool,
+) -> Result<(), String> {
+    let library_key = library_path.map(|path| normalized_compare_key(path));
     let prepared = prepare_symbols_for_index(raw, library_path);
     let grouped = group_prepared_symbols_by_file(prepared);
     let canonical_rows_by_file =
@@ -1363,9 +1849,19 @@ impl Drop for CancelGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mercurio_sysml_pkg::compile_support::canonical_symbol_id as canonical_symbol_id_shared;
+    use crate::symbol_index::query_project_symbols;
     use crate::settings::AppSettings;
+    use mercurio_sysml_pkg::compile_support::canonical_symbol_id as canonical_symbol_id_shared;
+    use mercurio_sysml_pkg::semantic_projection::build_symbol_span_index;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn map_semantic_element_to_symbol(
+        element: SemanticElementView,
+        symbol_spans: &HashMap<String, SymbolSpan>,
+    ) -> SymbolView {
+        let projected = map_semantic_element_to_projected_symbol(element, symbol_spans);
+        map_projected_semantic_symbol(projected)
+    }
 
     #[test]
     fn stdlib_snapshot_includes_comments_docs_and_metaclass_defs() {
@@ -1549,7 +2045,7 @@ standard library package KerML {
             true,
         )
         .expect("first load");
-        assert!(!first.stdlib_cache_hit);
+        assert!(!first.workspace_snapshot_hit);
 
         let second = load_library_symbols_sync(
             &state,
@@ -1558,7 +2054,7 @@ standard library package KerML {
             true,
         )
         .expect("second load");
-        assert!(second.stdlib_cache_hit);
+        assert!(second.workspace_snapshot_hit);
 
         std::thread::sleep(std::time::Duration::from_millis(5));
         fs::write(
@@ -1574,7 +2070,7 @@ standard library package KerML {
             true,
         )
         .expect("third load");
-        assert!(!third.stdlib_cache_hit);
+        assert!(!third.workspace_snapshot_hit);
         assert!(third
             .symbols
             .iter()
@@ -2095,6 +2591,50 @@ standard library package KerML {
     }
 
     #[test]
+    fn compile_project_delta_without_symbols_still_seeds_index() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_delta_no_symbols_{stamp}"));
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(project_dir.join("main.sysml"), "package P { part def A; }\n")
+            .expect("write project file");
+        fs::write(
+            project_dir.join(".project"),
+            "{\"name\":\"delta-no-symbols\",\"src\":[\"*.sysml\"]}",
+        )
+        .expect("write project descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let project_root = project_dir.to_string_lossy().to_string();
+        let response = compile_project_delta_sync_with_options(
+            &state,
+            project_root.clone(),
+            501,
+            true,
+            None,
+            Vec::new(),
+            false,
+            |_| {},
+        )
+        .expect("delta compile");
+        assert!(response.ok);
+        assert_eq!(response.symbols.len(), 0);
+        assert!(response.project_symbol_count > 0);
+        assert_eq!(response.stdlib_duration_ms, 0);
+        assert_eq!(response.stdlib_file_count, 0);
+
+        let indexed = query_project_symbols(&state, project_root, None, Some(0), Some(10_000))
+            .expect("query project symbols");
+        assert!(!indexed.is_empty());
+        assert!(indexed.iter().any(|symbol| symbol.qualified_name == "P"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn augment_owned_relationships_adds_owned_attributes_property() {
         fn symbol(kind: &str, qualified_name: &str, start_line: u32) -> SymbolView {
             let name = qualified_name
@@ -2242,7 +2782,8 @@ standard library package KerML {
             .expect("ownedAttributes property");
         match &owned_attrs_prop.value {
             PropertyValueView::List { items } => {
-                assert_eq!(items, &vec!["Demo::ScenarioState::speed".to_string()]);
+                let expected = vec!["Demo::ScenarioState::speed".to_string()];
+                assert_eq!(items.as_slice(), expected.as_slice());
             }
             _ => panic!("ownedAttributes should be a list"),
         }
@@ -2398,15 +2939,15 @@ standard library package KerML {
         let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
         let a1 = load_library_symbols_sync(&state, project_a.to_string_lossy().to_string(), None, true)
             .expect("load a1");
-        assert!(!a1.stdlib_cache_hit);
+        assert!(!a1.workspace_snapshot_hit);
 
         let b1 = load_library_symbols_sync(&state, project_b.to_string_lossy().to_string(), None, true)
             .expect("load b1");
-        assert!(!b1.stdlib_cache_hit);
+        assert!(!b1.workspace_snapshot_hit);
 
         let a2 = load_library_symbols_sync(&state, project_a.to_string_lossy().to_string(), None, true)
             .expect("load a2");
-        assert!(a2.stdlib_cache_hit);
+        assert!(a2.workspace_snapshot_hit);
 
         let _ = fs::remove_dir_all(root);
     }

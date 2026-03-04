@@ -2,10 +2,11 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use mercurio_symbol_index::SymbolIndexStore;
+use mercurio_symbol_index::{SymbolIndexStore, SymbolRecord};
 use mercurio_sysml_pkg::project_model_projection::{
     collect_inherited_attributes, collect_project_expression_records,
-    load_stdlib_metatype_index_with_cache, symbol_to_attribute_rows,
+    resolve_mapped_metatype,
+    symbol_to_attribute_rows, SymbolMetatypeMappingData,
 };
 pub use mercurio_sysml_pkg::project_model_projection::{
     ProjectExpressionRecordView, ProjectExpressionRecordsView,
@@ -16,12 +17,32 @@ pub use mercurio_sysml_semantics::semantic_project_model_contract::{
 };
 use mercurio_sysml_semantics::stdlib::MetatypeIndex;
 
-use crate::compile::compile_project_delta_sync;
 use crate::project::load_project_config;
 use crate::project_model_seed::seed_symbol_index_if_empty;
-use crate::project_model_transform::resolve_mapped_metatype;
-use crate::state::CoreState;
+use crate::state::{CoreState, WorkspaceSnapshotCacheEntry};
 use crate::stdlib::resolve_stdlib_path;
+
+fn resolve_symbol_metatype(
+    store: &dyn SymbolIndexStore,
+    root: &str,
+    symbol: &SymbolRecord,
+) -> (Option<String>, Vec<String>) {
+    let mapping = store
+        .symbol_mapping(root, &symbol.qualified_name, Some(&symbol.file_path))
+        .or_else(|| store.symbol_mapping(root, &symbol.qualified_name, None))
+        .map(|row| SymbolMetatypeMappingData {
+            resolved_metatype_qname: row.resolved_metatype_qname,
+            mapping_source: row.mapping_source,
+            confidence: row.confidence,
+            diagnostic: row.diagnostic,
+        });
+    resolve_mapped_metatype(
+        &symbol.qualified_name,
+        symbol.metatype_qname.as_deref(),
+        symbol.properties_json.as_deref(),
+        mapping.as_ref(),
+    )
+}
 
 pub fn get_project_element_attributes(
     state: &CoreState,
@@ -35,7 +56,7 @@ pub fn get_project_element_attributes(
     }
     seed_symbol_index_if_empty(state, &root)?;
 
-    let (mut symbol, mut metatype_qname, mut diagnostics) = {
+    let (symbol, metatype_qname, mut diagnostics) = {
         let store = state
             .symbol_index
             .lock()
@@ -49,35 +70,9 @@ pub fn get_project_element_attributes(
                 diagnostics: vec!["Element not found in current project symbol index.".to_string()],
             });
         };
-        let (metatype_qname, diagnostics) = resolve_mapped_metatype(&*store, &root, &symbol);
+        let (metatype_qname, diagnostics) = resolve_symbol_metatype(&*store, &root, &symbol);
         (symbol, metatype_qname, diagnostics)
     };
-
-    if metatype_qname.is_none() {
-        let _ = compile_project_delta_sync(
-            state,
-            root.clone(),
-            0,
-            true,
-            Some(PathBuf::from(symbol.file_path.clone())),
-            Vec::new(),
-            |_| {},
-        );
-        if let Ok(store) = state.symbol_index.lock() {
-            if let Some(refreshed) = store.project_symbol(&root, &element_qualified_name, symbol_kind.as_deref()) {
-                let (retry_metatype, retry_diagnostics) = resolve_mapped_metatype(&*store, &root, &refreshed);
-                symbol = refreshed;
-                metatype_qname = retry_metatype;
-                diagnostics.extend(retry_diagnostics);
-                if metatype_qname.is_some() {
-                    diagnostics.push(
-                        "Metatype resolved after targeted semantic refresh from mercurio-sysml."
-                            .to_string(),
-                    );
-                }
-            }
-        }
-    }
 
     if metatype_qname.is_none() {
         if diagnostics.is_empty() {
@@ -91,6 +86,12 @@ pub fn get_project_element_attributes(
                 symbol.qualified_name, symbol.kind
             ));
         }
+        diagnostics.push(
+            "Metatype mapping is unavailable for this symbol in the current index state.".to_string(),
+        );
+        diagnostics.push(
+            "No per-request semantic refresh is performed in this endpoint; run compile to refresh symbol and metatype data.".to_string(),
+        );
     }
     let explicit_attributes = symbol_to_attribute_rows(
         &symbol.qualified_name,
@@ -105,7 +106,13 @@ pub fn get_project_element_attributes(
             &explicit_attributes,
             &mut diagnostics,
         ),
-        Ok(None) => Vec::new(),
+        Ok(None) => {
+            diagnostics.push(
+                "Inherited attributes unavailable because stdlib metatype index is unresolved."
+                    .to_string(),
+            );
+            Vec::new()
+        }
         Err(error) => {
             diagnostics.push(format!("Unable to load stdlib metatype index: {error}"));
             Vec::new()
@@ -146,15 +153,30 @@ fn load_stdlib_metatype_index(state: &CoreState, root: &str) -> Result<Option<Ar
         stdlib_override,
         &root_path,
     );
-    let cache_entries = if let Ok(cache) = state.stdlib_cache.lock() {
-        cache
-            .values()
-            .map(|entry| (entry.path.clone(), entry.metatype_index.clone()))
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
+    let Some(target_stdlib_path) = stdlib_path.as_ref() else {
+        return Ok(None);
     };
-    load_stdlib_metatype_index_with_cache(stdlib_path.as_deref(), cache_entries)
+    let target_key = normalize_compare_key(target_stdlib_path);
+    let cache = state
+        .workspace_snapshot_cache
+        .lock()
+        .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
+    for entry in cache.values() {
+        if let WorkspaceSnapshotCacheEntry::Stdlib(snapshot) = entry {
+            if normalize_compare_key(&snapshot.path) == target_key {
+                return Ok(Some(snapshot.metatype_index.clone()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn normalize_compare_key(path: &std::path::Path) -> String {
+    let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    normalized
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase()
 }
 
 pub fn get_project_model(state: &CoreState, root: String) -> Result<ProjectModelView, String> {
@@ -192,7 +214,7 @@ pub fn get_project_model(state: &CoreState, root: String) -> Result<ProjectModel
 
     let mut elements = Vec::new();
     for symbol in indexed.into_iter().chain(indexed_library.into_iter()) {
-        let (metatype_qname, diagnostics) = resolve_mapped_metatype(&*store, &root, &symbol);
+        let (metatype_qname, diagnostics) = resolve_symbol_metatype(&*store, &root, &symbol);
         let attributes = symbol_to_attribute_rows(
             &symbol.qualified_name,
             &symbol.name,
@@ -222,7 +244,7 @@ pub fn get_project_model(state: &CoreState, root: String) -> Result<ProjectModel
 
     Ok(ProjectModelView {
         stdlib_path: stdlib_path.map(|path| path.to_string_lossy().to_string()),
-        stdlib_cache_hit: false,
+        workspace_snapshot_hit: false,
         project_cache_hit: false,
         element_count: elements.len(),
         elements,
@@ -260,12 +282,27 @@ pub fn get_project_expression_records(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compile::compile_workspace_sync;
     use crate::settings::AppSettings;
     use crate::state::CoreState;
     use crate::stdlib::get_stdlib_metamodel;
     use mercurio_symbol_index::SymbolIndexStore;
     use std::fs;
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn compile_for_index(state: &CoreState, project_root: &Path) {
+        let _ = compile_workspace_sync(
+            state,
+            project_root.to_string_lossy().to_string(),
+            1,
+            true,
+            None,
+            Vec::new(),
+            |_| {},
+        )
+        .expect("compile workspace");
+    }
 
     #[test]
     fn project_model_is_built_from_symbol_index() {
@@ -285,6 +322,7 @@ mod tests {
         .expect("write descriptor");
 
         let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        compile_for_index(&state, &project_dir);
         let view = get_project_model(&state, project_dir.to_string_lossy().to_string())
             .expect("get project model");
         assert!(view.element_count > 0);
@@ -324,6 +362,7 @@ mod tests {
         .expect("write descriptor");
 
         let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        compile_for_index(&state, &project_dir);
         let attrs = get_project_element_attributes(
             &state,
             project_dir.to_string_lossy().to_string(),
@@ -375,6 +414,7 @@ standard library package KerML {
         .expect("write descriptor");
 
         let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        compile_for_index(&state, &project_dir);
         let attrs = get_project_element_attributes(
             &state,
             project_dir.to_string_lossy().to_string(),
@@ -489,6 +529,7 @@ standard library package KerML {
         .expect("write descriptor");
 
         let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        compile_for_index(&state, &project_dir);
         let _ = get_project_element_attributes(
             &state,
             project_dir.to_string_lossy().to_string(),
@@ -602,6 +643,7 @@ standard library package KerML {
         .expect("write descriptor");
 
         let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        compile_for_index(&state, &project_dir);
         let _ = get_project_element_attributes(
             &state,
             project_dir.to_string_lossy().to_string(),

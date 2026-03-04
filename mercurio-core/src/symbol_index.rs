@@ -1,7 +1,9 @@
 use mercurio_symbol_index::{SymbolIndexStore, SymbolMetatypeMappingRecord, SymbolRecord};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
+use crate::state::WorkspaceSnapshotCacheEntry;
 use crate::CoreState;
 
 #[derive(Debug, Clone, Serialize)]
@@ -152,7 +154,38 @@ pub fn query_project_symbols(
         .symbol_index
         .lock()
         .map_err(|_| "Symbol index lock poisoned".to_string())?;
-    let mut symbols = store.project_symbols(&project_root, file_path.as_deref());
+    Ok(store
+        .project_symbols_paged(&project_root, file_path.as_deref(), offset, limit)
+        .into_iter()
+        .map(to_view)
+        .collect())
+}
+
+pub fn query_project_symbols_for_files(
+    state: &CoreState,
+    project_root: String,
+    file_paths: Vec<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<Vec<IndexedSymbolView>, String> {
+    let offset = offset.unwrap_or(0);
+    let limit = limit.unwrap_or(usize::MAX);
+    let unique_file_paths = file_paths
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>();
+    if unique_file_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let store = state
+        .symbol_index
+        .lock()
+        .map_err(|_| "Symbol index lock poisoned".to_string())?;
+    let mut symbols = unique_file_paths
+        .iter()
+        .flat_map(|file_path| store.project_symbols(&project_root, Some(file_path)))
+        .collect::<Vec<_>>();
     symbols.sort_by(|a, b| {
         a.file_path
             .cmp(&b.file_path)
@@ -160,6 +193,7 @@ pub fn query_project_symbols(
             .then(a.start_col.cmp(&b.start_col))
             .then(a.qualified_name.cmp(&b.qualified_name))
     });
+    symbols.dedup_by(|left, right| left.id == right.id);
     Ok(symbols
         .into_iter()
         .skip(offset)
@@ -209,59 +243,82 @@ pub fn query_project_semantic_element_by_qualified_name(
     if target.is_empty() {
         return Ok(None);
     }
-    let store = state
-        .symbol_index
+    let requested_file_key = file_path
+        .as_deref()
+        .map(|value| normalized_compare_key(Path::new(value)));
+    let root_prefix = format!("project-semantic|{}|", project_root);
+    let cache = state
+        .workspace_snapshot_cache
         .lock()
-        .map_err(|_| "Symbol index lock poisoned".to_string())?;
-    let symbol = if let Some(path) = file_path.as_deref() {
-        store
-            .project_symbols(&project_root, Some(path))
-            .into_iter()
-            .find(|entry| entry.qualified_name == target)
-            .or_else(|| store.project_symbol(&project_root, target, None))
-    } else {
-        store.project_symbol(&project_root, target, None)
-    };
-    let Some(symbol) = symbol else {
-        return Ok(None);
-    };
+        .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
 
-    let mapping = store
-        .symbol_mapping(&project_root, &symbol.qualified_name, Some(&symbol.file_path))
-        .or_else(|| store.symbol_mapping(&project_root, &symbol.qualified_name, None));
-
-    let mut attributes = BTreeMap::<String, String>::new();
-    attributes.insert("emf::qualifiedName".to_string(), symbol.qualified_name.clone());
-    attributes.insert("symbol::name".to_string(), symbol.name.clone());
-    attributes.insert("symbol::kind".to_string(), symbol.kind.clone());
-    attributes.insert(
-        "symbol::span".to_string(),
-        format!(
-            "{}:{}-{}:{}",
-            symbol.start_line, symbol.start_col, symbol.end_line, symbol.end_col
-        ),
-    );
-    if let Some(value) = symbol.metatype_qname.clone().or_else(|| {
-        mapping
-            .as_ref()
-            .and_then(|entry| entry.resolved_metatype_qname.clone())
-    }) {
-        attributes.insert("element::metatype".to_string(), value.clone());
-        attributes.insert("semantic.metatype_qname".to_string(), value);
-    }
-    if let Some(doc) = symbol.doc_text.clone() {
-        let trimmed = doc.trim();
-        if !trimmed.is_empty() {
-            attributes.insert("documentation".to_string(), trimmed.to_string());
+    let mut fallback: Option<IndexedSemanticElementView> = None;
+    for (key, entry) in cache.iter() {
+        if !key.starts_with(&root_prefix) {
+            continue;
+        }
+        let WorkspaceSnapshotCacheEntry::ProjectSemantic(elements) = entry else {
+            continue;
+        };
+        for element in elements.iter() {
+            if element.qualified_name != target {
+                continue;
+            }
+            let view = semantic_element_to_indexed_view(element);
+            if let Some(requested_key) = requested_file_key.as_ref() {
+                let candidate_key = normalized_compare_key(Path::new(&view.file_path));
+                if &candidate_key == requested_key {
+                    return Ok(Some(view));
+                }
+                if fallback.is_none() {
+                    fallback = Some(view);
+                }
+            } else {
+                return Ok(Some(view));
+            }
         }
     }
 
-    Ok(Some(IndexedSemanticElementView {
-        name: symbol.name,
-        qualified_name: symbol.qualified_name,
-        file_path: symbol.file_path,
+    Ok(fallback)
+}
+
+fn semantic_element_to_indexed_view(
+    element: &mercurio_sysml_semantics::semantic_contract::SemanticElementView,
+) -> IndexedSemanticElementView {
+    let mut attributes = BTreeMap::<String, String>::new();
+    for (key, value) in &element.attributes {
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        attributes.insert(key.to_string(), value.to_string());
+    }
+    attributes
+        .entry("emf::qualifiedName".to_string())
+        .or_insert_with(|| element.qualified_name.clone());
+    attributes
+        .entry("emf::name".to_string())
+        .or_insert_with(|| element.name.clone());
+    if let Some(metatype) = element.metatype_qname.as_ref() {
+        attributes
+            .entry("emf::metatype".to_string())
+            .or_insert_with(|| metatype.clone());
+    }
+    IndexedSemanticElementView {
+        name: element.name.clone(),
+        qualified_name: element.qualified_name.clone(),
+        file_path: element.file_path.clone(),
         attributes,
-    }))
+    }
+}
+
+fn normalized_compare_key(path: &Path) -> String {
+    let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    normalized
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -475,7 +532,7 @@ mod tests {
     }
 
     #[test]
-    fn query_project_semantic_element_by_qualified_name_uses_index() {
+    fn query_project_semantic_element_by_qualified_name_uses_semantic_cache() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -574,6 +631,55 @@ mod tests {
             normalized_compare_key(Path::new(&right_row.file_path)),
             normalized_compare_key(&right)
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_project_symbols_for_files_returns_combined_rows() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_batch_symbol_query_{stamp}"));
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        let left = project_dir.join("left.sysml");
+        let right = project_dir.join("right.sysml");
+        fs::write(&left, "package LeftPkg { action def LeftAction; }\n").expect("write left file");
+        fs::write(&right, "package RightPkg { action def RightAction; }\n").expect("write right file");
+        fs::write(
+            project_dir.join(".project"),
+            "{\"name\":\"batch\",\"src\":[\"*.sysml\"]}",
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let project_root = project_dir.to_string_lossy().to_string();
+        let _ = compile_project_delta_sync(
+            &state,
+            project_root.clone(),
+            111,
+            true,
+            None,
+            Vec::new(),
+            |_| {},
+        )
+        .expect("compile");
+
+        let rows = query_project_symbols_for_files(
+            &state,
+            project_root,
+            vec![
+                left.to_string_lossy().to_string(),
+                right.to_string_lossy().to_string(),
+            ],
+            Some(0),
+            Some(10_000),
+        )
+        .expect("batch query");
+        assert!(rows.iter().any(|row| row.qualified_name == "LeftPkg"));
+        assert!(rows.iter().any(|row| row.qualified_name == "RightPkg"));
 
         let _ = fs::remove_dir_all(root);
     }

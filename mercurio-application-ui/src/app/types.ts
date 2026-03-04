@@ -209,9 +209,9 @@ export type StdlibMetamodelDiagnostics = {
   resolved_stdlib_path?: string | null;
   cache_key: string;
   cache_hit: boolean;
-  snapshot_hit: boolean;
+  workspace_snapshot_hit: boolean;
   cache_lookup_error?: string | null;
-  stdlib_cache_snapshot_error?: string | null;
+  workspace_snapshot_error?: string | null;
   metamodel_cache_store_error?: string | null;
   failure_reason?: string | null;
   duplicate_qualified_names: string[];
@@ -231,7 +231,7 @@ export type StdlibExpressionRecordView = ExpressionRecordView;
 
 export type StdlibMetamodelView = {
   stdlib_path?: string | null;
-  stdlib_cache_hit: boolean;
+  workspace_snapshot_hit: boolean;
   type_count: number;
   types: MetamodelTypeView[];
   expression_records: StdlibExpressionRecordView[];
@@ -272,7 +272,7 @@ export type ProjectModelElementView = {
 
 export type ProjectModelView = {
   stdlib_path?: string | null;
-  stdlib_cache_hit: boolean;
+  workspace_snapshot_hit: boolean;
   project_cache_hit: boolean;
   element_count: number;
   elements: ProjectModelElementView[];

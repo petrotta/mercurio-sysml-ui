@@ -1,5 +1,5 @@
-use crate::compile::compile_workspace_sync;
 use crate::state::CoreState;
+use crate::workspace_ir_cache::seed_symbol_index_from_workspace_ir_cache;
 use mercurio_symbol_index::SymbolIndexStore;
 
 pub(crate) fn seed_symbol_index_if_empty(state: &CoreState, root: &str) -> Result<(), String> {
@@ -11,15 +11,7 @@ pub(crate) fn seed_symbol_index_if_empty(state: &CoreState, root: &str) -> Resul
         store.project_symbols(root, None).is_empty()
     };
     if need_seed {
-        let _ = compile_workspace_sync(
-            state,
-            root.to_string(),
-            0,
-            true,
-            None,
-            Vec::new(),
-            |_| {},
-        )?;
+        let _ = seed_symbol_index_from_workspace_ir_cache(state, root)?;
     }
     Ok(())
 }

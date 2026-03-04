@@ -9,56 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::state::{CoreState, StdlibCache};
+use crate::state::{CoreState, StdlibCache, WorkspaceSnapshotCacheEntry};
 use mercurio_sysml_pkg::mercurio_sysml_semantic_adapter::{ingest_text, Language};
 
-const STDLIB_DIR: &str = "stdlib";
-
-pub(crate) fn resolve_default_stdlib_path(
-    root: &Path,
-    stdlib_root: &Path,
-    default_stdlib: Option<&str>,
-) -> PathBuf {
-    let root_stdlib = root.join(STDLIB_DIR);
-    if root_stdlib.exists() && root_stdlib.is_dir() {
-        return root_stdlib;
-    }
-
-    if let Some(version) = default_stdlib {
-        let candidate = stdlib_root.join(version);
-        if candidate.exists() && candidate.is_dir() {
-            return candidate;
-        }
-    }
-    if let Ok(versions) = list_stdlib_versions_from_root(stdlib_root) {
-        if let Some(first) = versions.first() {
-            let candidate = stdlib_root.join(first);
-            if candidate.exists() && candidate.is_dir() {
-                return candidate;
-            }
-        }
-    }
-
-    discover_stdlib_path()
-}
-
 pub fn list_stdlib_versions_from_root(stdlib_root: &Path) -> Result<Vec<String>, String> {
-    if !stdlib_root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut entries = Vec::new();
-    let read_dir = std::fs::read_dir(stdlib_root).map_err(|e| e.to_string())?;
-    for entry in read_dir {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                entries.push(name.to_string());
-            }
-        }
-    }
-    entries.sort();
-    Ok(entries)
+    mercurio_sysml_pkg::workspace_config::list_stdlib_versions_from_root(stdlib_root)
 }
 
 pub(crate) fn resolve_stdlib_path(
@@ -68,76 +23,22 @@ pub(crate) fn resolve_stdlib_path(
     override_id: Option<&String>,
     project_root: &Path,
 ) -> ((), Option<PathBuf>) {
-    match config {
-        Some(crate::LibraryConfig::Path { path }) => {
-            if path.trim().is_empty() {
-                let discovered =
-                    resolve_default_stdlib_path(project_root, stdlib_root, default_stdlib);
-                ((), Some(discovered))
-            } else {
-                let raw_path = PathBuf::from(path);
-                let resolved = if raw_path.is_absolute() {
-                    raw_path
-                } else {
-                    project_root.join(raw_path)
-                };
-                ((), Some(resolved))
-            }
-        }
-        Some(crate::LibraryConfig::Default(value)) => {
-            let trimmed = value.trim();
-            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
-                let discovered =
-                    resolve_default_stdlib_path(project_root, stdlib_root, default_stdlib);
-                ((), Some(discovered))
-            } else {
-                let raw_path = PathBuf::from(trimmed);
-                let resolved = if raw_path.is_absolute() {
-                    raw_path
-                } else {
-                    project_root.join(raw_path)
-                };
-                ((), Some(resolved))
-            }
-        }
-        None => {
-            if let Some(stdlib_id) = override_id {
-                let trimmed = stdlib_id.trim();
-                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
-                    let discovered =
-                        resolve_default_stdlib_path(project_root, stdlib_root, default_stdlib);
-                    ((), Some(discovered))
-                } else {
-                    let resolved = stdlib_root.join(trimmed);
-                    ((), Some(resolved))
-                }
-            } else {
-                let discovered =
-                    resolve_default_stdlib_path(project_root, stdlib_root, default_stdlib);
-                ((), Some(discovered))
-            }
-        }
-    }
-}
-
-fn discover_stdlib_path() -> PathBuf {
-    if let Some(exe_dir) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
-    {
-        let stdlib_next_to_exe = exe_dir.join(STDLIB_DIR);
-        if stdlib_next_to_exe.exists() && stdlib_next_to_exe.is_dir() {
-            return stdlib_next_to_exe;
-        }
-    }
-
-    PathBuf::from(STDLIB_DIR)
+    (
+        (),
+        mercurio_sysml_pkg::workspace_config::resolve_stdlib_path(
+            stdlib_root,
+            default_stdlib,
+            config,
+            override_id,
+            project_root,
+        ),
+    )
 }
 
 #[derive(Serialize, Clone)]
 pub struct StdlibMetamodelView {
     pub stdlib_path: Option<String>,
-    pub stdlib_cache_hit: bool,
+    pub workspace_snapshot_hit: bool,
     pub type_count: usize,
     pub types: Vec<MetamodelTypeView>,
     pub expression_records: Vec<StdlibExpressionRecordView>,
@@ -189,9 +90,9 @@ pub struct StdlibMetamodelDiagnostics {
     pub resolved_stdlib_path: Option<String>,
     pub cache_key: String,
     pub cache_hit: bool,
-    pub snapshot_hit: bool,
+    pub workspace_snapshot_hit: bool,
     pub cache_lookup_error: Option<String>,
-    pub stdlib_cache_snapshot_error: Option<String>,
+    pub workspace_snapshot_error: Option<String>,
     pub metamodel_cache_store_error: Option<String>,
     pub failure_reason: Option<String>,
     pub duplicate_qualified_names: Vec<String>,
@@ -219,9 +120,9 @@ impl StdlibMetamodelDiagnostics {
             resolved_stdlib_path,
             cache_key,
             cache_hit: false,
-            snapshot_hit: false,
+            workspace_snapshot_hit: false,
             cache_lookup_error: None,
-            stdlib_cache_snapshot_error: None,
+            workspace_snapshot_error: None,
             metamodel_cache_store_error: None,
             failure_reason: None,
             duplicate_qualified_names: Vec::new(),
@@ -301,37 +202,21 @@ pub fn get_stdlib_metamodel(
     diagnostics.record_phase("resolve_stdlib_path", resolution_start.elapsed());
 
     let cache_lookup_start = Instant::now();
-    match state.metamodel_cache.try_lock() {
-        Ok(cache) => {
-            if let Some(cached) = cache.get(&cache_key) {
-                let mut view = cached.clone();
-                view.stdlib_cache_hit = true;
-                view.diagnostics.cache_hit = true;
-                view
-                    .diagnostics
-                    .record_phase("metamodel_cache_lookup", cache_lookup_start.elapsed());
-                return Ok(view);
-            }
-        }
-        Err(err) => {
-            diagnostics.cache_lookup_error = Some(format!("{:?}", err));
-        }
-    }
     diagnostics.record_phase("metamodel_cache_lookup", cache_lookup_start.elapsed());
 
     let snapshot_start = Instant::now();
     let (cache_entries, snapshot_error, snapshot_index) =
         collect_stdlib_cache_snapshot(state, normalized_stdlib_path.as_deref());
     diagnostics.cache_entries = cache_entries;
-    diagnostics.stdlib_cache_snapshot_error = snapshot_error;
-    diagnostics.record_phase("stdlib_cache_snapshot_lookup", snapshot_start.elapsed());
+    diagnostics.workspace_snapshot_error = snapshot_error;
+    diagnostics.record_phase("workspace_snapshot_lookup", snapshot_start.elapsed());
     if snapshot_index.is_some() {
-        diagnostics.snapshot_hit = true;
+        diagnostics.workspace_snapshot_hit = true;
     }
 
     let mut types = Vec::new();
     let mut duplicates = Vec::new();
-    let mut stdlib_cache_hit = false;
+    let mut workspace_snapshot_hit = false;
     let mut vfs = Vfs::new();
     let mut files = Vec::new();
 
@@ -343,7 +228,7 @@ pub fn get_stdlib_metamodel(
             diagnostics.record_phase("metamodel_projection", projection_start.elapsed());
             types = snapshot_types;
             duplicates = snapshot_duplicates;
-            stdlib_cache_hit = true;
+            workspace_snapshot_hit = true;
         } else {
             let build_start = Instant::now();
             let index = build_metatype_index(&vfs, &files);
@@ -370,23 +255,14 @@ pub fn get_stdlib_metamodel(
     diagnostics.duplicate_qualified_names = duplicates;
     let expression_records = collect_expression_records(&files, &vfs, &mut diagnostics);
 
-    let mut view = StdlibMetamodelView {
+    let view = StdlibMetamodelView {
         stdlib_path: resolved_stdlib_path,
-        stdlib_cache_hit,
+        workspace_snapshot_hit,
         type_count: types.len(),
         types,
         expression_records,
         diagnostics,
     };
-
-    match state.metamodel_cache.try_lock() {
-        Ok(mut cache) => {
-            cache.insert(cache_key.clone(), view.clone());
-        }
-        Err(err) => {
-            view.diagnostics.metamodel_cache_store_error = Some(format!("{:?}", err));
-        }
-    }
 
     Ok(view)
 }
@@ -444,15 +320,26 @@ fn collect_stdlib_cache_snapshot(
     state: &CoreState,
     normalized_stdlib_key: Option<&str>,
 ) -> (Vec<StdlibCacheSummary>, Option<String>, Option<Arc<MetatypeIndex>>) {
-    match state.stdlib_cache.try_lock() {
+    match state.workspace_snapshot_cache.try_lock() {
         Ok(cache) => {
+            let stdlib_entries = cache
+                .values()
+                .filter_map(|entry| match entry {
+                    WorkspaceSnapshotCacheEntry::Stdlib(value) => Some(value),
+                    WorkspaceSnapshotCacheEntry::ProjectSemantic(_) => None,
+                })
+                .collect::<Vec<_>>();
             let summaries = cache
                 .values()
+                .filter_map(|entry| match entry {
+                    WorkspaceSnapshotCacheEntry::Stdlib(value) => Some(value),
+                    WorkspaceSnapshotCacheEntry::ProjectSemantic(_) => None,
+                })
                 .map(StdlibCacheSummary::from_entry)
                 .collect::<Vec<_>>();
             let snapshot_index = normalized_stdlib_key.and_then(|normalized| {
-                cache
-                    .values()
+                stdlib_entries
+                    .iter()
                     .find(|entry| normalized_compare_key(&entry.path) == normalized)
                     .map(|entry| entry.metatype_index.clone())
             });

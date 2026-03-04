@@ -94,11 +94,11 @@ fn bench_mode(state: &CoreState, root: &str, include_symbols: bool, label: &str)
     println!("mode={label} include_symbols={include_symbols}");
     println!(
         "cold: cache_hit={} stdlib_ms={} total_ms={} wall_ms={}",
-        first.stdlib_cache_hit, first.stdlib_duration_ms, first.total_duration_ms, wall1
+        first.workspace_snapshot_hit, first.stdlib_duration_ms, first.total_duration_ms, wall1
     );
     println!(
         "warm: cache_hit={} stdlib_ms={} total_ms={} wall_ms={}",
-        second.stdlib_cache_hit, second.stdlib_duration_ms, second.total_duration_ms, wall2
+        second.workspace_snapshot_hit, second.stdlib_duration_ms, second.total_duration_ms, wall2
     );
     if second.stdlib_duration_ms > 0 {
         let ratio = first.stdlib_duration_ms as f64 / second.stdlib_duration_ms as f64;
