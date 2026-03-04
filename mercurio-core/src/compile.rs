@@ -1,14 +1,23 @@
+use mercurio_symbol_index::{SymbolIndexStore, SymbolRecord};
 use mercurio_sysml_core::parser::Parser;
-use mercurio_sysml_semantics::defmap::{DefKind, build_defmap, DefInfo};
-use mercurio_sysml_semantics::hir::lower_defmap_with_cst;
-use mercurio_sysml_semantics::model_rel::{
-    ModelFileAnalysis, build_model_stdlib_relations_from_analyses,
+use mercurio_sysml_pkg::compile_support::{
+    build_canonical_symbol_rows_by_file, build_compile_workspace_files,
+    build_stdlib_snapshot_with_progress as build_stdlib_snapshot_rows_with_progress,
+    build_workspace_semantic_elements_with_selection, collect_stdlib_files,
+    filter_out_library_files, group_prepared_symbols_by_file, is_library_symbol_path,
+    load_stdlib_snapshot_with_cache, map_semantic_element_to_projected_symbol,
+    normalized_compare_key as normalized_compare_key_shared, prepare_symbols_for_index,
+    select_workspace_files, stdlib_signature_key, workspace_semantic_cache_key, PreparedScope,
+    ProjectedPropertyValue, ProjectedSemanticSymbol, RawIndexSymbol, StdlibSymbolRow,
+    WorkspaceFileSelectionScope, WorkspaceSemanticInput, WorkspaceSemanticSelection,
 };
-use mercurio_sysml_semantics::stdlib::{MetatypeIndex, build_metatype_index_from_hirs};
-use mercurio_sysml_semantics::semantic_contract::{
-    SemanticElementView, SemanticIndexInput, SemanticPredicate, SemanticQuery, build_semantic_index,
+use mercurio_sysml_pkg::project_ingest::ingest_project_texts;
+use mercurio_sysml_pkg::semantic_projection::{
+    collect_unresolved_from_project_diagnostics, load_project_sources_for_ingest, SymbolSpan,
+    UnresolvedRef,
 };
-use mercurio_symbol_index::{Scope, SymbolIndexStore, SymbolRecord};
+use mercurio_sysml_pkg::workspace_file::WorkspaceFileScope;
+use mercurio_sysml_semantics::stdlib::MetatypeIndex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -17,12 +26,15 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use crate::project::load_project_config;
-use crate::index_contract::{canonical_symbol_record, CanonicalSymbolRecordArgs};
-use crate::symbol_index::query_project_symbols;
-use crate::state::{StdlibCache, StdlibSymbol};
+use crate::state::{StdlibCache, StdlibSymbol, WorkspaceSnapshotCacheEntry};
 use crate::stdlib::resolve_stdlib_path;
-use crate::workspace::{collect_model_files, collect_project_files, query_semantic};
+use crate::symbol_index::query_project_symbols;
+use crate::workspace::{collect_model_files, collect_project_files};
+use crate::workspace_ir_cache::persist_workspace_ir_cache;
 use crate::CoreState;
+
+#[cfg(test)]
+use mercurio_sysml_semantics::semantic_contract::SemanticElementView;
 
 pub use crate::state::CompileFileResult;
 
@@ -38,7 +50,7 @@ pub struct CompileResponse {
     pub unresolved: Vec<UnresolvedRefView>,
     pub library_path: Option<String>,
     pub parse_failed: bool,
-    pub stdlib_cache_hit: bool,
+    pub workspace_snapshot_hit: bool,
     pub parsed_files: Vec<String>,
     pub parse_duration_ms: u128,
     pub analysis_duration_ms: u128,
@@ -53,7 +65,7 @@ pub struct LibrarySymbolsResponse {
     pub symbols: Vec<SymbolView>,
     pub library_files: Vec<String>,
     pub library_path: Option<String>,
-    pub stdlib_cache_hit: bool,
+    pub workspace_snapshot_hit: bool,
     pub stdlib_duration_ms: u128,
     pub stdlib_file_count: usize,
     pub total_duration_ms: u128,
@@ -177,6 +189,8 @@ pub struct CompileRequest {
     pub run_id: u64,
     #[serde(default)]
     pub allow_parse_errors: bool,
+    #[serde(default = "default_include_symbols")]
+    pub include_symbols: bool,
     #[serde(default)]
     pub unsaved: Vec<UnsavedFileInput>,
     #[serde(default, alias = "file", alias = "path")]
@@ -184,7 +198,7 @@ pub struct CompileRequest {
 }
 
 impl CompileRequest {
-    pub fn into_parts(self) -> (String, u64, bool, Option<PathBuf>, Vec<UnsavedFile>) {
+    pub fn into_parts(self) -> (String, u64, bool, bool, Option<PathBuf>, Vec<UnsavedFile>) {
         let unsaved = self
             .unsaved
             .into_iter()
@@ -198,6 +212,7 @@ impl CompileRequest {
             self.root,
             self.run_id,
             self.allow_parse_errors,
+            self.include_symbols,
             target_path,
             unsaved,
         )
@@ -296,30 +311,299 @@ fn performance_warnings(
 
 pub fn query_semantic_symbols(state: &CoreState, root: String) -> Result<Vec<SymbolView>, String> {
     let indexed = query_project_symbols(state, root.clone(), None, None, None).unwrap_or_default();
-    let mut span_seed = HashMap::<String, SymbolSpan>::new();
-    for symbol in indexed {
-        let key = symbol_key(&symbol.file_path, &symbol.qualified_name);
-        span_seed.insert(
-            key,
-            SymbolSpan {
+    let (semantic_by_file_qname, semantic_by_qname) =
+        semantic_attribute_lookups_for_root(state, &root);
+    Ok(indexed
+        .into_iter()
+        .map(|symbol| {
+            let file_key = normalized_compare_key(Path::new(&symbol.file_path));
+            let key = format!("{file_key}|{}", symbol.qualified_name);
+            let semantic_attributes = semantic_by_file_qname
+                .get(&key)
+                .or_else(|| semantic_by_qname.get(&symbol.qualified_name));
+            let supertypes = semantic_attributes
+                .map(extract_metatype_supertypes)
+                .unwrap_or_default();
+            let mut relationships = semantic_attributes
+                .map(|attributes| {
+                    classification_relationships_from_semantic_attributes(
+                        attributes,
+                        symbol.start_line,
+                        symbol.start_col,
+                        symbol.end_line,
+                        symbol.end_col,
+                    )
+                })
+                .unwrap_or_default();
+            if relationships.is_empty() {
+                if let Some(metatype) = symbol.metatype_qname.as_ref() {
+                    let metatype = metatype.trim();
+                    if !metatype.is_empty() {
+                        relationships.push(RelationshipView {
+                            kind: "classifiedBy".to_string(),
+                            target: metatype.to_string(),
+                            resolved_target: Some(metatype.to_string()),
+                            start_line: symbol.start_line,
+                            start_col: symbol.start_col,
+                            end_line: symbol.end_line,
+                            end_col: symbol.end_col,
+                        });
+                    }
+                }
+            }
+            let mut properties = semantic_attributes
+                .map(semantic_attributes_to_properties)
+                .unwrap_or_default();
+            if properties.is_empty() {
+                if let Some(metatype) = symbol.metatype_qname.as_ref() {
+                    let metatype = metatype.trim();
+                    if !metatype.is_empty() {
+                        properties.push(PropertyItemView {
+                            name: "metatype_qname".to_string(),
+                            label: "metatype_qname".to_string(),
+                            value: PropertyValueView::Text {
+                                value: metatype.to_string(),
+                            },
+                            hint: None,
+                            group: Some("classification".to_string()),
+                        });
+                    }
+                }
+            }
+            SymbolView {
+                file_path: symbol.file_path,
+                name: symbol.name,
+                short_name: None,
+                qualified_name: symbol.qualified_name,
+                kind: symbol.kind,
+                file: 0,
                 start_line: symbol.start_line,
                 start_col: symbol.start_col,
                 end_line: symbol.end_line,
                 end_col: symbol.end_col,
-            },
-        );
-    }
-    let query = SemanticQuery {
-        metatype: None,
-        metatype_is_a: None,
-        predicates: Vec::new(),
+                expr_start_line: None,
+                expr_start_col: None,
+                expr_end_line: None,
+                expr_end_col: None,
+                short_name_start_line: None,
+                short_name_start_col: None,
+                short_name_end_line: None,
+                short_name_end_col: None,
+                doc: symbol.doc_text,
+                supertypes,
+                relationships,
+                type_refs: Vec::new(),
+                is_public: true,
+                properties,
+            }
+        })
+        .collect())
+}
+
+fn semantic_attribute_lookups_for_root(
+    state: &CoreState,
+    root: &str,
+) -> (
+    HashMap<String, HashMap<String, String>>,
+    HashMap<String, HashMap<String, String>>,
+) {
+    let mut by_file_qname = HashMap::<String, HashMap<String, String>>::new();
+    let mut by_qname = HashMap::<String, HashMap<String, String>>::new();
+    let root_prefix = format!("project-semantic|{}|", root);
+    let Ok(cache) = state.workspace_snapshot_cache.lock() else {
+        return (by_file_qname, by_qname);
     };
-    let elements = query_semantic(state, root, query)?;
-    let mut out = Vec::with_capacity(elements.len());
-    for element in elements {
-        out.push(map_semantic_element_to_symbol(element, &span_seed));
+    for (key, entry) in cache.iter() {
+        if !key.starts_with(&root_prefix) {
+            continue;
+        }
+        let WorkspaceSnapshotCacheEntry::ProjectSemantic(elements) = entry else {
+            continue;
+        };
+        for element in elements.iter() {
+            let mut attributes = HashMap::<String, String>::new();
+            for (name, value) in &element.attributes {
+                let name = name.trim();
+                let value = value.trim();
+                if name.is_empty() || value.is_empty() {
+                    continue;
+                }
+                attributes.insert(name.to_string(), value.to_string());
+            }
+            if let Some(metatype) = element.metatype_qname.as_ref() {
+                let metatype = metatype.trim();
+                if !metatype.is_empty() {
+                    attributes
+                        .entry("metatype_qname".to_string())
+                        .or_insert_with(|| metatype.to_string());
+                }
+            }
+            if attributes.is_empty() {
+                continue;
+            }
+            let file_key = normalized_compare_key(Path::new(&element.file_path));
+            let file_qname_key = format!("{file_key}|{}", element.qualified_name);
+            upsert_richer_attribute_entry(&mut by_file_qname, file_qname_key, attributes.clone());
+            upsert_richer_attribute_entry(
+                &mut by_qname,
+                element.qualified_name.clone(),
+                attributes,
+            );
+        }
     }
-    Ok(out)
+    (by_file_qname, by_qname)
+}
+
+fn upsert_richer_attribute_entry(
+    target: &mut HashMap<String, HashMap<String, String>>,
+    key: String,
+    attributes: HashMap<String, String>,
+) {
+    let should_replace = target
+        .get(&key)
+        .map(|current| attributes.len() > current.len())
+        .unwrap_or(true);
+    if should_replace {
+        target.insert(key, attributes);
+    }
+}
+
+fn parse_comma_list(raw: &str) -> Vec<String> {
+    raw.trim()
+        .trim_matches(|ch| ch == '[' || ch == ']')
+        .split(',')
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_string())
+        .collect()
+}
+
+fn extract_metatype_supertypes(attributes: &HashMap<String, String>) -> Vec<String> {
+    let mut out = attributes
+        .get("metatype_supertypes")
+        .or_else(|| attributes.get("mercurio::metatypeSupertypes"))
+        .map(|value| parse_comma_list(value))
+        .unwrap_or_default();
+    if out.is_empty() {
+        if let Some(lineage) = attributes
+            .get("metatype_lineage")
+            .or_else(|| attributes.get("mercurio::metatypeLineage"))
+        {
+            out = parse_comma_list(lineage).into_iter().skip(1).collect();
+        }
+    }
+    out.dedup();
+    out
+}
+
+fn classification_relationships_from_semantic_attributes(
+    attributes: &HashMap<String, String>,
+    start_line: u32,
+    start_col: u32,
+    end_line: u32,
+    end_col: u32,
+) -> Vec<RelationshipView> {
+    let mut out = Vec::<RelationshipView>::new();
+    if let Some(owner) = attributes
+        .get("mercurio::owner")
+        .or_else(|| attributes.get("Element::owner"))
+        .or_else(|| attributes.get("emf::owner"))
+    {
+        let owner = owner.trim();
+        if !owner.is_empty() {
+            out.push(RelationshipView {
+                kind: "owningNamespace".to_string(),
+                target: owner.to_string(),
+                resolved_target: Some(owner.to_string()),
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+            });
+        }
+    }
+    if let Some(metatype) = attributes
+        .get("metatype_qname")
+        .or_else(|| attributes.get("mercurio::metatype"))
+        .or_else(|| attributes.get("Element::metatype"))
+    {
+        let metatype = metatype.trim();
+        if !metatype.is_empty() {
+            out.push(RelationshipView {
+                kind: "classifiedBy".to_string(),
+                target: metatype.to_string(),
+                resolved_target: Some(metatype.to_string()),
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+            });
+        }
+    }
+    for supertype in extract_metatype_supertypes(attributes) {
+        out.push(RelationshipView {
+            kind: "metatypeSupertype".to_string(),
+            target: supertype.clone(),
+            resolved_target: Some(supertype),
+            start_line,
+            start_col,
+            end_line,
+            end_col,
+        });
+    }
+    out
+}
+
+fn semantic_attributes_to_properties(attributes: &HashMap<String, String>) -> Vec<PropertyItemView> {
+    let mut keys = attributes.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    let mut properties = Vec::<PropertyItemView>::new();
+    for key in keys {
+        let Some(raw) = attributes.get(&key) else {
+            continue;
+        };
+        let value = raw.trim();
+        if value.is_empty() {
+            continue;
+        }
+        let is_list = matches!(
+            key.as_str(),
+            "metatype_lineage"
+                | "mercurio::metatypeLineage"
+                | "metatype_supertypes"
+                | "mercurio::metatypeSupertypes"
+                | "mercurio::ownedElements"
+                | "Element::ownedElement"
+                | "emf::ownedElements"
+                | "base_metatypes"
+                | "attribute_type_metatypes"
+                | "relationship_endpoint_metatypes"
+                | "behavior_relation_metatypes"
+        ) || (value.starts_with('[') && value.ends_with(']'));
+        let property_value = if is_list {
+            PropertyValueView::List {
+                items: parse_comma_list(value),
+            }
+        } else if value.eq_ignore_ascii_case("true") {
+            PropertyValueView::Bool { value: true }
+        } else if value.eq_ignore_ascii_case("false") {
+            PropertyValueView::Bool { value: false }
+        } else if let Ok(number) = value.parse::<u64>() {
+            PropertyValueView::Number { value: number }
+        } else {
+            PropertyValueView::Text {
+                value: value.to_string(),
+            }
+        };
+        properties.push(PropertyItemView {
+            name: key.clone(),
+            label: key,
+            value: property_value,
+            hint: None,
+            group: None,
+        });
+    }
+    properties
 }
 
 pub fn compile_workspace_sync<F: Fn(CompileProgressPayload)>(
@@ -339,6 +623,7 @@ pub fn compile_workspace_sync<F: Fn(CompileProgressPayload)>(
         target_path,
         unsaved,
         true,
+        true,
         emit_progress,
     )
 }
@@ -352,6 +637,28 @@ pub fn compile_project_delta_sync<F: Fn(CompileProgressPayload)>(
     unsaved: Vec<UnsavedFile>,
     emit_progress: F,
 ) -> Result<CompileResponse, String> {
+    compile_project_delta_sync_with_options(
+        state,
+        root,
+        run_id,
+        allow_parse_errors,
+        target_path,
+        unsaved,
+        true,
+        emit_progress,
+    )
+}
+
+pub fn compile_project_delta_sync_with_options<F: Fn(CompileProgressPayload)>(
+    state: &CoreState,
+    root: String,
+    run_id: u64,
+    allow_parse_errors: bool,
+    target_path: Option<PathBuf>,
+    unsaved: Vec<UnsavedFile>,
+    include_symbols: bool,
+    emit_progress: F,
+) -> Result<CompileResponse, String> {
     compile_workspace_sync_internal(
         state,
         root,
@@ -360,6 +667,7 @@ pub fn compile_project_delta_sync<F: Fn(CompileProgressPayload)>(
         target_path,
         unsaved,
         false,
+        include_symbols,
         emit_progress,
     )
 }
@@ -372,6 +680,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
     target_path: Option<PathBuf>,
     unsaved: Vec<UnsavedFile>,
     include_library_symbols: bool,
+    include_symbols: bool,
     emit_progress: F,
 ) -> Result<CompileResponse, String> {
     let compile_start = Instant::now();
@@ -379,6 +688,18 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
     if !root_path.exists() {
         return Err("Root path does not exist".to_string());
     }
+    let compile_target = target_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| "<project>".to_string());
+    let _background_job = state.try_start_background_job(
+        "compile",
+        Some(format!(
+            "run_id={} target={} include_symbols={}",
+            run_id, compile_target, include_symbols
+        )),
+        Some(run_id),
+    );
 
     let default_stdlib = state
         .settings
@@ -438,11 +759,11 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
     if files.is_empty() {
         collect_model_files(&root_path, &mut files)?;
     }
-    files = filter_out_stdlib_files(files, stdlib_path_for_log.as_deref());
+    files = filter_out_library_files(files, stdlib_path_for_log.as_deref());
     if files.is_empty() {
         let mut fallback = Vec::new();
         collect_model_files(&root_path, &mut fallback)?;
-        files = filter_out_stdlib_files(fallback, stdlib_path_for_log.as_deref());
+        files = filter_out_library_files(fallback, stdlib_path_for_log.as_deref());
     }
     if let Some(target) = target_path.as_ref() {
         let should_include_target = target.exists()
@@ -458,6 +779,12 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
     }
     files.sort();
     files.dedup();
+    emit_progress(
+        "parsing",
+        Some(format!("queued {} project files", files.len())),
+        None,
+        Some(files.len()),
+    );
 
     let mut workspace = state
         .workspace
@@ -498,7 +825,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
 
         let mut should_parse = false;
         let mut content_override = None;
-        if let Some(content) = unsaved_map.get(path) {
+        if let Some(content) = unsaved_content_for_path(&unsaved_map, path) {
             should_parse = true;
             content_override = Some(content.as_str());
         } else {
@@ -577,7 +904,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
                 .as_ref()
                 .map(|path| path.to_string_lossy().to_string()),
             parse_failed: true,
-            stdlib_cache_hit: false,
+            workspace_snapshot_hit: false,
             parsed_files,
             parse_duration_ms,
             analysis_duration_ms,
@@ -587,101 +914,376 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
         });
     }
 
-    let stdlib_start = Instant::now();
-    let (stdlib_files, stdlib_metatype_index, stdlib_symbols, stdlib_cache_hit) =
-        if include_library_symbols {
-            let (
-                stdlib_entries,
-                stdlib_metatype_index,
-                stdlib_symbols,
-                stdlib_cache_hit,
-                _stdlib_signature,
-            ) = load_stdlib_snapshot(state, stdlib_path_for_log.as_deref())?;
-            let files = stdlib_entries
-                .iter()
-                .map(|(path, _)| path.clone())
-                .collect::<Vec<_>>();
-            (files, stdlib_metatype_index, stdlib_symbols, stdlib_cache_hit)
-        } else {
-            let files = collect_stdlib_files(stdlib_path_for_log.as_deref())?;
-            (
-                files,
-                Arc::new(MetatypeIndex::default()),
-                Arc::new(Vec::new()),
-                false,
-            )
-        };
-    let stdlib_duration_ms = stdlib_start.elapsed().as_millis();
+    let use_stdlib_snapshot = true;
+    let (
+        stdlib_entries,
+        stdlib_files,
+        stdlib_metatype_index,
+        workspace_snapshot_hit,
+        stdlib_signature,
+        stdlib_duration_ms,
+    ) = if use_stdlib_snapshot {
+        emit_progress(
+            "stdlib",
+            Some("loading stdlib snapshot".to_string()),
+            None,
+            None,
+        );
+        let stdlib_start = Instant::now();
+        let mut in_flight_stdlib_file: Option<(usize, usize, PathBuf, Instant)> = None;
+        let (
+            stdlib_entries,
+            stdlib_metatype_index,
+            _stdlib_snapshot_symbols,
+            workspace_snapshot_hit,
+            stdlib_signature,
+        ) = load_stdlib_snapshot(
+            state,
+            stdlib_path_for_log.as_deref(),
+            |index, total, path| {
+                if total == 0 {
+                    return;
+                }
+                if let Some((prev_index, prev_total, prev_path, started_at)) =
+                    in_flight_stdlib_file.take()
+                {
+                    emit_progress(
+                        "stdlib",
+                        Some(format!(
+                            "parsed stdlib {}/{} in {} ms: {}",
+                            prev_index,
+                            prev_total,
+                            started_at.elapsed().as_millis(),
+                            prev_path.to_string_lossy()
+                        )),
+                        Some(prev_index),
+                        Some(prev_total),
+                    );
+                }
+                in_flight_stdlib_file = Some((index, total, path.to_path_buf(), Instant::now()));
+                emit_progress(
+                    "stdlib",
+                    Some(format!(
+                        "parsing stdlib {}/{}: {}",
+                        index,
+                        total,
+                        path.to_string_lossy()
+                    )),
+                    Some(index),
+                    Some(total),
+                );
+            },
+        )?;
+        if let Some((index, total, path, started_at)) = in_flight_stdlib_file.take() {
+            emit_progress(
+                "stdlib",
+                Some(format!(
+                    "parsed stdlib {}/{} in {} ms: {}",
+                    index,
+                    total,
+                    started_at.elapsed().as_millis(),
+                    path.to_string_lossy()
+                )),
+                Some(index),
+                Some(total),
+            );
+        }
+        let files = stdlib_entries
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let stdlib_duration_ms = stdlib_start.elapsed().as_millis();
+        emit_progress(
+            "stdlib",
+            Some(format!(
+                "loaded {} stdlib files (snapshot_hit={})",
+                files.len(),
+                workspace_snapshot_hit
+            )),
+            Some(files.len()),
+            Some(files.len()),
+        );
+        (
+            stdlib_entries,
+            files,
+            stdlib_metatype_index,
+            workspace_snapshot_hit,
+            stdlib_signature,
+            stdlib_duration_ms,
+        )
+    } else {
+        emit_progress(
+            "stdlib",
+            Some("skipped stdlib snapshot (fast project mode)".to_string()),
+            Some(0),
+            Some(0),
+        );
+        (
+            Vec::new(),
+            Vec::new(),
+            Arc::new(MetatypeIndex::default()),
+            false,
+            String::new(),
+            0,
+        )
+    };
 
     let analysis_start = Instant::now();
     check_cancel()?;
-    emit_progress("analysis", None, None, None);
+    emit_progress(
+        "analysis",
+        Some("starting semantic analysis".to_string()),
+        None,
+        None,
+    );
 
-    let project_symbol_files = select_symbol_files(&files, target_path.as_deref());
-    let symbol_spans = build_symbol_span_index(&project_symbol_files, &unsaved_map);
+    let workspace_files = build_compile_workspace_files(&files, &stdlib_files);
+    let project_symbol_files = select_workspace_files(
+        &workspace_files,
+        WorkspaceFileSelectionScope::Project,
+        target_path.as_deref(),
+    );
+    let symbol_spans = build_symbol_span_seed_from_index(state, &root, &project_symbol_files);
+    let unresolved_files = if include_library_symbols {
+        files.clone()
+    } else {
+        project_symbol_files.clone()
+    };
+    emit_progress(
+        "analysis",
+        Some(format!(
+            "collecting unresolved references ({} files)",
+            unresolved_files.len()
+        )),
+        Some(0),
+        Some(unresolved_files.len()),
+    );
+    let unresolved = if unresolved_files.is_empty() {
+        Vec::new()
+    } else {
+        check_cancel()?;
+        let project_sources = load_project_sources_for_ingest(&unresolved_files, &unsaved_map)?;
+        match ingest_project_texts(project_sources.clone()) {
+            Ok(ingest) => {
+                collect_unresolved_from_project_diagnostics(ingest.diagnostics, &project_sources)
+                    .into_iter()
+                    .map(
+                        |UnresolvedRef {
+                             file_path,
+                             message,
+                             line,
+                             column,
+                             code,
+                         }| UnresolvedRefView {
+                            file_path,
+                            message,
+                            line,
+                            column,
+                            code,
+                        },
+                    )
+                    .collect()
+            }
+            Err(_) => Vec::new(),
+        }
+    };
+    emit_progress(
+        "analysis",
+        Some(format!(
+            "unresolved references collected: {}",
+            unresolved.len()
+        )),
+        Some(unresolved.len()),
+        Some(unresolved.len()),
+    );
 
     let mut symbols = Vec::new();
+    let mut raw_index_symbols = Vec::<RawIndexSymbol>::new();
     let mut seen = HashSet::new();
 
     let mut project_symbol_count = 0usize;
     let mut library_symbol_count = 0usize;
-    for symbol in project_decl_symbols(&project_symbol_files, &unsaved_map) {
-        let key = format!("{}|{}|{}", symbol.file_path, symbol.qualified_name, symbol.name);
-        if seen.insert(key) {
-            symbols.push(symbol);
-            project_symbol_count += 1;
-        }
-    }
-    for symbol in project_connection_end_symbols(&project_symbol_files, &unsaved_map) {
-        let key = format!("{}|{}|{}", symbol.file_path, symbol.qualified_name, symbol.name);
-        if seen.insert(key) {
-            symbols.push(symbol);
-            project_symbol_count += 1;
-        }
-    }
-    for symbol in project_import_symbols(&project_symbol_files, &unsaved_map) {
-        let key = format!("{}|{}|{}", symbol.file_path, symbol.qualified_name, symbol.name);
-        if seen.insert(key) {
-            symbols.push(symbol);
-            project_symbol_count += 1;
-        }
-    }
-    // Delta compiles prioritize responsiveness for UI symbol tree updates.
-    // Skip the expensive semantic projection pass here and rely on defmap-backed symbols.
-    if include_library_symbols {
-        for element in semantic_elements_for_project(
-            &project_symbol_files,
-            &unsaved_map,
+    let project_semantic_inputs =
+        load_project_sources_for_ingest(&project_symbol_files, &unsaved_map)?
+            .into_iter()
+            .map(|(path, source)| WorkspaceSemanticInput {
+                path,
+                source,
+                scope: WorkspaceFileScope::Project,
+            })
+            .collect::<Vec<_>>();
+    let semantic_pipeline = "project-semantic-v2";
+    let semantic_cache_key = workspace_semantic_cache_key(
+        &root,
+        &project_semantic_inputs,
+        &stdlib_signature,
+        semantic_pipeline,
+    );
+    let semantic_elements = if let Ok(cache) = state.workspace_snapshot_cache.lock() {
+        cache
+            .get(&semantic_cache_key)
+            .and_then(|entry| match entry {
+                WorkspaceSnapshotCacheEntry::ProjectSemantic(elements) => Some(elements.clone()),
+                WorkspaceSnapshotCacheEntry::Stdlib(_) => None,
+            })
+    } else {
+        None
+    };
+    let semantic_elements = if let Some(cached) = semantic_elements {
+        emit_progress(
+            "analysis",
+            Some(format!("semantic cache hit ({} elements)", cached.len())),
+            Some(cached.len()),
+            Some(cached.len()),
+        );
+        cached
+    } else {
+        emit_progress(
+            "analysis",
+            Some(format!(
+                "building semantic elements ({} files)",
+                project_semantic_inputs.len()
+            )),
+            Some(0),
+            Some(project_semantic_inputs.len()),
+        );
+        let computed = Arc::new(build_workspace_semantic_elements_with_selection(
+            &project_semantic_inputs,
             stdlib_metatype_index.as_ref(),
             stdlib_files.len(),
-        ) {
-            let key = format!(
-                "{}|{}|{}",
-                element.file_path, element.qualified_name, element.name
+            WorkspaceSemanticSelection::ProjectOnly,
+        ));
+        if let Ok(mut cache) = state.workspace_snapshot_cache.lock() {
+            clear_project_semantic_cache_for_root(&mut cache, &root);
+            cache.insert(
+                semantic_cache_key.clone(),
+                WorkspaceSnapshotCacheEntry::ProjectSemantic(computed.clone()),
             );
-            if seen.insert(key) {
-                symbols.push(map_semantic_element_to_symbol(element, &symbol_spans));
-                project_symbol_count += 1;
+        }
+        computed
+    };
+    let semantic_total = semantic_elements.len();
+    emit_progress(
+        "analysis",
+        Some(format!(
+            "projecting semantic symbols ({} elements)",
+            semantic_total
+        )),
+        Some(0),
+        Some(semantic_total),
+    );
+    for (semantic_index, element) in semantic_elements.iter().cloned().enumerate() {
+        if semantic_index % 500 == 0 {
+            check_cancel()?;
+            emit_progress(
+                "analysis",
+                Some(format!(
+                    "projecting semantic symbols {}/{}",
+                    semantic_index + 1,
+                    semantic_total
+                )),
+                Some(semantic_index + 1),
+                Some(semantic_total),
+            );
+        }
+        let projected = map_semantic_element_to_projected_symbol(element, &symbol_spans);
+        let key = format!(
+            "{}|{}|{}",
+            projected.file_path, projected.qualified_name, projected.name
+        );
+        if seen.insert(key) {
+            raw_index_symbols.push(map_projected_semantic_symbol_to_raw_index(&projected));
+            if include_symbols {
+                symbols.push(map_projected_semantic_symbol(projected));
             }
+            project_symbol_count += 1;
         }
     }
+    emit_progress(
+        "analysis",
+        Some(format!(
+            "project symbols projected: {}",
+            project_symbol_count
+        )),
+        Some(project_symbol_count),
+        Some(project_symbol_count),
+    );
     if include_library_symbols {
-        for symbol in stdlib_symbols.iter().map(map_stdlib_symbol_to_symbol_view) {
+        let library_semantic_inputs = stdlib_entries
+            .iter()
+            .map(|(path, source)| WorkspaceSemanticInput {
+                path: path.clone(),
+                source: source.clone(),
+                scope: WorkspaceFileScope::Library,
+            })
+            .collect::<Vec<_>>();
+        emit_progress(
+            "analysis",
+            Some(format!(
+                "building library semantic elements ({} files)",
+                library_semantic_inputs.len()
+            )),
+            Some(0),
+            Some(library_semantic_inputs.len()),
+        );
+        let empty_library_spans = HashMap::<String, SymbolSpan>::new();
+        let library_semantic_elements = build_workspace_semantic_elements_with_selection(
+            &library_semantic_inputs,
+            stdlib_metatype_index.as_ref(),
+            stdlib_files.len(),
+            WorkspaceSemanticSelection::LibraryOnly,
+        );
+        let library_total = library_semantic_elements.len();
+        emit_progress(
+            "analysis",
+            Some(format!(
+                "projecting library semantic symbols ({} elements)",
+                library_total
+            )),
+            Some(0),
+            Some(library_total),
+        );
+        for (library_index, element) in library_semantic_elements.into_iter().enumerate() {
+            if library_index % 500 == 0 {
+                check_cancel()?;
+                emit_progress(
+                    "analysis",
+                    Some(format!(
+                        "projecting library semantic symbols {}/{}",
+                        library_index + 1,
+                        library_total
+                    )),
+                    Some(library_index + 1),
+                    Some(library_total),
+                );
+            }
+            let projected = map_semantic_element_to_projected_symbol(element, &empty_library_spans);
             let key = format!(
                 "{}|{}|{}",
-                symbol.file_path, symbol.qualified_name, symbol.name
+                projected.file_path, projected.qualified_name, projected.name
             );
             if seen.insert(key) {
-                symbols.push(symbol);
+                raw_index_symbols.push(map_projected_semantic_symbol_to_raw_index(&projected));
+                if include_symbols {
+                    symbols.push(map_projected_semantic_symbol(projected));
+                }
                 library_symbol_count += 1;
             }
         }
     }
-    augment_owned_relationships(&mut symbols);
+    if include_symbols {
+        augment_owned_relationships(&mut symbols);
+    }
 
     let mut symbol_counts = HashMap::<String, usize>::new();
-    for symbol in &symbols {
-        *symbol_counts.entry(symbol.file_path.clone()).or_insert(0) += 1;
+    if include_symbols {
+        for symbol in &symbols {
+            *symbol_counts.entry(symbol.file_path.clone()).or_insert(0) += 1;
+        }
+    } else {
+        for symbol in &raw_index_symbols {
+            *symbol_counts.entry(symbol.file_path.clone()).or_insert(0) += 1;
+        }
     }
     for file in &mut file_results {
         file.symbol_count = symbol_counts.get(&file.path).copied().unwrap_or(0);
@@ -698,20 +1300,21 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
         stdlib_duration_ms,
         total_duration_ms,
     );
+    let response_symbols = if include_symbols { symbols } else { Vec::new() };
     let response = CompileResponse {
         ok: file_results.iter().all(|f| f.ok),
         files: file_results,
         parse_error_categories,
         performance_warnings,
-        symbols,
+        symbols: response_symbols,
         project_symbol_count,
         library_symbol_count,
-        unresolved: Vec::new(),
+        unresolved,
         library_path: stdlib_path_for_log
             .as_ref()
             .map(|path| path.to_string_lossy().to_string()),
         parse_failed: false,
-        stdlib_cache_hit,
+        workspace_snapshot_hit,
         parsed_files,
         parse_duration_ms,
         analysis_duration_ms,
@@ -719,7 +1322,13 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
         stdlib_file_count: stdlib_files.len(),
         total_duration_ms,
     };
-    if include_library_symbols {
+    if include_symbols {
+        emit_progress(
+            "indexing",
+            Some(format!("indexing {} symbols", response.symbols.len())),
+            Some(response.symbols.len()),
+            Some(response.symbols.len()),
+        );
         let _ = index_symbols_for_project(
             state,
             &root,
@@ -729,26 +1338,32 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
             false,
         );
     } else {
-        let _ = index_symbols_for_project(
+        emit_progress(
+            "indexing",
+            Some(format!(
+                "indexing {} raw symbols",
+                raw_index_symbols.len()
+            )),
+            Some(raw_index_symbols.len()),
+            Some(raw_index_symbols.len()),
+        );
+        let _ = index_raw_symbols_for_project(
             state,
             &root,
             stdlib_path_for_log.as_deref(),
-            &response.symbols,
-            false,
+            raw_index_symbols,
+            true,
             false,
         );
     }
+    let persist_signature = if stdlib_signature.is_empty() {
+        None
+    } else {
+        Some(stdlib_signature.as_str())
+    };
+    let _ = persist_workspace_ir_cache(state, &root, persist_signature);
+    emit_progress("complete", Some("compile done".to_string()), None, None);
     Ok(response)
-}
-
-fn filter_out_stdlib_files(files: Vec<PathBuf>, stdlib_path: Option<&Path>) -> Vec<PathBuf> {
-    match stdlib_path {
-        None => files,
-        Some(stdlib_root) => files
-            .into_iter()
-            .filter(|file| !is_library_symbol_path(&file.to_string_lossy(), Some(stdlib_root)))
-            .collect(),
-    }
 }
 
 pub fn load_library_symbols_sync(
@@ -762,6 +1377,18 @@ pub fn load_library_symbols_sync(
     if !root_path.exists() {
         return Err("Root path does not exist".to_string());
     }
+    let load_target = target_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| "<all-library-files>".to_string());
+    let _background_job = state.try_start_background_job(
+        "library-load",
+        Some(format!(
+            "target={} include_symbols={}",
+            load_target, include_symbols
+        )),
+        None,
+    );
 
     let default_stdlib = state
         .settings
@@ -795,142 +1422,183 @@ pub fn load_library_symbols_sync(
     } else {
         stdlib_signature_key(&stdlib_files)?
     };
-    let symbols = if include_symbols {
-        let selected_files = select_symbol_files(&stdlib_files, target_path.as_deref());
-        let selected = selected_files
-            .iter()
-            .map(|path| normalized_compare_key(path))
-            .collect::<HashSet<_>>();
-        let mut loaded = Vec::new();
-        for file in &stdlib_files {
-            if let Ok(text) = fs::read_to_string(file) {
-                loaded.push((file.clone(), text));
-            }
-        }
-        let fast_symbols = build_stdlib_symbols_only(&loaded);
-        fast_symbols
-            .into_iter()
-            .filter(|symbol| {
-                target_path.is_none()
-                    || selected.contains(&normalized_compare_key(Path::new(&symbol.file_path)))
-            })
-            .map(|symbol| map_stdlib_symbol_to_symbol_view(&symbol))
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    let stdlib_cache_hit = !stdlib_signature.is_empty()
-        && stdlib_path_for_log.as_ref().is_some_and(|path| {
-            let key = normalized_compare_key(path);
-            state
-                .symbol_index
-                .lock()
-                .ok()
-                .map(|store| store.is_stdlib_index_fresh(&root, &key, &stdlib_signature))
-                .unwrap_or(false)
-        });
     let stdlib_file_count = stdlib_files.len();
-    let stdlib_duration_ms = stdlib_start.elapsed().as_millis();
-
     let library_path_text = stdlib_path_for_log
         .as_ref()
         .map(|path| path.to_string_lossy().to_string());
     let library_key = stdlib_path_for_log
         .as_ref()
         .map(|path| normalized_compare_key(path));
-    let can_mark_freshness = target_path.is_none() && !stdlib_signature.is_empty();
-    let should_index_stdlib = if let Some(key) = library_key.as_ref() {
-        if !include_symbols {
-            false
-        } else if can_mark_freshness {
+    let index_fresh =
+        if let (Some(key), false) = (library_key.as_ref(), stdlib_signature.is_empty()) {
             let store = state
                 .symbol_index
                 .lock()
                 .map_err(|_| "Symbol index lock poisoned".to_string())?;
-            !store.is_stdlib_index_fresh(&root, key, &stdlib_signature)
+            store.is_stdlib_index_fresh(&root, key, &stdlib_signature)
         } else {
-            include_symbols
-        }
+            false
+        };
+
+    let mut workspace_snapshot_hit = index_fresh;
+    let symbols = if !include_symbols {
+        Vec::new()
+    } else if index_fresh {
+        let target_file = target_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string());
+        let indexed = {
+            let store = state
+                .symbol_index
+                .lock()
+                .map_err(|_| "Symbol index lock poisoned".to_string())?;
+            store.library_symbols(&root, target_file.as_deref())
+        };
+        indexed
+            .iter()
+            .map(map_index_symbol_record_to_symbol_view)
+            .collect::<Vec<_>>()
     } else {
-        include_symbols
+        let trace_stdlib = std::env::var("MERCURIO_STDLIB_TRACE")
+            .ok()
+            .map(|value| {
+                let normalized = value.trim().to_ascii_lowercase();
+                matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false);
+        let mut in_flight_stdlib_file: Option<(usize, usize, PathBuf, Instant)> = None;
+        let (
+            stdlib_entries,
+            _stdlib_metatype_index,
+            _stdlib_snapshot_symbols,
+            snapshot_hit,
+            _snapshot_signature,
+        ) = load_stdlib_snapshot(
+            state,
+            stdlib_path_for_log.as_deref(),
+            |index, total, path| {
+                if !trace_stdlib || total == 0 {
+                    return;
+                }
+                if let Some((prev_index, prev_total, prev_path, started_at)) =
+                    in_flight_stdlib_file.take()
+                {
+                    eprintln!(
+                        "[stdlib-load] parsed {}/{} in {} ms: {}",
+                        prev_index,
+                        prev_total,
+                        started_at.elapsed().as_millis(),
+                        prev_path.to_string_lossy()
+                    );
+                }
+                in_flight_stdlib_file = Some((index, total, path.to_path_buf(), Instant::now()));
+                eprintln!(
+                    "[stdlib-load] parsing {}/{}: {}",
+                    index,
+                    total,
+                    path.to_string_lossy()
+                );
+            },
+        )?;
+        if trace_stdlib {
+            if let Some((index, total, path, started_at)) = in_flight_stdlib_file.take() {
+                eprintln!(
+                    "[stdlib-load] parsed {}/{} in {} ms: {}",
+                    index,
+                    total,
+                    started_at.elapsed().as_millis(),
+                    path.to_string_lossy()
+                );
+            }
+        }
+        workspace_snapshot_hit = snapshot_hit;
+        let stdlib_entry_files = stdlib_entries
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let selected_files = select_workspace_files(
+            &build_compile_workspace_files(&[], &stdlib_entry_files),
+            WorkspaceFileSelectionScope::Library,
+            target_path.as_deref(),
+        );
+        let selected = selected_files
+            .iter()
+            .map(|path| normalized_compare_key(path))
+            .collect::<HashSet<_>>();
+        let selected_entries = stdlib_entries
+            .iter()
+            .filter(|(path, _)| {
+                target_path.is_none() || selected.contains(&normalized_compare_key(path))
+            })
+            .map(|(path, source)| (path.clone(), source.clone()))
+            .collect::<Vec<_>>();
+        let library_semantic_inputs = selected_entries
+            .iter()
+            .map(|(path, source)| WorkspaceSemanticInput {
+                path: path.clone(),
+                source: source.clone(),
+                scope: WorkspaceFileScope::Library,
+            })
+            .collect::<Vec<_>>();
+        let empty_library_spans = HashMap::<String, SymbolSpan>::new();
+        let projected_library_symbols = build_workspace_semantic_elements_with_selection(
+            &library_semantic_inputs,
+            _stdlib_metatype_index.as_ref(),
+            stdlib_entry_files.len(),
+            WorkspaceSemanticSelection::LibraryOnly,
+        )
+        .into_iter()
+        .map(|element| map_semantic_element_to_projected_symbol(element, &empty_library_spans))
+        .collect::<Vec<_>>();
+        let mut resolved = Vec::<SymbolView>::new();
+        let mut raw_for_index = Vec::<RawIndexSymbol>::new();
+        for projected in projected_library_symbols {
+            raw_for_index.push(map_projected_semantic_symbol_to_raw_index(&projected));
+            resolved.push(map_projected_semantic_symbol(projected));
+        }
+
+        let _ = index_raw_symbols_for_project(
+            state,
+            &root,
+            stdlib_path_for_log.as_deref(),
+            raw_for_index,
+            true,
+            false,
+        );
+        if let Some(key) = library_key.as_ref() {
+            if let Ok(mut store) = state.symbol_index.lock() {
+                if !stdlib_signature.is_empty() {
+                    store.mark_stdlib_indexed(&root, key, &stdlib_signature);
+                }
+            }
+        }
+        resolved
     };
+    let stdlib_duration_ms = stdlib_start.elapsed().as_millis();
+
     let response = LibrarySymbolsResponse {
         ok: true,
         symbols,
         library_files,
         library_path: library_path_text,
-        stdlib_cache_hit,
+        workspace_snapshot_hit,
         stdlib_duration_ms,
         stdlib_file_count,
         total_duration_ms: start.elapsed().as_millis(),
     };
-    if should_index_stdlib {
-        let symbols_for_index = response.symbols.clone();
-        let _ = index_symbols_for_project(
-            state,
-            &root,
-            stdlib_path_for_log.as_deref(),
-            &symbols_for_index,
-            true,
-            false,
-        );
-        if let (Some(key), true) = (library_key.as_ref(), can_mark_freshness) {
-            if let Ok(mut store) = state.symbol_index.lock() {
-                store.mark_stdlib_indexed(&root, key, &stdlib_signature);
-            }
-        }
-    }
+    let persist_signature = if stdlib_signature.is_empty() {
+        None
+    } else {
+        Some(stdlib_signature.as_str())
+    };
+    let _ = persist_workspace_ir_cache(state, &root, persist_signature);
     Ok(response)
 }
 
-fn build_stdlib_symbols_only(entries: &[(PathBuf, String)]) -> Vec<StdlibSymbol> {
-    let mut symbols = Vec::new();
-    for (path, source) in entries {
-        let mut parser = Parser::new(source);
-        let root = parser.parse_root();
-        let defmap = build_defmap(&root, source);
-        if let Some(package) = defmap.package.as_ref() {
-            if let Some(symbol) = stdlib_symbol_from_def(path, package, source) {
-                symbols.push(symbol);
-            }
-        }
-        for import in &defmap.imports {
-            if let Some(symbol) = stdlib_symbol_from_def(path, import, source) {
-                symbols.push(symbol);
-            }
-        }
-        for def in &defmap.defs {
-            if let Some(symbol) = stdlib_symbol_from_def(path, def, source) {
-                symbols.push(symbol);
-            }
-        }
-        for dependency in &defmap.dependencies {
-            if let Some(symbol) = stdlib_symbol_from_def(path, dependency, source) {
-                symbols.push(symbol);
-            }
-        }
-    }
-    symbols
-}
-
-fn collect_stdlib_files(stdlib_path: Option<&Path>) -> Result<Vec<PathBuf>, String> {
-    let mut files = Vec::new();
-    let Some(path) = stdlib_path else {
-        return Ok(files);
-    };
-    if path.is_dir() {
-        collect_model_files(path, &mut files)?;
-    } else if path.is_file() {
-        files.push(path.to_path_buf());
-    }
-    files.sort();
-    files.dedup();
-    Ok(files)
-}
-
-fn load_stdlib_snapshot(
+fn load_stdlib_snapshot<F>(
     state: &CoreState,
     stdlib_path: Option<&Path>,
+    mut on_progress: F,
 ) -> Result<
     (
         Vec<(PathBuf, String)>,
@@ -940,124 +1608,117 @@ fn load_stdlib_snapshot(
         String,
     ),
     String,
-> {
-    let Some(stdlib_path) = stdlib_path else {
-        return Ok((
-            Vec::new(),
-            Arc::new(MetatypeIndex::default()),
-            Arc::new(Vec::new()),
-            false,
-            String::new(),
-        ));
-    };
-    let stdlib_path = stdlib_path.to_path_buf();
-    let cache_key = normalized_compare_key(&stdlib_path);
-    let files = collect_stdlib_files(Some(&stdlib_path))?;
-    let signature = stdlib_signature_key(&files)?;
-
-    let mut cache = state
-        .stdlib_cache
-        .lock()
-        .map_err(|_| "Stdlib cache lock poisoned".to_string())?;
-    if let Some(entry) = cache.get(&cache_key) {
-        if entry.path == stdlib_path && entry.signature == signature {
-            return Ok((
-                entry.files.clone(),
-                entry.metatype_index.clone(),
-                entry.symbols.clone(),
-                true,
-                signature,
-            ));
-        }
-    }
-
-    let mut loaded = Vec::new();
-    for file in files {
-        if let Ok(text) = fs::read_to_string(&file) {
-            loaded.push((file, text));
-        }
-    }
-    let (metatype_index, symbols) = build_stdlib_snapshot(&loaded);
-    let metatype_index = Arc::new(metatype_index);
-    let symbols = Arc::new(symbols);
-    cache.insert(cache_key, StdlibCache {
-        path: stdlib_path,
-        signature: signature.clone(),
-        files: loaded.clone(),
-        metatype_index: metatype_index.clone(),
-        symbols: symbols.clone(),
-    });
-    // Keep a small working-set of stdlib snapshots so switching projects does not thrash cache.
-    const STDLIB_CACHE_MAX_ENTRIES: usize = 4;
-    if cache.len() > STDLIB_CACHE_MAX_ENTRIES {
-        if let Some(key) = cache.keys().next().cloned() {
-            cache.remove(&key);
-        }
-    }
-    Ok((loaded, metatype_index, symbols, false, signature))
-}
-
-fn stdlib_signature_key(files: &[PathBuf]) -> Result<String, String> {
-    const STDLIB_SCHEMA_VERSION: &str = "stdlib-snapshot-v2";
-    let mut parts = Vec::with_capacity(files.len());
-    for path in files {
-        let normalized = normalized_compare_key(path);
-        let meta = fs::metadata(path).map_err(|e| e.to_string())?;
-        let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        let stamp = modified
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        parts.push(format!("{normalized}:{stamp}:{}", meta.len()));
-    }
-    Ok(format!(
-        "{STDLIB_SCHEMA_VERSION}:{}:{}",
-        env!("CARGO_PKG_VERSION"),
-        parts.join("|")
-    ))
-}
-
-fn build_stdlib_snapshot(entries: &[(PathBuf, String)]) -> (MetatypeIndex, Vec<StdlibSymbol>) {
-    let mut hirs = Vec::new();
-    let mut symbols = Vec::new();
-    for (path, source) in entries {
-        let mut parser = Parser::new(source);
-        let root = parser.parse_root();
-        let defmap = build_defmap(&root, source);
-        hirs.push(lower_defmap_with_cst(&defmap, &root, source));
-        if let Some(package) = defmap.package.as_ref() {
-            if let Some(symbol) = stdlib_symbol_from_def(path, package, source) {
-                symbols.push(symbol);
-            }
-        }
-        for import in &defmap.imports {
-            if let Some(symbol) = stdlib_symbol_from_def(path, import, source) {
-                symbols.push(symbol);
-            }
-        }
-        for def in &defmap.defs {
-            if let Some(symbol) = stdlib_symbol_from_def(path, def, source) {
-                symbols.push(symbol);
-            }
-        }
-        for dependency in &defmap.dependencies {
-            if let Some(symbol) = stdlib_symbol_from_def(path, dependency, source) {
-                symbols.push(symbol);
-            }
-        }
-    }
-    (build_metatype_index_from_hirs(&hirs), symbols)
-}
-
-fn select_symbol_files(candidates: &[PathBuf], target_path: Option<&Path>) -> Vec<PathBuf> {
-    match target_path {
-        None => candidates.to_vec(),
-        Some(target) => candidates
+>
+where
+    F: FnMut(usize, usize, &Path),
+{
+    let mut stdlib_cache = {
+        let cache = state
+            .workspace_snapshot_cache
+            .lock()
+            .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
+        cache
             .iter()
-            .filter(|candidate| same_path(candidate, target))
-            .cloned()
-            .collect(),
+            .filter_map(|(key, entry)| match entry {
+                WorkspaceSnapshotCacheEntry::Stdlib(value) => Some((key.clone(), value.clone())),
+                WorkspaceSnapshotCacheEntry::ProjectSemantic(_) => None,
+            })
+            .collect::<HashMap<String, StdlibCache>>()
+    };
+    let result = load_stdlib_snapshot_with_cache(stdlib_path, &mut stdlib_cache, |entries| {
+        build_stdlib_snapshot_with_progress(entries, |index, total, path| {
+            on_progress(index, total, path);
+        })
+    })?;
+    let mut cache = state
+        .workspace_snapshot_cache
+        .lock()
+        .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
+    cache.retain(|_, entry| !matches!(entry, WorkspaceSnapshotCacheEntry::Stdlib(_)));
+    for (key, value) in stdlib_cache {
+        cache.insert(key, WorkspaceSnapshotCacheEntry::Stdlib(value));
     }
+    Ok(result)
+}
+
+fn build_stdlib_snapshot_with_progress<F>(
+    entries: &[(PathBuf, String)],
+    on_progress: F,
+) -> (MetatypeIndex, Vec<StdlibSymbol>)
+where
+    F: FnMut(usize, usize, &Path),
+{
+    let (index, symbols) = build_stdlib_snapshot_rows_with_progress(entries, on_progress);
+    (
+        index,
+        symbols.into_iter().map(map_stdlib_symbol_row).collect(),
+    )
+}
+
+#[cfg(test)]
+fn build_stdlib_snapshot(entries: &[(PathBuf, String)]) -> (MetatypeIndex, Vec<StdlibSymbol>) {
+    build_stdlib_snapshot_with_progress(entries, |_index, _total, _path| {})
+}
+
+fn map_stdlib_symbol_row(row: StdlibSymbolRow) -> StdlibSymbol {
+    StdlibSymbol {
+        file_path: row.file_path,
+        name: row.name,
+        qualified_name: row.qualified_name,
+        kind: row.kind,
+        start_line: row.start_line,
+        start_col: row.start_col,
+        end_line: row.end_line,
+        end_col: row.end_col,
+    }
+}
+
+fn clear_project_semantic_cache_for_root(
+    cache: &mut HashMap<String, WorkspaceSnapshotCacheEntry>,
+    project_root: &str,
+) {
+    let prefix = format!("project-semantic|{}|", project_root);
+    let to_remove = cache
+        .iter()
+        .filter_map(|(key, entry)| match entry {
+            WorkspaceSnapshotCacheEntry::ProjectSemantic(_) if key.starts_with(&prefix) => {
+                Some(key.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for key in to_remove {
+        cache.remove(&key);
+    }
+}
+
+fn build_symbol_span_seed_from_index(
+    state: &CoreState,
+    project_root: &str,
+    files: &[PathBuf],
+) -> HashMap<String, SymbolSpan> {
+    if files.is_empty() {
+        return HashMap::new();
+    }
+    let Ok(store) = state.symbol_index.lock() else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    for file in files {
+        let file_path = file.to_string_lossy().to_string();
+        for symbol in store.project_symbols(project_root, Some(&file_path)) {
+            out.insert(
+                symbol_key(&symbol.file_path, &symbol.qualified_name),
+                SymbolSpan {
+                    start_line: symbol.start_line,
+                    start_col: symbol.start_col,
+                    end_line: symbol.end_line,
+                    end_col: symbol.end_col,
+                },
+            );
+        }
+    }
+    out
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -1065,220 +1726,46 @@ fn same_path(left: &Path, right: &Path) -> bool {
 }
 
 fn normalized_compare_key(path: &Path) -> String {
-    let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    normalized
-        .to_string_lossy()
-        .replace('/', "\\")
-        .to_ascii_lowercase()
+    normalized_compare_key_shared(path)
 }
 
-fn semantic_elements_for_project(
-    project_files: &[PathBuf],
-    unsaved_map: &HashMap<PathBuf, String>,
-    stdlib_index: &MetatypeIndex,
-    stdlib_file_count: usize,
-) -> Vec<SemanticElementView> {
-    let mut analyses = Vec::new();
-    for file in project_files {
-        let source = unsaved_map
-            .get(file)
-            .cloned()
-            .or_else(|| fs::read_to_string(file).ok());
-        let Some(source) = source else {
-            continue;
-        };
-        let mut parser = Parser::new(&source);
-        let root = parser.parse_root();
-        if !parser.errors().is_empty() {
-            continue;
-        }
-        let defmap = build_defmap(&root, &source);
-        let hir = lower_defmap_with_cst(&defmap, &root, &source);
-        analyses.push(ModelFileAnalysis {
-            file: file.clone(),
-            source,
-            hir,
-        });
-    }
-
-    let report = build_model_stdlib_relations_from_analyses(
-        project_files.len(),
-        stdlib_file_count,
-        stdlib_index,
-        &analyses,
-    );
-
-    build_semantic_index(SemanticIndexInput {
-        report: &report,
-        stdlib: stdlib_index,
+fn unsaved_content_for_path<'a>(
+    unsaved_map: &'a HashMap<PathBuf, String>,
+    path: &Path,
+) -> Option<&'a String> {
+    unsaved_map.get(path).or_else(|| {
+        unsaved_map
+            .iter()
+            .find(|(candidate, _)| same_path(candidate, path))
+            .map(|(_, content)| content)
     })
-    .query(&SemanticQuery {
-        metatype: None,
-        metatype_is_a: None,
-        predicates: Vec::<SemanticPredicate>::new(),
-    })
-}
-
-fn project_import_symbols(
-    project_files: &[PathBuf],
-    unsaved_map: &HashMap<PathBuf, String>,
-) -> Vec<SymbolView> {
-    let mut out = Vec::new();
-    for file in project_files {
-        let source = unsaved_map
-            .get(file)
-            .cloned()
-            .or_else(|| fs::read_to_string(file).ok());
-        let Some(source) = source else {
-            continue;
-        };
-        let mut parser = Parser::new(&source);
-        let root = parser.parse_root();
-        if !parser.errors().is_empty() {
-            continue;
-        }
-        let defmap = build_defmap(&root, &source);
-        for import in &defmap.imports {
-            if let Some(symbol) = project_symbol_from_def(file, import, &source) {
-                out.push(symbol);
-            }
-        }
-    }
-    out
-}
-
-fn project_decl_symbols(
-    project_files: &[PathBuf],
-    unsaved_map: &HashMap<PathBuf, String>,
-) -> Vec<SymbolView> {
-    let mut out = Vec::new();
-    for file in project_files {
-        let source = unsaved_map
-            .get(file)
-            .cloned()
-            .or_else(|| fs::read_to_string(file).ok());
-        let Some(source) = source else {
-            continue;
-        };
-        let mut parser = Parser::new(&source);
-        let root = parser.parse_root();
-        let defmap = build_defmap(&root, &source);
-        if let Some(package) = defmap.package.as_ref() {
-            if let Some(symbol) = project_symbol_from_def(file, package, &source) {
-                out.push(symbol);
-            }
-        }
-        for def in &defmap.defs {
-            if let Some(symbol) = project_symbol_from_def(file, def, &source) {
-                out.push(symbol);
-            }
-        }
-        for dependency in &defmap.dependencies {
-            if let Some(symbol) = project_symbol_from_def(file, dependency, &source) {
-                out.push(symbol);
-            }
-        }
-    }
-    out
-}
-
-fn project_connection_end_symbols(
-    project_files: &[PathBuf],
-    unsaved_map: &HashMap<PathBuf, String>,
-) -> Vec<SymbolView> {
-    let mut out = Vec::new();
-    for file in project_files {
-        let source = unsaved_map
-            .get(file)
-            .cloned()
-            .or_else(|| fs::read_to_string(file).ok());
-        let Some(source) = source else {
-            continue;
-        };
-        let mut parser = Parser::new(&source);
-        let root = parser.parse_root();
-        if !parser.errors().is_empty() {
-            continue;
-        }
-        let defmap = build_defmap(&root, &source);
-        let hir = lower_defmap_with_cst(&defmap, &root, &source);
-        for def in &hir.defs {
-            if def.kind != DefKind::ConnectionDef {
-                continue;
-            }
-            let Some(def_name) = def.name.as_ref() else {
-                continue;
-            };
-            let parent_qname = if def.package_path.is_empty() {
-                def_name.clone()
-            } else {
-                format!("{}::{}", def.package_path.join("::"), def_name)
-            };
-            let def_span = span_to_line_col(def.span.start, def.span.end, &source);
-            for attr in &def.attributes {
-                if attr.name.trim().is_empty() {
-                    continue;
-                }
-                let attr_span = find_connection_end_symbol_span(def, &attr.name, &source)
-                    .or_else(|| find_ident_span_in_range(def.span.start, def.span.end, &attr.name, &source))
-                    .unwrap_or(def_span);
-                let qualified_name = format!("{parent_qname}::{}", attr.name);
-                out.push(SymbolView {
-                    file_path: file.to_string_lossy().to_string(),
-                    name: attr.name.clone(),
-                    short_name: None,
-                    qualified_name,
-                    kind: "OwnedEnd".to_string(),
-                    file: 0,
-                    start_line: attr_span.start_line,
-                    start_col: attr_span.start_col,
-                    end_line: attr_span.end_line,
-                    end_col: attr_span.end_col,
-                    expr_start_line: None,
-                    expr_start_col: None,
-                    expr_end_line: None,
-                    expr_end_col: None,
-                    short_name_start_line: None,
-                    short_name_start_col: None,
-                    short_name_end_line: None,
-                    short_name_end_col: None,
-                    doc: None,
-                    supertypes: Vec::new(),
-                    relationships: Vec::new(),
-                    type_refs: Vec::new(),
-                    is_public: true,
-                    properties: vec![
-                        PropertyItemView {
-                            name: "kind".to_string(),
-                            label: "kind".to_string(),
-                            value: PropertyValueView::Text {
-                                value: "OwnedEnd".to_string(),
-                            },
-                            hint: None,
-                            group: None,
-                        },
-                        PropertyItemView {
-                            name: "owner_kind".to_string(),
-                            label: "owner_kind".to_string(),
-                            value: PropertyValueView::Text {
-                                value: "ConnectionDef".to_string(),
-                            },
-                            hint: None,
-                            group: None,
-                        },
-                    ],
-                });
-            }
-        }
-    }
-    out
 }
 
 fn augment_owned_relationships(symbols: &mut [SymbolView]) {
+    fn is_owned_attribute_symbol(symbol: &SymbolView) -> bool {
+        if symbol.kind.to_ascii_lowercase().contains("attribute") {
+            return true;
+        }
+        symbol_metatype_qname(symbol)
+            .map(|metatype| metatype.to_ascii_lowercase().contains("attribute"))
+            .unwrap_or(false)
+    }
+
     let mut qname_to_index = HashMap::<String, usize>::new();
     for (idx, symbol) in symbols.iter().enumerate() {
-        qname_to_index.entry(symbol.qualified_name.clone()).or_insert(idx);
+        qname_to_index
+            .entry(symbol.qualified_name.clone())
+            .or_insert(idx);
     }
+    let is_attribute_by_qname = symbols
+        .iter()
+        .map(|symbol| {
+            (
+                symbol.qualified_name.clone(),
+                is_owned_attribute_symbol(symbol),
+            )
+        })
+        .collect::<HashMap<_, _>>();
 
     let mut relationships_by_parent = HashMap::<usize, Vec<RelationshipView>>::new();
     for symbol in symbols.iter() {
@@ -1348,6 +1835,27 @@ fn augment_owned_relationships(symbols: &mut [SymbolView]) {
                 Some("connection"),
             );
         }
+        let mut owned_attributes = Vec::<String>::new();
+        for rel in parent
+            .relationships
+            .iter()
+            .filter(|rel| rel.kind == "ownedMember")
+        {
+            let Some(is_attribute) = is_attribute_by_qname.get(&rel.target) else {
+                continue;
+            };
+            if *is_attribute && !owned_attributes.iter().any(|target| target == &rel.target) {
+                owned_attributes.push(rel.target.clone());
+            }
+        }
+        if !owned_attributes.is_empty() {
+            upsert_list_property(
+                &mut parent.properties,
+                "ownedAttributes",
+                owned_attributes,
+                Some("ownership"),
+            );
+        }
     }
 }
 
@@ -1371,203 +1879,27 @@ fn upsert_number_property(
     });
 }
 
-fn find_connection_end_symbol_span(def: &mercurio_sysml_semantics::hir::HirDef, name: &str, source: &str) -> Option<SymbolSpan> {
-    if name.trim().is_empty() {
-        return None;
+fn upsert_list_property(
+    properties: &mut Vec<PropertyItemView>,
+    name: &str,
+    items: Vec<String>,
+    group: Option<&str>,
+) {
+    if let Some(property) = properties.iter_mut().find(|prop| prop.name == name) {
+        property.value = PropertyValueView::List { items };
+        property.group = group.map(|value| value.to_string());
+        return;
     }
-    let start = usize::try_from(def.span.start).ok()?.min(source.len());
-    let end = usize::try_from(def.span.end).ok()?.min(source.len());
-    if end <= start {
-        return None;
-    }
-    let block = &source[start..end];
-    let mut stmt_start = 0usize;
-    while stmt_start < block.len() {
-        let rel_end = block[stmt_start..]
-            .find(';')
-            .map(|idx| stmt_start + idx + 1)
-            .unwrap_or(block.len());
-        let statement = &block[stmt_start..rel_end];
-        if let Some((name_start, name_end)) = find_connection_end_name_span_in_statement(statement, name)
-        {
-            let abs_start = start + stmt_start + name_start;
-            let abs_end = start + stmt_start + name_end;
-            return Some(span_to_line_col(abs_start as u32, abs_end as u32, source));
-        }
-        if rel_end == block.len() {
-            break;
-        }
-        stmt_start = rel_end;
-    }
-    None
+    properties.push(PropertyItemView {
+        name: name.to_string(),
+        label: name.to_string(),
+        value: PropertyValueView::List { items },
+        hint: None,
+        group: group.map(|value| value.to_string()),
+    });
 }
 
-fn find_connection_end_name_span_in_statement(statement: &str, target_name: &str) -> Option<(usize, usize)> {
-    let bytes = statement.as_bytes();
-    let mut idx = 0usize;
-    let mut seen_end = false;
-    while let Some((token, token_start, token_end)) = next_ident_token(statement, idx) {
-        if token == "end" {
-            seen_end = true;
-            idx = token_end;
-            continue;
-        }
-        if seen_end && token == "item" {
-            let mut lookahead = token_end;
-            while lookahead < bytes.len() {
-                let ch = bytes[lookahead] as char;
-                if ch.is_ascii_alphanumeric() || ch == '_' {
-                    break;
-                }
-                lookahead += 1;
-            }
-            if let Some((name_token, name_start, name_end)) = next_ident_token(statement, lookahead) {
-                if name_token == target_name {
-                    return Some((name_start, name_end));
-                }
-            }
-            return None;
-        }
-        idx = token_end.max(token_start + 1);
-    }
-    None
-}
-
-fn next_ident_token(text: &str, from: usize) -> Option<(&str, usize, usize)> {
-    let bytes = text.as_bytes();
-    let mut start = from;
-    while start < bytes.len() {
-        let ch = bytes[start] as char;
-        if ch.is_ascii_alphabetic() || ch == '_' {
-            break;
-        }
-        start += 1;
-    }
-    if start >= bytes.len() {
-        return None;
-    }
-    let mut end = start + 1;
-    while end < bytes.len() {
-        let ch = bytes[end] as char;
-        if !(ch.is_ascii_alphanumeric() || ch == '_') {
-            break;
-        }
-        end += 1;
-    }
-    Some((&text[start..end], start, end))
-}
-
-fn find_ident_span_in_range(start: u32, end: u32, target_name: &str, source: &str) -> Option<SymbolSpan> {
-    if target_name.is_empty() {
-        return None;
-    }
-    let start_idx = usize::try_from(start).ok()?.min(source.len());
-    let end_idx = usize::try_from(end).ok()?.min(source.len());
-    if end_idx <= start_idx {
-        return None;
-    }
-    let slice = &source[start_idx..end_idx];
-    let mut cursor = 0usize;
-    while let Some((token, token_start, token_end)) = next_ident_token(slice, cursor) {
-        if token == target_name {
-            let abs_start = start_idx + token_start;
-            let abs_end = start_idx + token_end;
-            return Some(span_to_line_col(abs_start as u32, abs_end as u32, source));
-        }
-        cursor = token_end.max(token_start + 1);
-    }
-    None
-}
-
-fn stdlib_symbol_from_def(path: &Path, def: &DefInfo, source: &str) -> Option<StdlibSymbol> {
-    let name = def.name.clone()?;
-    let qualified_name = if def.package_path.is_empty() {
-        name.clone()
-    } else {
-        format!("{}::{}", def.package_path.join("::"), name)
-    };
-    let kind = def_kind_label(def.kind).to_string();
-    let span = span_to_line_col(def.span.start, def.span.end, source);
-    Some(StdlibSymbol {
-        file_path: path.to_string_lossy().to_string(),
-        name,
-        qualified_name,
-        kind,
-        start_line: span.start_line,
-        start_col: span.start_col,
-        end_line: span.end_line,
-        end_col: span.end_col,
-    })
-}
-
-fn project_symbol_from_def(path: &Path, def: &DefInfo, source: &str) -> Option<SymbolView> {
-    let name = def.name.clone()?;
-    let qualified_name = if def.package_path.is_empty() {
-        name.clone()
-    } else {
-        format!("{}::{}", def.package_path.join("::"), name)
-    };
-    let kind = def_kind_label(def.kind).to_string();
-    let span = span_to_line_col(def.span.start, def.span.end, source);
-    Some(SymbolView {
-        file_path: path.to_string_lossy().to_string(),
-        name,
-        short_name: None,
-        qualified_name,
-        kind: kind.clone(),
-        file: 0,
-        start_line: span.start_line,
-        start_col: span.start_col,
-        end_line: span.end_line,
-        end_col: span.end_col,
-        expr_start_line: None,
-        expr_start_col: None,
-        expr_end_line: None,
-        expr_end_col: None,
-        short_name_start_line: None,
-        short_name_start_col: None,
-        short_name_end_line: None,
-        short_name_end_col: None,
-        doc: None,
-        supertypes: Vec::new(),
-        relationships: Vec::new(),
-        type_refs: Vec::new(),
-        is_public: true,
-        properties: vec![PropertyItemView {
-            name: "kind".to_string(),
-            label: "kind".to_string(),
-            value: PropertyValueView::Text { value: kind },
-            hint: None,
-            group: None,
-        }],
-    })
-}
-
-fn def_kind_label(kind: DefKind) -> &'static str {
-    match kind {
-        DefKind::Package => "Package",
-        DefKind::Import => "Import",
-        DefKind::Documentation => "Documentation",
-        DefKind::Comment => "Comment",
-        DefKind::PartDef => "PartDef",
-        DefKind::ItemDef => "ItemDef",
-        DefKind::PortDef => "PortDef",
-        DefKind::ConnectionDef => "ConnectionDef",
-        DefKind::AllocationDef => "AllocationDef",
-        DefKind::RequirementDef => "RequirementDef",
-        DefKind::ActionDef => "ActionDef",
-        DefKind::AttributeDef => "AttributeDef",
-        DefKind::ConstraintDef => "ConstraintDef",
-        DefKind::MetadataDef => "MetadataDef",
-        DefKind::StructDef => "StructDef",
-        DefKind::MetaclassDef => "MetaclassDef",
-        DefKind::FunctionDef => "FunctionDef",
-        DefKind::Usage => "Usage",
-        DefKind::Dependency => "Dependency",
-    }
-}
-
-fn map_stdlib_symbol_to_symbol_view(symbol: &StdlibSymbol) -> SymbolView {
+fn map_index_symbol_record_to_symbol_view(symbol: &SymbolRecord) -> SymbolView {
     SymbolView {
         file_path: symbol.file_path.clone(),
         name: symbol.name.clone(),
@@ -1587,7 +1919,7 @@ fn map_stdlib_symbol_to_symbol_view(symbol: &StdlibSymbol) -> SymbolView {
         short_name_start_col: None,
         short_name_end_line: None,
         short_name_end_col: None,
-        doc: None,
+        doc: symbol.doc_text.clone(),
         supertypes: Vec::new(),
         relationships: Vec::new(),
         type_refs: Vec::new(),
@@ -1604,146 +1936,18 @@ fn map_stdlib_symbol_to_symbol_view(symbol: &StdlibSymbol) -> SymbolView {
     }
 }
 
-fn map_semantic_element_to_symbol(
-    element: SemanticElementView,
-    symbol_spans: &HashMap<String, SymbolSpan>,
-) -> SymbolView {
-    fn normalize_attr_key(input: &str) -> String {
-        input.replace(':', "").to_lowercase()
-    }
-
-    fn semantic_attr(attributes: &HashMap<String, String>, keys: &[&str]) -> Option<String> {
-        let wanted = keys
-            .iter()
-            .map(|key| normalize_attr_key(key))
-            .collect::<Vec<_>>();
-        for (key, value) in attributes {
-            let norm = normalize_attr_key(key);
-            if wanted.iter().any(|candidate| candidate == &norm) {
-                let text = value.trim();
-                if !text.is_empty() {
-                    return Some(text.to_string());
-                }
-            }
-        }
-        None
-    }
-
-    fn semantic_attr_by_suffix(attributes: &HashMap<String, String>, suffixes: &[&str]) -> Option<String> {
-        for (key, value) in attributes {
-            for suffix in suffixes {
-                if key == suffix || key.ends_with(&format!("::{suffix}")) {
-                    let text = value.trim();
-                    if !text.is_empty() {
-                        return Some(text.to_string());
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    let qualified_name = semantic_attr(
-        &element.attributes,
-        &["emf::qualifiedName", "Element::qualifiedName"],
-    )
-    .unwrap_or_else(|| element.qualified_name.clone());
-    let name = semantic_attr(&element.attributes, &["emf::name", "NamedElement::name"])
-        .or_else(|| {
-            qualified_name
-                .split("::")
-                .filter(|segment| !segment.is_empty())
-                .last()
-                .map(|segment| segment.to_string())
-        })
-        .unwrap_or_else(|| element.name.clone());
-    let metatype_qname = semantic_attr(
-        &element.attributes,
-        &["emf::metatype", "Element::metatype"],
-    )
-    .or_else(|| element.metatype_qname.clone());
-    let kind = semantic_attr(&element.attributes, &["emf::kind", "Element::kind", "kind"])
-        .or_else(|| {
-            metatype_qname
-                .as_deref()
-                .and_then(|value| value.rsplit("::").next())
-                .filter(|value| !value.is_empty())
-                .map(|value| value.to_string())
-        })
-        .unwrap_or_else(|| "Unknown".to_string());
-    let multiplicity_text = semantic_attr(
-        &element.attributes,
-        &["emf::multiplicityText", "multiplicityText", "multiplicity"],
-    )
-    .or_else(|| semantic_attr_by_suffix(&element.attributes, &["multiplicityText", "multiplicity"]));
-    let owner_qname = semantic_attr(&element.attributes, &["emf::owner", "Element::owner"]);
-
-    let mut keys = element.attributes.keys().cloned().collect::<Vec<_>>();
-    keys.sort();
-    let mut properties = keys
-        .into_iter()
-        .filter_map(|key| {
-            element.attributes.get(&key).map(|value| PropertyItemView {
-                name: key.clone(),
-                label: key,
-                value: PropertyValueView::Text {
-                    value: value.clone(),
-                },
-                hint: None,
-                group: None,
-            })
-        })
-        .collect::<Vec<_>>();
-    if let Some(metatype_qname) = metatype_qname.as_ref() {
-        properties.push(PropertyItemView {
-            name: "metatype_qname".to_string(),
-            label: "metatype_qname".to_string(),
-            value: PropertyValueView::Text {
-                value: metatype_qname.clone(),
-            },
-            hint: None,
-            group: None,
-        });
-    }
-    if let Some(multiplicity_text) = multiplicity_text.as_ref() {
-        properties.push(PropertyItemView {
-            name: "multiplicity".to_string(),
-            label: "multiplicity".to_string(),
-            value: PropertyValueView::Text {
-                value: multiplicity_text.clone(),
-            },
-            hint: None,
-            group: None,
-        });
-    }
-    let key = symbol_key(&element.file_path, &qualified_name);
-    let span = symbol_spans.get(&key);
-    let relationships = owner_qname
-        .as_ref()
-        .map(|owner| {
-            vec![RelationshipView {
-                kind: "owningNamespace".to_string(),
-                target: owner.clone(),
-                resolved_target: Some(owner.clone()),
-                start_line: span.map(|s| s.start_line).unwrap_or(0),
-                start_col: span.map(|s| s.start_col).unwrap_or(0),
-                end_line: span.map(|s| s.end_line).unwrap_or(0),
-                end_col: span.map(|s| s.end_col).unwrap_or(0),
-            }]
-        })
-        .unwrap_or_default();
-
+fn map_projected_semantic_symbol(symbol: ProjectedSemanticSymbol) -> SymbolView {
     SymbolView {
-        file_path: element.file_path,
-        name,
+        file_path: symbol.file_path,
+        name: symbol.name,
         short_name: None,
-        qualified_name,
-        kind,
+        qualified_name: symbol.qualified_name,
+        kind: symbol.kind,
         file: 0,
-        start_line: span.map(|s| s.start_line).unwrap_or(0),
-        start_col: span.map(|s| s.start_col).unwrap_or(0),
-        end_line: span.map(|s| s.end_line).unwrap_or(0),
-        end_col: span.map(|s| s.end_col).unwrap_or(0),
+        start_line: symbol.start_line,
+        start_col: symbol.start_col,
+        end_line: symbol.end_line,
+        end_col: symbol.end_col,
         expr_start_line: None,
         expr_start_col: None,
         expr_end_line: None,
@@ -1752,12 +1956,74 @@ fn map_semantic_element_to_symbol(
         short_name_start_col: None,
         short_name_end_line: None,
         short_name_end_col: None,
-        doc: None,
-        supertypes: Vec::new(),
-        relationships,
+        doc: symbol.doc,
+        supertypes: symbol.supertypes,
+        relationships: symbol
+            .relationships
+            .into_iter()
+            .map(|rel| RelationshipView {
+                kind: rel.kind,
+                target: rel.target,
+                resolved_target: rel.resolved_target,
+                start_line: rel.start_line,
+                start_col: rel.start_col,
+                end_line: rel.end_line,
+                end_col: rel.end_col,
+            })
+            .collect(),
         type_refs: Vec::new(),
-        is_public: true,
-        properties,
+        is_public: symbol.is_public,
+        properties: symbol
+            .properties
+            .into_iter()
+            .map(|item| PropertyItemView {
+                name: item.name,
+                label: item.label,
+                value: map_projected_property_value(item.value),
+                hint: item.hint,
+                group: item.group,
+            })
+            .collect(),
+    }
+}
+
+fn map_projected_property_value(value: ProjectedPropertyValue) -> PropertyValueView {
+    match value {
+        ProjectedPropertyValue::Text { value } => PropertyValueView::Text { value },
+        ProjectedPropertyValue::List { items } => PropertyValueView::List { items },
+        ProjectedPropertyValue::Bool { value } => PropertyValueView::Bool { value },
+        ProjectedPropertyValue::Number { value } => PropertyValueView::Number { value },
+    }
+}
+
+fn projected_symbol_metatype_qname(symbol: &ProjectedSemanticSymbol) -> Option<String> {
+    symbol.properties.iter().find_map(|item| {
+        if item.name != "metatype_qname" {
+            return None;
+        }
+        match &item.value {
+            ProjectedPropertyValue::Text { value } if !value.trim().is_empty() => {
+                Some(value.clone())
+            }
+            _ => None,
+        }
+    })
+}
+
+fn map_projected_semantic_symbol_to_raw_index(symbol: &ProjectedSemanticSymbol) -> RawIndexSymbol {
+    RawIndexSymbol {
+        file_path: symbol.file_path.clone(),
+        name: symbol.name.clone(),
+        qualified_name: symbol.qualified_name.clone(),
+        parent_qualified_name: projected_symbol_parent_qualified_name(symbol),
+        kind: symbol.kind.clone(),
+        metatype_qname: projected_symbol_metatype_qname(symbol),
+        start_line: symbol.start_line,
+        start_col: symbol.start_col,
+        end_line: symbol.end_line,
+        end_col: symbol.end_col,
+        doc_text: symbol.doc.clone(),
+        properties_json: None,
     }
 }
 
@@ -1775,13 +2041,102 @@ fn symbol_metatype_qname(symbol: &SymbolView) -> Option<String> {
     None
 }
 
-fn is_library_symbol_path(symbol_file_path: &str, library_path: Option<&Path>) -> bool {
-    let Some(lib) = library_path else {
-        return false;
-    };
-    let symbol_key = normalized_compare_key(Path::new(symbol_file_path));
-    let lib_key = normalized_compare_key(lib);
-    symbol_key == lib_key || symbol_key.starts_with(&(lib_key + "\\"))
+fn parent_qualified_name_from_qname(qualified_name: &str) -> Option<String> {
+    let value = qualified_name.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let index = value.rfind("::")?;
+    if index == 0 {
+        return None;
+    }
+    Some(value[..index].to_string())
+}
+
+fn projected_symbol_parent_qualified_name(symbol: &ProjectedSemanticSymbol) -> Option<String> {
+    for relationship in &symbol.relationships {
+        if relationship.kind.eq_ignore_ascii_case("owningNamespace") {
+            let target = relationship.target.trim();
+            if !target.is_empty() {
+                return Some(target.to_string());
+            }
+        }
+    }
+    for property in &symbol.properties {
+        let key = property.name.as_str();
+        let is_owner_property = matches!(
+            key,
+            "mercurio::owner" | "element::owner" | "emf::owner" | "owner"
+        );
+        if !is_owner_property {
+            continue;
+        }
+        match &property.value {
+            ProjectedPropertyValue::Text { value } => {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+            ProjectedPropertyValue::List { items } => {
+                if let Some(value) = items.iter().find_map(|item| {
+                    let trimmed = item.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                }) {
+                    return Some(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    parent_qualified_name_from_qname(&symbol.qualified_name)
+}
+
+fn symbol_parent_qualified_name(symbol: &SymbolView) -> Option<String> {
+    for relationship in &symbol.relationships {
+        if relationship.kind.eq_ignore_ascii_case("owningNamespace") {
+            let target = relationship.target.trim();
+            if !target.is_empty() {
+                return Some(target.to_string());
+            }
+        }
+    }
+    for property in &symbol.properties {
+        let key = property.name.as_str();
+        let is_owner_property = matches!(
+            key,
+            "mercurio::owner" | "element::owner" | "emf::owner" | "owner"
+        );
+        if !is_owner_property {
+            continue;
+        }
+        match &property.value {
+            PropertyValueView::Text { value } => {
+                let value = value.trim();
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+            PropertyValueView::List { items } => {
+                if let Some(value) = items.iter().find_map(|item| {
+                    let trimmed = item.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                }) {
+                    return Some(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    parent_qualified_name_from_qname(&symbol.qualified_name)
 }
 
 fn index_symbols_for_project(
@@ -1792,41 +2147,50 @@ fn index_symbols_for_project(
     rebuild_mappings: bool,
     non_blocking_lock: bool,
 ) -> Result<(), String> {
-    let mut grouped = HashMap::<String, Vec<SymbolRecord>>::new();
+    let raw = symbols
+        .iter()
+        .map(|symbol| RawIndexSymbol {
+            file_path: symbol.file_path.clone(),
+            name: symbol.name.clone(),
+            qualified_name: symbol.qualified_name.clone(),
+            parent_qualified_name: symbol_parent_qualified_name(symbol),
+            kind: symbol.kind.clone(),
+            metatype_qname: symbol_metatype_qname(symbol),
+            start_line: symbol.start_line,
+            start_col: symbol.start_col,
+            end_line: symbol.end_line,
+            end_col: symbol.end_col,
+            doc_text: symbol.doc.clone(),
+            properties_json: serde_json::to_string(&serde_json::json!({
+                "schema": 1,
+                "properties": symbol.properties
+            }))
+            .ok(),
+        })
+        .collect::<Vec<_>>();
+    index_raw_symbols_for_project(
+        state,
+        project_root,
+        library_path,
+        raw,
+        rebuild_mappings,
+        non_blocking_lock,
+    )
+}
+
+fn index_raw_symbols_for_project(
+    state: &CoreState,
+    project_root: &str,
+    library_path: Option<&Path>,
+    raw: Vec<RawIndexSymbol>,
+    rebuild_mappings: bool,
+    non_blocking_lock: bool,
+) -> Result<(), String> {
     let library_key = library_path.map(|path| normalized_compare_key(path));
-    for symbol in symbols {
-        let scope = if is_library_symbol_path(&symbol.file_path, library_path) {
-            Scope::Stdlib
-        } else {
-            Scope::Project
-        };
-        let normalized_file_key = normalized_compare_key(Path::new(&symbol.file_path));
-        let metatype_qname = symbol_metatype_qname(symbol);
-        let properties_json = serde_json::to_string(&serde_json::json!({
-            "schema": 1,
-            "properties": symbol.properties
-        })).ok();
-        let record = canonical_symbol_record(
-            project_root,
-            &normalized_file_key,
-            library_key.as_deref(),
-            CanonicalSymbolRecordArgs {
-                scope,
-                name: &symbol.name,
-                qualified_name: &symbol.qualified_name,
-                kind: &symbol.kind,
-                metatype_qname: metatype_qname.as_deref(),
-                file_path: &symbol.file_path,
-                start_line: symbol.start_line,
-                start_col: symbol.start_col,
-                end_line: symbol.end_line,
-                end_col: symbol.end_col,
-                doc_text: symbol.doc.as_deref(),
-                properties_json: properties_json.as_deref(),
-            },
-        );
-        grouped.entry(symbol.file_path.clone()).or_default().push(record);
-    }
+    let prepared = prepare_symbols_for_index(raw, library_path);
+    let grouped = group_prepared_symbols_by_file(prepared);
+    let canonical_rows_by_file =
+        build_canonical_symbol_rows_by_file(project_root, library_key.as_deref(), grouped);
     let mut store = if non_blocking_lock {
         state
             .symbol_index
@@ -1838,10 +2202,31 @@ fn index_symbols_for_project(
             .lock()
             .map_err(|_| "Symbol index lock poisoned".to_string())?
     };
-    let mut file_paths = grouped.keys().cloned().collect::<Vec<_>>();
-    file_paths.sort();
-    for file_path in file_paths {
-        let entries = grouped.remove(&file_path).unwrap_or_default();
+    for (file_path, rows) in canonical_rows_by_file {
+        let entries = rows
+            .into_iter()
+            .map(|row| SymbolRecord {
+                id: row.id,
+                project_root: row.project_root,
+                library_key: row.library_key,
+                scope: match row.scope {
+                    PreparedScope::Stdlib => mercurio_symbol_index::Scope::Stdlib,
+                    PreparedScope::Project => mercurio_symbol_index::Scope::Project,
+                },
+                name: row.name,
+                qualified_name: row.qualified_name,
+                parent_qualified_name: row.parent_qualified_name,
+                kind: row.kind,
+                metatype_qname: row.metatype_qname,
+                file_path: row.file_path,
+                start_line: row.start_line,
+                start_col: row.start_col,
+                end_line: row.end_line,
+                end_col: row.end_col,
+                doc_text: row.doc_text,
+                properties_json: row.properties_json,
+            })
+            .collect::<Vec<SymbolRecord>>();
         store.upsert_symbols_for_file(project_root, &file_path, entries);
     }
     if rebuild_mappings {
@@ -1850,85 +2235,8 @@ fn index_symbols_for_project(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-struct SymbolSpan {
-    start_line: u32,
-    start_col: u32,
-    end_line: u32,
-    end_col: u32,
-}
-
-fn build_symbol_span_index(
-    files: &[PathBuf],
-    unsaved_map: &HashMap<PathBuf, String>,
-) -> HashMap<String, SymbolSpan> {
-    let mut out = HashMap::new();
-
-    for path in files {
-        let text = unsaved_map
-            .get(path)
-            .cloned()
-            .or_else(|| fs::read_to_string(path).ok());
-        let Some(text) = text else {
-            continue;
-        };
-        let mut parser = Parser::new(&text);
-        let tree = parser.parse_root();
-        let defmap = build_defmap(&tree, &text);
-
-        if let Some(package) = defmap.package.as_ref() {
-            insert_span_for_def(path, package, &text, &mut out);
-        }
-        for def in &defmap.defs {
-            insert_span_for_def(path, def, &text, &mut out);
-        }
-    }
-
-    out
-}
-
-fn insert_span_for_def(path: &Path, def: &DefInfo, source: &str, out: &mut HashMap<String, SymbolSpan>) {
-    let Some(name) = def.name.as_ref() else {
-        return;
-    };
-    let qualified_name = if def.package_path.is_empty() {
-        name.clone()
-    } else {
-        format!("{}::{}", def.package_path.join("::"), name)
-    };
-    let key = symbol_key(&path.to_string_lossy(), &qualified_name);
-    out.entry(key).or_insert_with(|| span_to_line_col(def.span.start, def.span.end, source));
-}
-
 fn symbol_key(file_path: &str, qualified_name: &str) -> String {
     format!("{file_path}|{qualified_name}")
-}
-
-fn span_to_line_col(start: u32, end: u32, text: &str) -> SymbolSpan {
-    let (start_line, start_col) = offset_to_line_col(text, start as usize);
-    let end_offset = if end > start { end - 1 } else { end };
-    let (end_line, end_col) = offset_to_line_col(text, end_offset as usize);
-    SymbolSpan {
-        start_line,
-        start_col,
-        end_line,
-        end_col,
-    }
-}
-
-fn offset_to_line_col(text: &str, offset: usize) -> (u32, u32) {
-    let safe = offset.min(text.len());
-    let mut line = 1u32;
-    let mut col = 1u32;
-    for ch in text[..safe].chars() {
-        if ch == '\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
 }
 
 struct CancelGuard {
@@ -1948,7 +2256,18 @@ impl Drop for CancelGuard {
 mod tests {
     use super::*;
     use crate::settings::AppSettings;
+    use crate::symbol_index::query_project_symbols;
+    use mercurio_sysml_pkg::compile_support::canonical_symbol_id as canonical_symbol_id_shared;
+    use mercurio_sysml_pkg::semantic_projection::build_symbol_span_index;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn map_semantic_element_to_symbol(
+        element: SemanticElementView,
+        symbol_spans: &HashMap<String, SymbolSpan>,
+    ) -> SymbolView {
+        let projected = map_semantic_element_to_projected_symbol(element, symbol_spans);
+        map_projected_semantic_symbol(projected)
+    }
 
     #[test]
     fn stdlib_snapshot_includes_comments_docs_and_metaclass_defs() {
@@ -1968,9 +2287,8 @@ standard library package KerML {
         let (_index, symbols) = build_stdlib_snapshot(&entries);
 
         assert!(symbols.iter().any(|symbol| symbol.kind == "Package"));
-        assert!(symbols
-            .iter()
-            .any(|symbol| symbol.kind == "Documentation" && symbol.qualified_name.starts_with("KerML::doc@")));
+        assert!(symbols.iter().any(|symbol| symbol.kind == "Documentation"
+            && symbol.qualified_name.starts_with("KerML::doc@")));
         assert!(symbols
             .iter()
             .any(|symbol| symbol.kind == "Comment" && symbol.qualified_name == "KerML::cmt"));
@@ -2027,9 +2345,10 @@ standard library package KerML {
         assert!(response
             .symbols
             .iter()
-            .any(|symbol| symbol.kind == "MetaclassDef"
-                && symbol.name == "AnnotatingElement"
-                && symbol.qualified_name.ends_with("KerML::Root::AnnotatingElement")));
+            .any(|symbol| symbol.name == "AnnotatingElement"
+                && symbol
+                    .qualified_name
+                    .ends_with("KerML::Root::AnnotatingElement")));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2076,7 +2395,9 @@ standard library package KerML {
 
         assert!(response.ok);
         assert!(response.symbols.iter().any(|symbol| {
-            symbol.kind == "MetaclassDef" && symbol.qualified_name.ends_with("KerML::Root::AnnotatingElement")
+            symbol
+                .qualified_name
+                .ends_with("KerML::Root::AnnotatingElement")
         }));
 
         let _ = fs::remove_dir_all(root);
@@ -2085,9 +2406,12 @@ standard library package KerML {
     #[test]
     fn span_to_line_col_is_one_based() {
         let text = "package A {\n  part def P;\n}\n";
-        let start = text.find("part").expect("part offset") as u32;
-        let end = (start as usize + "part def P;".len()) as u32;
-        let span = span_to_line_col(start, end, text);
+        let file = PathBuf::from("main.sysml");
+        let mut unsaved = HashMap::new();
+        unsaved.insert(file.clone(), text.to_string());
+        let spans = build_symbol_span_index(&[file.clone()], &unsaved);
+        let key = symbol_key(&file.to_string_lossy(), "A::P");
+        let span = spans.get(&key).expect("symbol span for A::P");
         assert_eq!(span.start_line, 2);
         assert_eq!(span.start_col, 3);
         assert_eq!(span.end_line, 2);
@@ -2129,7 +2453,7 @@ standard library package KerML {
             true,
         )
         .expect("first load");
-        assert!(!first.stdlib_cache_hit);
+        assert!(!first.workspace_snapshot_hit);
 
         let second = load_library_symbols_sync(
             &state,
@@ -2138,7 +2462,7 @@ standard library package KerML {
             true,
         )
         .expect("second load");
-        assert!(second.stdlib_cache_hit);
+        assert!(second.workspace_snapshot_hit);
 
         std::thread::sleep(std::time::Duration::from_millis(5));
         fs::write(
@@ -2154,11 +2478,11 @@ standard library package KerML {
             true,
         )
         .expect("third load");
-        assert!(!third.stdlib_cache_hit);
+        assert!(!third.workspace_snapshot_hit);
         assert!(third
             .symbols
             .iter()
-            .any(|symbol| symbol.kind == "MetaclassDef" && symbol.name == "B"));
+            .any(|symbol| symbol.name == "B"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2306,8 +2630,11 @@ package Comments2 {
             "standard library package KerML { package Root { metaclass AnnotatingElement specializes Element {} } }",
         )
         .expect("write library file");
-        fs::write(project_dir.join("main.sysml"), "package P { part def A; }\n")
-            .expect("write project file");
+        fs::write(
+            project_dir.join("main.sysml"),
+            "package P { part def A; }\n",
+        )
+        .expect("write project file");
         fs::write(
             project_dir.join(".project"),
             format!(
@@ -2331,10 +2658,9 @@ package Comments2 {
 
         assert!(response.ok);
         assert_eq!(response.library_symbol_count, 0);
-        assert!(response
-            .symbols
-            .iter()
-            .all(|symbol| !symbol.qualified_name.contains("KerML::Root::AnnotatingElement")));
+        assert!(response.symbols.iter().all(|symbol| !symbol
+            .qualified_name
+            .contains("KerML::Root::AnnotatingElement")));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2405,9 +2731,9 @@ standard library package KerML {
 ";
         let entries = vec![(PathBuf::from("KerML.kerml"), source.to_string())];
         let (_index, symbols) = build_stdlib_snapshot(&entries);
-        assert!(symbols
-            .iter()
-            .any(|symbol| symbol.kind == "Import" && symbol.qualified_name.contains("ScalarValues")));
+        assert!(symbols.iter().any(
+            |symbol| symbol.kind == "Import" && symbol.qualified_name.contains("ScalarValues")
+        ));
         assert!(symbols
             .iter()
             .any(|symbol| symbol.kind == "Import" && symbol.qualified_name.contains("Kernel")));
@@ -2459,10 +2785,9 @@ standard library package KerML {
             true,
         )
         .expect("library load");
-        assert!(response
-            .symbols
-            .iter()
-            .any(|symbol| symbol.kind == "Import" && symbol.qualified_name.contains("ScalarValues")));
+        assert!(response.symbols.iter().any(
+            |symbol| symbol.kind == "Import" && symbol.qualified_name.contains("ScalarValues")
+        ));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2483,8 +2808,11 @@ standard library package KerML {
             "standard library package KerML { private import ScalarValues::*; package Root { metaclass A specializes Element {} } }",
         )
         .expect("write library file");
-        fs::write(project_dir.join("main.sysml"), "package P { part def A; }\n")
-            .expect("write project file");
+        fs::write(
+            project_dir.join("main.sysml"),
+            "package P { part def A; }\n",
+        )
+        .expect("write project file");
         fs::write(
             project_dir.join(".project"),
             format!(
@@ -2507,16 +2835,15 @@ standard library package KerML {
         .expect("compile response");
 
         assert!(response.library_symbol_count >= 2);
-        assert!(response
-            .symbols
-            .iter()
-            .any(|symbol| symbol.kind == "Import" && symbol.qualified_name.contains("ScalarValues")));
+        assert!(response.symbols.iter().any(
+            |symbol| symbol.kind == "Import" && symbol.qualified_name.contains("ScalarValues")
+        ));
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn compile_workspace_includes_project_import_symbols() {
+    fn compile_workspace_includes_project_import_symbols_via_semantic_pipeline() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -2557,16 +2884,17 @@ standard library package KerML {
         )
         .expect("compile response");
 
-        assert!(response
-            .symbols
-            .iter()
-            .any(|symbol| symbol.kind == "Import" && symbol.file_path.ends_with("main.sysml")));
+        assert!(response.symbols.iter().any(|symbol| {
+            symbol.kind == "Import"
+                && symbol.file_path.ends_with("main.sysml")
+                && symbol.qualified_name.contains("ScalarValues")
+        }));
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn compile_workspace_connection_end_symbols_are_nested_under_connection_def() {
+    fn compile_workspace_does_not_synthesize_connection_end_symbols_locally() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -2607,61 +2935,10 @@ standard library package KerML {
         )
         .expect("compile response");
 
-        assert!(response
+        assert!(!response
             .symbols
             .iter()
-            .any(|symbol| symbol.kind == "ConnectionDef" && symbol.qualified_name.ends_with("Demo::ProductSelection")));
-        assert!(response
-            .symbols
-            .iter()
-            .any(|symbol| symbol.kind == "OwnedEnd" && symbol.qualified_name.ends_with("Demo::ProductSelection::cart")));
-        assert!(response
-            .symbols
-            .iter()
-            .any(|symbol| symbol.kind == "OwnedEnd" && symbol.qualified_name.ends_with("Demo::ProductSelection::selectedProduct")));
-        assert!(response
-            .symbols
-            .iter()
-            .any(|symbol| symbol.kind == "OwnedEnd" && symbol.qualified_name.ends_with("Demo::ProductSelection::account")));
-        let parent = response
-            .symbols
-            .iter()
-            .find(|symbol| symbol.kind == "ConnectionDef" && symbol.qualified_name.ends_with("Demo::ProductSelection"))
-            .expect("parent connection symbol");
-        assert_eq!(
-            parent
-                .relationships
-                .iter()
-                .filter(|rel| rel.kind == "ownedEnd")
-                .count(),
-            3
-        );
-        let cart = response
-            .symbols
-            .iter()
-            .find(|symbol| symbol.kind == "OwnedEnd" && symbol.qualified_name.ends_with("Demo::ProductSelection::cart"))
-            .expect("cart symbol");
-        assert_eq!(cart.start_line, 3);
-        assert_eq!(cart.start_col, 19);
-        let selected_product = response
-            .symbols
-            .iter()
-            .find(|symbol| {
-                symbol.kind == "OwnedEnd"
-                    && symbol
-                        .qualified_name
-                        .ends_with("Demo::ProductSelection::selectedProduct")
-            })
-            .expect("selectedProduct symbol");
-        assert_eq!(selected_product.start_line, 4);
-        assert_eq!(selected_product.start_col, 19);
-        let account = response
-            .symbols
-            .iter()
-            .find(|symbol| symbol.kind == "OwnedEnd" && symbol.qualified_name.ends_with("Demo::ProductSelection::account"))
-            .expect("account symbol");
-        assert_eq!(account.start_line, 5);
-        assert_eq!(account.start_col, 19);
+            .any(|symbol| symbol.kind == "OwnedEnd" && symbol.file_path.ends_with("main.sysml")));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2726,6 +3003,311 @@ standard library package KerML {
     }
 
     #[test]
+    fn compile_project_delta_without_symbols_still_seeds_index() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_delta_no_symbols_{stamp}"));
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(
+            project_dir.join("main.sysml"),
+            "package P { part def A; }\n",
+        )
+        .expect("write project file");
+        fs::write(
+            project_dir.join(".project"),
+            "{\"name\":\"delta-no-symbols\",\"src\":[\"*.sysml\"]}",
+        )
+        .expect("write project descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let project_root = project_dir.to_string_lossy().to_string();
+        let response = compile_project_delta_sync_with_options(
+            &state,
+            project_root.clone(),
+            501,
+            true,
+            None,
+            Vec::new(),
+            false,
+            |_| {},
+        )
+        .expect("delta compile");
+        assert!(response.ok);
+        assert_eq!(response.symbols.len(), 0);
+        assert!(response.project_symbol_count > 0);
+        assert_eq!(response.stdlib_duration_ms, 0);
+        assert_eq!(response.stdlib_file_count, 0);
+
+        let indexed = query_project_symbols(&state, project_root, None, Some(0), Some(10_000))
+            .expect("query project symbols");
+        assert!(!indexed.is_empty());
+        assert!(indexed.iter().any(|symbol| symbol.qualified_name == "P"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn augment_owned_relationships_adds_owned_attributes_property() {
+        fn symbol(kind: &str, qualified_name: &str, start_line: u32) -> SymbolView {
+            let name = qualified_name
+                .rsplit("::")
+                .next()
+                .unwrap_or(qualified_name)
+                .to_string();
+            SymbolView {
+                file_path: "main.sysml".to_string(),
+                name,
+                short_name: None,
+                qualified_name: qualified_name.to_string(),
+                kind: kind.to_string(),
+                file: 0,
+                start_line,
+                start_col: 1,
+                end_line: start_line,
+                end_col: 10,
+                expr_start_line: None,
+                expr_start_col: None,
+                expr_end_line: None,
+                expr_end_col: None,
+                short_name_start_line: None,
+                short_name_start_col: None,
+                short_name_end_line: None,
+                short_name_end_col: None,
+                doc: None,
+                supertypes: Vec::new(),
+                relationships: Vec::new(),
+                type_refs: Vec::new(),
+                is_public: true,
+                properties: Vec::new(),
+            }
+        }
+
+        let mut symbols = vec![
+            symbol("PartDef", "Demo::ScenarioState", 1),
+            symbol("AttributeUsage", "Demo::ScenarioState::speed", 2),
+            symbol("AttributeUsage", "Demo::ScenarioState::heading", 3),
+            symbol("PartDef", "Demo::ScenarioState::nestedPart", 4),
+        ];
+        augment_owned_relationships(&mut symbols);
+
+        let parent = symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "Demo::ScenarioState")
+            .expect("scenario state symbol");
+        let owned_attrs_prop = parent
+            .properties
+            .iter()
+            .find(|prop| prop.name == "ownedAttributes")
+            .expect("ownedAttributes property");
+        match &owned_attrs_prop.value {
+            PropertyValueView::List { items } => {
+                assert_eq!(
+                    items,
+                    &vec![
+                        "Demo::ScenarioState::speed".to_string(),
+                        "Demo::ScenarioState::heading".to_string()
+                    ]
+                );
+            }
+            _ => panic!("ownedAttributes should be a list"),
+        }
+    }
+
+    #[test]
+    fn augment_owned_relationships_detects_attribute_usage_via_metatype() {
+        fn symbol(
+            kind: &str,
+            qualified_name: &str,
+            start_line: u32,
+            metatype_qname: Option<&str>,
+        ) -> SymbolView {
+            let mut properties = Vec::new();
+            if let Some(metatype) = metatype_qname {
+                properties.push(PropertyItemView {
+                    name: "metatype_qname".to_string(),
+                    label: "metatype_qname".to_string(),
+                    value: PropertyValueView::Text {
+                        value: metatype.to_string(),
+                    },
+                    hint: None,
+                    group: None,
+                });
+            }
+            let name = qualified_name
+                .rsplit("::")
+                .next()
+                .unwrap_or(qualified_name)
+                .to_string();
+            SymbolView {
+                file_path: "main.sysml".to_string(),
+                name,
+                short_name: None,
+                qualified_name: qualified_name.to_string(),
+                kind: kind.to_string(),
+                file: 0,
+                start_line,
+                start_col: 1,
+                end_line: start_line,
+                end_col: 10,
+                expr_start_line: None,
+                expr_start_col: None,
+                expr_end_line: None,
+                expr_end_col: None,
+                short_name_start_line: None,
+                short_name_start_col: None,
+                short_name_end_line: None,
+                short_name_end_col: None,
+                doc: None,
+                supertypes: Vec::new(),
+                relationships: Vec::new(),
+                type_refs: Vec::new(),
+                is_public: true,
+                properties,
+            }
+        }
+
+        let mut symbols = vec![
+            symbol("PartDef", "Demo::ScenarioState", 1, None),
+            symbol(
+                "Usage",
+                "Demo::ScenarioState::speed",
+                2,
+                Some("sysml::AttributeUsage"),
+            ),
+            symbol(
+                "Usage",
+                "Demo::ScenarioState::sensor",
+                3,
+                Some("sysml::PartUsage"),
+            ),
+        ];
+        augment_owned_relationships(&mut symbols);
+
+        let parent = symbols
+            .iter()
+            .find(|symbol| symbol.qualified_name == "Demo::ScenarioState")
+            .expect("scenario state symbol");
+        let owned_attrs_prop = parent
+            .properties
+            .iter()
+            .find(|prop| prop.name == "ownedAttributes")
+            .expect("ownedAttributes property");
+        match &owned_attrs_prop.value {
+            PropertyValueView::List { items } => {
+                let expected = vec!["Demo::ScenarioState::speed".to_string()];
+                assert_eq!(items.as_slice(), expected.as_slice());
+            }
+            _ => panic!("ownedAttributes should be a list"),
+        }
+    }
+
+    #[test]
+    fn map_semantic_element_parses_emf_owned_elements_as_list_property() {
+        let mut attrs = HashMap::new();
+        attrs.insert("emf::name".to_string(), "ScenarioState".to_string());
+        attrs.insert(
+            "emf::qualifiedName".to_string(),
+            "Demo::ScenarioState".to_string(),
+        );
+        attrs.insert(
+            "emf::ownedElements".to_string(),
+            "Demo::ScenarioState::speed, Demo::ScenarioState::heading".to_string(),
+        );
+        let element = SemanticElementView {
+            name: "ScenarioState".to_string(),
+            qualified_name: "Demo::ScenarioState".to_string(),
+            metatype_qname: Some("sysml::PartDefinition".to_string()),
+            file_path: "main.sysml".to_string(),
+            attributes: attrs,
+        };
+        let symbol = map_semantic_element_to_symbol(element, &HashMap::new());
+        let owned_elements = symbol
+            .properties
+            .iter()
+            .find(|prop| prop.name == "emf::ownedElements")
+            .expect("emf::ownedElements property");
+        match &owned_elements.value {
+            PropertyValueView::List { items } => {
+                assert_eq!(
+                    items,
+                    &vec![
+                        "Demo::ScenarioState::speed".to_string(),
+                        "Demo::ScenarioState::heading".to_string()
+                    ]
+                );
+            }
+            _ => panic!("emf::ownedElements should be a list"),
+        }
+    }
+
+    #[test]
+    fn map_semantic_element_uses_semantic_span_when_index_missing() {
+        let mut attrs = HashMap::new();
+        attrs.insert("emf::name".to_string(), "x".to_string());
+        attrs.insert(
+            "emf::qualifiedName".to_string(),
+            "ActionTest::A::x".to_string(),
+        );
+        attrs.insert("emf::startLine".to_string(), "6".to_string());
+        attrs.insert("emf::startColumn".to_string(), "9".to_string());
+        attrs.insert("emf::endLine".to_string(), "6".to_string());
+        attrs.insert("emf::endColumn".to_string(), "10".to_string());
+        let element = SemanticElementView {
+            name: "x".to_string(),
+            qualified_name: "ActionTest::A::x".to_string(),
+            metatype_qname: Some("sysml::Usage".to_string()),
+            file_path: "ActionTest.sysml".to_string(),
+            attributes: attrs,
+        };
+
+        let symbol = map_semantic_element_to_symbol(element, &HashMap::new());
+        assert_eq!(symbol.start_line, 6);
+        assert_eq!(symbol.start_col, 9);
+        assert_eq!(symbol.end_line, 6);
+        assert_eq!(symbol.end_col, 10);
+    }
+
+    #[test]
+    fn map_semantic_element_prefers_index_span_over_semantic_span() {
+        let mut attrs = HashMap::new();
+        attrs.insert("emf::name".to_string(), "x".to_string());
+        attrs.insert(
+            "emf::qualifiedName".to_string(),
+            "ActionTest::A::x".to_string(),
+        );
+        attrs.insert("emf::startLine".to_string(), "6".to_string());
+        attrs.insert("emf::startColumn".to_string(), "9".to_string());
+        attrs.insert("emf::endLine".to_string(), "6".to_string());
+        attrs.insert("emf::endColumn".to_string(), "10".to_string());
+        let element = SemanticElementView {
+            name: "x".to_string(),
+            qualified_name: "ActionTest::A::x".to_string(),
+            metatype_qname: Some("sysml::Usage".to_string()),
+            file_path: "ActionTest.sysml".to_string(),
+            attributes: attrs,
+        };
+        let mut index = HashMap::new();
+        index.insert(
+            symbol_key("ActionTest.sysml", "ActionTest::A::x"),
+            SymbolSpan {
+                start_line: 12,
+                start_col: 2,
+                end_line: 12,
+                end_col: 5,
+            },
+        );
+
+        let symbol = map_semantic_element_to_symbol(element, &index);
+        assert_eq!(symbol.start_line, 12);
+        assert_eq!(symbol.start_col, 2);
+        assert_eq!(symbol.end_line, 12);
+        assert_eq!(symbol.end_col, 5);
+    }
+
+    #[test]
     fn stdlib_cache_retained_across_project_switches() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2770,17 +3352,20 @@ standard library package KerML {
         .expect("write project b descriptor");
 
         let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
-        let a1 = load_library_symbols_sync(&state, project_a.to_string_lossy().to_string(), None, true)
-            .expect("load a1");
-        assert!(!a1.stdlib_cache_hit);
+        let a1 =
+            load_library_symbols_sync(&state, project_a.to_string_lossy().to_string(), None, true)
+                .expect("load a1");
+        assert!(!a1.workspace_snapshot_hit);
 
-        let b1 = load_library_symbols_sync(&state, project_b.to_string_lossy().to_string(), None, true)
-            .expect("load b1");
-        assert!(!b1.stdlib_cache_hit);
+        let b1 =
+            load_library_symbols_sync(&state, project_b.to_string_lossy().to_string(), None, true)
+                .expect("load b1");
+        assert!(!b1.workspace_snapshot_hit);
 
-        let a2 = load_library_symbols_sync(&state, project_a.to_string_lossy().to_string(), None, true)
-            .expect("load a2");
-        assert!(a2.stdlib_cache_hit);
+        let a2 =
+            load_library_symbols_sync(&state, project_a.to_string_lossy().to_string(), None, true)
+                .expect("load a2");
+        assert!(a2.workspace_snapshot_hit);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2801,8 +3386,11 @@ standard library package KerML {
             "standard library package KerML { package Root { metaclass Element specializes Anything {} } }",
         )
         .expect("write library file");
-        fs::write(project_dir.join("main.sysml"), "package P {\n  part def A\n}\n")
-            .expect("write project file");
+        fs::write(
+            project_dir.join("main.sysml"),
+            "package P {\n  part def A\n}\n",
+        )
+        .expect("write project file");
         fs::write(
             project_dir.join(".project"),
             format!(
@@ -2837,11 +3425,58 @@ standard library package KerML {
     }
 
     #[test]
+    fn compile_response_includes_unresolved_refs_from_project_ingest() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_unresolved_project_ingest_{stamp}"));
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(
+            project_dir.join("a.sysml"),
+            "package A {\n  part def Wheel;\n}\n",
+        )
+        .expect("write a.sysml");
+        fs::write(
+            project_dir.join("b.sysml"),
+            "package B {\n  dependency from Missing to Wheel;\n}\n",
+        )
+        .expect("write b.sysml");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let response = compile_project_delta_sync(
+            &state,
+            project_dir.to_string_lossy().to_string(),
+            101,
+            true,
+            None,
+            Vec::new(),
+            |_| {},
+        )
+        .expect("compile response");
+
+        assert!(!response.unresolved.is_empty());
+        assert!(response
+            .unresolved
+            .iter()
+            .any(|issue| issue.message.contains("unresolved_ref")));
+        assert!(response
+            .unresolved
+            .iter()
+            .any(|issue| issue.file_path.ends_with("b.sysml")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn performance_warning_thresholds_are_reported() {
         let warnings = super::performance_warnings(800, 900, 600, 2100);
         assert!(warnings.iter().any(|w| w.contains("compile exceeded")));
         assert!(warnings.iter().any(|w| w.contains("parse stage exceeded")));
-        assert!(warnings.iter().any(|w| w.contains("analysis stage exceeded")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("analysis stage exceeded")));
         assert!(warnings.iter().any(|w| w.contains("stdlib load exceeded")));
     }
 
@@ -2888,9 +3523,90 @@ standard library package KerML {
         )
         .expect("compile response");
 
-        let semantic = query_semantic_symbols(&state, project_root).expect("query semantic symbols");
+        let semantic =
+            query_semantic_symbols(&state, project_root).expect("query semantic symbols");
         assert!(!semantic.is_empty());
-        assert!(semantic.iter().any(|symbol| symbol.qualified_name == "Demo"));
+        assert!(semantic
+            .iter()
+            .any(|symbol| symbol.qualified_name == "Demo"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_semantic_symbols_exposes_backend_classification_lineage() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_semantic_lineage_{stamp}"));
+        let library_dir = root.join("stdlib");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&library_dir).expect("create library dir");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(
+            library_dir.join("Parts.sysml"),
+            "package Parts {\n  abstract item def Item {}\n  abstract part def Part :> Item {}\n}\n",
+        )
+        .expect("write stdlib parts");
+        fs::write(
+            project_dir.join("main.sysml"),
+            "package PartTest {\n  public part def A {}\n}\n",
+        )
+        .expect("write project file");
+        fs::write(
+            project_dir.join(".project"),
+            format!(
+                "{{\"name\":\"semantic-lineage\",\"library\":{{\"path\":\"{}\"}},\"src\":[\"*.sysml\"]}}",
+                library_dir.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let project_root = project_dir.to_string_lossy().to_string();
+        let _ = compile_project_delta_sync(
+            &state,
+            project_root.clone(),
+            17,
+            true,
+            None,
+            Vec::new(),
+            |_| {},
+        )
+        .expect("compile response");
+
+        let semantic =
+            query_semantic_symbols(&state, project_root).expect("query semantic symbols");
+        let a = semantic
+            .iter()
+            .find(|symbol| symbol.qualified_name == "PartTest::A")
+            .expect("PartTest::A symbol");
+        assert!(a
+            .relationships
+            .iter()
+            .any(|rel| rel.kind == "classifiedBy" && rel.target == "Parts::Part"));
+        assert!(a
+            .relationships
+            .iter()
+            .any(|rel| rel.kind == "metatypeSupertype" && rel.target == "Parts::Item"));
+        assert!(a.supertypes.iter().any(|ty| ty == "Parts::Item"));
+        assert!(a.properties.iter().any(|prop| {
+            prop.name == "metatype_source"
+                && matches!(
+                    prop.value,
+                    PropertyValueView::Text { ref value } if value == "inferred-kind"
+                )
+        }));
+        assert!(a.properties.iter().any(|prop| {
+            prop.name == "metatype_lineage"
+                && matches!(
+                    prop.value,
+                    PropertyValueView::List { ref items }
+                        if items.iter().any(|item| item == "Parts::Part")
+                            && items.iter().any(|item| item == "Parts::Item")
+                )
+        }));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2924,9 +3640,9 @@ standard library package KerML {
             properties: Vec::new(),
         };
         let file_key = normalized_compare_key(Path::new(&symbol.file_path));
-        let project_id_a = crate::index_contract::canonical_symbol_id(
+        let project_id_a = canonical_symbol_id_shared(
             "rootA",
-            Scope::Project,
+            PreparedScope::Project,
             &file_key,
             &symbol.qualified_name,
             &symbol.kind,
@@ -2935,9 +3651,9 @@ standard library package KerML {
             symbol.end_line,
             symbol.end_col,
         );
-        let project_id_b = crate::index_contract::canonical_symbol_id(
+        let project_id_b = canonical_symbol_id_shared(
             "rootA",
-            Scope::Project,
+            PreparedScope::Project,
             &file_key,
             &symbol.qualified_name,
             &symbol.kind,
@@ -2946,9 +3662,9 @@ standard library package KerML {
             symbol.end_line,
             symbol.end_col,
         );
-        let stdlib_id = crate::index_contract::canonical_symbol_id(
+        let stdlib_id = canonical_symbol_id_shared(
             "rootA",
-            Scope::Stdlib,
+            PreparedScope::Stdlib,
             &file_key,
             &symbol.qualified_name,
             &symbol.kind,
@@ -2957,9 +3673,9 @@ standard library package KerML {
             symbol.end_line,
             symbol.end_col,
         );
-        let other_root_id = crate::index_contract::canonical_symbol_id(
+        let other_root_id = canonical_symbol_id_shared(
             "rootB",
-            Scope::Project,
+            PreparedScope::Project,
             &file_key,
             &symbol.qualified_name,
             &symbol.kind,

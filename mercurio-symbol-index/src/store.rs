@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use crate::mapping::{best_tail_candidate, collapse_metatype_qname, tail_name};
 use crate::model::{Scope, SymbolMetatypeMappingRecord, SymbolRecord};
-use crate::sqlite_store::SqliteSymbolIndexStore;
 
 pub trait SymbolIndexStore {
     fn upsert_symbols_for_file(
@@ -13,6 +11,7 @@ pub trait SymbolIndexStore {
         symbols: Vec<SymbolRecord>,
     );
     fn delete_symbols_for_file(&mut self, project_root: &str, file_path: &str);
+    fn clear_all(&mut self);
     fn symbols_by_metatype(&self, project_root: &str, metatype_qname: &str) -> Vec<SymbolRecord>;
     fn library_symbols(&self, project_root: &str, file_path: Option<&str>) -> Vec<SymbolRecord>;
     fn library_symbols_paged(
@@ -23,6 +22,13 @@ pub trait SymbolIndexStore {
         limit: usize,
     ) -> Vec<SymbolRecord>;
     fn project_symbols(&self, project_root: &str, file_path: Option<&str>) -> Vec<SymbolRecord>;
+    fn project_symbols_paged(
+        &self,
+        project_root: &str,
+        file_path: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<SymbolRecord>;
     fn project_symbol(
         &self,
         project_root: &str,
@@ -31,7 +37,8 @@ pub trait SymbolIndexStore {
     ) -> Option<SymbolRecord>;
     fn stdlib_documentation_symbols(&self, library_key: &str) -> Vec<SymbolRecord>;
     fn library_summary(&self, project_root: &str) -> (usize, usize, Vec<(String, usize)>);
-    fn is_stdlib_index_fresh(&self, project_root: &str, library_key: &str, signature: &str) -> bool;
+    fn is_stdlib_index_fresh(&self, project_root: &str, library_key: &str, signature: &str)
+        -> bool;
     fn mark_stdlib_indexed(&mut self, project_root: &str, library_key: &str, signature: &str);
     fn rebuild_symbol_mappings(&mut self, project_root: &str);
     fn symbol_mapping(
@@ -44,7 +51,6 @@ pub trait SymbolIndexStore {
 
 pub enum SymbolIndex {
     InMemory(InMemorySymbolIndex),
-    Sqlite(SqliteSymbolIndexStore),
 }
 
 impl SymbolIndexStore for SymbolIndex {
@@ -58,30 +64,30 @@ impl SymbolIndexStore for SymbolIndex {
             SymbolIndex::InMemory(store) => {
                 store.upsert_symbols_for_file(project_root, file_path, symbols)
             }
-            SymbolIndex::Sqlite(store) => {
-                store.upsert_symbols_for_file(project_root, file_path, symbols)
-            }
         }
     }
 
     fn delete_symbols_for_file(&mut self, project_root: &str, file_path: &str) {
         match self {
             SymbolIndex::InMemory(store) => store.delete_symbols_for_file(project_root, file_path),
-            SymbolIndex::Sqlite(store) => store.delete_symbols_for_file(project_root, file_path),
+        }
+    }
+
+    fn clear_all(&mut self) {
+        match self {
+            SymbolIndex::InMemory(store) => store.clear_all(),
         }
     }
 
     fn symbols_by_metatype(&self, project_root: &str, metatype_qname: &str) -> Vec<SymbolRecord> {
         match self {
             SymbolIndex::InMemory(store) => store.symbols_by_metatype(project_root, metatype_qname),
-            SymbolIndex::Sqlite(store) => store.symbols_by_metatype(project_root, metatype_qname),
         }
     }
 
     fn library_symbols(&self, project_root: &str, file_path: Option<&str>) -> Vec<SymbolRecord> {
         match self {
             SymbolIndex::InMemory(store) => store.library_symbols(project_root, file_path),
-            SymbolIndex::Sqlite(store) => store.library_symbols(project_root, file_path),
         }
     }
 
@@ -96,32 +102,29 @@ impl SymbolIndexStore for SymbolIndex {
             SymbolIndex::InMemory(store) => {
                 store.library_symbols_paged(project_root, file_path, offset, limit)
             }
-            SymbolIndex::Sqlite(store) => {
-                store.library_symbols_paged(project_root, file_path, offset, limit)
-            }
         }
     }
 
     fn stdlib_documentation_symbols(&self, library_key: &str) -> Vec<SymbolRecord> {
         match self {
             SymbolIndex::InMemory(store) => store.stdlib_documentation_symbols(library_key),
-            SymbolIndex::Sqlite(store) => store.stdlib_documentation_symbols(library_key),
         }
     }
 
     fn library_summary(&self, project_root: &str) -> (usize, usize, Vec<(String, usize)>) {
         match self {
             SymbolIndex::InMemory(store) => store.library_summary(project_root),
-            SymbolIndex::Sqlite(store) => store.library_summary(project_root),
         }
     }
 
-    fn is_stdlib_index_fresh(&self, project_root: &str, library_key: &str, signature: &str) -> bool {
+    fn is_stdlib_index_fresh(
+        &self,
+        project_root: &str,
+        library_key: &str,
+        signature: &str,
+    ) -> bool {
         match self {
             SymbolIndex::InMemory(store) => {
-                store.is_stdlib_index_fresh(project_root, library_key, signature)
-            }
-            SymbolIndex::Sqlite(store) => {
                 store.is_stdlib_index_fresh(project_root, library_key, signature)
             }
         }
@@ -132,16 +135,26 @@ impl SymbolIndexStore for SymbolIndex {
             SymbolIndex::InMemory(store) => {
                 store.mark_stdlib_indexed(project_root, library_key, signature)
             }
-            SymbolIndex::Sqlite(store) => {
-                store.mark_stdlib_indexed(project_root, library_key, signature)
-            }
         }
     }
 
     fn project_symbols(&self, project_root: &str, file_path: Option<&str>) -> Vec<SymbolRecord> {
         match self {
             SymbolIndex::InMemory(store) => store.project_symbols(project_root, file_path),
-            SymbolIndex::Sqlite(store) => store.project_symbols(project_root, file_path),
+        }
+    }
+
+    fn project_symbols_paged(
+        &self,
+        project_root: &str,
+        file_path: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<SymbolRecord> {
+        match self {
+            SymbolIndex::InMemory(store) => {
+                store.project_symbols_paged(project_root, file_path, offset, limit)
+            }
         }
     }
 
@@ -155,16 +168,12 @@ impl SymbolIndexStore for SymbolIndex {
             SymbolIndex::InMemory(store) => {
                 store.project_symbol(project_root, qualified_name, symbol_kind)
             }
-            SymbolIndex::Sqlite(store) => {
-                store.project_symbol(project_root, qualified_name, symbol_kind)
-            }
         }
     }
 
     fn rebuild_symbol_mappings(&mut self, project_root: &str) {
         match self {
             SymbolIndex::InMemory(store) => store.rebuild_symbol_mappings(project_root),
-            SymbolIndex::Sqlite(store) => store.rebuild_symbol_mappings(project_root),
         }
     }
 
@@ -176,9 +185,6 @@ impl SymbolIndexStore for SymbolIndex {
     ) -> Option<SymbolMetatypeMappingRecord> {
         match self {
             SymbolIndex::InMemory(store) => {
-                store.symbol_mapping(project_root, symbol_qualified_name, file_path)
-            }
-            SymbolIndex::Sqlite(store) => {
                 store.symbol_mapping(project_root, symbol_qualified_name, file_path)
             }
         }
@@ -199,10 +205,8 @@ impl SymbolIndexStore for InMemorySymbolIndex {
         file_path: &str,
         symbols: Vec<SymbolRecord>,
     ) {
-        self.by_project_file.insert(
-            (project_root.to_string(), file_path.to_string()),
-            symbols,
-        );
+        self.by_project_file
+            .insert((project_root.to_string(), file_path.to_string()), symbols);
     }
 
     fn delete_symbols_for_file(&mut self, project_root: &str, file_path: &str) {
@@ -210,22 +214,20 @@ impl SymbolIndexStore for InMemorySymbolIndex {
             .remove(&(project_root.to_string(), file_path.to_string()));
     }
 
+    fn clear_all(&mut self) {
+        self.by_project_file.clear();
+        self.stdlib_freshness.clear();
+        self.mappings_by_symbol.clear();
+    }
+
     fn symbols_by_metatype(&self, project_root: &str, metatype_qname: &str) -> Vec<SymbolRecord> {
         let mut out = Vec::new();
-        let metatype_leaf = metatype_qname
-            .rsplit("::")
-            .next()
-            .unwrap_or(metatype_qname);
-        let metatype_def = format!("{metatype_leaf}Def");
         for ((root, _), items) in &self.by_project_file {
             if root != project_root {
                 continue;
             }
             for symbol in items {
-                if symbol.metatype_qname.as_deref() == Some(metatype_qname)
-                    || symbol.kind == metatype_leaf
-                    || symbol.kind == metatype_def
-                {
+                if symbol.metatype_qname.as_deref() == Some(metatype_qname) {
                     out.push(symbol.clone());
                 }
             }
@@ -301,6 +303,16 @@ impl SymbolIndexStore for InMemorySymbolIndex {
     }
 
     fn project_symbols(&self, project_root: &str, file_path: Option<&str>) -> Vec<SymbolRecord> {
+        self.project_symbols_paged(project_root, file_path, 0, usize::MAX)
+    }
+
+    fn project_symbols_paged(
+        &self,
+        project_root: &str,
+        file_path: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<SymbolRecord> {
         let mut out = Vec::new();
         for ((root, file), items) in &self.by_project_file {
             if root != project_root {
@@ -323,7 +335,11 @@ impl SymbolIndexStore for InMemorySymbolIndex {
                 .then(a.start_line.cmp(&b.start_line))
                 .then(a.start_col.cmp(&b.start_col))
         });
-        out
+        if offset >= out.len() {
+            return Vec::new();
+        }
+        let end = offset.saturating_add(limit).min(out.len());
+        out[offset..end].to_vec()
     }
 
     fn project_symbol(
@@ -338,7 +354,10 @@ impl SymbolIndexStore for InMemorySymbolIndex {
             .filter(|symbol| symbol.qualified_name == qualified_name)
             .collect::<Vec<_>>();
         if let Some(kind) = symbol_kind {
-            if let Some(exact) = out.iter().find(|symbol| symbol.kind.eq_ignore_ascii_case(kind)) {
+            if let Some(exact) = out
+                .iter()
+                .find(|symbol| symbol.kind.eq_ignore_ascii_case(kind))
+            {
                 return Some(exact.clone());
             }
         }
@@ -373,7 +392,12 @@ impl SymbolIndexStore for InMemorySymbolIndex {
         (files.len(), symbol_count, kind_counts)
     }
 
-    fn is_stdlib_index_fresh(&self, project_root: &str, library_key: &str, signature: &str) -> bool {
+    fn is_stdlib_index_fresh(
+        &self,
+        project_root: &str,
+        library_key: &str,
+        signature: &str,
+    ) -> bool {
         self.stdlib_freshness
             .get(&(project_root.to_string(), library_key.to_string()))
             .map(|known| known == signature)
@@ -392,7 +416,6 @@ impl SymbolIndexStore for InMemorySymbolIndex {
             .retain(|(root, _), _| root != project_root);
 
         let mut stdlib_by_qname = HashMap::<String, String>::new();
-        let mut stdlib_by_tail = HashMap::<String, Vec<String>>::new();
         let mut project_symbols = Vec::<SymbolRecord>::new();
         for ((root, _), items) in &self.by_project_file {
             if root != project_root {
@@ -402,16 +425,6 @@ impl SymbolIndexStore for InMemorySymbolIndex {
                 match symbol.scope {
                     Scope::Stdlib => {
                         stdlib_by_qname.insert(symbol.qualified_name.clone(), symbol.id.clone());
-                        let tail = symbol
-                            .qualified_name
-                            .rsplit("::")
-                            .next()
-                            .unwrap_or(symbol.qualified_name.as_str())
-                            .to_ascii_lowercase();
-                        stdlib_by_tail
-                            .entry(tail)
-                            .or_default()
-                            .push(symbol.qualified_name.clone());
                     }
                     Scope::Project => project_symbols.push(symbol.clone()),
                 }
@@ -431,7 +444,11 @@ impl SymbolIndexStore for InMemorySymbolIndex {
                 confidence: 0.0,
                 diagnostic: Some("Symbol has no metatype_qname.".to_string()),
             };
-            if let Some(raw) = symbol.metatype_qname.clone().filter(|s| !s.trim().is_empty()) {
+            if let Some(raw) = symbol
+                .metatype_qname
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+            {
                 if let Some(target_id) = stdlib_by_qname.get(&raw) {
                     mapping.resolved_metatype_qname = Some(raw.clone());
                     mapping.target_symbol_id = Some(target_id.clone());
@@ -439,58 +456,12 @@ impl SymbolIndexStore for InMemorySymbolIndex {
                     mapping.confidence = 1.0;
                     mapping.diagnostic = None;
                 } else {
-                    if let Some(collapsed) = collapse_metatype_qname(&raw) {
-                        if let Some(target_id) = stdlib_by_qname.get(&collapsed) {
-                            mapping.resolved_metatype_qname = Some(collapsed);
-                            mapping.target_symbol_id = Some(target_id.clone());
-                            mapping.mapping_source = "collapsed".to_string();
-                            mapping.confidence = 0.9;
-                            mapping.diagnostic = Some(format!("Mapped from metatype_qname '{raw}'."));
-                        }
-                    }
-                    if mapping.target_symbol_id.is_none() {
-                        let tail = tail_name(&raw).to_ascii_lowercase();
-                        if let Some(candidates) = stdlib_by_tail.get(&tail) {
-                            if candidates.len() == 1 {
-                                let qname = candidates[0].clone();
-                                mapping.resolved_metatype_qname = Some(qname.clone());
-                                mapping.target_symbol_id = stdlib_by_qname.get(&qname).cloned();
-                                mapping.mapping_source = "tail_unique".to_string();
-                                mapping.confidence = 0.7;
-                                mapping.diagnostic =
-                                    Some(format!("Mapped by unique tail '{}' from '{raw}'.", tail));
-                            } else if candidates.len() > 1 {
-                                if let Some(best) = best_tail_candidate(&raw, candidates) {
-                                    mapping.resolved_metatype_qname = Some(best.clone());
-                                    mapping.target_symbol_id = stdlib_by_qname.get(&best).cloned();
-                                    mapping.mapping_source = "tail_ranked".to_string();
-                                    mapping.confidence = 0.5;
-                                    mapping.diagnostic = Some(format!(
-                                        "Mapped by ranked tail '{}' from '{raw}'.",
-                                        tail
-                                    ));
-                                } else {
-                                    mapping.resolved_metatype_qname = Some(raw.clone());
-                                    mapping.mapping_source = "ambiguous_tail".to_string();
-                                    mapping.confidence = 0.2;
-                                    mapping.diagnostic = Some(format!(
-                                        "Metatype tail '{}' is ambiguous across stdlib symbols.",
-                                        tail
-                                    ));
-                                }
-                            } else {
-                                mapping.resolved_metatype_qname = Some(raw.clone());
-                                mapping.diagnostic = Some(format!(
-                                    "No stdlib symbol found for metatype '{raw}'."
-                                ));
-                            }
-                        } else {
-                            mapping.resolved_metatype_qname = Some(raw.clone());
-                            mapping.diagnostic = Some(format!(
-                                "No stdlib symbol found for metatype '{raw}'."
-                            ));
-                        }
-                    }
+                    mapping.resolved_metatype_qname = Some(raw.clone());
+                    mapping.mapping_source = "unresolved".to_string();
+                    mapping.confidence = 0.0;
+                    mapping.diagnostic = Some(format!(
+                        "No exact stdlib symbol found for EMF metatype '{raw}'."
+                    ));
                 }
             }
             self.mappings_by_symbol
@@ -550,6 +521,7 @@ mod tests {
             scope,
             name: id.to_string(),
             qualified_name: id.to_string(),
+            parent_qualified_name: None,
             kind: kind.to_string(),
             metatype_qname: metatype_qname.map(|v| v.to_string()),
             file_path: file_path.to_string(),
@@ -603,7 +575,7 @@ mod tests {
             ],
         );
         store.rebuild_symbol_mappings("p1");
-        assert_eq!(store.symbols_by_metatype("p1", "KerML::Action").len(), 1);
+        assert_eq!(store.symbols_by_metatype("p1", "m1").len(), 1);
         assert_eq!(store.stdlib_documentation_symbols("stdlib@1").len(), 1);
         let summary = store.library_summary("p1");
         assert_eq!(summary.0, 2);
@@ -616,10 +588,17 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_queries_work() {
-        let sqlite = crate::sqlite_store::SqliteSymbolIndexStore::in_memory()
-            .expect("open sqlite in-memory store");
-        let mut store = SymbolIndex::Sqlite(sqlite);
+    fn freshness_round_trip_works() {
+        let mut store = InMemorySymbolIndex::default();
+        assert!(!store.is_stdlib_index_fresh("p1", "stdlib@1", "sig1"));
+        store.mark_stdlib_indexed("p1", "stdlib@1", "sig1");
+        assert!(store.is_stdlib_index_fresh("p1", "stdlib@1", "sig1"));
+        assert!(!store.is_stdlib_index_fresh("p1", "stdlib@1", "sig2"));
+    }
+
+    #[test]
+    fn in_memory_clear_all_removes_symbols_mappings_and_freshness() {
+        let mut store = InMemorySymbolIndex::default();
         store.upsert_symbols_for_file(
             "p1",
             "Kernel.kerml",
@@ -636,50 +615,66 @@ mod tests {
         store.upsert_symbols_for_file(
             "p1",
             "a.sysml",
-            vec![
-                symbol(
-                    "a1",
-                    "p1",
-                    None,
-                    Scope::Project,
-                    "ActionDef",
-                    Some("m1"),
-                    "a.sysml",
-                ),
-                symbol(
-                    "d1",
-                    "p1",
-                    Some("stdlib@1"),
-                    Scope::Stdlib,
-                    "Documentation",
-                    None,
-                    "KerML.kerml",
-                ),
-            ],
+            vec![symbol(
+                "a1",
+                "p1",
+                None,
+                Scope::Project,
+                "ActionDef",
+                Some("m1"),
+                "a.sysml",
+            )],
         );
-        store.rebuild_symbol_mappings("p1");
-        assert_eq!(store.symbols_by_metatype("p1", "KerML::Action").len(), 1);
-        assert_eq!(store.stdlib_documentation_symbols("stdlib@1").len(), 1);
-        let summary = store.library_summary("p1");
-        assert_eq!(summary.0, 2);
-        assert_eq!(summary.1, 2);
-        assert!(!store.is_stdlib_index_fresh("p1", "stdlib@1", "sig1"));
         store.mark_stdlib_indexed("p1", "stdlib@1", "sig1");
+        store.rebuild_symbol_mappings("p1");
+        assert!(!store.project_symbols("p1", None).is_empty());
+        assert!(store.symbol_mapping("p1", "a1", None).is_some());
         assert!(store.is_stdlib_index_fresh("p1", "stdlib@1", "sig1"));
-        assert!(!store.is_stdlib_index_fresh("p1", "stdlib@1", "sig2"));
-        let mapping = store
-            .symbol_mapping("p1", "a1", Some("a.sysml"))
-            .expect("mapping");
-        assert_eq!(mapping.mapping_source, "exact");
-        assert_eq!(mapping.resolved_metatype_qname.as_deref(), Some("m1"));
+
+        store.clear_all();
+
+        assert!(store.project_symbols("p1", None).is_empty());
+        assert!(store.library_symbols("p1", None).is_empty());
+        assert!(store.symbol_mapping("p1", "a1", None).is_none());
+        assert!(!store.is_stdlib_index_fresh("p1", "stdlib@1", "sig1"));
     }
 
     #[test]
-    fn freshness_round_trip_works() {
+    fn in_memory_mapping_does_not_use_tail_or_collapsed_heuristics() {
         let mut store = InMemorySymbolIndex::default();
-        assert!(!store.is_stdlib_index_fresh("p1", "stdlib@1", "sig1"));
-        store.mark_stdlib_indexed("p1", "stdlib@1", "sig1");
-        assert!(store.is_stdlib_index_fresh("p1", "stdlib@1", "sig1"));
-        assert!(!store.is_stdlib_index_fresh("p1", "stdlib@1", "sig2"));
+        store.upsert_symbols_for_file(
+            "p1",
+            "Kernel.kerml",
+            vec![symbol(
+                "KerML::Root::Action",
+                "p1",
+                Some("stdlib@1"),
+                Scope::Stdlib,
+                "Metaclass",
+                None,
+                "Kernel.kerml",
+            )],
+        );
+        store.upsert_symbols_for_file(
+            "p1",
+            "a.sysml",
+            vec![symbol(
+                "a1",
+                "p1",
+                None,
+                Scope::Project,
+                "ActionDef",
+                Some("Action"),
+                "a.sysml",
+            )],
+        );
+
+        store.rebuild_symbol_mappings("p1");
+        let mapping = store
+            .symbol_mapping("p1", "a1", Some("a.sysml"))
+            .expect("mapping exists");
+        assert_eq!(mapping.mapping_source, "unresolved");
+        assert!(mapping.target_symbol_id.is_none());
+        assert_eq!(mapping.resolved_metatype_qname.as_deref(), Some("Action"));
     }
 }

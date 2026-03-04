@@ -4,57 +4,16 @@ use mercurio_sysml_semantics::stdlib::{
 };
 use serde::Serialize;
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use crate::state::CoreState;
-
-const STDLIB_DIR: &str = "stdlib";
-
-pub(crate) fn resolve_default_stdlib_path(
-    root: &Path,
-    stdlib_root: &Path,
-    default_stdlib: Option<&str>,
-) -> PathBuf {
-    let root_stdlib = root.join(STDLIB_DIR);
-    if root_stdlib.exists() && root_stdlib.is_dir() {
-        return root_stdlib;
-    }
-
-    if let Some(version) = default_stdlib {
-        let candidate = stdlib_root.join(version);
-        if candidate.exists() && candidate.is_dir() {
-            return candidate;
-        }
-    }
-    if let Ok(versions) = list_stdlib_versions_from_root(stdlib_root) {
-        if let Some(first) = versions.first() {
-            let candidate = stdlib_root.join(first);
-            if candidate.exists() && candidate.is_dir() {
-                return candidate;
-            }
-        }
-    }
-
-    discover_stdlib_path()
-}
+use crate::state::{CoreState, StdlibCache, WorkspaceSnapshotCacheEntry};
+use mercurio_sysml_pkg::mercurio_sysml_semantic_adapter::{ingest_text, Language};
 
 pub fn list_stdlib_versions_from_root(stdlib_root: &Path) -> Result<Vec<String>, String> {
-    if !stdlib_root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut entries = Vec::new();
-    let read_dir = std::fs::read_dir(stdlib_root).map_err(|e| e.to_string())?;
-    for entry in read_dir {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                entries.push(name.to_string());
-            }
-        }
-    }
-    entries.sort();
-    Ok(entries)
+    mercurio_sysml_pkg::workspace_config::list_stdlib_versions_from_root(stdlib_root)
 }
 
 pub(crate) fn resolve_stdlib_path(
@@ -64,78 +23,34 @@ pub(crate) fn resolve_stdlib_path(
     override_id: Option<&String>,
     project_root: &Path,
 ) -> ((), Option<PathBuf>) {
-    match config {
-        Some(crate::LibraryConfig::Path { path }) => {
-            if path.trim().is_empty() {
-                let discovered =
-                    resolve_default_stdlib_path(project_root, stdlib_root, default_stdlib);
-                ((), Some(discovered))
-            } else {
-                let raw_path = PathBuf::from(path);
-                let resolved = if raw_path.is_absolute() {
-                    raw_path
-                } else {
-                    project_root.join(raw_path)
-                };
-                ((), Some(resolved))
-            }
-        }
-        Some(crate::LibraryConfig::Default(value)) => {
-            let trimmed = value.trim();
-            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
-                let discovered =
-                    resolve_default_stdlib_path(project_root, stdlib_root, default_stdlib);
-                ((), Some(discovered))
-            } else {
-                let raw_path = PathBuf::from(trimmed);
-                let resolved = if raw_path.is_absolute() {
-                    raw_path
-                } else {
-                    project_root.join(raw_path)
-                };
-                ((), Some(resolved))
-            }
-        }
-        None => {
-            if let Some(stdlib_id) = override_id {
-                let trimmed = stdlib_id.trim();
-                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("default") {
-                    let discovered =
-                        resolve_default_stdlib_path(project_root, stdlib_root, default_stdlib);
-                    ((), Some(discovered))
-                } else {
-                    let resolved = stdlib_root.join(trimmed);
-                    ((), Some(resolved))
-                }
-            } else {
-                let discovered =
-                    resolve_default_stdlib_path(project_root, stdlib_root, default_stdlib);
-                ((), Some(discovered))
-            }
-        }
-    }
-}
-
-fn discover_stdlib_path() -> PathBuf {
-    if let Some(exe_dir) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
-    {
-        let stdlib_next_to_exe = exe_dir.join(STDLIB_DIR);
-        if stdlib_next_to_exe.exists() && stdlib_next_to_exe.is_dir() {
-            return stdlib_next_to_exe;
-        }
-    }
-
-    PathBuf::from(STDLIB_DIR)
+    (
+        (),
+        mercurio_sysml_pkg::workspace_config::resolve_stdlib_path(
+            stdlib_root,
+            default_stdlib,
+            config,
+            override_id,
+            project_root,
+        ),
+    )
 }
 
 #[derive(Serialize, Clone)]
 pub struct StdlibMetamodelView {
     pub stdlib_path: Option<String>,
-    pub stdlib_cache_hit: bool,
+    pub workspace_snapshot_hit: bool,
     pub type_count: usize,
     pub types: Vec<MetamodelTypeView>,
+    pub expression_records: Vec<StdlibExpressionRecordView>,
+    pub diagnostics: StdlibMetamodelDiagnostics,
+}
+
+#[derive(Serialize, Clone)]
+pub struct StdlibExpressionRecordView {
+    pub owner_id: u64,
+    pub qualified_name: String,
+    pub feature: Option<String>,
+    pub expression: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -170,6 +85,78 @@ pub struct MetamodelModifiersView {
     pub is_parallel: bool,
 }
 
+#[derive(Serialize, Clone)]
+pub struct StdlibMetamodelDiagnostics {
+    pub resolved_stdlib_path: Option<String>,
+    pub cache_key: String,
+    pub cache_hit: bool,
+    pub workspace_snapshot_hit: bool,
+    pub cache_lookup_error: Option<String>,
+    pub workspace_snapshot_error: Option<String>,
+    pub metamodel_cache_store_error: Option<String>,
+    pub failure_reason: Option<String>,
+    pub duplicate_qualified_names: Vec<String>,
+    pub cache_entries: Vec<StdlibCacheSummary>,
+    pub phase_timings: Vec<PhaseTimingView>,
+    pub expression_records_error: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct StdlibCacheSummary {
+    pub path: String,
+    pub signature: String,
+    pub file_count: usize,
+}
+
+#[derive(Serialize, Clone)]
+pub struct PhaseTimingView {
+    pub phase: String,
+    pub duration_ms: u128,
+}
+
+impl StdlibMetamodelDiagnostics {
+    fn new(cache_key: String, resolved_stdlib_path: Option<String>) -> Self {
+        Self {
+            resolved_stdlib_path,
+            cache_key,
+            cache_hit: false,
+            workspace_snapshot_hit: false,
+            cache_lookup_error: None,
+            workspace_snapshot_error: None,
+            metamodel_cache_store_error: None,
+            failure_reason: None,
+            duplicate_qualified_names: Vec::new(),
+            cache_entries: Vec::new(),
+            phase_timings: Vec::new(),
+            expression_records_error: None,
+        }
+    }
+
+    fn record_phase(&mut self, phase: &str, duration: Duration) {
+        self.phase_timings
+            .push(PhaseTimingView::new(phase, duration));
+    }
+}
+
+impl StdlibCacheSummary {
+    fn from_entry(entry: &StdlibCache) -> Self {
+        Self {
+            path: entry.path.to_string_lossy().to_string(),
+            signature: entry.signature.clone(),
+            file_count: entry.files.len(),
+        }
+    }
+}
+
+impl PhaseTimingView {
+    fn new(phase: &str, duration: Duration) -> Self {
+        Self {
+            phase: phase.to_string(),
+            duration_ms: duration.as_millis() as u128,
+        }
+    }
+}
+
 pub fn get_stdlib_metamodel(
     state: &CoreState,
     root: String,
@@ -185,13 +172,17 @@ pub fn get_stdlib_metamodel(
         .ok()
         .and_then(|settings| settings.default_stdlib.clone());
 
-    let project_config = crate::project::load_project_config(&root_path).ok().flatten();
+    let project_config = crate::project::load_project_config(&root_path)
+        .ok()
+        .flatten();
     let library_config = project_config
         .as_ref()
         .and_then(|config| config.library.as_ref());
     let stdlib_override = project_config
         .as_ref()
         .and_then(|config| config.stdlib.as_ref());
+
+    let resolution_start = Instant::now();
     let (_loader, stdlib_path) = resolve_stdlib_path(
         &state.stdlib_root,
         default_stdlib.as_deref(),
@@ -199,52 +190,81 @@ pub fn get_stdlib_metamodel(
         stdlib_override,
         &root_path,
     );
-
-    let cache_key = stdlib_path
+    let resolved_stdlib_path = stdlib_path
         .as_ref()
-        .map(|path| path.to_string_lossy().to_string())
+        .map(|path| path.to_string_lossy().to_string());
+    let normalized_stdlib_path = stdlib_path
+        .as_ref()
+        .map(|path| normalized_compare_key(path));
+    let cache_key = normalized_stdlib_path
+        .clone()
         .unwrap_or_else(|| "<none>".to_string());
 
-    if let Ok(cache) = state.metamodel_cache.lock() {
-        if let Some(cached) = cache.get(&cache_key) {
-            let mut view = cached.clone();
-            view.stdlib_cache_hit = true;
-            return Ok(view);
-        }
+    let mut diagnostics =
+        StdlibMetamodelDiagnostics::new(cache_key.clone(), resolved_stdlib_path.clone());
+    diagnostics.record_phase("resolve_stdlib_path", resolution_start.elapsed());
+
+    let cache_lookup_start = Instant::now();
+    diagnostics.record_phase("metamodel_cache_lookup", cache_lookup_start.elapsed());
+
+    let snapshot_start = Instant::now();
+    let (cache_entries, snapshot_error, snapshot_index) =
+        collect_stdlib_cache_snapshot(state, normalized_stdlib_path.as_deref());
+    diagnostics.cache_entries = cache_entries;
+    diagnostics.workspace_snapshot_error = snapshot_error;
+    diagnostics.record_phase("workspace_snapshot_lookup", snapshot_start.elapsed());
+    if snapshot_index.is_some() {
+        diagnostics.workspace_snapshot_hit = true;
     }
 
     let mut types = Vec::new();
+    let mut duplicates = Vec::new();
+    let mut workspace_snapshot_hit = false;
+    let mut vfs = Vfs::new();
+    let mut files = Vec::new();
+
     if let Some(path) = stdlib_path.as_ref() {
-        let normalized = normalized_compare_key(path);
-        let mut from_snapshot = false;
-        if let Ok(cache) = state.stdlib_cache.lock() {
-            for entry in cache.values() {
-                if normalized_compare_key(&entry.path) == normalized {
-                    types = metamodel_types_from_index(entry.metatype_index.as_ref());
-                    from_snapshot = true;
-                    break;
-                }
-            }
-        }
-        if !from_snapshot {
-            let mut vfs = Vfs::new();
-            let files = load_stdlib_from_path(&mut vfs, path);
+        files = load_stdlib_from_path(&mut vfs, path);
+        if let Some(index) = snapshot_index {
+            let projection_start = Instant::now();
+            let (snapshot_types, snapshot_duplicates) = metamodel_types_from_index(index.as_ref());
+            diagnostics.record_phase("metamodel_projection", projection_start.elapsed());
+            types = snapshot_types;
+            duplicates = snapshot_duplicates;
+            workspace_snapshot_hit = true;
+        } else {
+            let build_start = Instant::now();
             let index = build_metatype_index(&vfs, &files);
-            types = metamodel_types_from_index(&index);
+            diagnostics.record_phase("stdlib_load_and_index", build_start.elapsed());
+
+            if files.is_empty() {
+                diagnostics.failure_reason =
+                    Some("Stdlib path resolved but no loadable files were found".to_string());
+            }
+
+            let projection_start = Instant::now();
+            let (built_types, built_duplicates) = metamodel_types_from_index(&index);
+            diagnostics.record_phase("metamodel_projection", projection_start.elapsed());
+            types = built_types;
+            duplicates = built_duplicates;
         }
+    } else if diagnostics.failure_reason.is_none() {
+        diagnostics.failure_reason =
+            Some("Unable to resolve a stdlib path for the requested project root".to_string());
     }
+
     types.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
+    diagnostics.duplicate_qualified_names = duplicates;
+    let expression_records = collect_expression_records(&files, &vfs, &mut diagnostics);
 
     let view = StdlibMetamodelView {
-        stdlib_path: stdlib_path.map(|path| path.to_string_lossy().to_string()),
-        stdlib_cache_hit: false,
+        stdlib_path: resolved_stdlib_path,
+        workspace_snapshot_hit,
         type_count: types.len(),
         types,
+        expression_records,
+        diagnostics,
     };
-
-    if let Ok(mut cache) = state.metamodel_cache.lock() {
-        cache.insert(cache_key, view.clone());
-    }
 
     Ok(view)
 }
@@ -257,7 +277,85 @@ fn normalized_compare_key(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
-fn metamodel_types_from_index(index: &MetatypeIndex) -> Vec<MetamodelTypeView> {
+fn collect_expression_records(
+    files: &[PathBuf],
+    vfs: &Vfs,
+    diagnostics: &mut StdlibMetamodelDiagnostics,
+) -> Vec<StdlibExpressionRecordView> {
+    let mut out = Vec::new();
+    for path in files {
+        let text = match read_stdlib_file_text(vfs, path) {
+            Some(text) => text,
+            None => continue,
+        };
+        match ingest_text(&text, Language::SysML) {
+            Ok(output) => {
+                for record in output.expression_records() {
+                    out.push(StdlibExpressionRecordView {
+                        owner_id: record.owner_id.0,
+                        qualified_name: record.qualified_name,
+                        feature: record.feature,
+                        expression: record.expression,
+                    });
+                }
+            }
+            Err(err) => {
+                if diagnostics.expression_records_error.is_none() {
+                    diagnostics.expression_records_error = Some(err.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn read_stdlib_file_text(vfs: &Vfs, path: &Path) -> Option<String> {
+    if let Some(id) = vfs.file_id_by_path(path) {
+        if let Some(text) = vfs.file_text(id) {
+            return Some(text.to_string());
+        }
+    }
+    fs::read_to_string(path).ok()
+}
+
+fn collect_stdlib_cache_snapshot(
+    state: &CoreState,
+    normalized_stdlib_key: Option<&str>,
+) -> (
+    Vec<StdlibCacheSummary>,
+    Option<String>,
+    Option<Arc<MetatypeIndex>>,
+) {
+    match state.workspace_snapshot_cache.try_lock() {
+        Ok(cache) => {
+            let stdlib_entries = cache
+                .values()
+                .filter_map(|entry| match entry {
+                    WorkspaceSnapshotCacheEntry::Stdlib(value) => Some(value),
+                    WorkspaceSnapshotCacheEntry::ProjectSemantic(_) => None,
+                })
+                .collect::<Vec<_>>();
+            let summaries = cache
+                .values()
+                .filter_map(|entry| match entry {
+                    WorkspaceSnapshotCacheEntry::Stdlib(value) => Some(value),
+                    WorkspaceSnapshotCacheEntry::ProjectSemantic(_) => None,
+                })
+                .map(StdlibCacheSummary::from_entry)
+                .collect::<Vec<_>>();
+            let snapshot_index = normalized_stdlib_key.and_then(|normalized| {
+                stdlib_entries
+                    .iter()
+                    .find(|entry| normalized_compare_key(&entry.path) == normalized)
+                    .map(|entry| entry.metatype_index.clone())
+            });
+            (summaries, None, snapshot_index)
+        }
+        Err(err) => (Vec::new(), Some(format!("{:?}", err)), None),
+    }
+}
+
+fn metamodel_types_from_index(index: &MetatypeIndex) -> (Vec<MetamodelTypeView>, Vec<String>) {
     let qname_by_id = index
         .infos
         .iter()
@@ -267,7 +365,8 @@ fn metamodel_types_from_index(index: &MetatypeIndex) -> Vec<MetamodelTypeView> {
     for info in &index.infos {
         types.push(metamodel_type_from_info(info, index, &qname_by_id));
     }
-    types
+    let duplicates = collect_duplicate_qualified_names(&types);
+    (types, duplicates)
 }
 
 fn metamodel_type_from_info(
@@ -313,6 +412,19 @@ fn metamodel_type_from_info(
         modifiers: default_modifiers(),
         attributes,
     }
+}
+
+fn collect_duplicate_qualified_names(types: &[MetamodelTypeView]) -> Vec<String> {
+    let mut counts = HashMap::new();
+    for ty in types {
+        *counts.entry(ty.qualified_name.clone()).or_insert(0) += 1;
+    }
+    let mut duplicates = counts
+        .into_iter()
+        .filter_map(|(name, count)| if count > 1 { Some(name) } else { None })
+        .collect::<Vec<_>>();
+    duplicates.sort();
+    duplicates
 }
 
 fn default_modifiers() -> MetamodelModifiersView {

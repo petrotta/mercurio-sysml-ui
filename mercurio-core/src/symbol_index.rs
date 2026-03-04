@@ -1,6 +1,9 @@
 use mercurio_symbol_index::{SymbolIndexStore, SymbolMetatypeMappingRecord, SymbolRecord};
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
+use crate::state::WorkspaceSnapshotCacheEntry;
 use crate::CoreState;
 
 #[derive(Debug, Clone, Serialize)]
@@ -11,6 +14,7 @@ pub struct IndexedSymbolView {
     pub scope: String,
     pub name: String,
     pub qualified_name: String,
+    pub parent_qualified_name: Option<String>,
     pub kind: String,
     pub metatype_qname: Option<String>,
     pub file_path: String,
@@ -42,6 +46,14 @@ pub struct SymbolMetatypeMappingView {
     pub diagnostic: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexedSemanticElementView {
+    pub name: String,
+    pub qualified_name: String,
+    pub file_path: String,
+    pub attributes: BTreeMap<String, String>,
+}
+
 fn to_view(record: SymbolRecord) -> IndexedSymbolView {
     IndexedSymbolView {
         id: record.id,
@@ -53,6 +65,7 @@ fn to_view(record: SymbolRecord) -> IndexedSymbolView {
         },
         name: record.name,
         qualified_name: record.qualified_name,
+        parent_qualified_name: record.parent_qualified_name,
         kind: record.kind,
         metatype_qname: record.metatype_qname,
         file_path: record.file_path,
@@ -143,7 +156,38 @@ pub fn query_project_symbols(
         .symbol_index
         .lock()
         .map_err(|_| "Symbol index lock poisoned".to_string())?;
-    let mut symbols = store.project_symbols(&project_root, file_path.as_deref());
+    Ok(store
+        .project_symbols_paged(&project_root, file_path.as_deref(), offset, limit)
+        .into_iter()
+        .map(to_view)
+        .collect())
+}
+
+pub fn query_project_symbols_for_files(
+    state: &CoreState,
+    project_root: String,
+    file_paths: Vec<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<Vec<IndexedSymbolView>, String> {
+    let offset = offset.unwrap_or(0);
+    let limit = limit.unwrap_or(usize::MAX);
+    let unique_file_paths = file_paths
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<BTreeSet<_>>();
+    if unique_file_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let store = state
+        .symbol_index
+        .lock()
+        .map_err(|_| "Symbol index lock poisoned".to_string())?;
+    let mut symbols = unique_file_paths
+        .iter()
+        .flat_map(|file_path| store.project_symbols(&project_root, Some(file_path)))
+        .collect::<Vec<_>>();
     symbols.sort_by(|a, b| {
         a.file_path
             .cmp(&b.file_path)
@@ -151,6 +195,7 @@ pub fn query_project_symbols(
             .then(a.start_col.cmp(&b.start_col))
             .then(a.qualified_name.cmp(&b.qualified_name))
     });
+    symbols.dedup_by(|left, right| left.id == right.id);
     Ok(symbols
         .into_iter()
         .skip(offset)
@@ -190,12 +235,147 @@ pub fn query_symbol_metatype_mapping(
         .map(to_mapping_view))
 }
 
+pub fn query_project_semantic_element_by_qualified_name(
+    state: &CoreState,
+    project_root: String,
+    qualified_name: String,
+    file_path: Option<String>,
+) -> Result<Option<IndexedSemanticElementView>, String> {
+    let target = qualified_name.trim();
+    if target.is_empty() {
+        return Ok(None);
+    }
+    let requested_file_key = file_path
+        .as_deref()
+        .map(|value| normalized_compare_key(Path::new(value)));
+    let root_prefix = format!("project-semantic|{}|", project_root);
+    let cache = state
+        .workspace_snapshot_cache
+        .lock()
+        .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
+
+    let mut exact_file_candidates = Vec::<IndexedSemanticElementView>::new();
+    let mut fallback_candidates = Vec::<IndexedSemanticElementView>::new();
+    for (key, entry) in cache.iter() {
+        if !key.starts_with(&root_prefix) {
+            continue;
+        }
+        let WorkspaceSnapshotCacheEntry::ProjectSemantic(elements) = entry else {
+            continue;
+        };
+        for element in elements.iter() {
+            if element.qualified_name != target {
+                continue;
+            }
+            let view = semantic_element_to_indexed_view(element);
+            if let Some(requested_key) = requested_file_key.as_ref() {
+                let candidate_key = normalized_compare_key(Path::new(&view.file_path));
+                if &candidate_key == requested_key {
+                    exact_file_candidates.push(view);
+                } else {
+                    fallback_candidates.push(view);
+                }
+            } else {
+                fallback_candidates.push(view);
+            }
+        }
+    }
+
+    if !exact_file_candidates.is_empty() {
+        return Ok(select_best_semantic_candidate(exact_file_candidates));
+    }
+
+    Ok(select_best_semantic_candidate(fallback_candidates))
+}
+
+fn semantic_element_to_indexed_view(
+    element: &mercurio_sysml_semantics::semantic_contract::SemanticElementView,
+) -> IndexedSemanticElementView {
+    let mut attributes = BTreeMap::<String, String>::new();
+    for (key, value) in &element.attributes {
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        attributes.insert(key.to_string(), value.to_string());
+    }
+    attributes
+        .entry("emf::qualifiedName".to_string())
+        .or_insert_with(|| element.qualified_name.clone());
+    attributes
+        .entry("emf::name".to_string())
+        .or_insert_with(|| element.name.clone());
+    if let Some(metatype) = element.metatype_qname.as_ref() {
+        attributes
+            .entry("emf::metatype".to_string())
+            .or_insert_with(|| metatype.clone());
+    }
+    IndexedSemanticElementView {
+        name: element.name.clone(),
+        qualified_name: element.qualified_name.clone(),
+        file_path: element.file_path.clone(),
+        attributes,
+    }
+}
+
+fn select_best_semantic_candidate(
+    mut candidates: Vec<IndexedSemanticElementView>,
+) -> Option<IndexedSemanticElementView> {
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort_by(|a, b| {
+        semantic_candidate_score(b)
+            .cmp(&semantic_candidate_score(a))
+            .then(a.file_path.cmp(&b.file_path))
+            .then(a.qualified_name.cmp(&b.qualified_name))
+            .then(a.name.cmp(&b.name))
+    });
+    candidates.into_iter().next()
+}
+
+fn semantic_candidate_score(candidate: &IndexedSemanticElementView) -> usize {
+    let mut score = candidate.attributes.len();
+    let metatype_present = candidate
+        .attributes
+        .get("metatype_qname")
+        .or_else(|| candidate.attributes.get("emf::metatype"))
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    if metatype_present {
+        score += 500;
+    }
+    let metatype_source = candidate
+        .attributes
+        .get("metatype_source")
+        .or_else(|| candidate.attributes.get("mercurio::metatypeSource"))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !metatype_source.is_empty() {
+        if metatype_source == "unresolved" {
+            score = score.saturating_sub(200);
+        } else {
+            score += 200;
+        }
+    }
+    score
+}
+
+fn normalized_compare_key(path: &Path) -> String {
+    let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    normalized
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        compile_project_delta_sync, compile_workspace_sync, load_library_symbols_sync,
-        settings::AppSettings, CoreState,
+        compile_project_delta_sync, compile_project_delta_sync_with_options,
+        compile_workspace_sync, load_library_symbols_sync, settings::AppSettings, CoreState,
     };
     use std::fs;
     use std::path::Path;
@@ -227,8 +407,11 @@ mod tests {
             "standard library package KerML { doc /* d */ package Root { metaclass Action specializes Element {} } }",
         )
         .expect("write library file");
-        fs::write(project_dir.join("main.sysml"), "package P { action def DoThing; }\n")
-            .expect("write project file");
+        fs::write(
+            project_dir.join("main.sysml"),
+            "package P { action def DoThing; }\n",
+        )
+        .expect("write project file");
         fs::write(
             project_dir.join(".project"),
             format!(
@@ -257,14 +440,6 @@ mod tests {
         )
         .expect("load library symbols");
 
-        let action_symbols = query_symbols_by_metatype(
-            &state,
-            project_dir.to_string_lossy().to_string(),
-            "KerML::Action".to_string(),
-        )
-        .expect("query by metatype");
-        assert!(!action_symbols.is_empty());
-
         let mapping = query_symbol_metatype_mapping(
             &state,
             project_dir.to_string_lossy().to_string(),
@@ -275,12 +450,20 @@ mod tests {
         .expect("mapping exists");
         assert_eq!(mapping.symbol_qualified_name, "P");
         assert!(!mapping.mapping_source.is_empty());
-
-        let docs = query_stdlib_documentation_symbols(
+        let mapped_metatype = mapping
+            .resolved_metatype_qname
+            .clone()
+            .expect("resolved metatype");
+        let mapped_symbols = query_symbols_by_metatype(
             &state,
-            normalized_compare_key(&library_dir),
+            project_dir.to_string_lossy().to_string(),
+            mapped_metatype,
         )
-        .expect("query docs");
+        .expect("query by mapped metatype");
+        assert!(!mapped_symbols.is_empty());
+
+        let docs = query_stdlib_documentation_symbols(&state, normalized_compare_key(&library_dir))
+            .expect("query docs");
         assert!(!docs.is_empty());
 
         let all_stdlib = query_library_symbols(
@@ -384,15 +567,330 @@ mod tests {
         assert!(library_full.ok);
         assert!(!library_full.symbols.is_empty());
 
-        let indexed_library = query_library_symbols(
+        let indexed_library =
+            query_library_symbols(&state, project_root, None, Some(0), Some(10_000))
+                .expect("query indexed library symbols");
+        assert!(!indexed_library.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_project_semantic_element_by_qualified_name_uses_semantic_cache() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_semantic_qname_lookup_{stamp}"));
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(
+            project_dir.join("main.sysml"),
+            "package P { action def DoThing; }\n",
+        )
+        .expect("write project file");
+        fs::write(
+            project_dir.join(".project"),
+            "{\"name\":\"lookup\",\"src\":[\"*.sysml\"]}",
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let project_root = project_dir.to_string_lossy().to_string();
+        let _ = compile_project_delta_sync(
+            &state,
+            project_root.clone(),
+            77,
+            true,
+            None,
+            Vec::new(),
+            |_| {},
+        )
+        .expect("compile");
+
+        let found = query_project_semantic_element_by_qualified_name(
+            &state,
+            project_root.clone(),
+            "P".to_string(),
+            None,
+        )
+        .expect("query by qname")
+        .expect("semantic row exists");
+        assert_eq!(found.qualified_name, "P");
+        assert_eq!(
+            found
+                .attributes
+                .get("emf::qualifiedName")
+                .map(|value| value.as_str()),
+            Some("P")
+        );
+
+        let missing = query_project_semantic_element_by_qualified_name(
             &state,
             project_root,
+            "DoesNotExist".to_string(),
             None,
+        )
+        .expect("query missing");
+        assert!(missing.is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_project_semantic_element_prefers_requested_file_path() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("mercurio_semantic_qname_file_lookup_{stamp}"));
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        let left = project_dir.join("left.sysml");
+        let right = project_dir.join("right.sysml");
+        fs::write(&left, "package P { action def LeftAction; }\n").expect("write left file");
+        fs::write(&right, "package P { action def RightAction; }\n").expect("write right file");
+        fs::write(
+            project_dir.join(".project"),
+            "{\"name\":\"lookup\",\"src\":[\"*.sysml\"]}",
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let project_root = project_dir.to_string_lossy().to_string();
+        let _ = compile_project_delta_sync(
+            &state,
+            project_root.clone(),
+            91,
+            true,
+            None,
+            Vec::new(),
+            |_| {},
+        )
+        .expect("compile");
+
+        let right_row = query_project_semantic_element_by_qualified_name(
+            &state,
+            project_root,
+            "P".to_string(),
+            Some(right.to_string_lossy().to_string()),
+        )
+        .expect("query by qname with file")
+        .expect("semantic row exists");
+        assert_eq!(
+            normalized_compare_key(Path::new(&right_row.file_path)),
+            normalized_compare_key(&right)
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_project_semantic_element_resolves_package_metatype_in_delta_compile_without_symbols() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir()
+            .join(format!("mercurio_semantic_pkg_metatype_delta_no_symbols_{stamp}"));
+        let library_dir = root.join("stdlib");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&library_dir).expect("create library dir");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(
+            library_dir.join("Kernel.kerml"),
+            "standard library package Kernel { package Root { metaclass Element {} metaclass PackageDefinition specializes Element {} metaclass ActionDefinition specializes Element {} } }",
+        )
+        .expect("write stdlib file");
+        let main_file = project_dir.join("main.sysml");
+        fs::write(
+            &main_file,
+            "package P { action def Focus { out xrsl: Exposure; } }\n",
+        )
+        .expect("write project file");
+        fs::write(
+            project_dir.join(".project"),
+            format!(
+                "{{\"name\":\"semantic-pkg\",\"library\":{{\"path\":\"{}\"}},\"src\":[\"*.sysml\"]}}",
+                library_dir.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let project_root = project_dir.to_string_lossy().to_string();
+        let response = compile_project_delta_sync_with_options(
+            &state,
+            project_root.clone(),
+            901,
+            true,
+            None,
+            Vec::new(),
+            false,
+            |_| {},
+        )
+        .expect("delta compile");
+        assert!(response.ok);
+        assert_eq!(response.symbols.len(), 0);
+        assert!(response.stdlib_file_count >= 1);
+
+        let package = query_project_semantic_element_by_qualified_name(
+            &state,
+            project_root.clone(),
+            "P".to_string(),
+            Some(main_file.to_string_lossy().to_string()),
+        )
+        .expect("query package semantic row")
+        .expect("package semantic row");
+        assert_eq!(
+            package
+                .attributes
+                .get("metatype_source")
+                .map(|value| value.as_str()),
+            Some("inferred-kind")
+        );
+        assert!(
+            package
+                .attributes
+                .get("metatype_qname")
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false),
+            "package metatype_qname should be present"
+        );
+
+        let action = query_project_semantic_element_by_qualified_name(
+            &state,
+            project_root,
+            "P::Focus".to_string(),
+            Some(main_file.to_string_lossy().to_string()),
+        )
+        .expect("query action semantic row")
+        .expect("action semantic row");
+        assert_eq!(
+            action
+                .attributes
+                .get("metatype_source")
+                .map(|value| value.as_str()),
+            Some("inferred-kind")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_project_semantic_element_prefers_resolved_candidate_without_file_hint() {
+        let state = CoreState::new(
+            std::env::temp_dir().join("mercurio_semantic_candidate_pref"),
+            AppSettings::default(),
+        );
+        let project_root = "C:\\tmp\\semantic-candidate-pref".to_string();
+        let unresolved = mercurio_sysml_semantics::semantic_contract::SemanticElementView {
+            name: "P".to_string(),
+            qualified_name: "P".to_string(),
+            metatype_qname: None,
+            file_path: "C:\\tmp\\left.sysml".to_string(),
+            attributes: std::collections::HashMap::from([
+                ("metatype_source".to_string(), "unresolved".to_string()),
+                ("kind".to_string(), "Package".to_string()),
+            ]),
+        };
+        let resolved = mercurio_sysml_semantics::semantic_contract::SemanticElementView {
+            name: "P".to_string(),
+            qualified_name: "P".to_string(),
+            metatype_qname: Some("sysml::Package".to_string()),
+            file_path: "C:\\tmp\\right.sysml".to_string(),
+            attributes: std::collections::HashMap::from([
+                ("metatype_source".to_string(), "inferred-kind".to_string()),
+                ("metatype_qname".to_string(), "sysml::Package".to_string()),
+                ("kind".to_string(), "Package".to_string()),
+            ]),
+        };
+        {
+            let mut cache = state
+                .workspace_snapshot_cache
+                .lock()
+                .expect("workspace cache lock");
+            cache.insert(
+                format!("project-semantic|{}|a", project_root),
+                WorkspaceSnapshotCacheEntry::ProjectSemantic(std::sync::Arc::new(vec![unresolved])),
+            );
+            cache.insert(
+                format!("project-semantic|{}|b", project_root),
+                WorkspaceSnapshotCacheEntry::ProjectSemantic(std::sync::Arc::new(vec![resolved])),
+            );
+        }
+
+        let found = query_project_semantic_element_by_qualified_name(
+            &state,
+            project_root,
+            "P".to_string(),
+            None,
+        )
+        .expect("semantic query")
+        .expect("semantic row");
+        assert_eq!(
+            found
+                .attributes
+                .get("metatype_source")
+                .map(|value| value.as_str()),
+            Some("inferred-kind")
+        );
+        assert_eq!(
+            found
+                .attributes
+                .get("metatype_qname")
+                .map(|value| value.as_str()),
+            Some("sysml::Package")
+        );
+    }
+
+    #[test]
+    fn query_project_symbols_for_files_returns_combined_rows() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_batch_symbol_query_{stamp}"));
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        let left = project_dir.join("left.sysml");
+        let right = project_dir.join("right.sysml");
+        fs::write(&left, "package LeftPkg { action def LeftAction; }\n").expect("write left file");
+        fs::write(&right, "package RightPkg { action def RightAction; }\n")
+            .expect("write right file");
+        fs::write(
+            project_dir.join(".project"),
+            "{\"name\":\"batch\",\"src\":[\"*.sysml\"]}",
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let project_root = project_dir.to_string_lossy().to_string();
+        let _ = compile_project_delta_sync(
+            &state,
+            project_root.clone(),
+            111,
+            true,
+            None,
+            Vec::new(),
+            |_| {},
+        )
+        .expect("compile");
+
+        let rows = query_project_symbols_for_files(
+            &state,
+            project_root,
+            vec![
+                left.to_string_lossy().to_string(),
+                right.to_string_lossy().to_string(),
+            ],
             Some(0),
             Some(10_000),
         )
-        .expect("query indexed library symbols");
-        assert!(!indexed_library.is_empty());
+        .expect("batch query");
+        assert!(rows.iter().any(|row| row.qualified_name == "LeftPkg"));
+        assert!(rows.iter().any(|row| row.qualified_name == "RightPkg"));
 
         let _ = fs::remove_dir_all(root);
     }

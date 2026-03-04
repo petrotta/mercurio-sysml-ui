@@ -54,8 +54,9 @@ fn run_probe(state: &CoreState, root: &str) {
     );
 
     thread::sleep(Duration::from_millis(750));
-    let indexed_project = query_project_symbols(state, root.to_string(), None, Some(0), Some(1_000_000))
-        .unwrap_or_default();
+    let indexed_project =
+        query_project_symbols(state, root.to_string(), None, Some(0), Some(1_000_000))
+            .unwrap_or_default();
     println!("index.project_symbols={}", indexed_project.len());
     let sample = indexed_project
         .iter()

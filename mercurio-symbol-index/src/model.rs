@@ -14,6 +14,8 @@ pub struct SymbolRecord {
     pub scope: Scope,
     pub name: String,
     pub qualified_name: String,
+    #[serde(default)]
+    pub parent_qualified_name: Option<String>,
     pub kind: String,
     pub metatype_qname: Option<String>,
     pub file_path: String,

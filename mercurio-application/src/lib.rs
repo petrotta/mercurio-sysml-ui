@@ -1,115 +1,44 @@
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::fs;
 use std::fs::File;
 use std::io;
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::env;
-use std::sync::{Arc, Mutex};
-use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
+use std::sync::Mutex;
+use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::path::BaseDirectory;
 use tauri::{Emitter, EventTarget, Manager};
 use zip::ZipArchive;
+use notify::{Event, RecursiveMode, RecommendedWatcher, Watcher};
 
 mod commands;
-mod agent;
 
-// Re-exported Tauri commands from focused modules.
 use commands::{
-    ai_agent_run, ai_test_endpoint, create_dir, create_file, detect_git_repo, get_user_projects_root,
-    get_project_element_attributes, get_project_model, query_semantic, query_semantic_symbols,
-    get_default_stdlib, get_stdlib_metamodel,
-    git_checkout_branch, git_commit, git_create_branch, git_list_branches, git_push, git_stage_paths,
-    git_status, git_unstage_paths, list_dir, list_stdlib_versions, open_in_explorer, path_exists,
-    read_diagram, read_file, rename_path, window_close, window_minimize, window_toggle_maximize,
-    call_tool, list_tools,
-    write_diagram, write_file, set_default_stdlib,
+    app_exit, call_tool, list_dir, read_file, show_in_explorer, window_close, window_minimize, window_toggle_maximize,
+    write_file,
 };
-
 
 use mercurio_core::{
     cancel_compile as core_cancel_compile,
-    compile_project_delta_sync as core_compile_project_delta_sync,
-    compile_workspace_sync as core_compile_workspace_sync,
-    create_project_descriptor as core_create_project_descriptor,
-    ensure_mercurio_paths,
-    ensure_project_descriptor as core_ensure_project_descriptor,
-    export_model_to_path as core_export_model_to_path,
-    get_ast_for_content as core_get_ast_for_content,
-    get_ast_for_path as core_get_ast_for_path,
-    get_parse_tree_for_content as core_get_parse_tree_for_content,
-    get_parse_errors_for_content as core_get_parse_errors_for_content,
-    get_project_descriptor_view,
-    update_project_descriptor as core_update_project_descriptor,
-    query_library_symbols as core_query_library_symbols,
-    query_library_summary as core_query_library_summary,
-    query_project_symbols as core_query_project_symbols,
-    query_symbol_metatype_mapping as core_query_symbol_metatype_mapping,
-    query_stdlib_documentation_symbols as core_query_stdlib_documentation_symbols,
-    query_symbols_by_metatype as core_query_symbols_by_metatype,
-    list_stdlib_versions_from_root,
-    load_app_settings,
-    save_app_settings,
-    AppSettings,
-    CompileRequest,
-    CompileResponse,
-    CoreState,
-    IndexedSymbolView,
-    LibraryIndexSummaryView,
-    LibrarySymbolsRequest,
-    LibrarySymbolsResponse,
-    SymbolMetatypeMappingView,
-    LibraryConfig,
-    MercurioPaths,
-    ParseErrorsPayload,
-    ParseTreeNodeView,
-    ProjectDescriptorUpdate,
-    ProjectDescriptorView,
-    load_library_symbols_sync as core_load_library_symbols_sync,
+    compile_project_delta_sync_with_options as core_compile_project_delta_sync_with_options,
+    ensure_mercurio_paths, ensure_project_descriptor, list_stdlib_versions_from_root,
+    load_app_settings, load_project_descriptor, save_app_settings, write_project_descriptor,
+    AppSettings, BackgroundCancelSummary, BackgroundJobsSnapshot, CacheClearSummary,
+    CompileRequest, CompileResponse, CoreState, LibraryConfig, MercurioPaths,
 };
+
+pub(crate) struct AppState {
+    pub(crate) core: CoreState,
+    pub(crate) settings_path: PathBuf,
+    pub(crate) project_file_watchers: Mutex<HashMap<String, ActiveProjectFileWatcher>>,
+}
 
 #[derive(Serialize)]
 pub(crate) struct DirEntry {
     name: String,
     path: String,
     is_dir: bool,
-}
-
-#[derive(Deserialize)]
-struct CreateProjectDescriptorPayload {
-    root: String,
-    name: String,
-    author: Option<String>,
-    description: Option<String>,
-    organization: Option<String>,
-    use_default_library: bool,
-}
-
-#[derive(Deserialize)]
-struct UpdateProjectDescriptorPayload {
-    root: String,
-    name: Option<String>,
-    author: Option<String>,
-    description: Option<String>,
-    organization: Option<String>,
-    src: Option<Vec<String>>,
-    #[serde(rename = "import", alias = "import_entries")]
-    import_entries: Option<Vec<String>>,
-    stdlib: Option<String>,
-    library: Option<LibraryConfig>,
-}
-
-#[derive(Serialize, Clone)]
-struct FsEventPayload {
-    path: String,
-    kind: String,
-}
-
-#[derive(Clone)]
-pub(crate) struct AppState {
-    pub(crate) watcher: Arc<Mutex<Option<RecommendedWatcher>>>,
-    pub(crate) core: CoreState,
-    pub(crate) settings_path: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -123,6 +52,16 @@ struct PackagedStdlibEntry {
     zip: String,
 }
 
+#[derive(Clone, Serialize)]
+struct ProjectFilesChangedPayload {
+    root: String,
+    path: String,
+    kind: String,
+}
+
+struct ActiveProjectFileWatcher {
+    _watcher: RecommendedWatcher,
+}
 
 fn sanitize_zip_path(path: &Path) -> Result<PathBuf, String> {
     let mut clean = PathBuf::new();
@@ -200,163 +139,34 @@ fn ensure_packaged_stdlibs(
 }
 
 #[tauri::command]
-fn set_watch_root(app: tauri::AppHandle, state: tauri::State<AppState>, root: String) -> Result<(), String> {
-    let root_path = PathBuf::from(&root);
-    if !root_path.exists() {
-        return Err("Root path does not exist".to_string());
-    }
-
-    let mut guard = state
-        .watcher
-        .lock()
-        .map_err(|_| "Watcher lock poisoned".to_string())?;
-    *guard = None;
-
-    let app_handle = app.clone();
-    let watcher = notify::recommended_watcher(move |res| {
-        let event: notify::Event = match res {
-            Ok(event) => event,
-            Err(_) => return,
-        };
-        let kind = match event.kind {
-            EventKind::Create(_) => "create",
-            EventKind::Modify(_) => "modify",
-            EventKind::Remove(_) => "remove",
-            EventKind::Any => "any",
-            _ => "other",
-        };
-        for path in event.paths {
-            if let Some(path_str) = path.to_str() {
-                let payload = FsEventPayload {
-                    path: path_str.to_string(),
-                    kind: kind.to_string(),
-                };
-                let _ = app_handle.emit_to(EventTarget::webview_window("main"), "fs-changed", payload);
-            }
-        }
-    })
-    .map_err(|e| e.to_string())?;
-
-    let mut watcher = watcher;
-    watcher
-        .watch(&root_path, RecursiveMode::Recursive)
-        .map_err(|e| e.to_string())?;
-    *guard = Some(watcher);
-    Ok(())
-}
-
-#[tauri::command]
-fn get_parse_errors_for_content(path: String, content: String) -> Result<ParseErrorsPayload, String> {
-    let file_path = PathBuf::from(&path);
-    core_get_parse_errors_for_content(&file_path, &content)
-}
-
-#[tauri::command]
-fn get_ast_for_path(path: String) -> Result<String, String> {
-    let file_path = PathBuf::from(&path);
-    core_get_ast_for_path(&file_path)
-}
-
-#[tauri::command]
-fn get_ast_for_content(path: String, content: String) -> Result<String, String> {
-    let file_path = PathBuf::from(&path);
-    core_get_ast_for_content(&file_path, &content)
-}
-
-#[tauri::command]
-fn get_parse_tree_for_content(path: String, content: String) -> Result<Vec<ParseTreeNodeView>, String> {
-    let file_path = PathBuf::from(&path);
-    core_get_parse_tree_for_content(&file_path, &content)
-}
-
-#[tauri::command]
-async fn compile_workspace(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, AppState>,
-    payload: CompileRequest,
-) -> Result<CompileResponse, String> {
-    let (root, run_id, allow_parse_errors, target_path, unsaved) = payload.into_parts();
-    let core = state.core.clone();
-    let app_handle = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        core_compile_workspace_sync(
-            &core,
-            root,
-            run_id,
-            allow_parse_errors,
-            target_path,
-            unsaved,
-            |progress| {
-                let _ = app_handle.emit_to(
-                    EventTarget::webview_window("main"),
-                    "compile-progress",
-                    progress,
-                );
-            },
-        )
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-fn collect_model_files_recursive(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    let read_dir = fs::read_dir(root).map_err(|e| e.to_string())?;
-    for entry in read_dir {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_model_files_recursive(&path, out)?;
-            continue;
-        }
-        let Some(ext) = path.extension().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        if ext.eq_ignore_ascii_case("sysml") || ext.eq_ignore_ascii_case("kerml") {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn eval_expression(root: String, expression: String) -> Result<String, String> {
-    let root_path = PathBuf::from(&root);
-    if !root_path.exists() {
-        return Err("Root path does not exist".to_string());
-    }
-    let mut files = Vec::<PathBuf>::new();
-    collect_model_files_recursive(&root_path, &mut files)?;
-    files.sort();
-    files.dedup();
-    let mut sources = Vec::<String>::new();
-    for file in files {
-        if let Ok(text) = fs::read_to_string(&file) {
-            sources.push(text);
-        }
-    }
-    if sources.is_empty() {
-        return Err("No model files found under root".to_string());
-    }
-    mercurio_sysml::expression_eval::eval_expression_in_sources(&sources, &expression)
-}
-
-#[tauri::command]
 async fn compile_project_delta(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     payload: CompileRequest,
 ) -> Result<CompileResponse, String> {
-    let (root, run_id, allow_parse_errors, target_path, unsaved) = payload.into_parts();
+    let (root, run_id, allow_parse_errors, include_symbols, target_path, unsaved) =
+        payload.into_parts();
+    let root_for_log = root.clone();
+    let target_for_log = target_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| "<project>".to_string());
+    let unsaved_count = unsaved.len();
+    eprintln!(
+        "[compile] start run_id={} root={} target={} include_symbols={} unsaved={}",
+        run_id, root_for_log, target_for_log, include_symbols, unsaved_count
+    );
     let core = state.core.clone();
     let app_handle = app.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        core_compile_project_delta_sync(
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        core_compile_project_delta_sync_with_options(
             &core,
             root,
             run_id,
             allow_parse_errors,
             target_path,
             unsaved,
+            include_symbols,
             |progress| {
                 let _ = app_handle.emit_to(
                     EventTarget::webview_window("main"),
@@ -367,252 +177,202 @@ async fn compile_project_delta(
         )
     })
     .await
-    .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-async fn load_library_symbols(
-    state: tauri::State<'_, AppState>,
-    payload: LibrarySymbolsRequest,
-) -> Result<LibrarySymbolsResponse, String> {
-    let (root, target_path, include_symbols) = payload.into_parts();
-    let core = state.core.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        core_load_library_symbols_sync(&core, root, target_path, include_symbols)
-    })
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-async fn query_index_symbols_by_metatype(
-    state: tauri::State<'_, AppState>,
-    payload: serde_json::Value,
-) -> Result<Vec<IndexedSymbolView>, String> {
-    let root = payload
-        .get("root")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "Missing required 'root' argument".to_string())?
-        .to_string();
-    let metatype_qname = payload
-        .get("metatype_qname")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "Missing required 'metatype_qname' argument".to_string())?
-        .to_string();
-    let core = state.core.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        core_query_symbols_by_metatype(&core, root, metatype_qname)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-async fn query_index_stdlib_documentation_symbols(
-    state: tauri::State<'_, AppState>,
-    payload: serde_json::Value,
-) -> Result<Vec<IndexedSymbolView>, String> {
-    let library_key = payload
-        .get("library_key")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "Missing required 'library_key' argument".to_string())?
-        .to_string();
-    let core = state.core.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        core_query_stdlib_documentation_symbols(&core, library_key)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-async fn query_index_library_symbols(
-    state: tauri::State<'_, AppState>,
-    payload: serde_json::Value,
-) -> Result<Vec<IndexedSymbolView>, String> {
-    let root = payload
-        .get("root")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "Missing required 'root' argument".to_string())?
-        .to_string();
-    let file = payload
-        .get("file")
-        .or_else(|| payload.get("path"))
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_string());
-    let offset = payload
-        .get("offset")
-        .or_else(|| payload.get("skip"))
-        .and_then(|value| value.as_u64())
-        .map(|value| value as usize);
-    let limit = payload
-        .get("limit")
-        .or_else(|| payload.get("take"))
-        .and_then(|value| value.as_u64())
-        .map(|value| value as usize);
-    let core = state.core.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        core_query_library_symbols(&core, root, file, offset, limit)
-    })
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-async fn query_index_project_symbols(
-    state: tauri::State<'_, AppState>,
-    payload: serde_json::Value,
-) -> Result<Vec<IndexedSymbolView>, String> {
-    let root = payload
-        .get("root")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "Missing required 'root' argument".to_string())?
-        .to_string();
-    let file = payload
-        .get("file")
-        .or_else(|| payload.get("path"))
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_string());
-    let offset = payload
-        .get("offset")
-        .or_else(|| payload.get("skip"))
-        .and_then(|value| value.as_u64())
-        .map(|value| value as usize);
-    let limit = payload
-        .get("limit")
-        .or_else(|| payload.get("take"))
-        .and_then(|value| value.as_u64())
-        .map(|value| value as usize);
-    let core = state.core.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        core_query_project_symbols(&core, root, file, offset, limit)
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-async fn query_index_library_summary(
-    state: tauri::State<'_, AppState>,
-    payload: serde_json::Value,
-) -> Result<LibraryIndexSummaryView, String> {
-    let root = payload
-        .get("root")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "Missing required 'root' argument".to_string())?
-        .to_string();
-    let core = state.core.clone();
-    tauri::async_runtime::spawn_blocking(move || core_query_library_summary(&core, root))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-async fn query_index_symbol_metatype_mapping(
-    state: tauri::State<'_, AppState>,
-    payload: serde_json::Value,
-) -> Result<Option<SymbolMetatypeMappingView>, String> {
-    let root = payload
-        .get("root")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "Missing required 'root' argument".to_string())?
-        .to_string();
-    let symbol_qualified_name = payload
-        .get("symbol_qualified_name")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "Missing required 'symbol_qualified_name' argument".to_string())?
-        .to_string();
-    let file_path = payload
-        .get("file_path")
-        .and_then(|value| value.as_str())
-        .map(|value| value.to_string());
-    let core = state.core.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        core_query_symbol_metatype_mapping(&core, root, symbol_qualified_name, file_path)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    match &result {
+        Ok(response) => {
+            eprintln!(
+                "[compile] done run_id={} ok={} parse_failed={} parsed_files={} unresolved={} total_ms={} parse_ms={} analysis_ms={} stdlib_ms={}",
+                run_id,
+                response.ok,
+                response.parse_failed,
+                response.parsed_files.len(),
+                response.unresolved.len(),
+                response.total_duration_ms,
+                response.parse_duration_ms,
+                response.analysis_duration_ms,
+                response.stdlib_duration_ms,
+            );
+        }
+        Err(error) => {
+            eprintln!("[compile] error run_id={} error={}", run_id, error);
+        }
+    }
+    result
 }
 
 #[tauri::command]
 fn cancel_compile(state: tauri::State<'_, AppState>, run_id: u64) -> Result<(), String> {
+    eprintln!("[compile] cancel requested run_id={}", run_id);
     core_cancel_compile(&state.core, run_id)
 }
 
 #[tauri::command]
-async fn export_compiled_model(
+fn get_background_jobs(
     state: tauri::State<'_, AppState>,
-    payload: serde_json::Value,
-) -> Result<(), String> {
-    let root = payload
-        .get("root")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "Missing required 'root' argument".to_string())?
-        .to_string();
-    let output = payload
-        .get("output")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| "Missing required 'output' argument".to_string())?
-        .to_string();
-    let format = payload
-        .get("format")
-        .and_then(|value| value.as_str())
-        .unwrap_or("xmi")
-        .to_string();
-    let include_stdlib = payload
-        .get("include_stdlib")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
-    let core = state.core.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        core_export_model_to_path(&core, root, output, format, include_stdlib)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+) -> Result<BackgroundJobsSnapshot, String> {
+    state.core.background_jobs_snapshot()
 }
 
 #[tauri::command]
-fn get_project_descriptor(root: String) -> Result<Option<ProjectDescriptorView>, String> {
-    let root_path = PathBuf::from(root);
-    get_project_descriptor_view(&root_path)
+fn cancel_background_jobs(
+    state: tauri::State<'_, AppState>,
+) -> Result<BackgroundCancelSummary, String> {
+    let summary = state.core.cancel_background_jobs()?;
+    eprintln!(
+        "[jobs] cancel requested active={} cancelable={} compile_cancel_requests={}",
+        summary.active_jobs, summary.cancelable_jobs, summary.compile_cancel_requests
+    );
+    Ok(summary)
 }
 
 #[tauri::command]
-fn create_project_descriptor(payload: CreateProjectDescriptorPayload) -> Result<ProjectDescriptorView, String> {
-    let root_path = PathBuf::from(payload.root);
-    core_create_project_descriptor(
-        &root_path,
-        payload.name,
-        payload.author,
-        payload.description,
-        payload.organization,
-        payload.use_default_library,
+fn clear_all_caches(
+    state: tauri::State<'_, AppState>,
+    root: Option<String>,
+) -> Result<CacheClearSummary, String> {
+    let summary = state.core.clear_runtime_caches_for_root(root.as_deref())?;
+    eprintln!(
+        "[cache] cleared workspace_snapshot={} metamodel={} parsed_files={} mtimes={} canceled={} symbol_index_cleared={} project_ir_deleted={}",
+        summary.workspace_snapshot_entries,
+        summary.metamodel_entries,
+        summary.parsed_file_entries,
+        summary.file_mtime_entries,
+        summary.canceled_compile_entries,
+        summary.symbol_index_cleared,
+        summary.project_ir_cache_deleted,
+    );
+    Ok(summary)
+}
+
+#[tauri::command]
+fn start_project_file_watcher(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    root: String,
+) -> Result<bool, String> {
+    let root_path = PathBuf::from(root.trim());
+    if root_path.as_os_str().is_empty() {
+        return Err("Project root is required".to_string());
+    }
+    if !root_path.exists() || !root_path.is_dir() {
+        return Err(format!("Project root does not exist or is not a directory: {}", root_path.display()));
+    }
+    let canonical_root = root_path
+        .canonicalize()
+        .map_err(|error| format!("Failed to canonicalize project root: {}", error))?;
+    let root_key = canonical_root.to_string_lossy().to_string();
+    let mut watchers = state
+        .project_file_watchers
+        .lock()
+        .map_err(|error| format!("Failed to access watcher registry: {}", error))?;
+    if watchers.contains_key(&root_key) {
+        return Ok(false);
+    }
+
+    let root_key_for_event = root_key.clone();
+    let root_path_for_watch = canonical_root.clone();
+    let app_for_emit = app.clone();
+    let mut watcher = notify::recommended_watcher(
+        move |result: notify::Result<Event>| {
+            let Ok(event) = result else {
+                return;
+            };
+            let kind = format!("{:?}", event.kind);
+            for path in event.paths {
+                let _ = app_for_emit.emit_to(
+                    EventTarget::webview_window("main"),
+                    "project-files-changed",
+                    ProjectFilesChangedPayload {
+                        root: root_key_for_event.clone(),
+                        path: path.to_string_lossy().to_string(),
+                        kind: kind.to_string(),
+                    },
+                );
+            }
+        },
     )
+    .map_err(|error| error.to_string())?;
+
+    let mut watcher = watcher;
+    watcher
+        .watch(&root_path_for_watch, RecursiveMode::Recursive)
+        .map_err(|error| error.to_string())?;
+    watchers.insert(
+        root_key.clone(),
+        ActiveProjectFileWatcher {
+            _watcher: watcher,
+        },
+    );
+    Ok(true)
 }
 
 #[tauri::command]
-fn ensure_project_descriptor(root: String) -> Result<ProjectDescriptorView, String> {
-    let root_path = PathBuf::from(root);
-    core_ensure_project_descriptor(&root_path)
-}
-
-#[tauri::command]
-fn update_project_descriptor(
+fn stop_project_file_watcher(
     state: tauri::State<'_, AppState>,
-    payload: UpdateProjectDescriptorPayload,
-) -> Result<ProjectDescriptorView, String> {
-    let root_path = PathBuf::from(&payload.root);
-    let update = ProjectDescriptorUpdate {
-        name: payload.name,
-        author: payload.author,
-        description: payload.description,
-        organization: payload.organization,
-        src: payload.src,
-        import_entries: payload.import_entries,
-        stdlib: payload.stdlib,
-        library: payload.library,
-    };
-    core_update_project_descriptor(&root_path, &state.core.stdlib_root, update)
+    root: String,
+) -> Result<bool, String> {
+    let root_path = PathBuf::from(root.trim());
+    if root_path.as_os_str().is_empty() {
+        return Err("Project root is required".to_string());
+    }
+    let canonical_root = root_path
+        .canonicalize()
+        .map_err(|error| format!("Failed to canonicalize project root: {}", error))?;
+    let root_key = canonical_root.to_string_lossy().to_string();
+    let mut watchers = state
+        .project_file_watchers
+        .lock()
+        .map_err(|error| format!("Failed to access watcher registry: {}", error))?;
+    Ok(watchers.remove(&root_key).is_some())
+}
+
+#[tauri::command]
+fn set_project_stdlib_path(
+    state: tauri::State<'_, AppState>,
+    root: String,
+    stdlib_path: String,
+) -> Result<String, String> {
+    let root_path = PathBuf::from(root.trim());
+    if root_path.as_os_str().is_empty() {
+        return Err("Project root is required".to_string());
+    }
+    if !root_path.exists() || !root_path.is_dir() {
+        return Err(format!(
+            "Project root does not exist or is not a directory: {}",
+            root_path.display()
+        ));
+    }
+
+    let mut selected_path = PathBuf::from(stdlib_path.trim());
+    if selected_path.as_os_str().is_empty() {
+        return Err("Stdlib path is required".to_string());
+    }
+    if !selected_path.exists() || !selected_path.is_dir() {
+        return Err(format!(
+            "Stdlib path does not exist or is not a directory: {}",
+            selected_path.display()
+        ));
+    }
+    if let Ok(canonical) = selected_path.canonicalize() {
+        selected_path = canonical;
+    }
+
+    // Ensure descriptor exists so path updates are always persisted in project config.
+    let _ = ensure_project_descriptor(&root_path)?;
+    let mut descriptor = load_project_descriptor(&root_path)?
+        .ok_or_else(|| "Failed to load project descriptor".to_string())?;
+    descriptor.config.library = Some(LibraryConfig::Path {
+        path: selected_path.to_string_lossy().to_string(),
+    });
+    descriptor.config.stdlib = None;
+    let _ = write_project_descriptor(&root_path, &descriptor)?;
+
+    let root_key = root_path.to_string_lossy().to_string();
+    let _ = state
+        .core
+        .clear_runtime_caches_for_root(Some(root_key.as_str()));
+
+    Ok(selected_path.to_string_lossy().to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -630,15 +390,17 @@ pub fn run() {
             settings_path,
         }
     });
+
     let settings = load_app_settings(&paths.settings_path);
     let core = CoreState::new(paths.stdlib_root.clone(), settings);
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
-            watcher: Arc::new(Mutex::new(None)),
             core,
             settings_path: paths.settings_path.clone(),
+            project_file_watchers: Mutex::new(HashMap::new()),
         })
         .setup(|app| {
             let state = app.state::<AppState>();
@@ -662,47 +424,61 @@ pub fn run() {
             let open_file = MenuItemBuilder::with_id("file.open_file", "Open File...")
                 .accelerator("Ctrl+O")
                 .build(app)?;
-            let project_properties = MenuItemBuilder::with_id("file.project_properties", "Project Properties...")
+            let save = MenuItemBuilder::with_id("file.save", "Save")
+                .accelerator("Ctrl+S")
                 .build(app)?;
-            let compile = MenuItemBuilder::with_id("build.compile", "Build")
-                .accelerator("Ctrl+B")
+            let compile_project =
+                MenuItemBuilder::with_id("build.compile_project", "Compile Project")
+                    .accelerator("Ctrl+B")
+                    .build(app)?;
+            let compile_file =
+                MenuItemBuilder::with_id("build.compile_file", "Compile Active File")
+                    .accelerator("Ctrl+Shift+B")
+                    .build(app)?;
+            let clear_caches = MenuItemBuilder::with_id("build.clear_caches", "Clear Caches")
+                .accelerator("Ctrl+Shift+K")
                 .build(app)?;
-            let build_options = MenuItemBuilder::with_id("build.options", "Show Build Options")
-                .accelerator("Ctrl+Shift+B")
+            let select_stdlib_path =
+                MenuItemBuilder::with_id("settings.select_stdlib_path", "Select Stdlib Path...")
+                    .build(app)?;
+            let toggle_theme = MenuItemBuilder::with_id("settings.theme_toggle", "Toggle Theme")
+                .accelerator("Ctrl+Alt+T")
                 .build(app)?;
-            let toggle_project = MenuItemBuilder::with_id("view.toggle_project", "Toggle Project")
-                .accelerator("Ctrl+Shift+P")
-                .build(app)?;
-            let toggle_terminal = MenuItemBuilder::with_id("view.toggle_terminal", "View Terminal")
-                .accelerator("Ctrl+`")
-                .build(app)?;
+            let light_theme =
+                MenuItemBuilder::with_id("settings.theme_light", "Light Theme").build(app)?;
+            let dark_theme =
+                MenuItemBuilder::with_id("settings.theme_dark", "Dark Theme").build(app)?;
             let about = MenuItemBuilder::with_id("help.about", "About").build(app)?;
+            let exit_app =
+                MenuItemBuilder::with_id("file.exit", "Exit").accelerator("CmdOrCtrl+Q").build(app)?;
 
             let file_menu = SubmenuBuilder::new(app, "File")
                 .item(&open_folder)
                 .item(&open_file)
-                .item(&project_properties)
+                .item(&save)
                 .separator()
-                .item(&PredefinedMenuItem::close_window(app, None)?)
+                .item(&exit_app)
                 .build()?;
             let build_menu = SubmenuBuilder::new(app, "Build")
-                .item(&compile)
-                .item(&build_options)
-                .build()?;
-            let view_menu = SubmenuBuilder::new(app, "View")
-                .item(&toggle_project)
-                .item(&toggle_terminal)
+                .item(&compile_project)
+                .item(&compile_file)
                 .separator()
-                .item(&PredefinedMenuItem::fullscreen(app, None)?)
+                .item(&clear_caches)
                 .build()?;
-            let help_menu = SubmenuBuilder::new(app, "Help")
-                .item(&about)
+            let settings_menu = SubmenuBuilder::new(app, "Settings")
+                .item(&select_stdlib_path)
+                .separator()
+                .item(&toggle_theme)
+                .separator()
+                .item(&light_theme)
+                .item(&dark_theme)
                 .build()?;
+            let help_menu = SubmenuBuilder::new(app, "Help").item(&about).build()?;
 
             MenuBuilder::new(app)
                 .item(&file_menu)
                 .item(&build_menu)
-                .item(&view_menu)
+                .item(&settings_menu)
                 .item(&help_menu)
                 .build()
         })
@@ -710,11 +486,15 @@ pub fn run() {
             let action = match event.id().as_ref() {
                 "file.open_folder" => Some("open-folder"),
                 "file.open_file" => Some("open-file"),
-                "file.project_properties" => Some("project-properties"),
-                "build.compile" => Some("compile-workspace"),
-                "build.options" => Some("build-options"),
-                "view.toggle_project" => Some("toggle-project"),
-                "view.toggle_terminal" => Some("toggle-terminal"),
+                "file.save" => Some("save-active"),
+                "build.compile_project" => Some("compile-workspace"),
+                "build.compile_file" => Some("compile-file"),
+                "build.clear_caches" => Some("clear-caches"),
+                "settings.select_stdlib_path" => Some("select-stdlib-path"),
+                "settings.theme_toggle" => Some("theme-toggle"),
+                "settings.theme_light" => Some("theme-light"),
+                "settings.theme_dark" => Some("theme-dark"),
+                "file.exit" => Some("close-window"),
                 "help.about" => Some("about"),
                 _ => None,
             };
@@ -723,65 +503,24 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            get_user_projects_root,
-            list_stdlib_versions,
-            get_default_stdlib,
-            set_default_stdlib,
-            get_stdlib_metamodel,
-            get_project_model,
-            get_project_element_attributes,
-            query_semantic,
-            query_semantic_symbols,
             list_dir,
             read_file,
-            path_exists,
             write_file,
-            read_diagram,
-            write_diagram,
-            create_file,
-            create_dir,
-            rename_path,
-            set_watch_root,
-            open_in_explorer,
-            get_parse_errors_for_content,
-            get_ast_for_path,
-            get_ast_for_content,
-            get_parse_tree_for_content,
-            eval_expression,
-            get_project_descriptor,
-            create_project_descriptor,
-            ensure_project_descriptor,
-            update_project_descriptor,
-            detect_git_repo,
-            git_commit,
-            git_create_branch,
-            git_checkout_branch,
-            git_list_branches,
-            git_push,
-            git_stage_paths,
-            git_status,
-            git_unstage_paths,
             window_minimize,
             window_toggle_maximize,
+            app_exit,
             window_close,
-            compile_workspace,
+            show_in_explorer,
             compile_project_delta,
-            load_library_symbols,
-            query_index_symbols_by_metatype,
-            query_index_stdlib_documentation_symbols,
-            query_index_library_symbols,
-            query_index_project_symbols,
-            query_index_library_summary,
-            query_index_symbol_metatype_mapping,
             cancel_compile,
-            export_compiled_model,
-            ai_test_endpoint,
-            ai_agent_run,
-            list_tools,
+            get_background_jobs,
+            cancel_background_jobs,
+            clear_all_caches,
+            start_project_file_watcher,
+            stop_project_file_watcher,
+            set_project_stdlib_path,
             call_tool,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-
-

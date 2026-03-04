@@ -6,9 +6,7 @@ edition = "2021"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-salsa = "0.18"
-mercurio-sysml-core = { path = "..\\..\\mercurio-sysml\\crates\\mercurio-sysml-core" }
-mercurio_sysml_pkg = { package = "mercurio-sysml", path = "..\\..\\mercurio-sysml" }
-mercurio-sysml-workspace = { path = "..\\..\\mercurio-sysml\\crates\\mercurio-sysml-workspace" }
-mercurio-sysml-semantics = { path = "..\\..\\mercurio-sysml\\crates\\mercurio-sysml-semantics" }
-mercurio-symbol-index = { path = "..\\mercurio-symbol-index" }
+mercurio-sysml-core = { path = "../../mercurio-sysml/crates/mercurio-sysml-core" }
+mercurio_sysml_pkg = { package = "mercurio-sysml", path = "../../mercurio-sysml" }
+mercurio-sysml-semantics = { path = "../../mercurio-sysml/crates/mercurio-sysml-semantics" }
+mercurio-symbol-index = { path = "../mercurio-symbol-index" }

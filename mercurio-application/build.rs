@@ -32,7 +32,10 @@ fn ensure_tauri_sidecar_name() -> Result<(), String> {
     };
 
     let source = workspace_root.join("target").join(&profile).join(bin_name);
-    let sidecar = workspace_root.join("target").join(&profile).join(sidecar_name);
+    let sidecar = workspace_root
+        .join("target")
+        .join(&profile)
+        .join(sidecar_name);
 
     println!("cargo:rerun-if-changed={}", source.display());
 

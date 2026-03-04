@@ -6,22 +6,18 @@ use tauri::command;
 
 use mercurio_core::{
     get_project_element_attributes as core_get_project_element_attributes,
-    get_project_model as core_get_project_model, query_semantic as core_query_semantic,
-    query_semantic_symbols as core_query_semantic_symbols,
-    get_stdlib_metamodel as core_get_stdlib_metamodel,
-    resolve_under_root, CoreState,
-    SemanticQuery,
+    get_project_expression_records as core_get_project_expression_records,
+    get_project_model as core_get_project_model, get_stdlib_metamodel as core_get_stdlib_metamodel,
+    load_library_symbols_sync as core_load_library_symbols_sync,
+    query_library_symbols as core_query_library_symbols,
+    query_project_semantic_element_by_qualified_name as core_query_project_semantic_element_by_qualified_name,
+    query_project_symbols as core_query_project_symbols,
+    query_project_symbols_for_files as core_query_project_symbols_for_files,
+    query_semantic as core_query_semantic, query_semantic_symbols as core_query_semantic_symbols,
+    resolve_under_root, CoreState, SemanticQuery,
 };
 
 use crate::{list_stdlib_versions_from_root, save_app_settings, AppState};
-
-#[derive(Serialize, Clone)]
-pub struct ToolDefinition {
-    pub name: String,
-    pub description: String,
-    pub input_schema: Value,
-    pub read_only: bool,
-}
 
 #[derive(Deserialize)]
 pub struct ToolCallPayload {
@@ -46,7 +42,10 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), 
                 .and_then(|n| n.to_str())
                 .unwrap_or_default()
                 .to_lowercase();
-            if matches!(name.as_str(), ".git" | "node_modules" | "target" | "dist" | "build") {
+            if matches!(
+                name.as_str(),
+                ".git" | "node_modules" | "target" | "dist" | "build"
+            ) {
                 continue;
             }
             collect_files(root, &path, out)?;
@@ -74,6 +73,19 @@ fn arg_optional_string(args: &Value, key: &str) -> Option<String> {
 
 fn arg_bool(args: &Value, key: &str, default: bool) -> bool {
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+}
+
+fn arg_string_list(args: &Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|entry| entry.as_str())
+                .map(|entry| entry.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 fn arg_usize(args: &Value, key: &str, default: usize) -> usize {
@@ -199,89 +211,6 @@ fn apply_patch_under_root(
     }))
 }
 
-pub fn tool_catalog() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            name: "fs.read_file@v1".to_string(),
-            description: "Read a UTF-8 text file under project root.".to_string(),
-            input_schema: json!({"type":"object","required":["root","path"]}),
-            read_only: true,
-        },
-        ToolDefinition {
-            name: "fs.list_dir@v1".to_string(),
-            description: "List directories and files under project root.".to_string(),
-            input_schema: json!({"type":"object","required":["root","path"]}),
-            read_only: true,
-        },
-        ToolDefinition {
-            name: "fs.search_text@v1".to_string(),
-            description: "Search text under project root.".to_string(),
-            input_schema: json!({"type":"object","required":["root","query"]}),
-            read_only: true,
-        },
-        ToolDefinition {
-            name: "fs.write_file@v1".to_string(),
-            description: "Write text file under project root.".to_string(),
-            input_schema: json!({"type":"object","required":["root","path","content"]}),
-            read_only: false,
-        },
-        ToolDefinition {
-            name: "fs.apply_patch@v1".to_string(),
-            description: "Replace text in a file under project root.".to_string(),
-            input_schema: json!({"type":"object","required":["root","path","find","replace"]}),
-            read_only: false,
-        },
-        ToolDefinition {
-            name: "core.query_semantic@v1".to_string(),
-            description: "Run semantic query for project root.".to_string(),
-            input_schema: json!({"type":"object","required":["root","query"]}),
-            read_only: true,
-        },
-        ToolDefinition {
-            name: "core.query_semantic_symbols@v1".to_string(),
-            description: "Get semantic symbols for project root.".to_string(),
-            input_schema: json!({"type":"object","required":["root"]}),
-            read_only: true,
-        },
-        ToolDefinition {
-            name: "core.get_project_model@v1".to_string(),
-            description: "Get project model projection.".to_string(),
-            input_schema: json!({"type":"object","required":["root"]}),
-            read_only: true,
-        },
-        ToolDefinition {
-            name: "core.get_project_element_attributes@v1".to_string(),
-            description: "Get explicit and inherited attributes for one element.".to_string(),
-            input_schema: json!({"type":"object","required":["root","element_qualified_name"]}),
-            read_only: true,
-        },
-        ToolDefinition {
-            name: "core.get_stdlib_metamodel@v1".to_string(),
-            description: "Get resolved stdlib metamodel projection.".to_string(),
-            input_schema: json!({"type":"object","required":["root"]}),
-            read_only: true,
-        },
-        ToolDefinition {
-            name: "stdlib.list_versions@v1".to_string(),
-            description: "List installed stdlib versions.".to_string(),
-            input_schema: json!({"type":"object","required":[]}),
-            read_only: true,
-        },
-        ToolDefinition {
-            name: "stdlib.get_default@v1".to_string(),
-            description: "Get configured default stdlib id.".to_string(),
-            input_schema: json!({"type":"object","required":[]}),
-            read_only: true,
-        },
-        ToolDefinition {
-            name: "stdlib.set_default@v1".to_string(),
-            description: "Set configured default stdlib id.".to_string(),
-            input_schema: json!({"type":"object","required":[]}),
-            read_only: false,
-        },
-    ]
-}
-
 fn canonical_tool_name(tool: &str) -> String {
     let normalized = tool.trim().to_ascii_lowercase();
     match normalized.as_str() {
@@ -296,6 +225,21 @@ fn canonical_tool_name(tool: &str) -> String {
         "query_semantic" | "core.query_semantic" => "core.query_semantic@v1".to_string(),
         "query_semantic_symbols" | "core.query_semantic_symbols" => {
             "core.query_semantic_symbols@v1".to_string()
+        }
+        "query_project_symbols" | "core.query_project_symbols" => {
+            "core.query_project_symbols@v1".to_string()
+        }
+        "query_project_symbols_for_files" | "core.query_project_symbols_for_files" => {
+            "core.query_project_symbols_for_files@v1".to_string()
+        }
+        "query_library_symbols" | "core.query_library_symbols" => {
+            "core.query_library_symbols@v1".to_string()
+        }
+        "load_library_symbols" | "core.load_library_symbols" => {
+            "core.load_library_symbols@v1".to_string()
+        }
+        "query_semantic_element" | "core.query_semantic_element" => {
+            "core.query_semantic_element@v1".to_string()
         }
         "get_project_model" | "core.get_project_model" => "core.get_project_model@v1".to_string(),
         "get_project_element_attributes" | "core.get_project_element_attributes" => {
@@ -316,6 +260,7 @@ fn canonical_tool_name(tool: &str) -> String {
 
 pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Value, String> {
     let tool = canonical_tool_name(tool);
+    let _background_job = core.try_start_background_job("tool", Some(tool.clone()), None);
     match tool.as_str() {
         "fs.read_file@v1" => {
             let root = root_from_args(&args)?;
@@ -369,19 +314,121 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
                 .map_err(|e| e.to_string())?
                 .and_then(|rows| serde_json::to_value(rows).map_err(|e| e.to_string()))
         }
+        "core.query_project_symbols@v1" => {
+            let root = arg_string(&args, "root")?;
+            let file_path = arg_optional_string(&args, "file_path");
+            let offset = args
+                .get("offset")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok());
+            let limit = args
+                .get("limit")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok());
+            tauri::async_runtime::spawn_blocking(move || {
+                core_query_project_symbols(&core, root, file_path, offset, limit)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|rows| serde_json::to_value(rows).map_err(|e| e.to_string()))
+        }
+        "core.query_project_symbols_for_files@v1" => {
+            let root = arg_string(&args, "root")?;
+            let file_paths = arg_string_list(&args, "file_paths");
+            let offset = args
+                .get("offset")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok());
+            let limit = args
+                .get("limit")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok());
+            tauri::async_runtime::spawn_blocking(move || {
+                core_query_project_symbols_for_files(&core, root, file_paths, offset, limit)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|rows| serde_json::to_value(rows).map_err(|e| e.to_string()))
+        }
+        "core.query_library_symbols@v1" => {
+            let root = arg_string(&args, "root")?;
+            let file_path = arg_optional_string(&args, "file_path");
+            let offset = args
+                .get("offset")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok());
+            let limit = args
+                .get("limit")
+                .and_then(|value| value.as_u64())
+                .and_then(|value| usize::try_from(value).ok());
+            tauri::async_runtime::spawn_blocking(move || {
+                core_query_library_symbols(&core, root, file_path, offset, limit)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|rows| serde_json::to_value(rows).map_err(|e| e.to_string()))
+        }
+        "core.load_library_symbols@v1" => {
+            let root = arg_string(&args, "root")?;
+            let file_path = arg_optional_string(&args, "file_path").map(PathBuf::from);
+            let include_symbols = arg_bool(&args, "include_symbols", true);
+            tauri::async_runtime::spawn_blocking(move || {
+                core_load_library_symbols_sync(&core, root, file_path, include_symbols)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|rows| serde_json::to_value(rows).map_err(|e| e.to_string()))
+        }
+        "core.query_semantic_element@v1" => {
+            let root = arg_string(&args, "root")?;
+            let qualified_name = arg_string(&args, "qualified_name")?;
+            let file_path = arg_optional_string(&args, "file_path");
+            tauri::async_runtime::spawn_blocking(move || {
+                core_query_project_semantic_element_by_qualified_name(
+                    &core,
+                    root,
+                    qualified_name,
+                    file_path,
+                )
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|row| serde_json::to_value(row).map_err(|e| e.to_string()))
+        }
         "core.get_project_model@v1" => {
             let root = arg_string(&args, "root")?;
-            tauri::async_runtime::spawn_blocking(move || core_get_project_model(&core, root))
-                .await
-                .map_err(|e| e.to_string())?
-                .and_then(|model| serde_json::to_value(model).map_err(|e| e.to_string()))
+            tauri::async_runtime::spawn_blocking(move || {
+                let model = core_get_project_model(&core, root.clone())?;
+                let expressions = core_get_project_expression_records(&core, root)?;
+                Ok::<_, String>((model, expressions))
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|(model, expressions)| {
+                let mut value = serde_json::to_value(model).map_err(|e| e.to_string())?;
+                if let Value::Object(ref mut obj) = value {
+                    obj.insert(
+                        "expression_records".to_string(),
+                        serde_json::to_value(expressions.records).map_err(|e| e.to_string())?,
+                    );
+                    if let Some(err) = expressions.error {
+                        obj.insert("expression_records_error".to_string(), Value::String(err));
+                    }
+                }
+                Ok(value)
+            })
         }
         "core.get_project_element_attributes@v1" => {
             let root = arg_string(&args, "root")?;
             let element_qualified_name = arg_string(&args, "element_qualified_name")?;
             let symbol_kind = arg_optional_string(&args, "symbol_kind");
             tauri::async_runtime::spawn_blocking(move || {
-                core_get_project_element_attributes(&core, root, element_qualified_name, symbol_kind)
+                core_get_project_element_attributes(
+                    &core,
+                    root,
+                    element_qualified_name,
+                    symbol_kind,
+                )
             })
             .await
             .map_err(|e| e.to_string())?
@@ -396,11 +443,6 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
         }
         _ => Err(format!("Unknown tool '{}'", tool)),
     }
-}
-
-#[command]
-pub fn list_tools() -> Result<Vec<ToolDefinition>, String> {
-    Ok(tool_catalog())
 }
 
 #[command]
