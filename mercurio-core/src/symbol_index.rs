@@ -14,6 +14,7 @@ pub struct IndexedSymbolView {
     pub scope: String,
     pub name: String,
     pub qualified_name: String,
+    pub parent_qualified_name: Option<String>,
     pub kind: String,
     pub metatype_qname: Option<String>,
     pub file_path: String,
@@ -64,6 +65,7 @@ fn to_view(record: SymbolRecord) -> IndexedSymbolView {
         },
         name: record.name,
         qualified_name: record.qualified_name,
+        parent_qualified_name: record.parent_qualified_name,
         kind: record.kind,
         metatype_qname: record.metatype_qname,
         file_path: record.file_path,
@@ -252,7 +254,8 @@ pub fn query_project_semantic_element_by_qualified_name(
         .lock()
         .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
 
-    let mut fallback: Option<IndexedSemanticElementView> = None;
+    let mut exact_file_candidates = Vec::<IndexedSemanticElementView>::new();
+    let mut fallback_candidates = Vec::<IndexedSemanticElementView>::new();
     for (key, entry) in cache.iter() {
         if !key.starts_with(&root_prefix) {
             continue;
@@ -268,18 +271,21 @@ pub fn query_project_semantic_element_by_qualified_name(
             if let Some(requested_key) = requested_file_key.as_ref() {
                 let candidate_key = normalized_compare_key(Path::new(&view.file_path));
                 if &candidate_key == requested_key {
-                    return Ok(Some(view));
-                }
-                if fallback.is_none() {
-                    fallback = Some(view);
+                    exact_file_candidates.push(view);
+                } else {
+                    fallback_candidates.push(view);
                 }
             } else {
-                return Ok(Some(view));
+                fallback_candidates.push(view);
             }
         }
     }
 
-    Ok(fallback)
+    if !exact_file_candidates.is_empty() {
+        return Ok(select_best_semantic_candidate(exact_file_candidates));
+    }
+
+    Ok(select_best_semantic_candidate(fallback_candidates))
 }
 
 fn semantic_element_to_indexed_view(
@@ -313,6 +319,49 @@ fn semantic_element_to_indexed_view(
     }
 }
 
+fn select_best_semantic_candidate(
+    mut candidates: Vec<IndexedSemanticElementView>,
+) -> Option<IndexedSemanticElementView> {
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort_by(|a, b| {
+        semantic_candidate_score(b)
+            .cmp(&semantic_candidate_score(a))
+            .then(a.file_path.cmp(&b.file_path))
+            .then(a.qualified_name.cmp(&b.qualified_name))
+            .then(a.name.cmp(&b.name))
+    });
+    candidates.into_iter().next()
+}
+
+fn semantic_candidate_score(candidate: &IndexedSemanticElementView) -> usize {
+    let mut score = candidate.attributes.len();
+    let metatype_present = candidate
+        .attributes
+        .get("metatype_qname")
+        .or_else(|| candidate.attributes.get("emf::metatype"))
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    if metatype_present {
+        score += 500;
+    }
+    let metatype_source = candidate
+        .attributes
+        .get("metatype_source")
+        .or_else(|| candidate.attributes.get("mercurio::metatypeSource"))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !metatype_source.is_empty() {
+        if metatype_source == "unresolved" {
+            score = score.saturating_sub(200);
+        } else {
+            score += 200;
+        }
+    }
+    score
+}
+
 fn normalized_compare_key(path: &Path) -> String {
     let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     normalized
@@ -325,8 +374,8 @@ fn normalized_compare_key(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::{
-        compile_project_delta_sync, compile_workspace_sync, load_library_symbols_sync,
-        settings::AppSettings, CoreState,
+        compile_project_delta_sync, compile_project_delta_sync_with_options,
+        compile_workspace_sync, load_library_symbols_sync, settings::AppSettings, CoreState,
     };
     use std::fs;
     use std::path::Path;
@@ -358,8 +407,11 @@ mod tests {
             "standard library package KerML { doc /* d */ package Root { metaclass Action specializes Element {} } }",
         )
         .expect("write library file");
-        fs::write(project_dir.join("main.sysml"), "package P { action def DoThing; }\n")
-            .expect("write project file");
+        fs::write(
+            project_dir.join("main.sysml"),
+            "package P { action def DoThing; }\n",
+        )
+        .expect("write project file");
         fs::write(
             project_dir.join(".project"),
             format!(
@@ -410,11 +462,8 @@ mod tests {
         .expect("query by mapped metatype");
         assert!(!mapped_symbols.is_empty());
 
-        let docs = query_stdlib_documentation_symbols(
-            &state,
-            normalized_compare_key(&library_dir),
-        )
-        .expect("query docs");
+        let docs = query_stdlib_documentation_symbols(&state, normalized_compare_key(&library_dir))
+            .expect("query docs");
         assert!(!docs.is_empty());
 
         let all_stdlib = query_library_symbols(
@@ -518,14 +567,9 @@ mod tests {
         assert!(library_full.ok);
         assert!(!library_full.symbols.is_empty());
 
-        let indexed_library = query_library_symbols(
-            &state,
-            project_root,
-            None,
-            Some(0),
-            Some(10_000),
-        )
-        .expect("query indexed library symbols");
+        let indexed_library =
+            query_library_symbols(&state, project_root, None, Some(0), Some(10_000))
+                .expect("query indexed library symbols");
         assert!(!indexed_library.is_empty());
 
         let _ = fs::remove_dir_all(root);
@@ -540,8 +584,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("mercurio_semantic_qname_lookup_{stamp}"));
         let project_dir = root.join("project");
         fs::create_dir_all(&project_dir).expect("create project dir");
-        fs::write(project_dir.join("main.sysml"), "package P { action def DoThing; }\n")
-            .expect("write project file");
+        fs::write(
+            project_dir.join("main.sysml"),
+            "package P { action def DoThing; }\n",
+        )
+        .expect("write project file");
         fs::write(
             project_dir.join(".project"),
             "{\"name\":\"lookup\",\"src\":[\"*.sysml\"]}",
@@ -571,7 +618,10 @@ mod tests {
         .expect("semantic row exists");
         assert_eq!(found.qualified_name, "P");
         assert_eq!(
-            found.attributes.get("emf::qualifiedName").map(|value| value.as_str()),
+            found
+                .attributes
+                .get("emf::qualifiedName")
+                .map(|value| value.as_str()),
             Some("P")
         );
 
@@ -593,7 +643,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("mercurio_semantic_qname_file_lookup_{stamp}"));
+        let root =
+            std::env::temp_dir().join(format!("mercurio_semantic_qname_file_lookup_{stamp}"));
         let project_dir = root.join("project");
         fs::create_dir_all(&project_dir).expect("create project dir");
         let left = project_dir.join("left.sysml");
@@ -636,6 +687,165 @@ mod tests {
     }
 
     #[test]
+    fn query_project_semantic_element_resolves_package_metatype_in_delta_compile_without_symbols() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir()
+            .join(format!("mercurio_semantic_pkg_metatype_delta_no_symbols_{stamp}"));
+        let library_dir = root.join("stdlib");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&library_dir).expect("create library dir");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(
+            library_dir.join("Kernel.kerml"),
+            "standard library package Kernel { package Root { metaclass Element {} metaclass PackageDefinition specializes Element {} metaclass ActionDefinition specializes Element {} } }",
+        )
+        .expect("write stdlib file");
+        let main_file = project_dir.join("main.sysml");
+        fs::write(
+            &main_file,
+            "package P { action def Focus { out xrsl: Exposure; } }\n",
+        )
+        .expect("write project file");
+        fs::write(
+            project_dir.join(".project"),
+            format!(
+                "{{\"name\":\"semantic-pkg\",\"library\":{{\"path\":\"{}\"}},\"src\":[\"*.sysml\"]}}",
+                library_dir.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let project_root = project_dir.to_string_lossy().to_string();
+        let response = compile_project_delta_sync_with_options(
+            &state,
+            project_root.clone(),
+            901,
+            true,
+            None,
+            Vec::new(),
+            false,
+            |_| {},
+        )
+        .expect("delta compile");
+        assert!(response.ok);
+        assert_eq!(response.symbols.len(), 0);
+        assert!(response.stdlib_file_count >= 1);
+
+        let package = query_project_semantic_element_by_qualified_name(
+            &state,
+            project_root.clone(),
+            "P".to_string(),
+            Some(main_file.to_string_lossy().to_string()),
+        )
+        .expect("query package semantic row")
+        .expect("package semantic row");
+        assert_eq!(
+            package
+                .attributes
+                .get("metatype_source")
+                .map(|value| value.as_str()),
+            Some("inferred-kind")
+        );
+        assert!(
+            package
+                .attributes
+                .get("metatype_qname")
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false),
+            "package metatype_qname should be present"
+        );
+
+        let action = query_project_semantic_element_by_qualified_name(
+            &state,
+            project_root,
+            "P::Focus".to_string(),
+            Some(main_file.to_string_lossy().to_string()),
+        )
+        .expect("query action semantic row")
+        .expect("action semantic row");
+        assert_eq!(
+            action
+                .attributes
+                .get("metatype_source")
+                .map(|value| value.as_str()),
+            Some("inferred-kind")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_project_semantic_element_prefers_resolved_candidate_without_file_hint() {
+        let state = CoreState::new(
+            std::env::temp_dir().join("mercurio_semantic_candidate_pref"),
+            AppSettings::default(),
+        );
+        let project_root = "C:\\tmp\\semantic-candidate-pref".to_string();
+        let unresolved = mercurio_sysml_semantics::semantic_contract::SemanticElementView {
+            name: "P".to_string(),
+            qualified_name: "P".to_string(),
+            metatype_qname: None,
+            file_path: "C:\\tmp\\left.sysml".to_string(),
+            attributes: std::collections::HashMap::from([
+                ("metatype_source".to_string(), "unresolved".to_string()),
+                ("kind".to_string(), "Package".to_string()),
+            ]),
+        };
+        let resolved = mercurio_sysml_semantics::semantic_contract::SemanticElementView {
+            name: "P".to_string(),
+            qualified_name: "P".to_string(),
+            metatype_qname: Some("sysml::Package".to_string()),
+            file_path: "C:\\tmp\\right.sysml".to_string(),
+            attributes: std::collections::HashMap::from([
+                ("metatype_source".to_string(), "inferred-kind".to_string()),
+                ("metatype_qname".to_string(), "sysml::Package".to_string()),
+                ("kind".to_string(), "Package".to_string()),
+            ]),
+        };
+        {
+            let mut cache = state
+                .workspace_snapshot_cache
+                .lock()
+                .expect("workspace cache lock");
+            cache.insert(
+                format!("project-semantic|{}|a", project_root),
+                WorkspaceSnapshotCacheEntry::ProjectSemantic(std::sync::Arc::new(vec![unresolved])),
+            );
+            cache.insert(
+                format!("project-semantic|{}|b", project_root),
+                WorkspaceSnapshotCacheEntry::ProjectSemantic(std::sync::Arc::new(vec![resolved])),
+            );
+        }
+
+        let found = query_project_semantic_element_by_qualified_name(
+            &state,
+            project_root,
+            "P".to_string(),
+            None,
+        )
+        .expect("semantic query")
+        .expect("semantic row");
+        assert_eq!(
+            found
+                .attributes
+                .get("metatype_source")
+                .map(|value| value.as_str()),
+            Some("inferred-kind")
+        );
+        assert_eq!(
+            found
+                .attributes
+                .get("metatype_qname")
+                .map(|value| value.as_str()),
+            Some("sysml::Package")
+        );
+    }
+
+    #[test]
     fn query_project_symbols_for_files_returns_combined_rows() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -647,7 +857,8 @@ mod tests {
         let left = project_dir.join("left.sysml");
         let right = project_dir.join("right.sysml");
         fs::write(&left, "package LeftPkg { action def LeftAction; }\n").expect("write left file");
-        fs::write(&right, "package RightPkg { action def RightAction; }\n").expect("write right file");
+        fs::write(&right, "package RightPkg { action def RightAction; }\n")
+            .expect("write right file");
         fs::write(
             project_dir.join(".project"),
             "{\"name\":\"batch\",\"src\":[\"*.sysml\"]}",

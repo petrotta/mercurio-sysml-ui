@@ -25,10 +25,7 @@ fn main() {
         }
     };
 
-    let root = std::env::temp_dir().join(format!(
-        "mercurio_stdlib_bench_{}",
-        std::process::id()
-    ));
+    let root = std::env::temp_dir().join(format!("mercurio_stdlib_bench_{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     if let Err(err) = fs::create_dir_all(&root) {
         eprintln!("Failed to create temp root: {err}");

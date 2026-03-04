@@ -133,7 +133,8 @@ impl StdlibMetamodelDiagnostics {
     }
 
     fn record_phase(&mut self, phase: &str, duration: Duration) {
-        self.phase_timings.push(PhaseTimingView::new(phase, duration));
+        self.phase_timings
+            .push(PhaseTimingView::new(phase, duration));
     }
 }
 
@@ -171,7 +172,9 @@ pub fn get_stdlib_metamodel(
         .ok()
         .and_then(|settings| settings.default_stdlib.clone());
 
-    let project_config = crate::project::load_project_config(&root_path).ok().flatten();
+    let project_config = crate::project::load_project_config(&root_path)
+        .ok()
+        .flatten();
     let library_config = project_config
         .as_ref()
         .and_then(|config| config.library.as_ref());
@@ -246,9 +249,8 @@ pub fn get_stdlib_metamodel(
             duplicates = built_duplicates;
         }
     } else if diagnostics.failure_reason.is_none() {
-        diagnostics.failure_reason = Some(
-            "Unable to resolve a stdlib path for the requested project root".to_string(),
-        );
+        diagnostics.failure_reason =
+            Some("Unable to resolve a stdlib path for the requested project root".to_string());
     }
 
     types.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
@@ -319,7 +321,11 @@ fn read_stdlib_file_text(vfs: &Vfs, path: &Path) -> Option<String> {
 fn collect_stdlib_cache_snapshot(
     state: &CoreState,
     normalized_stdlib_key: Option<&str>,
-) -> (Vec<StdlibCacheSummary>, Option<String>, Option<Arc<MetatypeIndex>>) {
+) -> (
+    Vec<StdlibCacheSummary>,
+    Option<String>,
+    Option<Arc<MetatypeIndex>>,
+) {
     match state.workspace_snapshot_cache.try_lock() {
         Ok(cache) => {
             let stdlib_entries = cache
@@ -403,9 +409,9 @@ fn metamodel_type_from_info(
         declared_supertypes: info.bases.clone(),
         supertypes,
         documentation: info.doc.clone(),
-    modifiers: default_modifiers(),
-    attributes,
-}
+        modifiers: default_modifiers(),
+        attributes,
+    }
 }
 
 fn collect_duplicate_qualified_names(types: &[MetamodelTypeView]) -> Vec<String> {

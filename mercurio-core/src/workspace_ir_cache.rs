@@ -200,8 +200,15 @@ mod tests {
                 None
             },
             scope,
-            name: qualified_name.rsplit("::").next().unwrap_or(qualified_name).to_string(),
+            name: qualified_name
+                .rsplit("::")
+                .next()
+                .unwrap_or(qualified_name)
+                .to_string(),
             qualified_name: qualified_name.to_string(),
+            parent_qualified_name: qualified_name
+                .rsplit_once("::")
+                .map(|(parent, _)| parent.to_string()),
             kind: "Package".to_string(),
             metatype_qname: Some("KerML::Kernel::Package".to_string()),
             file_path: file_path.to_string(),
@@ -254,16 +261,14 @@ mod tests {
         persist_workspace_ir_cache(&state, &project_root, Some("sig-a"))
             .expect("persist workspace cache");
 
-        state
-            .clear_runtime_caches()
-            .expect("clear runtime caches");
+        state.clear_runtime_caches().expect("clear runtime caches");
         {
             let store = state.symbol_index.lock().expect("index lock");
             assert!(store.project_symbols(&project_root, None).is_empty());
         }
 
-        let seeded =
-            seed_symbol_index_from_workspace_ir_cache(&state, &project_root).expect("seed from cache");
+        let seeded = seed_symbol_index_from_workspace_ir_cache(&state, &project_root)
+            .expect("seed from cache");
         assert!(seeded);
         {
             let store = state.symbol_index.lock().expect("index lock");

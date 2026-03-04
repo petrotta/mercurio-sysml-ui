@@ -7,11 +7,17 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { RECENTS_KEY, ROOT_STORAGE_KEY, THEME_KEY } from "./app/constants";
 import { useProjectTree } from "./app/useProjectTree";
-import { readFileText } from "./app/fileOps";
+import {
+  type ProjectFilesChangedEvent,
+  readFileText,
+  startProjectFileWatcher,
+  stopProjectFileWatcher,
+} from "./app/fileOps";
 import { useCompileRunner } from "./app/useCompileRunner";
 import { useSemanticSelection } from "./app/useSemanticSelection";
 import { getDefaultStdlib, getProjectModel } from "./app/services/semanticApi";
-import { CombinedPropertiesPane } from "./app/components/CombinedPropertiesPane";
+import { PropertiesPanel } from "./app/components/PropertiesPanel";
+import { ParseErrorsPanel } from "./app/components/ParseErrorsPanel";
 import { parseErrorLocation } from "./app/parseErrors";
 import type { FileEntry, SymbolView } from "./app/types";
 
@@ -47,6 +53,12 @@ type EditorTab = {
 };
 
 type TabContextMenuState = {
+  path: string;
+  x: number;
+  y: number;
+};
+
+type FileContextMenuState = {
   path: string;
   x: number;
   y: number;
@@ -90,6 +102,7 @@ type StdlibPathOption = {
 };
 
 const FILE_SYMBOL_RENDER_LIMIT = 300;
+const TAB_DROPDOWN_THRESHOLD = 12;
 const HARNESS_COMPILE_BUDGET_MS = 2000;
 const HARNESS_PROGRESS_UPDATE_BUDGET = 24;
 const SYSML_LANGUAGE_ID = "mercurio-sysml";
@@ -101,6 +114,14 @@ const RIGHT_PANE_WIDTH_KEY = "mercurio.simpleUi.rightPaneWidth";
 const DEFAULT_RIGHT_PANE_WIDTH = 420;
 const RIGHT_PANE_MIN_WIDTH = 300;
 const RIGHT_PANE_MAX_WIDTH = 820;
+const RIGHT_PANEL_SPLIT_KEY = "mercurio.simpleUi.rightPanelSplitRatio";
+const RIGHT_PANEL_SPLIT_MIN = 0.12;
+const RIGHT_PANEL_SPLIT_MAX = 0.88;
+const DEFAULT_RIGHT_PANEL_SPLIT = 0.66;
+const CENTER_HARNESS_SPLIT_KEY = "mercurio.simpleUi.centerHarnessSplitRatio";
+const CENTER_HARNESS_SPLIT_MIN = 0.08;
+const CENTER_HARNESS_SPLIT_MAX = 0.82;
+const DEFAULT_CENTER_HARNESS_SPLIT = 0.34;
 const CENTER_PANE_MIN_WIDTH = 480;
 const MAIN_LAYOUT_NON_CONTENT_WIDTH = 32;
 const MAX_RECENT_PROJECTS = 12;
@@ -108,6 +129,7 @@ const RECENT_PROJECT_BROWSE_VALUE = "__browse__";
 const BUILD_PROGRESS_VISIBLE_KEY = "mercurio.simpleUi.buildProgressVisible";
 const HARNESS_COLLAPSED_KEY = "mercurio.simpleUi.harnessCollapsed";
 const STDLIB_PATH_OPTIONS_KEY = "mercurio.simpleUi.stdlibPathOptions";
+const PROJECT_FILES_SHOW_BY_FILE_KEY = "mercurio.simpleUi.projectFilesShowByFile";
 const PARSE_MARKER_OWNER = "mercurio.parse";
 let sysmlLanguageRegistered = false;
 
@@ -153,6 +175,27 @@ function parseLeftPaneWidth(raw: string | null, viewportWidth: number, rightPane
 function parseRightPaneWidth(raw: string | null, viewportWidth: number, leftPaneWidth: number): number {
   const parsed = Number(raw || "");
   return clampRightPaneWidth(parsed, viewportWidth, leftPaneWidth);
+}
+
+function parseRightPanelSplitRatio(raw: string | null): number {
+  const parsed = Number(raw || "");
+  if (!Number.isFinite(parsed)) return DEFAULT_RIGHT_PANEL_SPLIT;
+  const value = parsed > 1 && parsed <= 100 ? parsed / 100 : parsed;
+  if (!Number.isFinite(value)) return DEFAULT_RIGHT_PANEL_SPLIT;
+  return Math.max(RIGHT_PANEL_SPLIT_MIN, Math.min(RIGHT_PANEL_SPLIT_MAX, value));
+}
+
+function parseCenterHarnessSplitRatio(raw: string | null): number {
+  const parsed = Number(raw || "");
+  if (!Number.isFinite(parsed)) return DEFAULT_CENTER_HARNESS_SPLIT;
+  const value = parsed > 1 && parsed <= 100 ? parsed / 100 : parsed;
+  if (!Number.isFinite(value)) return DEFAULT_CENTER_HARNESS_SPLIT;
+  return Math.max(CENTER_HARNESS_SPLIT_MIN, Math.min(CENTER_HARNESS_SPLIT_MAX, value));
+}
+
+function clampCenterHarnessSplitRatio(next: number): number {
+  const value = Number.isFinite(next) ? next : DEFAULT_CENTER_HARNESS_SPLIT;
+  return Math.max(CENTER_HARNESS_SPLIT_MIN, Math.min(CENTER_HARNESS_SPLIT_MAX, value));
 }
 
 function readRecentProjects(): string[] {
@@ -279,14 +322,6 @@ function compareSymbols(a: SymbolView, b: SymbolView): number {
   return (a.kind || "").localeCompare(b.kind || "");
 }
 
-function parentQualifiedName(qualifiedName: string | null | undefined): string {
-  const value = (qualifiedName || "").trim();
-  if (!value) return "";
-  const idx = value.lastIndexOf("::");
-  if (idx <= 0) return "";
-  return value.slice(0, idx);
-}
-
 function buildSymbolOwnershipTree(symbols: SymbolView[]): SymbolTreeNode[] {
   if (!symbols.length) return [];
   const nodes: SymbolTreeNode[] = symbols.map((symbol) => ({ symbol, children: [] }));
@@ -304,34 +339,13 @@ function buildSymbolOwnershipTree(symbols: SymbolView[]): SymbolTreeNode[] {
 
   const rootIndices: number[] = [];
   symbols.forEach((symbol, index) => {
-    const parentQname = parentQualifiedName(symbol.qualified_name);
+    const parentQname = (symbol.parent_qualified_name || "").trim();
     if (!parentQname) {
       rootIndices.push(index);
       return;
     }
     const candidates = qnameToIndices.get(parentQname) || [];
-    let parentIndex = -1;
-    const childLine = symbol.start_line || 0;
-    for (const candidateIndex of candidates) {
-      if (candidateIndex === index) continue;
-      const candidateLine = symbols[candidateIndex]?.start_line || 0;
-      if (candidateLine <= childLine) {
-        if (parentIndex < 0) {
-          parentIndex = candidateIndex;
-        } else {
-          const previousLine = symbols[parentIndex]?.start_line || 0;
-          if (candidateLine >= previousLine) {
-            parentIndex = candidateIndex;
-          }
-        }
-      }
-    }
-    if (parentIndex < 0 && candidates.length) {
-      const fallback = candidates[candidates.length - 1];
-      if (fallback !== undefined && fallback !== index) {
-        parentIndex = fallback;
-      }
-    }
+    const parentIndex = candidates.find((candidateIndex) => candidateIndex !== index) ?? -1;
     if (parentIndex >= 0) {
       nodes[parentIndex]?.children.push(nodes[index]);
     } else {
@@ -358,6 +372,59 @@ function fileExtension(path: string | null | undefined): string {
 
 function displayNameForPath(path: string): string {
   return path.split(/[\\/]/).pop() || path;
+}
+
+function treeNodeIcon(isDir: boolean): string {
+  return isDir ? "📁" : "📄";
+}
+
+function symbolKindIcon(kind: string | null | undefined): string {
+  const normalized = (kind || "").toLowerCase();
+  if (normalized.includes("package")) return "📦";
+  if (normalized.includes("namespace")) return "🧭";
+  if (normalized.includes("partdefinition") || normalized.includes("partusage") || normalized === "part") return "🧩";
+  if (normalized.includes("actiondefinition") || normalized.includes("actionusage") || normalized === "action") return "⚡";
+  if (normalized.includes("function")) return "ƒ";
+  if (normalized.includes("import")) return "⬇";
+  if (
+    normalized.includes("connector") ||
+    normalized.includes("association") ||
+    normalized.includes("associationend")
+  ) {
+    return "🔗";
+  }
+  if (
+    normalized.includes("attribute") ||
+    normalized.includes("feature") ||
+    normalized.includes("property") ||
+    normalized.includes("reference")
+  ) {
+    return "🏷";
+  }
+  if (
+    normalized.includes("interface") ||
+    normalized.includes("definition") ||
+    normalized.includes("usage") ||
+    normalized.includes("type")
+  ) {
+    return "◼";
+  }
+  return "•";
+}
+
+function shortMetatypeName(metatypeQname: string | null | undefined): string {
+  const raw = (metatypeQname || "").trim();
+  if (!raw) return "";
+  const withoutRootPrefix = raw.replace(/^(sysml|kerml)::/i, "");
+  const parts = withoutRootPrefix.split("::").filter(Boolean);
+  if (!parts.length) return withoutRootPrefix;
+  return parts[parts.length - 1] || withoutRootPrefix;
+}
+
+function symbolKindLabel(symbol: SymbolView): string {
+  const metatypeLabel = shortMetatypeName(symbol.metatype_qname);
+  if (metatypeLabel) return metatypeLabel;
+  return symbol.kind || "?";
 }
 
 function parseErrorToMarker(
@@ -505,7 +572,6 @@ export function App() {
   const [selectedSymbol, setSelectedSymbol] = useState<SymbolView | null>(null);
   const [semanticSelectedQname, setSemanticSelectedQname] = useState("");
   const [harnessRuns, setHarnessRuns] = useState<HarnessRun[]>([]);
-  const [harnessRunning, setHarnessRunning] = useState(false);
   const [harnessCollapsed, setHarnessCollapsed] = useState<boolean>(() =>
     window.localStorage?.getItem(HARNESS_COLLAPSED_KEY) === "1",
   );
@@ -516,15 +582,26 @@ export function App() {
   });
   const [expandedFileSymbols, setExpandedFileSymbols] = useState<Record<string, boolean>>({});
   const [expandedLibraryFiles, setExpandedLibraryFiles] = useState<Record<string, boolean>>({});
+  const [collapsedSymbolNodes, setCollapsedSymbolNodes] = useState<Record<string, boolean>>({});
+  const [expandedProjectElementsOverflow, setExpandedProjectElementsOverflow] = useState(false);
+  const [expandedProjectFileSymbolOverflow, setExpandedProjectFileSymbolOverflow] = useState<Record<string, boolean>>({});
+  const [expandedLibraryFileSymbolOverflow, setExpandedLibraryFileSymbolOverflow] = useState<Record<string, boolean>>({});
+  const [collapsedParseErrorFiles, setCollapsedParseErrorFiles] = useState<Record<string, boolean>>({});
   const [projectFilesExpanded, setProjectFilesExpanded] = useState(true);
+  const [projectFilesShowByFile, setProjectFilesShowByFile] = useState<boolean>(() =>
+    window.localStorage?.getItem(PROJECT_FILES_SHOW_BY_FILE_KEY) !== "0",
+  );
   const [libraryFilesExpanded, setLibraryFilesExpanded] = useState(true);
   const [menuOpen, setMenuOpen] = useState<"file" | "build" | "settings" | "help" | null>(null);
   const [stdlibManagerOpen, setStdlibManagerOpen] = useState(false);
+  const [aboutWindowOpen, setAboutWindowOpen] = useState(false);
+  const [projectFilesSettingsMenuOpen, setProjectFilesSettingsMenuOpen] = useState(false);
   const [stdlibPathOptions, setStdlibPathOptions] = useState<StdlibPathOption[]>(() => readStdlibPathOptions());
   const [dialogActiveStdlibPath, setDialogActiveStdlibPath] = useState("");
   const [dialogDefaultStdlibId, setDialogDefaultStdlibId] = useState<string | null>(null);
   const [dialogStdlibMetaLoading, setDialogStdlibMetaLoading] = useState(false);
   const [tabContextMenu, setTabContextMenu] = useState<TabContextMenuState | null>(null);
+  const [fileContextMenu, setFileContextMenu] = useState<FileContextMenuState | null>(null);
   const [tabsOverflow, setTabsOverflow] = useState(false);
   const [tabsOverflowMenuOpen, setTabsOverflowMenuOpen] = useState(false);
   const [dragTabPath, setDragTabPath] = useState<string | null>(null);
@@ -540,14 +617,25 @@ export function App() {
       initialRightPaneWidth,
     ),
   );
+  const [rightPanelSplitRatio, setRightPanelSplitRatio] = useState<number>(() =>
+    parseRightPanelSplitRatio(window.localStorage?.getItem(RIGHT_PANEL_SPLIT_KEY)),
+  );
+  const [centerHarnessSplitRatio, setCenterHarnessSplitRatio] = useState<number>(() =>
+    parseCenterHarnessSplitRatio(window.localStorage?.getItem(CENTER_HARNESS_SPLIT_KEY)),
+  );
   const [leftPaneDragging, setLeftPaneDragging] = useState(false);
   const [rightPaneDragging, setRightPaneDragging] = useState(false);
+  const [rightPanelSplitDragging, setRightPanelSplitDragging] = useState(false);
+  const [centerHarnessSplitDragging, setCenterHarnessSplitDragging] = useState(false);
+  const shouldShowTabDropdown = tabsOverflow || openTabs.length > TAB_DROPDOWN_THRESHOLD;
 
   const {
     treeEntries,
     expanded,
     refreshRoot,
     toggleExpand,
+    expandAll,
+    collapseAll,
   } = useProjectTree();
 
   const {
@@ -587,15 +675,26 @@ export function App() {
   const fileOpenReqRef = useRef(0);
   const contentRef = useRef("");
   const harnessRunIdRef = useRef(0);
-  const harnessActiveRef = useRef(false);
   const progressUiUpdatesRef = useRef(0);
   const cursorFlushTimerRef = useRef<number | undefined>(undefined);
   const pendingCursorRef = useRef<{ line: number; col: number } | null>(null);
   const leftPaneWidthRef = useRef(leftPaneWidth);
   const rightPaneWidthRef = useRef(rightPaneWidth);
   const tabsStripRef = useRef<HTMLDivElement | null>(null);
-  const leftPaneDragRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
-  const rightPaneDragRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
+const rightPanelRef = useRef<HTMLElement | null>(null);
+const centerPanelRef = useRef<HTMLElement | null>(null);
+const leftPaneDragRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
+const rightPaneDragRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
+const rightPanelSplitDragRef = useRef<{
+  pointerId: number | null;
+  startY: number;
+  startRatio: number;
+  captureTarget: HTMLElement | null;
+} | null>(null);
+const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; startRatio: number } | null>(null);
+  const projectFilesChangedTimerRef = useRef<number | undefined>(undefined);
+  const projectWatcherRootRef = useRef("");
+  const projectFilesSettingsButtonRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     dirtyRef.current = dirty;
@@ -639,6 +738,18 @@ export function App() {
   }, [recentProjects]);
 
   useEffect(() => {
+    window.localStorage?.setItem(RIGHT_PANEL_SPLIT_KEY, String(Math.round(rightPanelSplitRatio * 1000) / 1000));
+  }, [rightPanelSplitRatio]);
+
+  useEffect(() => {
+    window.localStorage?.setItem(CENTER_HARNESS_SPLIT_KEY, String(Math.round(centerHarnessSplitRatio * 1000) / 1000));
+  }, [centerHarnessSplitRatio]);
+
+  useEffect(() => {
+    window.localStorage?.setItem(PROJECT_FILES_SHOW_BY_FILE_KEY, projectFilesShowByFile ? "1" : "0");
+  }, [projectFilesShowByFile]);
+
+  useEffect(() => {
     if (!rootPath) {
       setTreeError("");
       return;
@@ -661,6 +772,10 @@ export function App() {
     setSemanticSelectedQname("");
     setExpandedFileSymbols({});
     setExpandedLibraryFiles({});
+    setCollapsedSymbolNodes({});
+    setExpandedProjectElementsOverflow(false);
+    setExpandedProjectFileSymbolOverflow({});
+    setExpandedLibraryFileSymbolOverflow({});
     contentRef.current = "";
     dirtyRef.current = false;
     setDirty(false);
@@ -736,31 +851,41 @@ export function App() {
 
   useEffect(() => {
     document.body.classList.toggle("simple-ui-resizing", leftPaneDragging || rightPaneDragging);
+    document.body.classList.toggle(
+      "simple-ui-resizing-vertical",
+      rightPanelSplitDragging || centerHarnessSplitDragging,
+    );
     return () => {
       document.body.classList.remove("simple-ui-resizing");
+      document.body.classList.remove("simple-ui-resizing-vertical");
     };
-  }, [leftPaneDragging, rightPaneDragging]);
+  }, [leftPaneDragging, rightPaneDragging, rightPanelSplitDragging, centerHarnessSplitDragging]);
+
+  const syncMonacoLayout = useCallback(() => {
+    const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 0;
+    const nextRight = clampRightPaneWidth(rightPaneWidthRef.current, viewportWidth, leftPaneWidthRef.current);
+    const nextLeft = clampLeftPaneWidth(leftPaneWidthRef.current, viewportWidth, nextRight);
+    if (nextRight !== rightPaneWidthRef.current) {
+      setRightPaneWidth(nextRight);
+    }
+    if (nextLeft !== leftPaneWidthRef.current) {
+      setLeftPaneWidth(nextLeft);
+    }
+    editorRef.current?.layout();
+  }, []);
 
   useEffect(() => {
-    const syncLayout = () => {
-      const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 0;
-      const nextRight = clampRightPaneWidth(rightPaneWidthRef.current, viewportWidth, leftPaneWidthRef.current);
-      const nextLeft = clampLeftPaneWidth(leftPaneWidthRef.current, viewportWidth, nextRight);
-      if (nextRight !== rightPaneWidthRef.current) {
-        setRightPaneWidth(nextRight);
-      }
-      if (nextLeft !== leftPaneWidthRef.current) {
-        setLeftPaneWidth(nextLeft);
-      }
-      editorRef.current?.layout();
-    };
-    const frame = window.requestAnimationFrame(syncLayout);
-    const timer = window.setTimeout(syncLayout, 120);
+    const frame = window.requestAnimationFrame(syncMonacoLayout);
+    const t1 = window.setTimeout(() => window.requestAnimationFrame(syncMonacoLayout), 16);
+    const t2 = window.setTimeout(() => window.requestAnimationFrame(syncMonacoLayout), 120);
+    const t3 = window.setTimeout(() => window.requestAnimationFrame(syncMonacoLayout), 260);
     return () => {
       window.cancelAnimationFrame(frame);
-      window.clearTimeout(timer);
+      window.clearTimeout(t1);
+      window.clearTimeout(t2);
+      window.clearTimeout(t3);
     };
-  }, []);
+  }, [syncMonacoLayout]);
 
   const measureTabsOverflow = useCallback(() => {
     const strip = tabsStripRef.current;
@@ -795,23 +920,29 @@ export function App() {
   }, [measureTabsOverflow]);
 
   useEffect(() => {
-    if (!tabContextMenu && !tabsOverflowMenuOpen) return;
+    if (!tabContextMenu && !fileContextMenu && !tabsOverflowMenuOpen) return;
     const onMouseDown = (event: MouseEvent) => {
       const target = event.target as HTMLElement | null;
       if (!target) return;
       if (
         target.closest(".simple-tab-context-menu")
+        || target.closest(".simple-file-context-menu")
+        || target.closest(".simple-project-files-settings-menu")
         || target.closest(".simple-editor-tabs-overflow")
       ) {
         return;
       }
       setTabContextMenu(null);
+      setFileContextMenu(null);
       setTabsOverflowMenuOpen(false);
+      setProjectFilesSettingsMenuOpen(false);
     };
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       setTabContextMenu(null);
+      setFileContextMenu(null);
       setTabsOverflowMenuOpen(false);
+      setProjectFilesSettingsMenuOpen(false);
     };
     window.addEventListener("mousedown", onMouseDown);
     window.addEventListener("keydown", onKeyDown);
@@ -819,7 +950,7 @@ export function App() {
       window.removeEventListener("mousedown", onMouseDown);
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [tabContextMenu, tabsOverflowMenuOpen]);
+  }, [tabContextMenu, fileContextMenu, tabsOverflowMenuOpen, projectFilesSettingsMenuOpen]);
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -855,6 +986,17 @@ export function App() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [stdlibManagerOpen]);
+
+  useEffect(() => {
+    if (!aboutWindowOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setAboutWindowOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [aboutWindowOpen]);
 
   useEffect(() => {
     if (!stdlibManagerOpen) return;
@@ -1032,6 +1174,7 @@ export function App() {
     setOpenTabs(nextTabs);
     const wasActive = !!activeFilePath && normalizePath(activeFilePath) === pathKey;
     setTabContextMenu(null);
+    setFileContextMenu(null);
     setTabsOverflowMenuOpen(false);
     if (!wasActive) return;
     const fallback = nextTabs[Math.max(0, index - 1)] || nextTabs[0] || null;
@@ -1074,6 +1217,7 @@ export function App() {
       activateEditorTab(keepTab);
     }
     setTabContextMenu(null);
+    setFileContextMenu(null);
     setTabsOverflowMenuOpen(false);
   }, [persistActiveEditorBuffer, openTabs, activeFilePath, activateEditorTab]);
 
@@ -1099,6 +1243,7 @@ export function App() {
       editorRef.current.setValue("");
     }
     setTabContextMenu(null);
+    setFileContextMenu(null);
     setTabsOverflowMenuOpen(false);
   }, [persistActiveEditorBuffer, openTabs]);
 
@@ -1312,6 +1457,12 @@ export function App() {
         void saveActiveFile();
         return;
       }
+      if (event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && lowered === "b") {
+        event.preventDefault();
+        if (compileRunId) return;
+        void compileProject();
+        return;
+      }
       if (event.key === "F5") {
         event.preventDefault();
         if (compileRunId) return;
@@ -1364,12 +1515,12 @@ export function App() {
         setAppTheme("dark");
         return;
       case "close-window":
-        await invoke("window_close").catch((error) => {
-          setCompileStatus(`Window close failed: ${String(error)}`);
+        await invoke("app_exit").catch((error) => {
+          setCompileStatus(`Exit failed: ${String(error)}`);
         });
         return;
       case "about":
-        setCompileStatus("Mercurio SysML UI");
+        setAboutWindowOpen(true);
         return;
       default:
         return;
@@ -1382,9 +1533,35 @@ export function App() {
     compileActiveFile,
     clearAllCaches,
     setStdlibManagerOpen,
+    setAboutWindowOpen,
     toggleTheme,
     setCompileStatus,
   ]);
+
+  const normalizeWatchedPath = useCallback((path: string) => {
+    return normalizePath(path).replace(/[\\\/]+$/, "");
+  }, []);
+
+  const scheduleProjectTreeRefresh = useCallback(() => {
+    if (projectFilesChangedTimerRef.current !== undefined) {
+      window.clearTimeout(projectFilesChangedTimerRef.current);
+    }
+    const timer = window.setTimeout(() => {
+      projectFilesChangedTimerRef.current = undefined;
+      const watchRoot = projectWatcherRootRef.current;
+      const activeRoot = rootPath;
+      if (!watchRoot || !activeRoot) {
+        return;
+      }
+      if (normalizeWatchedPath(watchRoot) !== normalizeWatchedPath(activeRoot)) {
+        return;
+      }
+      void refreshRoot(activeRoot).catch(() => {
+        if (!activeRoot) return;
+      });
+    }, 250);
+    projectFilesChangedTimerRef.current = timer;
+  }, [refreshRoot, rootPath, normalizeWatchedPath]);
 
   useEffect(() => {
     const unlistenPromise = listen<string>("menu-action", (event) => {
@@ -1397,20 +1574,47 @@ export function App() {
     };
   }, [runMenuAction]);
 
-  const runHarness = useCallback(async (iterations: number) => {
-    if (harnessActiveRef.current) return;
-    harnessActiveRef.current = true;
-    setHarnessRunning(true);
-    try {
-      for (let i = 0; i < iterations; i += 1) {
-        // Keep loop deterministic: always compile full project for repeatability.
-        await compileProject();
+  useEffect(() => {
+    if (!rootPath) {
+      if (projectWatcherRootRef.current) {
+        void stopProjectFileWatcher(projectWatcherRootRef.current);
       }
-    } finally {
-      harnessActiveRef.current = false;
-      setHarnessRunning(false);
+      projectWatcherRootRef.current = "";
+      if (projectFilesChangedTimerRef.current !== undefined) {
+        window.clearTimeout(projectFilesChangedTimerRef.current);
+        projectFilesChangedTimerRef.current = undefined;
+      }
+      return;
     }
-  }, [compileProject]);
+
+    if (
+      projectWatcherRootRef.current
+      && normalizeWatchedPath(projectWatcherRootRef.current) !== normalizeWatchedPath(rootPath)
+    ) {
+      void stopProjectFileWatcher(projectWatcherRootRef.current);
+    }
+    projectWatcherRootRef.current = rootPath;
+    const targetRoot = rootPath;
+    void startProjectFileWatcher(rootPath).catch((error) => {
+      setCompileStatus(`Filesystem watcher failed to start: ${String(error)}`);
+    });
+
+    const unlistenPromise = listen<ProjectFilesChangedEvent>("project-files-changed", (event) => {
+      const payload = event.payload;
+      if (!payload || !payload.root) return;
+      if (normalizeWatchedPath(payload.root) !== normalizeWatchedPath(targetRoot)) return;
+      scheduleProjectTreeRefresh();
+    });
+
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
+      if (projectFilesChangedTimerRef.current !== undefined) {
+        window.clearTimeout(projectFilesChangedTimerRef.current);
+        projectFilesChangedTimerRef.current = undefined;
+      }
+      void stopProjectFileWatcher(targetRoot);
+    };
+  }, [rootPath, scheduleProjectTreeRefresh, setCompileStatus, normalizeWatchedPath]);
 
   const projectSymbols = useMemo(
     () => symbols.filter((symbol) => symbol.source_scope !== "library"),
@@ -1420,6 +1624,11 @@ export function App() {
   const librarySymbols = useMemo(
     () => symbols.filter((symbol) => symbol.source_scope === "library"),
     [symbols],
+  );
+
+  const projectSymbolRoots = useMemo(
+    () => buildSymbolOwnershipTree(projectSymbols),
+    [projectSymbols],
   );
 
   const symbolsByFile = useMemo(() => {
@@ -1507,6 +1716,19 @@ export function App() {
     void openFilePath(path, selection);
   }, [openFilePath]);
 
+  const showPathInExplorer = useCallback(async (path: string) => {
+    const trimmed = (path || "").trim();
+    if (!trimmed) return;
+    setTabContextMenu(null);
+    setFileContextMenu(null);
+    setTabsOverflowMenuOpen(false);
+    try {
+      await invoke("show_in_explorer", { path: trimmed });
+    } catch (error) {
+      setCompileStatus(`Show in Explorer failed: ${String(error)}`);
+    }
+  }, [setCompileStatus]);
+
   const toggleProjectFileSymbols = useCallback((filePath: string) => {
     const key = normalizePath(filePath);
     setExpandedFileSymbols((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -1516,6 +1738,82 @@ export function App() {
     const key = normalizePath(filePath);
     setExpandedLibraryFiles((prev) => ({ ...prev, [key]: !prev[key] }));
   }, []);
+
+  const toggleSymbolNodeCollapse = useCallback((symbolId: string) => {
+    if (!symbolId) return;
+    setCollapsedSymbolNodes((prev) => ({ ...prev, [symbolId]: !prev[symbolId] }));
+  }, []);
+
+  const toggleParseErrorFile = useCallback((filePath: string) => {
+    const key = normalizePath(filePath);
+    setCollapsedParseErrorFiles((prev) => ({ ...prev, [key]: !prev[key] }));
+  }, []);
+
+  const showAllProjectElements = useCallback(() => {
+    setExpandedProjectElementsOverflow(true);
+  }, []);
+
+  const showAllProjectFileSymbols = useCallback((filePath: string) => {
+    const key = normalizePath(filePath);
+    setExpandedProjectFileSymbolOverflow((prev) => ({ ...prev, [key]: true }));
+  }, []);
+
+  const showAllLibraryFileSymbols = useCallback((filePath: string) => {
+    const key = normalizePath(filePath);
+    setExpandedLibraryFileSymbolOverflow((prev) => ({ ...prev, [key]: true }));
+  }, []);
+
+  const expandAllTreeElements = useCallback(async () => {
+    if (!rootPath) return;
+    setTreeError("");
+    try {
+      await expandAll();
+      setProjectFilesExpanded(true);
+      setLibraryFilesExpanded(true);
+      setExpandedFileSymbols(() => {
+        const next: Record<string, boolean> = {};
+        for (const key of symbolsByFile.keys()) {
+          next[key] = true;
+        }
+        return next;
+      });
+      setExpandedLibraryFiles(() => {
+        const next: Record<string, boolean> = {};
+        for (const libraryFilePath of libraryFilePaths) {
+          next[normalizePath(libraryFilePath)] = true;
+        }
+        return next;
+      });
+      setExpandedProjectElementsOverflow(true);
+      setExpandedProjectFileSymbolOverflow(() => {
+        const next: Record<string, boolean> = {};
+        for (const key of symbolsByFile.keys()) {
+          next[key] = true;
+        }
+        return next;
+      });
+      setExpandedLibraryFileSymbolOverflow(() => {
+        const next: Record<string, boolean> = {};
+        for (const libraryFilePath of libraryFilePaths) {
+          next[normalizePath(libraryFilePath)] = true;
+        }
+        return next;
+      });
+      setCollapsedSymbolNodes({});
+    } catch (error) {
+      setTreeError(`Failed to expand tree: ${String(error)}`);
+    }
+  }, [rootPath, expandAll, symbolsByFile, libraryFilePaths]);
+
+  const collapseAllTreeElements = useCallback(() => {
+    collapseAll();
+    setExpandedFileSymbols({});
+    setExpandedLibraryFiles({});
+    setCollapsedSymbolNodes({});
+    setExpandedProjectElementsOverflow(false);
+    setExpandedProjectFileSymbolOverflow({});
+    setExpandedLibraryFileSymbolOverflow({});
+  }, [collapseAll]);
 
   const handleLeftPaneResizerPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
@@ -1548,7 +1846,7 @@ export function App() {
     }
   }, []);
 
-  const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
     rightPaneDragRef.current = {
       pointerId: event.pointerId,
@@ -1574,6 +1872,148 @@ export function App() {
     if (!drag || drag.pointerId !== event.pointerId) return;
     rightPaneDragRef.current = null;
     setRightPaneDragging(false);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  }, []);
+
+  const clampRightPanelSplitRatio = useCallback((value: number): number => {
+    if (!Number.isFinite(value)) return DEFAULT_RIGHT_PANEL_SPLIT;
+    return Math.max(RIGHT_PANEL_SPLIT_MIN, Math.min(RIGHT_PANEL_SPLIT_MAX, value));
+  }, []);
+
+  const updateRightPanelSplit = useCallback(
+    (clientY: number) => {
+      const drag = rightPanelSplitDragRef.current;
+      if (!drag) return;
+      const panel = rightPanelRef.current;
+      if (!panel) return;
+      const panelHeight = panel.clientHeight;
+      if (!panelHeight) return;
+      const deltaY = clientY - drag.startY;
+      const next = drag.startRatio + deltaY / panelHeight;
+      const clamped = clampRightPanelSplitRatio(next);
+      if (Math.abs(clamped - rightPanelSplitRatio) > 0.0001) {
+        setRightPanelSplitRatio(clamped);
+      }
+    },
+    [clampRightPanelSplitRatio, rightPanelSplitRatio],
+  );
+
+  const stopRightPanelSplitDragById = useCallback((pointerId: number | null) => {
+    const drag = rightPanelSplitDragRef.current;
+    if (!drag || (pointerId !== null && drag.pointerId !== null && drag.pointerId !== pointerId)) return;
+    rightPanelSplitDragRef.current = null;
+    setRightPanelSplitDragging(false);
+    if (drag.pointerId !== null && drag.captureTarget && drag.captureTarget.hasPointerCapture(drag.pointerId)) {
+      drag.captureTarget.releasePointerCapture(drag.pointerId);
+    }
+  }, []);
+
+  const handleRightPanelSplitPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const panel = rightPanelRef.current;
+    if (!panel) return;
+    rightPanelSplitDragRef.current = {
+      pointerId: event.pointerId,
+      startY: event.clientY,
+      startRatio: rightPanelSplitRatio,
+      captureTarget: event.currentTarget,
+    };
+    setRightPanelSplitDragging(true);
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  }, [rightPanelSplitRatio]);
+
+  const handleRightPanelSplitPointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = rightPanelSplitDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    updateRightPanelSplit(event.clientY);
+  }, [updateRightPanelSplit]);
+
+  const stopRightPanelSplitDrag = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    stopRightPanelSplitDragById(event.pointerId);
+  }, [stopRightPanelSplitDragById]);
+
+  const handleRightPanelSplitMouseDown = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    const panel = rightPanelRef.current;
+    if (!panel) return;
+    rightPanelSplitDragRef.current = {
+      pointerId: null,
+      startY: event.clientY,
+      startRatio: rightPanelSplitRatio,
+      captureTarget: event.currentTarget,
+    };
+    setRightPanelSplitDragging(true);
+    event.preventDefault();
+  }, [rightPanelSplitRatio]);
+
+  useEffect(() => {
+    if (!rightPanelSplitDragging) return;
+    const onPointerMove = (event: PointerEvent) => {
+      const drag = rightPanelSplitDragRef.current;
+      if (!drag || drag.pointerId === null || drag.pointerId !== event.pointerId) return;
+      updateRightPanelSplit(event.clientY);
+    };
+    const onPointerUp = (event: PointerEvent) => {
+      stopRightPanelSplitDragById(event.pointerId);
+    };
+    const onMouseMove = (event: MouseEvent) => {
+      const drag = rightPanelSplitDragRef.current;
+      if (!drag || drag.pointerId !== null) return;
+      updateRightPanelSplit(event.clientY);
+    };
+    const onMouseUp = () => {
+      stopRightPanelSplitDragById(null);
+    };
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerUp);
+    window.addEventListener("mousemove", onMouseMove);
+    window.addEventListener("mouseup", onMouseUp);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerUp);
+      window.removeEventListener("mousemove", onMouseMove);
+      window.removeEventListener("mouseup", onMouseUp);
+    };
+  }, [clampRightPanelSplitRatio, rightPanelSplitDragging, rightPanelSplitRatio, stopRightPanelSplitDragById, updateRightPanelSplit]);
+
+  const handleCenterHarnessResizerPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    const panel = centerPanelRef.current;
+    if (!panel) return;
+    centerHarnessSplitDragRef.current = {
+      pointerId: event.pointerId,
+      startY: event.clientY,
+      startRatio: centerHarnessSplitRatio,
+    };
+    setCenterHarnessSplitDragging(true);
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  }, [centerHarnessSplitRatio]);
+
+  const handleCenterHarnessResizerPointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = centerHarnessSplitDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const panel = centerPanelRef.current;
+    const panelHeight = panel?.clientHeight || 0;
+    if (!panelHeight) return;
+    const delta = event.clientY - drag.startY;
+    const next = drag.startRatio + delta / panelHeight;
+    const clamped = clampCenterHarnessSplitRatio(next);
+    if (Math.abs(clamped - centerHarnessSplitRatio) > 0.0001) {
+      setCenterHarnessSplitRatio(clamped);
+    }
+    editorRef.current?.layout();
+  }, [centerHarnessSplitRatio]);
+
+  const stopCenterHarnessResizerDrag = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = centerHarnessSplitDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    centerHarnessSplitDragRef.current = null;
+    setCenterHarnessSplitDragging(false);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
@@ -1619,6 +2059,8 @@ export function App() {
     });
     suppressDirtyRef.current = true;
     editorInstance.setValue(contentRef.current || "");
+    window.requestAnimationFrame(syncMonacoLayout);
+    window.setTimeout(() => syncMonacoLayout(), 120);
   };
 
   const renderContainedSymbols = useCallback((
@@ -1632,32 +2074,68 @@ export function App() {
         if (budget.remaining <= 0) break;
         budget.remaining -= 1;
         const symbol = node.symbol;
+        const kindLabel = symbolKindLabel(symbol);
         const symbolId = symbolIdentity(symbol);
         const selected = selectedSymbolId === symbolId;
+        const hasChildren = node.children.length > 0;
+        const isCollapsed = hasChildren ? !!collapsedSymbolNodes[symbolId] : false;
         rows.push(
-          <button
+          <div
             key={symbolId}
-            type="button"
-            className={`ghost simple-tree-symbol-row ${selected ? "active" : ""}`}
+            className="simple-tree-symbol-row"
             style={{ paddingLeft: `${basePaddingLeft + depth * 14}px` }}
-            onClick={() => {
-              void selectSymbol(symbol);
-            }}
-            title={`${symbol.qualified_name}\n${symbol.file_path}`}
           >
-            <span className="simple-tree-symbol-kind">{symbol.kind || "?"}</span>
-            <span className="simple-tree-symbol-name">{symbol.name || "<anonymous>"}</span>
-            <span className="simple-tree-symbol-line">L{symbol.start_line || 1}</span>
-          </button>,
+            {hasChildren ? (
+              <button
+                type="button"
+                className="ghost simple-tree-symbol-toggle"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  toggleSymbolNodeCollapse(symbolId);
+                }}
+                title={isCollapsed ? "Expand" : "Collapse"}
+                aria-label={isCollapsed ? "Expand symbol node" : "Collapse symbol node"}
+              >
+                {isCollapsed ? ">" : "v"}
+              </button>
+            ) : (
+              <span className="simple-tree-symbol-toggle-placeholder" />
+            )}
+            <button
+              type="button"
+              className={`ghost simple-tree-symbol-entry ${selected ? "active" : ""}`}
+              onClick={() => {
+                void selectSymbol(symbol);
+              }}
+              title={`${symbol.qualified_name}\n${symbol.file_path}`}
+            >
+              <span className="simple-tree-symbol-kind">
+                <span className="simple-tree-symbol-kind-icon">{symbolKindIcon(kindLabel)}</span>
+                <span className="simple-tree-symbol-kind-label">{kindLabel}</span>
+              </span>
+              <span className="simple-tree-symbol-name">{symbol.name || "<anonymous>"}</span>
+            </button>
+          </div>,
         );
-        if (node.children.length && budget.remaining > 0) {
+        if (hasChildren && !isCollapsed && budget.remaining > 0) {
           rows.push(...renderNodes(node.children, depth + 1));
         }
       }
       return rows;
     };
     return renderNodes(symbolRoots, 0);
-  }, [selectedSymbolId, selectSymbol]);
+  }, [selectedSymbolId, selectSymbol, collapsedSymbolNodes, toggleSymbolNodeCollapse]);
+
+  const projectElementsTree = useMemo(() => {
+    const renderLimit = expandedProjectElementsOverflow
+      ? Math.max(FILE_SYMBOL_RENDER_LIMIT, projectSymbols.length + 1)
+      : FILE_SYMBOL_RENDER_LIMIT;
+    const budget = { remaining: renderLimit };
+    return {
+      shown: renderContainedSymbols(projectSymbolRoots, 14, budget),
+      shownCount: renderLimit - budget.remaining,
+    };
+  }, [expandedProjectElementsOverflow, projectSymbolRoots, projectSymbols.length, renderContainedSymbols]);
 
   const renderTree = useCallback((entries: FileEntry[], depth = 0): ReactNode => {
     return entries.map((entry) => {
@@ -1671,11 +2149,15 @@ export function App() {
       const symbolCount = fileSymbols.length;
       const isSymbolOpen = !isDir && !!expandedFileSymbols[fileKey];
       const symbolRoots = isSymbolOpen ? buildSymbolOwnershipTree(fileSymbols) : [];
-      const renderBudget = { remaining: FILE_SYMBOL_RENDER_LIMIT };
+      const expandedOverflow = !isDir && !!expandedProjectFileSymbolOverflow[fileKey];
+      const renderLimit = expandedOverflow
+        ? Math.max(FILE_SYMBOL_RENDER_LIMIT, symbolCount + 1)
+        : FILE_SYMBOL_RENDER_LIMIT;
+      const renderBudget = { remaining: renderLimit };
       const shownSymbols = isSymbolOpen
         ? renderContainedSymbols(symbolRoots, 30 + depth * 14, renderBudget)
         : [];
-      const shownSymbolCount = FILE_SYMBOL_RENDER_LIMIT - renderBudget.remaining;
+      const shownSymbolCount = renderLimit - renderBudget.remaining;
 
       return (
         <div key={key}>
@@ -1717,9 +2199,22 @@ export function App() {
               onClick={() => {
                 void openEntry(entry);
               }}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                setTabContextMenu(null);
+                setTabsOverflowMenuOpen(false);
+                setFileContextMenu({
+                  path: entry.path,
+                  x: event.clientX,
+                  y: event.clientY,
+                });
+              }}
               title={entry.path}
             >
-              <span className={`simple-tree-icon ${isDir ? "dir" : "file"}`}>{isDir ? "DIR" : "FILE"}</span>
+              <span className={`simple-tree-icon ${isDir ? "dir" : "file"}`}>
+                {isDir ? treeNodeIcon(true) : treeNodeIcon(false)}
+              </span>
               <span className="simple-tree-label">{entry.name}</span>
               {!isDir && symbolCount > 0 ? <span className="simple-tree-count">{symbolCount}</span> : null}
               {!isDir && hasParseError ? <span className="simple-tree-error">error</span> : null}
@@ -1732,12 +2227,18 @@ export function App() {
             <div className="simple-tree-symbols">
               {shownSymbols}
               {symbolCount > shownSymbolCount ? (
-                <div
-                  className="simple-tree-symbol-more muted"
+                <button
+                  type="button"
+                  className="ghost simple-tree-symbol-more simple-tree-symbol-more-btn muted"
                   style={{ paddingLeft: `${30 + depth * 14}px` }}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    showAllProjectFileSymbols(entry.path);
+                  }}
+                  title={`Show ${symbolCount - shownSymbolCount} more symbols`}
                 >
                   +{symbolCount - shownSymbolCount} more symbols
-                </div>
+                </button>
               ) : null}
             </div>
           ) : null}
@@ -1750,9 +2251,11 @@ export function App() {
     parseErrorPaths,
     symbolsByFile,
     expandedFileSymbols,
+    expandedProjectFileSymbolOverflow,
     toggleExpand,
     openEntry,
     toggleProjectFileSymbols,
+    showAllProjectFileSymbols,
     renderContainedSymbols,
   ]);
 
@@ -1762,16 +2265,20 @@ export function App() {
       const fileSymbols = librarySymbolsByFile.get(fileKey) || [];
       const isOpen = !!expandedLibraryFiles[fileKey];
       const symbolRoots = isOpen ? buildSymbolOwnershipTree(fileSymbols) : [];
-      const renderBudget = { remaining: FILE_SYMBOL_RENDER_LIMIT };
+      const expandedOverflow = !!expandedLibraryFileSymbolOverflow[fileKey];
+      const renderLimit = expandedOverflow
+        ? Math.max(FILE_SYMBOL_RENDER_LIMIT, fileSymbols.length + 1)
+        : FILE_SYMBOL_RENDER_LIMIT;
+      const renderBudget = { remaining: renderLimit };
       const shownSymbols = isOpen
         ? renderContainedSymbols(symbolRoots, 30, renderBudget)
         : [];
-      const shownSymbolCount = FILE_SYMBOL_RENDER_LIMIT - renderBudget.remaining;
+      const shownSymbolCount = renderLimit - renderBudget.remaining;
       const displayName = libraryFilePath.split(/[\\/]/).pop() || libraryFilePath;
 
       return (
         <div key={libraryFilePath}>
-          <div className="simple-tree-row library">
+          <div className="simple-tree-row">
             <button
               type="button"
               className="ghost simple-tree-toggle"
@@ -1786,14 +2293,22 @@ export function App() {
               type="button"
               className="ghost simple-tree-entry"
               onClick={() => {
-                const first = fileSymbols[0];
-                if (first) {
-                  void selectSymbol(first);
-                }
+                void openFilePath(libraryFilePath);
+              }}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                setTabContextMenu(null);
+                setTabsOverflowMenuOpen(false);
+                setFileContextMenu({
+                  path: libraryFilePath,
+                  x: event.clientX,
+                  y: event.clientY,
+                });
               }}
               title={libraryFilePath}
             >
-              <span className="simple-tree-icon file">LIB</span>
+              <span className="simple-tree-icon file">{treeNodeIcon(false)}</span>
               <span className="simple-tree-label">{displayName}</span>
               <span className="simple-tree-count">{fileSymbols.length}</span>
             </button>
@@ -1802,9 +2317,18 @@ export function App() {
             <div className="simple-tree-symbols">
               {shownSymbols}
               {fileSymbols.length > shownSymbolCount ? (
-                <div className="simple-tree-symbol-more muted" style={{ paddingLeft: "30px" }}>
+                <button
+                  type="button"
+                  className="ghost simple-tree-symbol-more simple-tree-symbol-more-btn muted"
+                  style={{ paddingLeft: "30px" }}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    showAllLibraryFileSymbols(libraryFilePath);
+                  }}
+                  title={`Show ${fileSymbols.length - shownSymbolCount} more symbols`}
+                >
                   +{fileSymbols.length - shownSymbolCount} more symbols
-                </div>
+                </button>
               ) : null}
             </div>
           ) : null}
@@ -1815,8 +2339,11 @@ export function App() {
     libraryFilePaths,
     librarySymbolsByFile,
     expandedLibraryFiles,
+    expandedLibraryFileSymbolOverflow,
     toggleLibraryFileSymbols,
+    showAllLibraryFileSymbols,
     renderContainedSymbols,
+    openFilePath,
   ]);
 
   const harnessMaxDuration = useMemo(
@@ -1855,6 +2382,16 @@ export function App() {
     const top = Math.max(8, Math.min(tabContextMenu.y, viewportHeight - menuHeight - 8));
     return { left, top };
   }, [tabContextMenu]);
+  const fileContextMenuStyle = useMemo((): CSSProperties | null => {
+    if (!fileContextMenu) return null;
+    const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 1280;
+    const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 800;
+    const menuWidth = 172;
+    const menuHeight = 38;
+    const left = Math.max(8, Math.min(fileContextMenu.x, viewportWidth - menuWidth - 8));
+    const top = Math.max(8, Math.min(fileContextMenu.y, viewportHeight - menuHeight - 8));
+    return { left, top };
+  }, [fileContextMenu]);
   const contextMenuHasOtherTabs = useMemo(() => {
     if (!contextTab) return false;
     const keepKey = normalizePath(contextTab.path);
@@ -1869,6 +2406,27 @@ export function App() {
       "--simple-right-pane-width": `${rightPaneWidth}px`,
     } as CSSProperties),
     [leftPaneWidth, rightPaneWidth],
+  );
+  const rightPanelLayoutStyle = useMemo(
+    () =>
+      ({
+        "--simple-right-top-panel-size": `${Math.max(0, Math.min(1, rightPanelSplitRatio)).toFixed(3)}`,
+        "--simple-right-bottom-panel-size": `${Math.max(0, Math.min(1, 1 - rightPanelSplitRatio)).toFixed(3)}`,
+      }) as CSSProperties,
+    [rightPanelSplitRatio],
+  );
+  const centerHarnessSizeStyle = useMemo(() => {
+    const collapsedRatio = harnessCollapsed
+      ? Math.min(0.07, centerHarnessSplitRatio)
+      : centerHarnessSplitRatio;
+    return `${Math.round(collapsedRatio * 100)}%`;
+  }, [harnessCollapsed, centerHarnessSplitRatio]);
+  const centerLayoutStyle = useMemo(
+    () =>
+      ({
+        "--simple-center-harness-size": centerHarnessSizeStyle,
+      }) as CSSProperties,
+    [centerHarnessSizeStyle],
   );
   const buildElapsedMs = useMemo(() => {
     if (!buildProgress.startedAtMs) return null;
@@ -1961,8 +2519,8 @@ export function App() {
   }, [setCompileStatus]);
 
   const closeWindow = useCallback(() => {
-    void invoke("window_close").catch((error) => {
-      setCompileStatus(`Window close failed: ${String(error)}`);
+    void invoke("app_exit").catch((error) => {
+      setCompileStatus(`Exit failed: ${String(error)}`);
     });
   }, [setCompileStatus]);
 
@@ -1972,7 +2530,17 @@ export function App() {
 
   return (
     <div className="app-shell simple-ui-shell">
-      <header className="native-titlebar">
+      <header
+        className="native-titlebar"
+        onDoubleClick={(event) => {
+          const target = event.target as HTMLElement | null;
+          if (!target) return;
+          if (target.closest(".native-window-btn") || target.closest(".menu-bar")) {
+            return;
+          }
+          toggleMaximizeWindow();
+        }}
+      >
         <div className="native-titlebar-left">
           <span className="app-mark">
             <img src="/app-icon.png" alt="Mercurio" className="app-mark-image" />
@@ -1994,7 +2562,7 @@ export function App() {
                   <div className="menu-bar-sep" />
                   <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); void runMenuAction("save-active"); }}>Save</button>
                   <div className="menu-bar-sep" />
-                  <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); void runMenuAction("close-window"); }}>Close Window</button>
+                  <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); void runMenuAction("close-window"); }}>Exit</button>
                 </div>
               ) : null}
             </div>
@@ -2051,9 +2619,9 @@ export function App() {
         </div>
         <div className="native-titlebar-center" data-tauri-drag-region />
         <div className="native-titlebar-right">
-          <button type="button" className="ghost native-window-btn" onClick={minimizeWindow} title="Minimize" aria-label="Minimize window">-</button>
-          <button type="button" className="ghost native-window-btn" onClick={toggleMaximizeWindow} title="Maximize" aria-label="Maximize or restore window">[]</button>
-          <button type="button" className="ghost native-window-btn close" onClick={closeWindow} title="Close" aria-label="Close window">X</button>
+          <button type="button" className="ghost native-window-btn" onClick={minimizeWindow} title="Minimize" aria-label="Minimize window">—</button>
+          <button type="button" className="ghost native-window-btn" onClick={toggleMaximizeWindow} title="Maximize" aria-label="Maximize or restore window">◻</button>
+          <button type="button" className="ghost native-window-btn close" onClick={closeWindow} title="Exit" aria-label="Exit">×</button>
         </div>
       </header>
       <header className="titlebar simple-ui-titlebar">
@@ -2105,14 +2673,97 @@ export function App() {
               <span className="simple-tree-section-title">Project Files</span>
               <span className="simple-tree-section-meta">{projectFolderLabel}</span>
             </button>
-            {treeError ? <span className="error">{treeError}</span> : null}
+            <div className="simple-tree-toolbar">
+              <div className="simple-tree-settings-wrap" ref={projectFilesSettingsButtonRef}>
+                <button
+                  type="button"
+                  className={`ghost simple-tree-toolbar-btn ${projectFilesSettingsMenuOpen ? "active" : ""}`}
+                  onClick={() => setProjectFilesSettingsMenuOpen((prev) => !prev)}
+                  title="Project files settings"
+                  aria-label="Project files settings"
+                >
+                  ⚙
+                </button>
+                {projectFilesSettingsMenuOpen ? (
+                  <div className="simple-project-files-settings-menu">
+                    <button
+                      type="button"
+                      className="ghost simple-project-files-settings-menu-item"
+                      onClick={() => {
+                        setProjectFilesShowByFile(true);
+                        setProjectFilesSettingsMenuOpen(false);
+                      }}
+                    >
+                      {projectFilesShowByFile ? "✓ " : "   "}Show by file
+                    </button>
+                    <button
+                      type="button"
+                      className="ghost simple-project-files-settings-menu-item"
+                      onClick={() => {
+                        setProjectFilesShowByFile(false);
+                        setProjectFilesSettingsMenuOpen(false);
+                      }}
+                    >
+                      {projectFilesShowByFile ? "   " : "✓ "}Hide files (show elements only)
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+              <button
+                type="button"
+                className="ghost simple-tree-toolbar-btn"
+                onClick={() => {
+                  void expandAllTreeElements();
+                }}
+                disabled={!rootPath}
+                title="Expand all"
+                aria-label="Expand all"
+              >
+                +
+              </button>
+              <button
+                type="button"
+                className="ghost simple-tree-toolbar-btn"
+                onClick={collapseAllTreeElements}
+                disabled={!rootPath}
+                title="Collapse all"
+                aria-label="Collapse all"
+              >
+                -
+              </button>
+            </div>
           </div>
+          {treeError ? <div className="simple-tree-toolbar-error error">{treeError}</div> : null}
           <div className="simple-ui-scroll">
             {rootPath ? (
               <>
                 <div className="simple-tree-section">
                   {projectFilesExpanded ? (
-                    treeEntries.length ? renderTree(treeEntries) : <div className="muted">No files in root.</div>
+                    projectFilesShowByFile ? (
+                      treeEntries.length ? renderTree(treeEntries) : <div className="muted">No files in root.</div>
+                    ) : (
+                      projectSymbolRoots.length ? (
+                        <div className="simple-tree-symbols">
+                          {projectElementsTree.shown}
+                          {projectSymbols.length > projectElementsTree.shownCount ? (
+                            <button
+                              type="button"
+                              className="ghost simple-tree-symbol-more simple-tree-symbol-more-btn muted"
+                              style={{ paddingLeft: "14px" }}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                showAllProjectElements();
+                              }}
+                              title={`Show ${projectSymbols.length - projectElementsTree.shownCount} more symbols`}
+                            >
+                              +{projectSymbols.length - projectElementsTree.shownCount} more symbols
+                            </button>
+                          ) : null}
+                        </div>
+                      ) : (
+                        <div className="muted">No project symbols indexed.</div>
+                      )
+                    )
                   ) : null}
                 </div>
                 <div className="simple-tree-section">
@@ -2154,115 +2805,65 @@ export function App() {
           />
         </aside>
 
-        <section className="panel editor simple-ui-center">
-          <div className="simple-editor-tabs">
-            <div ref={tabsStripRef} className="simple-editor-tabs-strip">
-              {openTabs.length ? (
-                openTabs.map((tab) => {
-                  const tabKey = normalizePath(tab.path);
-                  const isActive = !!activeFilePath && normalizePath(activeFilePath) === tabKey;
-                  const tabDirty = isActive ? dirty : tab.dirty;
-                  const isDragSource = !!dragTabPath && normalizePath(dragTabPath) === tabKey;
-                  const isDropTarget = !!dragOverTabPath && normalizePath(dragOverTabPath) === tabKey;
-                  return (
-                    <div
-                      key={tab.path}
-                      className={`simple-editor-tab ${isActive ? "active" : ""} ${isDragSource ? "drag-source" : ""} ${isDropTarget ? "drop-target" : ""}`}
-                      draggable
-                      onContextMenu={(event) => {
-                        event.preventDefault();
-                        setTabsOverflowMenuOpen(false);
-                        setTabContextMenu({
-                          path: tab.path,
-                          x: event.clientX,
-                          y: event.clientY,
-                        });
-                      }}
-                      onDragStart={(event) => {
-                        setDragTabPath(tab.path);
-                        setDragOverTabPath(tab.path);
-                        setTabsOverflowMenuOpen(false);
-                        event.dataTransfer.effectAllowed = "move";
-                        event.dataTransfer.setData("text/plain", tab.path);
-                      }}
-                      onDragOver={(event) => {
-                        event.preventDefault();
-                        if (dragOverTabPath !== tab.path) {
-                          setDragOverTabPath(tab.path);
-                        }
-                        event.dataTransfer.dropEffect = "move";
-                      }}
-                      onDrop={(event) => {
-                        event.preventDefault();
-                        const fromPath = dragTabPath || event.dataTransfer.getData("text/plain");
-                        if (!fromPath) return;
-                        reorderOpenTabs(fromPath, tab.path);
-                        setDragTabPath(null);
-                        setDragOverTabPath(null);
-                      }}
-                      onDragEnd={() => {
-                        setDragTabPath(null);
-                        setDragOverTabPath(null);
-                      }}
-                    >
-                      <button
-                        type="button"
-                        className="ghost simple-editor-tab-main"
-                        draggable={false}
-                        onClick={() => activateOpenTab(tab.path)}
-                        title={tab.path}
-                      >
-                        {tab.name}
-                        {tabDirty ? " *" : ""}
-                      </button>
-                      <button
-                        type="button"
-                        className="ghost simple-editor-tab-close"
-                        draggable={false}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          closeEditorTab(tab.path);
-                        }}
-                        title={`Close ${tab.name}`}
-                      >
-                        x
-                      </button>
-                    </div>
-                  );
-                })
-              ) : (
-                <div className="simple-editor-tabs-empty muted">No open files</div>
-              )}
-            </div>
-            {tabsOverflow ? (
-              <div className="simple-editor-tabs-overflow">
-                <button
-                  type="button"
-                  className={`ghost simple-editor-tabs-overflow-btn ${tabsOverflowMenuOpen ? "active" : ""}`}
-                  onClick={() => {
-                    setTabContextMenu(null);
-                    setTabsOverflowMenuOpen((prev) => !prev);
-                  }}
-                  title="Open tab list"
-                  aria-label="Open tab list"
-                >
-                  v
-                </button>
-                {tabsOverflowMenuOpen ? (
-                  <div className="simple-editor-tabs-dropdown">
-                    {openTabs.map((tab) => {
+        <section className="panel editor simple-ui-center" ref={centerPanelRef} style={centerLayoutStyle}>
+          <div className="simple-center-workspace">
+            <div className="simple-center-editor-stack">
+              <div className="simple-editor-tabs">
+                <div ref={tabsStripRef} className="simple-editor-tabs-strip">
+                  {openTabs.length ? (
+                    openTabs.map((tab) => {
                       const tabKey = normalizePath(tab.path);
                       const isActive = !!activeFilePath && normalizePath(activeFilePath) === tabKey;
                       const tabDirty = isActive ? dirty : tab.dirty;
+                      const isDragSource = !!dragTabPath && normalizePath(dragTabPath) === tabKey;
+                      const isDropTarget = !!dragOverTabPath && normalizePath(dragOverTabPath) === tabKey;
                       return (
-                        <div key={`dropdown:${tab.path}`} className={`simple-editor-tabs-dropdown-row ${isActive ? "active" : ""}`}>
+                        <div
+                          key={tab.path}
+                          className={`simple-editor-tab ${isActive ? "active" : ""} ${isDragSource ? "drag-source" : ""} ${isDropTarget ? "drop-target" : ""}`}
+                          draggable
+                          onContextMenu={(event) => {
+                            event.preventDefault();
+                            setTabsOverflowMenuOpen(false);
+                            setFileContextMenu(null);
+                            setTabContextMenu({
+                              path: tab.path,
+                              x: event.clientX,
+                              y: event.clientY,
+                            });
+                          }}
+                          onDragStart={(event) => {
+                            setDragTabPath(tab.path);
+                            setDragOverTabPath(tab.path);
+                            setTabsOverflowMenuOpen(false);
+                            event.dataTransfer.effectAllowed = "move";
+                            event.dataTransfer.setData("text/plain", tab.path);
+                          }}
+                          onDragOver={(event) => {
+                            event.preventDefault();
+                            if (dragOverTabPath !== tab.path) {
+                              setDragOverTabPath(tab.path);
+                            }
+                            event.dataTransfer.dropEffect = "move";
+                          }}
+                          onDrop={(event) => {
+                            event.preventDefault();
+                            const fromPath = dragTabPath || event.dataTransfer.getData("text/plain");
+                            if (!fromPath) return;
+                            reorderOpenTabs(fromPath, tab.path);
+                            setDragTabPath(null);
+                            setDragOverTabPath(null);
+                          }}
+                          onDragEnd={() => {
+                            setDragTabPath(null);
+                            setDragOverTabPath(null);
+                          }}
+                        >
                           <button
                             type="button"
-                            className="ghost simple-editor-tabs-dropdown-item"
-                            onClick={() => {
-                              activateOpenTab(tab.path);
-                              setTabsOverflowMenuOpen(false);
-                            }}
+                            className="ghost simple-editor-tab-main"
+                            draggable={false}
+                            onClick={() => activateOpenTab(tab.path)}
                             title={tab.path}
                           >
                             {tab.name}
@@ -2270,167 +2871,239 @@ export function App() {
                           </button>
                           <button
                             type="button"
-                            className="ghost simple-editor-tabs-dropdown-close"
-                            onClick={() => closeEditorTab(tab.path)}
+                            className="ghost simple-editor-tab-close"
+                            draggable={false}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              closeEditorTab(tab.path);
+                            }}
                             title={`Close ${tab.name}`}
                           >
                             x
                           </button>
                         </div>
                       );
-                    })}
-                    <div className="simple-editor-tabs-dropdown-footer">
-                      <button type="button" className="ghost" onClick={() => closeAllTabs()}>Close All</button>
-                    </div>
+                    })
+                  ) : (
+                    <div className="simple-editor-tabs-empty muted">No open files</div>
+                  )}
+                </div>
+                {shouldShowTabDropdown ? (
+                  <div className="simple-editor-tabs-overflow">
+                    <button
+                      type="button"
+                      className={`ghost simple-editor-tabs-overflow-btn ${tabsOverflowMenuOpen ? "active" : ""}`}
+                      onClick={() => {
+                        setTabContextMenu(null);
+                        setFileContextMenu(null);
+                        setTabsOverflowMenuOpen((prev) => !prev);
+                      }}
+                      title="Open tab list"
+                      aria-label="Open tab list"
+                    >
+                      v
+                    </button>
+                    {tabsOverflowMenuOpen ? (
+                      <div className="simple-editor-tabs-dropdown">
+                        {openTabs.map((tab) => {
+                          const tabKey = normalizePath(tab.path);
+                          const isActive = !!activeFilePath && normalizePath(activeFilePath) === tabKey;
+                          const tabDirty = isActive ? dirty : tab.dirty;
+                          return (
+                            <div key={`dropdown:${tab.path}`} className={`simple-editor-tabs-dropdown-row ${isActive ? "active" : ""}`}>
+                              <button
+                                type="button"
+                                className="ghost simple-editor-tabs-dropdown-item"
+                                onClick={() => {
+                                  activateOpenTab(tab.path);
+                                  setTabsOverflowMenuOpen(false);
+                                }}
+                                title={tab.path}
+                              >
+                                {tab.name}
+                                {tabDirty ? " *" : ""}
+                              </button>
+                              <button
+                                type="button"
+                                className="ghost simple-editor-tabs-dropdown-close"
+                                onClick={() => closeEditorTab(tab.path)}
+                                title={`Close ${tab.name}`}
+                              >
+                                x
+                              </button>
+                            </div>
+                          );
+                        })}
+                        <div className="simple-editor-tabs-dropdown-footer">
+                          <button type="button" className="ghost" onClick={() => closeAllTabs()}>Close All</button>
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
                 ) : null}
               </div>
-            ) : null}
-          </div>
-          {tabContextMenu && contextTab && tabContextMenuStyle ? (
-            <div className="simple-tab-context-menu" style={tabContextMenuStyle}>
-              <button
-                type="button"
-                className="ghost"
-                onClick={() => closeEditorTab(contextTab.path)}
-              >
-                Close
-              </button>
-              <button
-                type="button"
-                className="ghost"
-                onClick={() => closeOtherTabs(contextTab.path)}
-                disabled={!contextMenuHasOtherTabs}
-              >
-                Close Others
-              </button>
-              <button
-                type="button"
-                className="ghost"
-                onClick={() => closeAllTabs()}
-                disabled={!openTabs.length}
-              >
-                Close All
-              </button>
-            </div>
-          ) : null}
-          {showCenterWelcome ? (
-            <div className="simple-editor-welcome">
-              <div className="simple-editor-welcome-card">
-                <div className="simple-editor-welcome-title">Welcome to Mercurio SysML</div>
-                <div className="simple-editor-welcome-text">
-                  Choose a recent project or open a root folder, then select a file from the project tree.
-                </div>
-                <div className="simple-editor-welcome-hints muted">
-                  <div>Ctrl+Shift+O: Open Folder</div>
-                  <div>Ctrl+O: Open File</div>
-                  <div>Ctrl+S: Save</div>
-                  <div>Ctrl+B: Compile Project</div>
-                </div>
-              </div>
-            </div>
-          ) : (
-            <>
-              <div className="panel-header simple-editor-header">
-                <div className="simple-editor-title">{activeFileName}{dirty ? " *" : ""}</div>
-                <div className="simple-editor-meta">
-                  <span>Symbols in file: {activeFileSymbols.length}</span>
-                  <span>Parsed files: {parsedFiles.length}</span>
-                  <span>Unresolved: {unresolved.length}</span>
-                </div>
-              </div>
-              <div className="editor-host" id="monaco-root">
-                <MonacoEditor
-                  defaultValue=""
-                  onChange={(value) => {
-                    if (suppressDirtyRef.current) {
-                      suppressDirtyRef.current = false;
-                      return;
-                    }
-                    contentRef.current = value ?? "";
-                    if (!dirtyRef.current) {
-                      dirtyRef.current = true;
-                      setDirty(true);
-                      if (activeFilePath) {
-                        const activeKey = normalizePath(activeFilePath);
-                        setOpenTabs((prev) => prev.map((tab) => (
-                          normalizePath(tab.path) === activeKey
-                            ? { ...tab, dirty: true }
-                            : tab
-                        )));
-                      }
-                    }
-                  }}
-                  language={editorLanguage}
-                  theme={appTheme === "light" ? "vs" : "vs-dark"}
-                  onMount={handleEditorMount}
-                  options={{
-                    minimap: { enabled: false },
-                    wordWrap: "off",
-                    scrollBeyondLastLine: false,
-                    renderLineHighlight: "line",
-                    fontSize: 13,
-                    automaticLayout: true,
-                  }}
-                />
-              </div>
-              <div className="simple-harness">
-                <div className="panel-header simple-harness-header">
+              {tabContextMenu && contextTab && tabContextMenuStyle ? (
+                <div className="simple-tab-context-menu" style={tabContextMenuStyle}>
                   <button
                     type="button"
-                    className="ghost simple-harness-toggle"
-                    onClick={() => setHarnessCollapsed((prev) => !prev)}
-                    title={harnessCollapsed ? "Expand harness" : "Collapse harness"}
-                    aria-label={harnessCollapsed ? "Expand graphical test harness" : "Collapse graphical test harness"}
+                    className="ghost"
+                    onClick={() => closeEditorTab(contextTab.path)}
                   >
-                    <span className="simple-harness-caret">{harnessCollapsed ? ">" : "v"}</span>
-                    <strong>Graphical Test Harness</strong>
+                    Close
                   </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => closeOtherTabs(contextTab.path)}
+                    disabled={!contextMenuHasOtherTabs}
+                  >
+                    Close Others
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => closeAllTabs()}
+                    disabled={!openTabs.length}
+                  >
+                    Close All
+                  </button>
+                </div>
+              ) : null}
+              {fileContextMenu && fileContextMenuStyle ? (
+                <div className="simple-tab-context-menu simple-file-context-menu" style={fileContextMenuStyle}>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => {
+                      void showPathInExplorer(fileContextMenu.path);
+                    }}
+                  >
+                    Show in Explorer
+                  </button>
+                </div>
+              ) : null}
+              {showCenterWelcome ? (
+                <div className="simple-editor-welcome">
+                  <div className="simple-editor-welcome-card">
+                    <div className="simple-editor-welcome-title">Welcome to Mercurio SysML</div>
+                    <div className="simple-editor-welcome-text">
+                      Choose a recent project or open a root folder, then select a file from the project tree.
+                    </div>
+                    <div className="simple-editor-welcome-hints muted">
+                      <div>Ctrl+Shift+O: Open Folder</div>
+                      <div>Ctrl+O: Open File</div>
+                      <div>Ctrl+S: Save</div>
+                      <div>Alt+B: Compile Project</div>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="panel-header simple-editor-header">
+                    <div className="simple-editor-title">{activeFileName}{dirty ? " *" : ""}</div>
+                    <div className="simple-editor-meta">
+                      <span>Symbols in file: {activeFileSymbols.length}</span>
+                      <span>Parsed files: {parsedFiles.length}</span>
+                      <span>Unresolved: {unresolved.length}</span>
+                    </div>
+                  </div>
+                  <div className="editor-host" id="monaco-root">
+                    <MonacoEditor
+                      defaultValue=""
+                      onChange={(value) => {
+                        if (suppressDirtyRef.current) {
+                          suppressDirtyRef.current = false;
+                          return;
+                        }
+                        contentRef.current = value ?? "";
+                        if (!dirtyRef.current) {
+                          dirtyRef.current = true;
+                          setDirty(true);
+                          if (activeFilePath) {
+                            const activeKey = normalizePath(activeFilePath);
+                            setOpenTabs((prev) => prev.map((tab) => (
+                              normalizePath(tab.path) === activeKey
+                                ? { ...tab, dirty: true }
+                                : tab
+                            )));
+                          }
+                        }
+                      }}
+                      language={editorLanguage}
+                      theme={appTheme === "light" ? "vs" : "vs-dark"}
+                      onMount={handleEditorMount}
+                      options={{
+                        minimap: { enabled: false },
+                        wordWrap: "off",
+                        scrollBeyondLastLine: false,
+                        renderLineHighlight: "line",
+                        fontSize: 13,
+                        automaticLayout: true,
+                      }}
+                    />
+                  </div>
+                </>
+              )}
+            </div>
+            {!showCenterWelcome ? (
+              <>
+                <div
+                  className={`simple-harness-resizer ${centerHarnessSplitDragging ? "active" : ""}`}
+                  role="separator"
+                  aria-orientation="horizontal"
+                  aria-label="Resize build history"
+                  onPointerDown={handleCenterHarnessResizerPointerDown}
+                  onPointerMove={handleCenterHarnessResizerPointerMove}
+                  onPointerUp={stopCenterHarnessResizerDrag}
+                  onPointerCancel={stopCenterHarnessResizerDrag}
+                />
+                <div className="simple-harness">
+                  <div className="panel-header simple-harness-header">
+                    <button
+                      type="button"
+                      className="ghost simple-harness-toggle"
+                      onClick={() => setHarnessCollapsed((prev) => !prev)}
+                      title={harnessCollapsed ? "Expand harness" : "Collapse harness"}
+                      aria-label={harnessCollapsed ? "Expand build history" : "Collapse build history"}
+                    >
+                      <span className="simple-harness-caret">{harnessCollapsed ? ">" : "v"}</span>
+                      <strong>Build History</strong>
+                    </button>
+                  </div>
                   {!harnessCollapsed ? (
-                    <div className="simple-harness-actions">
-                      <button type="button" className="ghost" disabled={!rootPath || harnessRunning} onClick={() => void runHarness(1)}>
-                        Run 1x
-                      </button>
-                      <button type="button" className="ghost" disabled={!rootPath || harnessRunning} onClick={() => void runHarness(5)}>
-                        Run 5x
-                      </button>
-                      {harnessRunning ? <span className="muted">running...</span> : null}
+                    <div className="simple-harness-runs">
+                      <div className="muted">
+                        avg {Math.round(harnessAvgDuration)} ms | max {Math.round(harnessMaxDuration)} ms | ui updates {progressUiUpdates} | dropped requests {droppedCompileRequests} | budget failures {harnessBudgetFailures}
+                      </div>
+                      {harnessRuns.length ? (
+                        harnessRuns.map((run) => {
+                          const width = `${Math.max(6, Math.round((run.durationMs / harnessMaxDuration) * 100))}%`;
+                          const runOk = run.ok && run.budgetOk;
+                          return (
+                            <div key={run.id} className="simple-harness-row">
+                              <span>{run.at}</span>
+                              <span>{run.kind}</span>
+                              <span className={runOk ? "ok" : "error"}>{runOk ? "ok" : "fail"}</span>
+                              <span>{Math.round(run.durationMs)} ms</span>
+                              <span>{run.progressUpdates} ui</span>
+                              <div className="simple-harness-bar">
+                                <div className={`simple-harness-bar-fill ${runOk ? "ok" : "error"}`} style={{ width }} />
+                              </div>
+                            </div>
+                          );
+                        })
+                      ) : (
+                        <div className="muted">No runs yet.</div>
+                      )}
                     </div>
                   ) : null}
                 </div>
-                {!harnessCollapsed ? (
-                  <div className="simple-harness-runs">
-                    <div className="muted">
-                      avg {Math.round(harnessAvgDuration)} ms | max {Math.round(harnessMaxDuration)} ms | ui updates {progressUiUpdates} | dropped requests {droppedCompileRequests} | budget failures {harnessBudgetFailures}
-                    </div>
-                    {harnessRuns.length ? (
-                      harnessRuns.map((run) => {
-                        const width = `${Math.max(6, Math.round((run.durationMs / harnessMaxDuration) * 100))}%`;
-                        const runOk = run.ok && run.budgetOk;
-                        return (
-                          <div key={run.id} className="simple-harness-row">
-                            <span>{run.at}</span>
-                            <span>{run.kind}</span>
-                            <span className={runOk ? "ok" : "error"}>{runOk ? "ok" : "fail"}</span>
-                            <span>{Math.round(run.durationMs)} ms</span>
-                            <span>{run.progressUpdates} ui</span>
-                            <div className="simple-harness-bar">
-                              <div className={`simple-harness-bar-fill ${runOk ? "ok" : "error"}`} style={{ width }} />
-                            </div>
-                          </div>
-                        );
-                      })
-                    ) : (
-                      <div className="muted">No runs yet.</div>
-                    )}
-                  </div>
-                ) : null}
-              </div>
-            </>
-          )}
+              </>
+            ) : null}
+          </div>
         </section>
 
-        <aside className="panel simple-ui-right">
+        <aside className="panel simple-ui-right" ref={rightPanelRef} style={rightPanelLayoutStyle}>
           <div
             className={`simple-ui-right-resizer ${rightPaneDragging ? "active" : ""}`}
             role="separator"
@@ -2441,50 +3114,32 @@ export function App() {
             onPointerUp={stopRightPaneResizerDrag}
             onPointerCancel={stopRightPaneResizerDrag}
           />
-          <div className="panel-header"><strong>Properties</strong></div>
-          <div className="simple-ui-scroll simple-properties-host">
-            <CombinedPropertiesPane
-              selectedSymbols={selectedSymbol ? [selectedSymbol] : null}
-              selectedSemanticRow={selectedSemanticRow}
-              selectedSemanticLoading={selectedSemanticLoading}
-              selectedSemanticError={selectedSemanticError}
-              onSelectQualifiedName={selectQualifiedName}
-            />
-          </div>
-
-          <div className="panel-header"><strong>Parse Errors</strong></div>
-          <div className="simple-ui-scroll simple-error-list">
-            {compileToast.parseErrors.length ? (
-              compileToast.parseErrors.slice(0, 30).map((entry) => (
-                <div key={entry.path} className="simple-error-group">
-                  <button
-                    type="button"
-                    className="ghost simple-error-path"
-                    onClick={() => {
-                      const first = entry.errors[0] || "";
-                      openParseError(entry.path, first);
-                    }}
-                    title={entry.path}
-                  >
-                    {entry.path}
-                  </button>
-                  {entry.errors.slice(0, 3).map((message, idx) => (
-                    <button
-                      key={`${entry.path}:${idx}`}
-                      type="button"
-                      className="ghost simple-error-message"
-                      onClick={() => openParseError(entry.path, message)}
-                      title={message}
-                    >
-                      {message}
-                    </button>
-                  ))}
-                </div>
-              ))
-            ) : (
-              <div className="muted">No parse errors from latest compile.</div>
-            )}
-          </div>
+          <PropertiesPanel
+            selectedSymbol={selectedSymbol}
+            selectedSemanticRow={selectedSemanticRow}
+            selectedSemanticLoading={selectedSemanticLoading}
+            selectedSemanticError={selectedSemanticError}
+            onSelectQualifiedName={selectQualifiedName}
+          />
+          <div
+            className={`simple-right-splitter ${rightPanelSplitDragging ? "active" : ""}`}
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="Resize properties and parse errors"
+            onPointerDown={handleRightPanelSplitPointerDown}
+            onMouseDown={handleRightPanelSplitMouseDown}
+            onPointerMove={handleRightPanelSplitPointerMove}
+            onPointerUp={stopRightPanelSplitDrag}
+            onPointerCancel={stopRightPanelSplitDrag}
+          />
+          <ParseErrorsPanel
+            compileToast={compileToast}
+            collapsedParseErrorFiles={collapsedParseErrorFiles}
+            normalizePath={normalizePath}
+            displayNameForPath={displayNameForPath}
+            toggleParseErrorFile={toggleParseErrorFile}
+            openParseError={openParseError}
+          />
         </aside>
       </main>
 
@@ -2578,6 +3233,49 @@ export function App() {
               {rootPath
                 ? `Apply writes library.path for ${rootPath}`
                 : "Select a project root before applying a stdlib option."}
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {aboutWindowOpen ? (
+        <div
+          className="simple-modal-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setAboutWindowOpen(false);
+            }
+          }}
+        >
+          <section
+            className="simple-modal simple-about-window"
+            role="dialog"
+            aria-modal="true"
+            aria-label="About Mercurio SysML"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="simple-modal-header">
+              <strong>About Mercurio SysML</strong>
+              <div className="simple-modal-header-actions">
+                <button type="button" className="ghost" onClick={() => setAboutWindowOpen(false)}>
+                  Close
+                </button>
+              </div>
+            </div>
+            <div className="simple-modal-body simple-about-body">
+              <div className="simple-about-title">Mercurio SysML</div>
+              <div className="muted">Desktop UI for SysML/KerML authoring and semantic exploration.</div>
+              <div className="simple-about-grid">
+                <span className="muted">Project Root</span>
+                <span title={rootPath || "No root selected"}>{rootPath || "-"}</span>
+                <span className="muted">Theme</span>
+                <span>{appTheme}</span>
+                <span className="muted">Build</span>
+                <span>{compileStatus}</span>
+              </div>
+            </div>
+            <div className="simple-modal-footer muted">
+              Copyright (c) Mercurio
             </div>
           </section>
         </div>

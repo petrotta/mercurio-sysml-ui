@@ -3,44 +3,35 @@ use std::env;
 use std::fs;
 use std::fs::File;
 use std::io;
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
+use std::sync::Mutex;
+use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::path::BaseDirectory;
 use tauri::{Emitter, EventTarget, Manager};
 use zip::ZipArchive;
+use notify::{Event, RecursiveMode, RecommendedWatcher, Watcher};
 
 mod commands;
 
 use commands::{
-    call_tool, list_dir, read_file, window_close, window_minimize, window_toggle_maximize,
+    app_exit, call_tool, list_dir, read_file, show_in_explorer, window_close, window_minimize, window_toggle_maximize,
     write_file,
 };
 
 use mercurio_core::{
-    BackgroundCancelSummary,
-    BackgroundJobsSnapshot,
     cancel_compile as core_cancel_compile,
-    CacheClearSummary,
     compile_project_delta_sync_with_options as core_compile_project_delta_sync_with_options,
-    ensure_mercurio_paths,
-    ensure_project_descriptor,
-    LibraryConfig,
-    list_stdlib_versions_from_root,
-    load_project_descriptor,
-    load_app_settings,
-    save_app_settings,
-    write_project_descriptor,
-    AppSettings,
-    CompileRequest,
-    CompileResponse,
-    CoreState,
-    MercurioPaths,
+    ensure_mercurio_paths, ensure_project_descriptor, list_stdlib_versions_from_root,
+    load_app_settings, load_project_descriptor, save_app_settings, write_project_descriptor,
+    AppSettings, BackgroundCancelSummary, BackgroundJobsSnapshot, CacheClearSummary,
+    CompileRequest, CompileResponse, CoreState, LibraryConfig, MercurioPaths,
 };
 
-#[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) core: CoreState,
     pub(crate) settings_path: PathBuf,
+    pub(crate) project_file_watchers: Mutex<HashMap<String, ActiveProjectFileWatcher>>,
 }
 
 #[derive(Serialize)]
@@ -59,6 +50,17 @@ struct PackagedStdlibManifest {
 struct PackagedStdlibEntry {
     id: String,
     zip: String,
+}
+
+#[derive(Clone, Serialize)]
+struct ProjectFilesChangedPayload {
+    root: String,
+    path: String,
+    kind: String,
+}
+
+struct ActiveProjectFileWatcher {
+    _watcher: RecommendedWatcher,
 }
 
 fn sanitize_zip_path(path: &Path) -> Result<PathBuf, String> {
@@ -205,7 +207,9 @@ fn cancel_compile(state: tauri::State<'_, AppState>, run_id: u64) -> Result<(), 
 }
 
 #[tauri::command]
-fn get_background_jobs(state: tauri::State<'_, AppState>) -> Result<BackgroundJobsSnapshot, String> {
+fn get_background_jobs(
+    state: tauri::State<'_, AppState>,
+) -> Result<BackgroundJobsSnapshot, String> {
     state.core.background_jobs_snapshot()
 }
 
@@ -226,9 +230,7 @@ fn clear_all_caches(
     state: tauri::State<'_, AppState>,
     root: Option<String>,
 ) -> Result<CacheClearSummary, String> {
-    let summary = state
-        .core
-        .clear_runtime_caches_for_root(root.as_deref())?;
+    let summary = state.core.clear_runtime_caches_for_root(root.as_deref())?;
     eprintln!(
         "[cache] cleared workspace_snapshot={} metamodel={} parsed_files={} mtimes={} canceled={} symbol_index_cleared={} project_ir_deleted={}",
         summary.workspace_snapshot_entries,
@@ -240,6 +242,88 @@ fn clear_all_caches(
         summary.project_ir_cache_deleted,
     );
     Ok(summary)
+}
+
+#[tauri::command]
+fn start_project_file_watcher(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    root: String,
+) -> Result<bool, String> {
+    let root_path = PathBuf::from(root.trim());
+    if root_path.as_os_str().is_empty() {
+        return Err("Project root is required".to_string());
+    }
+    if !root_path.exists() || !root_path.is_dir() {
+        return Err(format!("Project root does not exist or is not a directory: {}", root_path.display()));
+    }
+    let canonical_root = root_path
+        .canonicalize()
+        .map_err(|error| format!("Failed to canonicalize project root: {}", error))?;
+    let root_key = canonical_root.to_string_lossy().to_string();
+    let mut watchers = state
+        .project_file_watchers
+        .lock()
+        .map_err(|error| format!("Failed to access watcher registry: {}", error))?;
+    if watchers.contains_key(&root_key) {
+        return Ok(false);
+    }
+
+    let root_key_for_event = root_key.clone();
+    let root_path_for_watch = canonical_root.clone();
+    let app_for_emit = app.clone();
+    let mut watcher = notify::recommended_watcher(
+        move |result: notify::Result<Event>| {
+            let Ok(event) = result else {
+                return;
+            };
+            let kind = format!("{:?}", event.kind);
+            for path in event.paths {
+                let _ = app_for_emit.emit_to(
+                    EventTarget::webview_window("main"),
+                    "project-files-changed",
+                    ProjectFilesChangedPayload {
+                        root: root_key_for_event.clone(),
+                        path: path.to_string_lossy().to_string(),
+                        kind: kind.to_string(),
+                    },
+                );
+            }
+        },
+    )
+    .map_err(|error| error.to_string())?;
+
+    let mut watcher = watcher;
+    watcher
+        .watch(&root_path_for_watch, RecursiveMode::Recursive)
+        .map_err(|error| error.to_string())?;
+    watchers.insert(
+        root_key.clone(),
+        ActiveProjectFileWatcher {
+            _watcher: watcher,
+        },
+    );
+    Ok(true)
+}
+
+#[tauri::command]
+fn stop_project_file_watcher(
+    state: tauri::State<'_, AppState>,
+    root: String,
+) -> Result<bool, String> {
+    let root_path = PathBuf::from(root.trim());
+    if root_path.as_os_str().is_empty() {
+        return Err("Project root is required".to_string());
+    }
+    let canonical_root = root_path
+        .canonicalize()
+        .map_err(|error| format!("Failed to canonicalize project root: {}", error))?;
+    let root_key = canonical_root.to_string_lossy().to_string();
+    let mut watchers = state
+        .project_file_watchers
+        .lock()
+        .map_err(|error| format!("Failed to access watcher registry: {}", error))?;
+    Ok(watchers.remove(&root_key).is_some())
 }
 
 #[tauri::command]
@@ -284,7 +368,9 @@ fn set_project_stdlib_path(
     let _ = write_project_descriptor(&root_path, &descriptor)?;
 
     let root_key = root_path.to_string_lossy().to_string();
-    let _ = state.core.clear_runtime_caches_for_root(Some(root_key.as_str()));
+    let _ = state
+        .core
+        .clear_runtime_caches_for_root(Some(root_key.as_str()));
 
     Ok(selected_path.to_string_lossy().to_string())
 }
@@ -314,6 +400,7 @@ pub fn run() {
         .manage(AppState {
             core,
             settings_path: paths.settings_path.clone(),
+            project_file_watchers: Mutex::new(HashMap::new()),
         })
         .setup(|app| {
             let state = app.state::<AppState>();
@@ -342,11 +429,12 @@ pub fn run() {
                 .build(app)?;
             let compile_project =
                 MenuItemBuilder::with_id("build.compile_project", "Compile Project")
-                .accelerator("Ctrl+B")
-                .build(app)?;
-            let compile_file = MenuItemBuilder::with_id("build.compile_file", "Compile Active File")
-                .accelerator("Ctrl+Shift+B")
-                .build(app)?;
+                    .accelerator("Ctrl+B")
+                    .build(app)?;
+            let compile_file =
+                MenuItemBuilder::with_id("build.compile_file", "Compile Active File")
+                    .accelerator("Ctrl+Shift+B")
+                    .build(app)?;
             let clear_caches = MenuItemBuilder::with_id("build.clear_caches", "Clear Caches")
                 .accelerator("Ctrl+Shift+K")
                 .build(app)?;
@@ -356,16 +444,20 @@ pub fn run() {
             let toggle_theme = MenuItemBuilder::with_id("settings.theme_toggle", "Toggle Theme")
                 .accelerator("Ctrl+Alt+T")
                 .build(app)?;
-            let light_theme = MenuItemBuilder::with_id("settings.theme_light", "Light Theme").build(app)?;
-            let dark_theme = MenuItemBuilder::with_id("settings.theme_dark", "Dark Theme").build(app)?;
+            let light_theme =
+                MenuItemBuilder::with_id("settings.theme_light", "Light Theme").build(app)?;
+            let dark_theme =
+                MenuItemBuilder::with_id("settings.theme_dark", "Dark Theme").build(app)?;
             let about = MenuItemBuilder::with_id("help.about", "About").build(app)?;
+            let exit_app =
+                MenuItemBuilder::with_id("file.exit", "Exit").accelerator("CmdOrCtrl+Q").build(app)?;
 
             let file_menu = SubmenuBuilder::new(app, "File")
                 .item(&open_folder)
                 .item(&open_file)
                 .item(&save)
                 .separator()
-                .item(&PredefinedMenuItem::close_window(app, None)?)
+                .item(&exit_app)
                 .build()?;
             let build_menu = SubmenuBuilder::new(app, "Build")
                 .item(&compile_project)
@@ -402,6 +494,7 @@ pub fn run() {
                 "settings.theme_toggle" => Some("theme-toggle"),
                 "settings.theme_light" => Some("theme-light"),
                 "settings.theme_dark" => Some("theme-dark"),
+                "file.exit" => Some("close-window"),
                 "help.about" => Some("about"),
                 _ => None,
             };
@@ -415,12 +508,16 @@ pub fn run() {
             write_file,
             window_minimize,
             window_toggle_maximize,
+            app_exit,
             window_close,
+            show_in_explorer,
             compile_project_delta,
             cancel_compile,
             get_background_jobs,
             cancel_background_jobs,
             clear_all_caches,
+            start_project_file_watcher,
+            stop_project_file_watcher,
             set_project_stdlib_path,
             call_tool,
         ])

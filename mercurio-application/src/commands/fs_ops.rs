@@ -1,5 +1,5 @@
 //! Filesystem commands for project browsing and editing.
-//! 
+//!
 //! Intent: keep a minimal file command surface for the simplified UI.
 
 use std::fs;

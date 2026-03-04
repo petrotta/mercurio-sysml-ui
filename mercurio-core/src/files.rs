@@ -94,7 +94,10 @@ pub fn get_ast_for_content(path: &Path, content: &str) -> Result<String, String>
     mercurio_sysml_pkg::parser_tools::get_ast_for_content(path, content)
 }
 
-pub fn get_parse_tree_for_content(path: &Path, content: &str) -> Result<Vec<ParseTreeNodeView>, String> {
+pub fn get_parse_tree_for_content(
+    path: &Path,
+    content: &str,
+) -> Result<Vec<ParseTreeNodeView>, String> {
     mercurio_sysml_pkg::parser_tools::get_parse_tree_for_content(path, content)
 }
 

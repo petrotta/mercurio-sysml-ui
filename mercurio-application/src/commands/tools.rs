@@ -5,18 +5,16 @@ use std::path::{Path, PathBuf};
 use tauri::command;
 
 use mercurio_core::{
-    query_library_symbols as core_query_library_symbols,
+    get_project_element_attributes as core_get_project_element_attributes,
+    get_project_expression_records as core_get_project_expression_records,
+    get_project_model as core_get_project_model, get_stdlib_metamodel as core_get_stdlib_metamodel,
     load_library_symbols_sync as core_load_library_symbols_sync,
+    query_library_symbols as core_query_library_symbols,
+    query_project_semantic_element_by_qualified_name as core_query_project_semantic_element_by_qualified_name,
     query_project_symbols as core_query_project_symbols,
     query_project_symbols_for_files as core_query_project_symbols_for_files,
-    query_project_semantic_element_by_qualified_name as core_query_project_semantic_element_by_qualified_name,
-    get_project_element_attributes as core_get_project_element_attributes,
-    get_project_model as core_get_project_model, query_semantic as core_query_semantic,
-    query_semantic_symbols as core_query_semantic_symbols,
-    get_project_expression_records as core_get_project_expression_records,
-    get_stdlib_metamodel as core_get_stdlib_metamodel,
-    resolve_under_root, CoreState,
-    SemanticQuery,
+    query_semantic as core_query_semantic, query_semantic_symbols as core_query_semantic_symbols,
+    resolve_under_root, CoreState, SemanticQuery,
 };
 
 use crate::{list_stdlib_versions_from_root, save_app_settings, AppState};
@@ -44,7 +42,10 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), 
                 .and_then(|n| n.to_str())
                 .unwrap_or_default()
                 .to_lowercase();
-            if matches!(name.as_str(), ".git" | "node_modules" | "target" | "dist" | "build") {
+            if matches!(
+                name.as_str(),
+                ".git" | "node_modules" | "target" | "dist" | "build"
+            ) {
                 continue;
             }
             collect_files(root, &path, out)?;
@@ -259,11 +260,7 @@ fn canonical_tool_name(tool: &str) -> String {
 
 pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Value, String> {
     let tool = canonical_tool_name(tool);
-    let _background_job = core.try_start_background_job(
-        "tool",
-        Some(tool.clone()),
-        None,
-    );
+    let _background_job = core.try_start_background_job("tool", Some(tool.clone()), None);
     match tool.as_str() {
         "fs.read_file@v1" => {
             let root = root_from_args(&args)?;
@@ -426,7 +423,12 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
             let element_qualified_name = arg_string(&args, "element_qualified_name")?;
             let symbol_kind = arg_optional_string(&args, "symbol_kind");
             tauri::async_runtime::spawn_blocking(move || {
-                core_get_project_element_attributes(&core, root, element_qualified_name, symbol_kind)
+                core_get_project_element_attributes(
+                    &core,
+                    root,
+                    element_qualified_name,
+                    symbol_kind,
+                )
             })
             .await
             .map_err(|e| e.to_string())?
@@ -519,4 +521,3 @@ pub async fn call_tool(
         }),
     }
 }
-

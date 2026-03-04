@@ -37,7 +37,8 @@ pub trait SymbolIndexStore {
     ) -> Option<SymbolRecord>;
     fn stdlib_documentation_symbols(&self, library_key: &str) -> Vec<SymbolRecord>;
     fn library_summary(&self, project_root: &str) -> (usize, usize, Vec<(String, usize)>);
-    fn is_stdlib_index_fresh(&self, project_root: &str, library_key: &str, signature: &str) -> bool;
+    fn is_stdlib_index_fresh(&self, project_root: &str, library_key: &str, signature: &str)
+        -> bool;
     fn mark_stdlib_indexed(&mut self, project_root: &str, library_key: &str, signature: &str);
     fn rebuild_symbol_mappings(&mut self, project_root: &str);
     fn symbol_mapping(
@@ -116,7 +117,12 @@ impl SymbolIndexStore for SymbolIndex {
         }
     }
 
-    fn is_stdlib_index_fresh(&self, project_root: &str, library_key: &str, signature: &str) -> bool {
+    fn is_stdlib_index_fresh(
+        &self,
+        project_root: &str,
+        library_key: &str,
+        signature: &str,
+    ) -> bool {
         match self {
             SymbolIndex::InMemory(store) => {
                 store.is_stdlib_index_fresh(project_root, library_key, signature)
@@ -199,10 +205,8 @@ impl SymbolIndexStore for InMemorySymbolIndex {
         file_path: &str,
         symbols: Vec<SymbolRecord>,
     ) {
-        self.by_project_file.insert(
-            (project_root.to_string(), file_path.to_string()),
-            symbols,
-        );
+        self.by_project_file
+            .insert((project_root.to_string(), file_path.to_string()), symbols);
     }
 
     fn delete_symbols_for_file(&mut self, project_root: &str, file_path: &str) {
@@ -350,7 +354,10 @@ impl SymbolIndexStore for InMemorySymbolIndex {
             .filter(|symbol| symbol.qualified_name == qualified_name)
             .collect::<Vec<_>>();
         if let Some(kind) = symbol_kind {
-            if let Some(exact) = out.iter().find(|symbol| symbol.kind.eq_ignore_ascii_case(kind)) {
+            if let Some(exact) = out
+                .iter()
+                .find(|symbol| symbol.kind.eq_ignore_ascii_case(kind))
+            {
                 return Some(exact.clone());
             }
         }
@@ -385,7 +392,12 @@ impl SymbolIndexStore for InMemorySymbolIndex {
         (files.len(), symbol_count, kind_counts)
     }
 
-    fn is_stdlib_index_fresh(&self, project_root: &str, library_key: &str, signature: &str) -> bool {
+    fn is_stdlib_index_fresh(
+        &self,
+        project_root: &str,
+        library_key: &str,
+        signature: &str,
+    ) -> bool {
         self.stdlib_freshness
             .get(&(project_root.to_string(), library_key.to_string()))
             .map(|known| known == signature)
@@ -432,7 +444,11 @@ impl SymbolIndexStore for InMemorySymbolIndex {
                 confidence: 0.0,
                 diagnostic: Some("Symbol has no metatype_qname.".to_string()),
             };
-            if let Some(raw) = symbol.metatype_qname.clone().filter(|s| !s.trim().is_empty()) {
+            if let Some(raw) = symbol
+                .metatype_qname
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+            {
                 if let Some(target_id) = stdlib_by_qname.get(&raw) {
                     mapping.resolved_metatype_qname = Some(raw.clone());
                     mapping.target_symbol_id = Some(target_id.clone());
@@ -505,6 +521,7 @@ mod tests {
             scope,
             name: id.to_string(),
             qualified_name: id.to_string(),
+            parent_qualified_name: None,
             kind: kind.to_string(),
             metatype_qname: metatype_qname.map(|v| v.to_string()),
             file_path: file_path.to_string(),
@@ -660,5 +677,4 @@ mod tests {
         assert!(mapping.target_symbol_id.is_none());
         assert_eq!(mapping.resolved_metatype_qname.as_deref(), Some("Action"));
     }
-
 }

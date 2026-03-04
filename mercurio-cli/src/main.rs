@@ -1,17 +1,8 @@
 use clap::{Parser, Subcommand};
 use mercurio_core::{
-    compile_workspace_sync,
-    ensure_mercurio_paths,
-    export_model_to_path,
-    get_parse_errors,
-    get_parse_errors_for_content,
-    read_diagram,
-    write_diagram,
-    load_app_settings,
-    CompileResponse,
-    CoreState,
-    DiagramFile,
-    UnsavedFile,
+    compile_workspace_sync, ensure_mercurio_paths, export_model_to_path, get_parse_errors,
+    get_parse_errors_for_content, load_app_settings, read_diagram, write_diagram, CompileResponse,
+    CoreState, DiagramFile, UnsavedFile,
 };
 use std::fs;
 use std::io::{self, Read};
@@ -89,7 +80,11 @@ fn main() {
     let state = CoreState::new(paths.stdlib_root, settings);
 
     match cli.command {
-        Commands::Compile { root, allow_parse_errors, run_id } => {
+        Commands::Compile {
+            root,
+            allow_parse_errors,
+            run_id,
+        } => {
             let result = compile_workspace_sync(
                 &state,
                 root,
@@ -101,7 +96,8 @@ fn main() {
             );
             match result {
                 Ok(payload) => {
-                    let json = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
+                    let json =
+                        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
                     println!("{json}");
                 }
                 Err(err) => {
@@ -118,7 +114,8 @@ fn main() {
             };
             match result {
                 Ok(payload) => {
-                    let json = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
+                    let json =
+                        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
                     println!("{json}");
                 }
                 Err(err) => {
@@ -127,7 +124,12 @@ fn main() {
                 }
             }
         }
-        Commands::Symbols { root, file, allow_parse_errors, run_id } => {
+        Commands::Symbols {
+            root,
+            file,
+            allow_parse_errors,
+            run_id,
+        } => {
             let target_path = file.as_ref().map(PathBuf::from);
             let result = compile_workspace_sync(
                 &state,
@@ -141,7 +143,8 @@ fn main() {
             match result {
                 Ok(payload) => {
                     let filtered = filter_symbols(payload, file.as_deref());
-                    let json = serde_json::to_string_pretty(&filtered).unwrap_or_else(|_| "{}".to_string());
+                    let json = serde_json::to_string_pretty(&filtered)
+                        .unwrap_or_else(|_| "{}".to_string());
                     println!("{json}");
                 }
                 Err(err) => {
@@ -155,7 +158,8 @@ fn main() {
             let path = PathBuf::from(path);
             match read_diagram(&root_path, &path) {
                 Ok(diagram) => {
-                    let json = serde_json::to_string_pretty(&diagram).unwrap_or_else(|_| "{}".to_string());
+                    let json =
+                        serde_json::to_string_pretty(&diagram).unwrap_or_else(|_| "{}".to_string());
                     println!("{json}");
                 }
                 Err(err) => {
@@ -190,7 +194,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Export { root, output, format, include_stdlib } => {
+        Commands::Export {
+            root,
+            output,
+            format,
+            include_stdlib,
+        } => {
             if let Err(err) = export_model_to_path(&state, root, output, format, include_stdlib) {
                 eprintln!("Export failed: {err}");
                 std::process::exit(1);

@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use mercurio_symbol_index::{SymbolIndexStore, SymbolRecord};
 use mercurio_sysml_pkg::project_model_projection::{
-    collect_inherited_attributes, collect_project_expression_records,
-    resolve_mapped_metatype,
+    collect_inherited_attributes, collect_project_expression_records, resolve_mapped_metatype,
     symbol_to_attribute_rows, SymbolMetatypeMappingData,
 };
 pub use mercurio_sysml_pkg::project_model_projection::{
@@ -61,7 +60,9 @@ pub fn get_project_element_attributes(
             .symbol_index
             .lock()
             .map_err(|_| "Symbol index lock poisoned".to_string())?;
-        let Some(symbol) = store.project_symbol(&root, &element_qualified_name, symbol_kind.as_deref()) else {
+        let Some(symbol) =
+            store.project_symbol(&root, &element_qualified_name, symbol_kind.as_deref())
+        else {
             return Ok(ProjectElementAttributesView {
                 element_qualified_name,
                 metatype_qname: None,
@@ -87,7 +88,8 @@ pub fn get_project_element_attributes(
             ));
         }
         diagnostics.push(
-            "Metatype mapping is unavailable for this symbol in the current index state.".to_string(),
+            "Metatype mapping is unavailable for this symbol in the current index state."
+                .to_string(),
         );
         diagnostics.push(
             "No per-request semantic refresh is performed in this endpoint; run compile to refresh symbol and metatype data.".to_string(),
@@ -128,7 +130,10 @@ pub fn get_project_element_attributes(
     })
 }
 
-fn load_stdlib_metatype_index(state: &CoreState, root: &str) -> Result<Option<Arc<MetatypeIndex>>, String> {
+fn load_stdlib_metatype_index(
+    state: &CoreState,
+    root: &str,
+) -> Result<Option<Arc<MetatypeIndex>>, String> {
     let root_path = PathBuf::from(root);
     if !root_path.exists() {
         return Err("Root path does not exist".to_string());
@@ -278,7 +283,6 @@ pub fn get_project_expression_records(
     Ok(collect_project_expression_records(file_paths.into_iter()))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,8 +317,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("mercurio_project_model_db_{stamp}"));
         let project_dir = root.join("project");
         fs::create_dir_all(&project_dir).expect("create project dir");
-        fs::write(project_dir.join("main.sysml"), "package P { action def DoThing; }\n")
-            .expect("write model file");
+        fs::write(
+            project_dir.join("main.sysml"),
+            "package P { action def DoThing; }\n",
+        )
+        .expect("write model file");
         fs::write(
             project_dir.join(".project"),
             "{\"name\":\"pm-db\",\"use_default_library\":true,\"src\":[\"*.sysml\"]}",
@@ -330,7 +337,10 @@ mod tests {
             .diagnostics
             .iter()
             .any(|line| line.contains("persisted symbol index")));
-        assert!(view.elements.iter().any(|element| element.qualified_name == "P"));
+        assert!(view
+            .elements
+            .iter()
+            .any(|element| element.qualified_name == "P"));
 
         let attrs = get_project_element_attributes(
             &state,
@@ -452,16 +462,27 @@ standard library package KerML {
             .iter()
             .find(|t| t.qualified_name == mapped_qname)
             .or_else(|| {
-                let tail = mapped_qname.rsplit("::").next().unwrap_or(mapped_qname.as_str());
+                let tail = mapped_qname
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(mapped_qname.as_str());
                 let mut candidates = metamodel
                     .types
                     .iter()
                     .filter(|t| t.qualified_name.ends_with(&format!("::{tail}")))
                     .collect::<Vec<_>>();
                 candidates.sort_by(|a, b| {
-                    let a_has_filter = a.attributes.iter().any(|attr| attr.name == "filterCondition");
-                    let b_has_filter = b.attributes.iter().any(|attr| attr.name == "filterCondition");
-                    b_has_filter.cmp(&a_has_filter).then(b.qualified_name.len().cmp(&a.qualified_name.len()))
+                    let a_has_filter = a
+                        .attributes
+                        .iter()
+                        .any(|attr| attr.name == "filterCondition");
+                    let b_has_filter = b
+                        .attributes
+                        .iter()
+                        .any(|attr| attr.name == "filterCondition");
+                    b_has_filter
+                        .cmp(&a_has_filter)
+                        .then(b.qualified_name.len().cmp(&a.qualified_name.len()))
                 });
                 candidates.into_iter().next()
             })
@@ -473,7 +494,10 @@ standard library package KerML {
             .iter()
             .map(|a| a.name.clone())
             .collect::<Vec<_>>();
-        println!("Package metatype attributes (db-backed path): {:?}", package_attrs);
+        println!(
+            "Package metatype attributes (db-backed path): {:?}",
+            package_attrs
+        );
         assert!(package_type
             .attributes
             .iter()
@@ -488,7 +512,8 @@ standard library package KerML {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("mercurio_project_model_pkg_inherited_{stamp}"));
+        let root =
+            std::env::temp_dir().join(format!("mercurio_project_model_pkg_inherited_{stamp}"));
         let library_dir = root.join("stdlib");
         let project_dir = root.join("project");
         fs::create_dir_all(&library_dir).expect("create library dir");
@@ -577,7 +602,8 @@ standard library package KerML {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("mercurio_project_model_pkg_full_chain_{stamp}"));
+        let root =
+            std::env::temp_dir().join(format!("mercurio_project_model_pkg_full_chain_{stamp}"));
         let library_dir = root.join("stdlib");
         let project_dir = root.join("project");
         fs::create_dir_all(&library_dir).expect("create library dir");

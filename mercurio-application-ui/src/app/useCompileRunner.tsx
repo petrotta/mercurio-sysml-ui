@@ -83,9 +83,11 @@ function indexedToSymbol(
   return {
     name: symbol.name,
     kind: symbol.kind,
+    metatype_qname: symbol.metatype_qname || null,
     file_path: symbol.file_path,
     source_scope: sourceScope,
     qualified_name: symbol.qualified_name,
+    parent_qualified_name: symbol.parent_qualified_name || null,
     file: 0,
     start_line: symbol.start_line,
     start_col: symbol.start_col,

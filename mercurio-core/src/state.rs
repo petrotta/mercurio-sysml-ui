@@ -1,6 +1,4 @@
-use mercurio_symbol_index::{
-    InMemorySymbolIndex, SymbolIndex, SymbolIndexStore,
-};
+use mercurio_symbol_index::{InMemorySymbolIndex, SymbolIndex, SymbolIndexStore};
 use mercurio_sysml_pkg::compile_support::StdlibSnapshotCacheEntry;
 use mercurio_sysml_semantics::semantic_contract::SemanticElementView;
 use serde::Serialize;
@@ -22,6 +20,7 @@ pub struct CompileFileResult {
 }
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub(crate) struct StdlibSymbol {
     pub(crate) file_path: String,
     pub(crate) name: String,
@@ -141,9 +140,7 @@ impl CoreState {
         detail: Option<String>,
         cancel_compile_run_id: Option<u64>,
     ) -> Option<BackgroundJobHandle> {
-        let job_id = self
-            .next_background_job_id
-            .fetch_add(1, Ordering::Relaxed);
+        let job_id = self.next_background_job_id.fetch_add(1, Ordering::Relaxed);
         let state = BackgroundJobState {
             id: job_id,
             kind: kind.into(),
@@ -348,10 +345,7 @@ mod tests {
         assert_eq!(summary.cancelable_jobs, 1);
         assert_eq!(summary.compile_cancel_requests, 1);
 
-        let canceled = state
-            .canceled_compiles
-            .lock()
-            .expect("canceled lock");
+        let canceled = state.canceled_compiles.lock().expect("canceled lock");
         assert!(canceled.contains(&42));
     }
 }

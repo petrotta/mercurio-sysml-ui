@@ -55,9 +55,11 @@ export type SymbolRelationship = {
 export type SymbolView = {
   name: string;
   kind: string;
+  metatype_qname?: string | null;
   file_path: string;
   source_scope?: "project" | "library";
   qualified_name: string;
+  parent_qualified_name?: string | null;
   file: number;
   start_line: number;
   start_col: number;
@@ -79,6 +81,7 @@ export type IndexedSymbolView = {
   scope: string;
   name: string;
   qualified_name: string;
+  parent_qualified_name?: string | null;
   kind: string;
   metatype_qname?: string | null;
   file_path: string;

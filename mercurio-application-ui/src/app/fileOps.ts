@@ -1,6 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { FileEntry, ParseTreeNodeView } from "./types";
 
+export type ProjectFilesChangedEvent = {
+  root: string;
+  path: string;
+  kind: string;
+};
+
 export async function readFileText(path: string): Promise<string> {
   const content = await invoke<string>("read_file", { path });
   return content || "";
@@ -24,4 +30,14 @@ export async function getAstForContent(path: string, content: string): Promise<s
 export async function getParseTreeForContent(path: string, content: string): Promise<ParseTreeNodeView[]> {
   const rows = await invoke<ParseTreeNodeView[]>("get_parse_tree_for_content", { path, content });
   return rows || [];
+}
+
+export async function startProjectFileWatcher(path: string): Promise<boolean> {
+  const result = await invoke<boolean>("start_project_file_watcher", { root: path });
+  return !!result;
+}
+
+export async function stopProjectFileWatcher(path: string): Promise<boolean> {
+  const result = await invoke<boolean>("stop_project_file_watcher", { root: path });
+  return !!result;
 }

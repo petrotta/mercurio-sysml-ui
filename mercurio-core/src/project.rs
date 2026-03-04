@@ -1,8 +1,7 @@
 use std::path::Path;
 
 pub use mercurio_sysml_pkg::workspace_config::{
-    LibraryConfig, ProjectConfig, ProjectDescriptor, ProjectDescriptorUpdate,
-    ProjectDescriptorView,
+    LibraryConfig, ProjectConfig, ProjectDescriptor, ProjectDescriptorUpdate, ProjectDescriptorView,
 };
 
 pub fn load_project_descriptor(root: &Path) -> Result<Option<ProjectDescriptor>, String> {
