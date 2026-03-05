@@ -299,6 +299,8 @@ export type ProjectElementAttributesView = {
   metatype_qname?: string | null;
   explicit_attributes: ProjectModelAttributeView[];
   inherited_attributes: ProjectElementInheritedAttributeView[];
+  direct_metatype_attributes?: ProjectElementInheritedAttributeView[];
+  inherited_metatype_attributes?: ProjectElementInheritedAttributeView[];
   diagnostics: string[];
 };
 

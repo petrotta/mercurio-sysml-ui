@@ -130,6 +130,9 @@ const BUILD_PROGRESS_VISIBLE_KEY = "mercurio.simpleUi.buildProgressVisible";
 const HARNESS_COLLAPSED_KEY = "mercurio.simpleUi.harnessCollapsed";
 const STDLIB_PATH_OPTIONS_KEY = "mercurio.simpleUi.stdlibPathOptions";
 const PROJECT_FILES_SHOW_BY_FILE_KEY = "mercurio.simpleUi.projectFilesShowByFile";
+const AUTO_BUILD_ACTIVE_FILE_KEY = "mercurio.simpleUi.autoBuildActiveFile";
+const AUTO_BUILD_DEBOUNCE_MS = 900;
+const AUTO_BUILD_MIN_INTERVAL_MS = 2500;
 const PARSE_MARKER_OWNER = "mercurio.parse";
 let sysmlLanguageRegistered = false;
 
@@ -609,6 +612,9 @@ export function App() {
   const [buildProgressVisible, setBuildProgressVisible] = useState<boolean>(() =>
     window.localStorage?.getItem(BUILD_PROGRESS_VISIBLE_KEY) !== "0",
   );
+  const [autoBuildActiveFile, setAutoBuildActiveFile] = useState<boolean>(() =>
+    window.localStorage?.getItem(AUTO_BUILD_ACTIVE_FILE_KEY) === "1",
+  );
   const [rightPaneWidth, setRightPaneWidth] = useState<number>(() => initialRightPaneWidth);
   const [leftPaneWidth, setLeftPaneWidth] = useState<number>(() =>
     parseLeftPaneWidth(
@@ -695,6 +701,9 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   const projectFilesChangedTimerRef = useRef<number | undefined>(undefined);
   const projectWatcherRootRef = useRef("");
   const projectFilesSettingsButtonRef = useRef<HTMLDivElement | null>(null);
+  const autoBuildTimerRef = useRef<number | undefined>(undefined);
+  const lastAutoBuildAtRef = useRef<number>(0);
+  const compileRunIdRef = useRef<number | null>(compileRunId ?? null);
 
   useEffect(() => {
     dirtyRef.current = dirty;
@@ -809,6 +818,14 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   useEffect(() => {
     window.localStorage?.setItem(BUILD_PROGRESS_VISIBLE_KEY, buildProgressVisible ? "1" : "0");
   }, [buildProgressVisible]);
+
+  useEffect(() => {
+    window.localStorage?.setItem(AUTO_BUILD_ACTIVE_FILE_KEY, autoBuildActiveFile ? "1" : "0");
+  }, [autoBuildActiveFile]);
+
+  useEffect(() => {
+    compileRunIdRef.current = compileRunId ?? null;
+  }, [compileRunId]);
 
   useEffect(() => {
     window.localStorage?.setItem(HARNESS_COLLAPSED_KEY, harnessCollapsed ? "1" : "0");
@@ -1359,6 +1376,34 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     return ok;
   }, [rootPath, activeFilePath, runCompile, compileProject, setCompileStatus, collectUnsavedCompileInputs, addHarnessRun]);
 
+  const scheduleAutoBuild = useCallback(() => {
+    if (!autoBuildActiveFile) return;
+    if (!rootPath) return;
+    if (!activeFilePath || !isSemanticSource(activeFilePath)) return;
+    if (compileRunIdRef.current) return;
+    if (autoBuildTimerRef.current !== undefined) {
+      window.clearTimeout(autoBuildTimerRef.current);
+    }
+    autoBuildTimerRef.current = window.setTimeout(() => {
+      autoBuildTimerRef.current = undefined;
+      if (!autoBuildActiveFile) return;
+      if (compileRunIdRef.current) return;
+      const now = Date.now();
+      if (now - lastAutoBuildAtRef.current < AUTO_BUILD_MIN_INTERVAL_MS) {
+        autoBuildTimerRef.current = window.setTimeout(() => {
+          autoBuildTimerRef.current = undefined;
+          if (!autoBuildActiveFile) return;
+          if (compileRunIdRef.current) return;
+          lastAutoBuildAtRef.current = Date.now();
+          void compileActiveFile();
+        }, AUTO_BUILD_MIN_INTERVAL_MS);
+        return;
+      }
+      lastAutoBuildAtRef.current = now;
+      void compileActiveFile();
+    }, AUTO_BUILD_DEBOUNCE_MS);
+  }, [autoBuildActiveFile, rootPath, activeFilePath, compileActiveFile]);
+
   const clearAllCaches = useCallback(async () => {
     if (compileRunId) {
       setCompileStatus("Cannot clear caches while compile is running");
@@ -1497,6 +1542,9 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
         return;
       case "compile-file":
         await compileActiveFile();
+        return;
+      case "toggle-autobuild-active-file":
+        setAutoBuildActiveFile((prev) => !prev);
         return;
       case "clear-caches":
         await clearAllCaches();
@@ -2578,6 +2626,13 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                 <div className="menu-bar-dropdown">
                   <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); void runMenuAction("compile-workspace"); }}>Compile Project</button>
                   <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); void runMenuAction("compile-file"); }}>Compile Active File</button>
+                  <button
+                    type="button"
+                    className="ghost menu-bar-entry"
+                    onClick={() => { setMenuOpen(null); void runMenuAction("toggle-autobuild-active-file"); }}
+                  >
+                    {autoBuildActiveFile ? "✓ " : ""}Autobuild Active File
+                  </button>
                   <div className="menu-bar-sep" />
                   <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); void runMenuAction("clear-caches"); }}>Clear Caches</button>
                 </div>
@@ -3028,6 +3083,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                             )));
                           }
                         }
+                        scheduleAutoBuild();
                       }}
                       language={editorLanguage}
                       theme={appTheme === "light" ? "vs" : "vs-dark"}
@@ -3115,6 +3171,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
             onPointerCancel={stopRightPaneResizerDrag}
           />
           <PropertiesPanel
+            rootPath={rootPath}
             selectedSymbol={selectedSymbol}
             selectedSemanticRow={selectedSemanticRow}
             selectedSemanticLoading={selectedSemanticLoading}

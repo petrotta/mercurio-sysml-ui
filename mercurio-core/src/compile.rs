@@ -1112,7 +1112,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
                 scope: WorkspaceFileScope::Project,
             })
             .collect::<Vec<_>>();
-    let semantic_pipeline = "project-semantic-v2";
+    let semantic_pipeline = "project-semantic-v3";
     let semantic_cache_key = workspace_semantic_cache_key(
         &root,
         &project_semantic_inputs,

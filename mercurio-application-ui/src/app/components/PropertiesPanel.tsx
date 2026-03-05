@@ -2,6 +2,7 @@ import { CombinedPropertiesPane } from "./CombinedPropertiesPane";
 import type { SemanticElementResult, SymbolView } from "../types";
 
 type PropertiesPanelProps = {
+  rootPath: string;
   selectedSymbol: SymbolView | null;
   selectedSemanticRow: SemanticElementResult | null;
   selectedSemanticLoading: boolean;
@@ -10,6 +11,7 @@ type PropertiesPanelProps = {
 };
 
 export function PropertiesPanel({
+  rootPath,
   selectedSymbol,
   selectedSemanticRow,
   selectedSemanticLoading,
@@ -21,6 +23,7 @@ export function PropertiesPanel({
       <div className="panel-header"><strong>Properties</strong></div>
       <div className="simple-ui-scroll simple-properties-host">
         <CombinedPropertiesPane
+          rootPath={rootPath}
           selectedSymbols={selectedSymbol ? [selectedSymbol] : null}
           selectedSemanticRow={selectedSemanticRow}
           selectedSemanticLoading={selectedSemanticLoading}
