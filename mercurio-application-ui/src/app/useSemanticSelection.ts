@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import {
   clearSemanticElementCache,
-  querySemanticElementByQualifiedName,
+  querySemanticElementProjectionByQualifiedName,
 } from "./services/semanticApi";
-import type { SemanticElementResult, SymbolView } from "./types";
+import type { SemanticElementProjectionResult, SymbolView } from "./types";
 
 type UseSemanticSelectionArgs = {
   rootPath: string;
@@ -12,7 +12,7 @@ type UseSemanticSelectionArgs = {
 };
 
 type UseSemanticSelectionResult = {
-  selectedSemanticRow: SemanticElementResult | null;
+  selectedSemanticRow: SemanticElementProjectionResult | null;
   selectedSemanticLoading: boolean;
   selectedSemanticError: string;
 };
@@ -22,7 +22,9 @@ export function useSemanticSelection({
   semanticSelectedQname,
   selectedSymbol,
 }: UseSemanticSelectionArgs): UseSemanticSelectionResult {
-  const [selectedSemanticRow, setSelectedSemanticRow] = useState<SemanticElementResult | null>(null);
+  const [selectedSemanticRow, setSelectedSemanticRow] = useState<SemanticElementProjectionResult | null>(
+    null,
+  );
   const [selectedSemanticLoading, setSelectedSemanticLoading] = useState(false);
   const [selectedSemanticError, setSelectedSemanticError] = useState("");
   const requestSeqRef = useRef(0);
@@ -52,7 +54,7 @@ export function useSemanticSelection({
     setSelectedSemanticLoading(true);
     setSelectedSemanticError("");
     const timer = window.setTimeout(() => {
-      void querySemanticElementByQualifiedName(rootPath, qname, filePath)
+      void querySemanticElementProjectionByQualifiedName(rootPath, qname, filePath)
         .then((payload) => {
           if (requestSeqRef.current !== requestSeq) return;
           setSelectedSemanticRow(payload || null);

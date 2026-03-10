@@ -1,8 +1,21 @@
 use mercurio_symbol_index::{SymbolIndexStore, SymbolMetatypeMappingRecord, SymbolRecord};
+use mercurio_sysml_pkg::compile_support::{
+    build_workspace_semantic_projection_views, workspace_semantic_cache_key, WorkspaceSemanticInput,
+};
+use mercurio_sysml_pkg::workspace_file::WorkspaceFileScope;
+use mercurio_sysml_pkg::workspace_query::{collect_model_files, collect_project_files};
+use mercurio_sysml_core::parser::Parser;
+use mercurio_sysml_semantics::semantic_contract::{
+    SemanticElementProjectionView,
+    SemanticFeatureView,
+    SemanticValueView,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
+use crate::project::load_project_config;
 use crate::state::WorkspaceSnapshotCacheEntry;
 use crate::CoreState;
 
@@ -52,6 +65,15 @@ pub struct IndexedSemanticElementView {
     pub qualified_name: String,
     pub file_path: String,
     pub attributes: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexedSemanticProjectionElementView {
+    pub name: String,
+    pub qualified_name: String,
+    pub file_path: String,
+    pub metatype_qname: Option<String>,
+    pub features: Vec<mercurio_sysml_semantics::semantic_contract::SemanticFeatureView>,
 }
 
 fn to_view(record: SymbolRecord) -> IndexedSymbolView {
@@ -288,6 +310,228 @@ pub fn query_project_semantic_element_by_qualified_name(
     Ok(select_best_semantic_candidate(fallback_candidates))
 }
 
+pub fn query_project_semantic_projection_by_qualified_name(
+    state: &CoreState,
+    project_root: String,
+    qualified_name: String,
+    file_path: Option<String>,
+) -> Result<Option<IndexedSemanticProjectionElementView>, String> {
+    let target = qualified_name.trim();
+    if target.is_empty() {
+        return Ok(None);
+    }
+    let requested_file_key = file_path
+        .as_deref()
+        .map(|value| normalized_compare_key(Path::new(value)));
+    let root_prefix = format!("project-semantic|{}|", project_root);
+    let mut exact_file_candidates = Vec::<IndexedSemanticProjectionElementView>::new();
+    let mut fallback_candidates = Vec::<IndexedSemanticProjectionElementView>::new();
+    if let Ok(cache) = state.workspace_snapshot_cache.lock() {
+        for (key, entry) in cache.iter() {
+            if !key.starts_with(&root_prefix) {
+                continue;
+            }
+            let WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(elements) = entry else {
+                continue;
+            };
+            for element in elements.iter() {
+                if element.qualified_name != target {
+                    continue;
+                }
+                let view = projection_element_to_indexed_view(element);
+                if let Some(requested_key) = requested_file_key.as_ref() {
+                    let candidate_key = normalized_compare_key(Path::new(&view.file_path));
+                    if &candidate_key == requested_key {
+                        exact_file_candidates.push(view);
+                    } else {
+                        fallback_candidates.push(view);
+                    }
+                } else {
+                    fallback_candidates.push(view);
+                }
+            }
+        }
+    }
+    if !exact_file_candidates.is_empty() {
+        return Ok(select_best_semantic_projection_candidate(
+            exact_file_candidates,
+        ));
+    }
+    if !fallback_candidates.is_empty() {
+        return Ok(select_best_semantic_projection_candidate(fallback_candidates));
+    }
+
+    let elements = match load_or_build_project_semantic_projection_cache(state, &project_root) {
+        Ok(elements) => elements,
+        Err(_) => {
+            return query_project_semantic_element_by_qualified_name(
+                state,
+                project_root,
+                qualified_name,
+                file_path,
+            )
+            .map(|legacy| legacy.map(fallback_projection_view_from_legacy_element));
+        }
+    };
+    for element in elements.iter() {
+        if element.qualified_name != target {
+            continue;
+        }
+        let view = projection_element_to_indexed_view(element);
+        if let Some(requested_key) = requested_file_key.as_ref() {
+            let candidate_key = normalized_compare_key(Path::new(&view.file_path));
+            if &candidate_key == requested_key {
+                exact_file_candidates.push(view);
+            } else {
+                fallback_candidates.push(view);
+            }
+        } else {
+            fallback_candidates.push(view);
+        }
+    }
+    if !exact_file_candidates.is_empty() {
+        return Ok(select_best_semantic_projection_candidate(
+            exact_file_candidates,
+        ));
+    }
+    let typed_result = select_best_semantic_projection_candidate(fallback_candidates);
+    if typed_result.is_some() {
+        return Ok(typed_result);
+    }
+
+    query_project_semantic_element_by_qualified_name(state, project_root, qualified_name, file_path)
+        .map(|legacy| legacy.map(fallback_projection_view_from_legacy_element))
+}
+
+fn fallback_projection_view_from_legacy_element(
+    element: IndexedSemanticElementView,
+) -> IndexedSemanticProjectionElementView {
+    let metatype_qname = element
+        .attributes
+        .get("emf::metatype")
+        .cloned()
+        .or_else(|| element.attributes.get("metatype_qname").cloned());
+    let mut features = element
+        .attributes
+        .into_iter()
+        .map(|(name, value)| {
+            let parsed = if value == "true" || value == "false" {
+                SemanticValueView::Bool {
+                    value: value == "true",
+                }
+            } else if let Ok(v) = value.parse::<i64>() {
+                SemanticValueView::I64 { value: v }
+            } else if let Ok(v) = value.parse::<u64>() {
+                SemanticValueView::U64 { value: v }
+            } else if let Ok(v) = value.parse::<f64>() {
+                SemanticValueView::F64 { value: v }
+            } else {
+                SemanticValueView::Text { value }
+            };
+            SemanticFeatureView {
+                name,
+                feature_kind: "attribute".to_string(),
+                many: false,
+                containment: false,
+                declared_type_qname: None,
+                metamodel_feature_qname: None,
+                value: parsed,
+                diagnostics: Vec::new(),
+            }
+        })
+        .collect::<Vec<_>>();
+    features.sort_by(|left, right| left.name.cmp(&right.name));
+    IndexedSemanticProjectionElementView {
+        name: element.name,
+        qualified_name: element.qualified_name,
+        file_path: element.file_path,
+        metatype_qname,
+        features,
+    }
+}
+
+fn load_or_build_project_semantic_projection_cache(
+    state: &CoreState,
+    project_root: &str,
+) -> Result<std::sync::Arc<Vec<SemanticElementProjectionView>>, String> {
+    let root_path = PathBuf::from(project_root);
+    if !root_path.exists() {
+        return Err("Root path does not exist".to_string());
+    }
+    let project_config = load_project_config(&root_path).ok().flatten();
+    let src_patterns = project_config
+        .as_ref()
+        .and_then(|config| config.src.as_deref());
+    let mut files = if let Some(src) = src_patterns {
+        collect_project_files(&root_path, src)?
+    } else {
+        Vec::new()
+    };
+    if files.is_empty() {
+        collect_model_files(&root_path, &mut files)?;
+    }
+    files.sort();
+    files.dedup();
+    let mut inputs = Vec::<WorkspaceSemanticInput>::new();
+    for path in files.iter() {
+        let source = fs::read_to_string(path).map_err(|error| error.to_string())?;
+        let mut parser = Parser::new(&source);
+        parser.parse_root();
+        if !parser.errors().is_empty() {
+            continue;
+        }
+        inputs.push(WorkspaceSemanticInput {
+            path: path.clone(),
+            source,
+            scope: WorkspaceFileScope::Project,
+        });
+    }
+    if inputs.is_empty() {
+        return Ok(std::sync::Arc::new(Vec::new()));
+    }
+    let cache_key = workspace_semantic_cache_key(
+        project_root,
+        &inputs,
+        "",
+        "project-semantic-projection-v1",
+    );
+    if let Ok(cache) = state.workspace_snapshot_cache.lock() {
+        if let Some(WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(elements)) =
+            cache.get(&cache_key)
+        {
+            return Ok(elements.clone());
+        }
+    }
+    let computed = std::sync::Arc::new(build_workspace_semantic_projection_views(&inputs)?);
+    if let Ok(mut cache) = state.workspace_snapshot_cache.lock() {
+        clear_project_semantic_projection_cache_for_root(&mut cache, project_root);
+        cache.insert(
+            cache_key,
+            WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(computed.clone()),
+        );
+    }
+    Ok(computed)
+}
+
+fn clear_project_semantic_projection_cache_for_root(
+    cache: &mut std::collections::HashMap<String, WorkspaceSnapshotCacheEntry>,
+    project_root: &str,
+) {
+    let prefix = format!("project-semantic|{}|", project_root);
+    let to_remove = cache
+        .iter()
+        .filter_map(|(key, entry)| match entry {
+            WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(_) if key.starts_with(&prefix) => {
+                Some(key.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for key in to_remove {
+        cache.remove(&key);
+    }
+}
+
 fn semantic_element_to_indexed_view(
     element: &mercurio_sysml_semantics::semantic_contract::SemanticElementView,
 ) -> IndexedSemanticElementView {
@@ -319,6 +563,18 @@ fn semantic_element_to_indexed_view(
     }
 }
 
+fn projection_element_to_indexed_view(
+    element: &SemanticElementProjectionView,
+) -> IndexedSemanticProjectionElementView {
+    IndexedSemanticProjectionElementView {
+        name: element.name.clone(),
+        qualified_name: element.qualified_name.clone(),
+        file_path: element.file_path.clone(),
+        metatype_qname: element.metatype_qname.clone(),
+        features: element.features.clone(),
+    }
+}
+
 fn select_best_semantic_candidate(
     mut candidates: Vec<IndexedSemanticElementView>,
 ) -> Option<IndexedSemanticElementView> {
@@ -328,6 +584,23 @@ fn select_best_semantic_candidate(
     candidates.sort_by(|a, b| {
         semantic_candidate_score(b)
             .cmp(&semantic_candidate_score(a))
+            .then(a.file_path.cmp(&b.file_path))
+            .then(a.qualified_name.cmp(&b.qualified_name))
+            .then(a.name.cmp(&b.name))
+    });
+    candidates.into_iter().next()
+}
+
+fn select_best_semantic_projection_candidate(
+    mut candidates: Vec<IndexedSemanticProjectionElementView>,
+) -> Option<IndexedSemanticProjectionElementView> {
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort_by(|a, b| {
+        b.features
+            .len()
+            .cmp(&a.features.len())
             .then(a.file_path.cmp(&b.file_path))
             .then(a.qualified_name.cmp(&b.qualified_name))
             .then(a.name.cmp(&b.name))
@@ -843,6 +1116,58 @@ mod tests {
                 .map(|value| value.as_str()),
             Some("sysml::Package")
         );
+    }
+
+    #[test]
+    fn query_project_semantic_projection_reads_typed_cache_entry() {
+        let state = CoreState::new(
+            std::env::temp_dir().join("mercurio_semantic_projection_cache"),
+            AppSettings::default(),
+        );
+        let project_root = "C:\\tmp\\semantic-projection".to_string();
+        let projection =
+            mercurio_sysml_semantics::semantic_contract::SemanticElementProjectionView {
+                name: "w".to_string(),
+                qualified_name: "Example::w".to_string(),
+                metatype_qname: Some("sysml::PartUsage".to_string()),
+                file_path: "C:\\tmp\\Example.sysml".to_string(),
+                features: vec![mercurio_sysml_semantics::semantic_contract::SemanticFeatureView {
+                    name: "name".to_string(),
+                    feature_kind: "attribute".to_string(),
+                    many: false,
+                    containment: false,
+                    declared_type_qname: None,
+                    metamodel_feature_qname: Some("sysml::Element::name".to_string()),
+                    value: mercurio_sysml_semantics::semantic_contract::SemanticValueView::Text {
+                        value: "w".to_string(),
+                    },
+                    diagnostics: Vec::new(),
+                }],
+            };
+        {
+            let mut cache = state
+                .workspace_snapshot_cache
+                .lock()
+                .expect("workspace cache lock");
+            cache.insert(
+                format!("project-semantic|{}|typed", project_root),
+                WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(std::sync::Arc::new(vec![
+                    projection,
+                ])),
+            );
+        }
+
+        let found = query_project_semantic_projection_by_qualified_name(
+            &state,
+            project_root,
+            "Example::w".to_string(),
+            None,
+        )
+        .expect("semantic projection query")
+        .expect("semantic projection row");
+        assert_eq!(found.qualified_name, "Example::w");
+        assert_eq!(found.features.len(), 1);
+        assert_eq!(found.features[0].name, "name");
     }
 
     #[test]

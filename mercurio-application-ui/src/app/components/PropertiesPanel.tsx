@@ -1,10 +1,10 @@
 import { CombinedPropertiesPane } from "./CombinedPropertiesPane";
-import type { SemanticElementResult, SymbolView } from "../types";
+import type { SemanticElementProjectionResult, SymbolView } from "../types";
 
 type PropertiesPanelProps = {
   rootPath: string;
   selectedSymbol: SymbolView | null;
-  selectedSemanticRow: SemanticElementResult | null;
+  selectedSemanticRow: SemanticElementProjectionResult | null;
   selectedSemanticLoading: boolean;
   selectedSemanticError: string;
   onSelectQualifiedName: (qualifiedName: string) => void;

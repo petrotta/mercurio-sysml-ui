@@ -1124,7 +1124,8 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
             .get(&semantic_cache_key)
             .and_then(|entry| match entry {
                 WorkspaceSnapshotCacheEntry::ProjectSemantic(elements) => Some(elements.clone()),
-                WorkspaceSnapshotCacheEntry::Stdlib(_) => None,
+                WorkspaceSnapshotCacheEntry::Stdlib(_)
+                | WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(_) => None,
             })
     } else {
         None
@@ -1621,7 +1622,8 @@ where
             .iter()
             .filter_map(|(key, entry)| match entry {
                 WorkspaceSnapshotCacheEntry::Stdlib(value) => Some((key.clone(), value.clone())),
-                WorkspaceSnapshotCacheEntry::ProjectSemantic(_) => None,
+                WorkspaceSnapshotCacheEntry::ProjectSemantic(_)
+                | WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(_) => None,
             })
             .collect::<HashMap<String, StdlibCache>>()
     };
@@ -1681,7 +1683,10 @@ fn clear_project_semantic_cache_for_root(
     let to_remove = cache
         .iter()
         .filter_map(|(key, entry)| match entry {
-            WorkspaceSnapshotCacheEntry::ProjectSemantic(_) if key.starts_with(&prefix) => {
+            WorkspaceSnapshotCacheEntry::ProjectSemantic(_)
+            | WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(_)
+                if key.starts_with(&prefix) =>
+            {
                 Some(key.clone())
             }
             _ => None,
