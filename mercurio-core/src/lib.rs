@@ -57,13 +57,16 @@ pub use project_model::{
 mod symbol_index;
 pub use symbol_index::{
     query_library_summary, query_library_symbols, query_project_semantic_element_by_qualified_name,
-    query_project_symbols, query_project_symbols_for_files, query_stdlib_documentation_symbols,
+    query_project_semantic_projection_by_qualified_name, query_project_symbols,
+    query_project_symbols_for_files, query_stdlib_documentation_symbols,
     query_symbol_metatype_mapping, query_symbols_by_metatype, IndexedSemanticElementView,
-    IndexedSymbolView, LibraryIndexSummaryView, SymbolMetatypeMappingView,
+    IndexedSemanticProjectionElementView, IndexedSymbolView, LibraryIndexSummaryView,
+    SymbolMetatypeMappingView,
 };
 
 pub use mercurio_sysml_semantics::semantic_contract::{
-    SemanticElementView, SemanticPredicate, SemanticQuery,
+    SemanticElementProjectionView, SemanticElementView, SemanticFeatureView, SemanticPredicate,
+    SemanticQuery, SemanticValueView,
 };
 pub use workspace::query_semantic;
 

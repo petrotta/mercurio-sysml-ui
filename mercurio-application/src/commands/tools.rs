@@ -11,6 +11,7 @@ use mercurio_core::{
     load_library_symbols_sync as core_load_library_symbols_sync,
     query_library_symbols as core_query_library_symbols,
     query_project_semantic_element_by_qualified_name as core_query_project_semantic_element_by_qualified_name,
+    query_project_semantic_projection_by_qualified_name as core_query_project_semantic_projection_by_qualified_name,
     query_project_symbols as core_query_project_symbols,
     query_project_symbols_for_files as core_query_project_symbols_for_files,
     query_semantic as core_query_semantic, query_semantic_symbols as core_query_semantic_symbols,
@@ -385,6 +386,22 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
             let file_path = arg_optional_string(&args, "file_path");
             tauri::async_runtime::spawn_blocking(move || {
                 core_query_project_semantic_element_by_qualified_name(
+                    &core,
+                    root,
+                    qualified_name,
+                    file_path,
+                )
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|row| serde_json::to_value(row).map_err(|e| e.to_string()))
+        }
+        "core.query_semantic_element@v2" => {
+            let root = arg_string(&args, "root")?;
+            let qualified_name = arg_string(&args, "qualified_name")?;
+            let file_path = arg_optional_string(&args, "file_path");
+            tauri::async_runtime::spawn_blocking(move || {
+                core_query_project_semantic_projection_by_qualified_name(
                     &core,
                     root,
                     qualified_name,

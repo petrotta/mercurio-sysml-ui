@@ -1523,6 +1523,18 @@ body.theme-light .simple-modal {
   max-height: calc(100vh - 44px);
 }
 
+.simple-metatype-attributes-modal {
+  width: min(1040px, calc(100vw - 36px));
+  min-height: 260px;
+}
+
+.simple-metatype-attributes-meta {
+  display: grid;
+  gap: 2px;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
 .simple-about-body {
   gap: 10px;
 }

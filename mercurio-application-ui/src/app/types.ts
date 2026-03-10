@@ -299,6 +299,8 @@ export type ProjectElementAttributesView = {
   metatype_qname?: string | null;
   explicit_attributes: ProjectModelAttributeView[];
   inherited_attributes: ProjectElementInheritedAttributeView[];
+  direct_metatype_attributes?: ProjectElementInheritedAttributeView[];
+  inherited_metatype_attributes?: ProjectElementInheritedAttributeView[];
   diagnostics: string[];
 };
 
@@ -320,4 +322,40 @@ export type SemanticElementResult = {
   qualified_name: string;
   file_path: string;
   attributes?: Record<string, string>;
+};
+
+export type SemanticValueView =
+  | { kind: "null" }
+  | { kind: "text"; value: string }
+  | { kind: "bool"; value: boolean }
+  | { kind: "i64"; value: number }
+  | { kind: "u64"; value: number }
+  | { kind: "f64"; value: number }
+  | { kind: "enum"; literal: string; enum_type_qname?: string | null }
+  | {
+      kind: "ref";
+      qualified_name?: string | null;
+      proxy_text?: string | null;
+      metatype_qname?: string | null;
+      containment: boolean;
+    }
+  | { kind: "list"; items: SemanticValueView[] };
+
+export type SemanticFeatureView = {
+  name: string;
+  feature_kind: string;
+  many: boolean;
+  containment: boolean;
+  declared_type_qname?: string | null;
+  metamodel_feature_qname?: string | null;
+  value: SemanticValueView;
+  diagnostics: string[];
+};
+
+export type SemanticElementProjectionResult = {
+  name: string;
+  qualified_name: string;
+  file_path: string;
+  metatype_qname?: string | null;
+  features: SemanticFeatureView[];
 };

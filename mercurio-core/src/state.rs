@@ -1,6 +1,8 @@
 use mercurio_symbol_index::{InMemorySymbolIndex, SymbolIndex, SymbolIndexStore};
 use mercurio_sysml_pkg::compile_support::StdlibSnapshotCacheEntry;
-use mercurio_sysml_semantics::semantic_contract::SemanticElementView;
+use mercurio_sysml_semantics::semantic_contract::{
+    SemanticElementProjectionView, SemanticElementView,
+};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -34,11 +36,13 @@ pub(crate) struct StdlibSymbol {
 
 pub(crate) type StdlibCache = StdlibSnapshotCacheEntry<StdlibSymbol>;
 pub(crate) type ProjectSemanticCache = Arc<Vec<SemanticElementView>>;
+pub(crate) type ProjectSemanticProjectionCache = Arc<Vec<SemanticElementProjectionView>>;
 
 #[derive(Clone)]
 pub(crate) enum WorkspaceSnapshotCacheEntry {
     Stdlib(StdlibCache),
     ProjectSemantic(ProjectSemanticCache),
+    ProjectSemanticProjection(ProjectSemanticProjectionCache),
 }
 
 pub(crate) type WorkspaceSnapshotCache = HashMap<String, WorkspaceSnapshotCacheEntry>;
