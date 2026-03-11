@@ -1,0 +1,64 @@
+[
+  {
+    "id": "package-basic",
+    "title": "Package structure",
+    "text": "Use packages to group related definitions.\n\npackage Example {\n  part def Vehicle;\n}\n"
+  },
+  {
+    "id": "part-def",
+    "title": "Part definition",
+    "text": "Define a reusable part with `part def` and instances with `part`.\n\npart def Sensor {\n  attribute id: String;\n}\n\npart sensor1 : Sensor;\n"
+  },
+  {
+    "id": "requirement",
+    "title": "Requirement",
+    "text": "Requirements capture constraints with id/text.\n\nrequirement ReqA {\n  id = \"REQ-001\";\n  text = \"The system shall ...\";\n}\n"
+  },
+  {
+    "id": "state1",
+    "title": "State1",
+    "text": "State  describe lifecycle behavior.\n\nstate Lifecycle {\n  state Idle;\n  state Active;\n  transition start from Idle to Active;\n}\n"
+  },
+  {
+    "id": "import-alias",
+    "title": "Alias import",
+    "text": "Use alias import to shorten qualified names.\n\nimport AliasImport::Definitions::Vehicle;\npart vehicle : Vehicle;\n"
+  },
+  {
+    "id": "interface",
+    "title": "Interface usage",
+    "text": "Interfaces define contracts between parts.\n\ninterface def Power {\n  attribute voltage: Real;\n}\n"
+  },
+  {
+    "id": "association",
+    "title": "Association",
+    "text": "Associations connect parts.\n\nassociation def Connects {\n  end a: PartA;\n  end b: PartB;\n}\n"
+  },
+  {
+    "id": "multiplicity",
+    "title": "Multiplicity",
+    "text": "Use multiplicity on parts/ends.\n\npart sensors[1..4] : Sensor;\n"
+  },
+  {
+    "id": "constraint",
+    "title": "Constraint",
+    "text": "Constraints capture invariants.\n\nconstraint def TempLimit {\n  attribute maxTemp: Real;\n}\n"
+  },
+  {
+    "id": "port",
+    "title": "Ports",
+    "text": "Ports expose interaction points.\n\nport powerIn : Power;\n"
+  },
+
+  {
+    "id": "state2",
+    "title": "state2",
+    "text": "state def S {\n  state off;\n  state on {\n    do providePower;\n  }\n\n  transition off_to_on\n    first off\n    accept OnSignal\n    then on;\n\n  transition on_to_off\n    first on\n    accept OffSignal\n    then off;\n}"
+  },
+  {
+    "id": "state3",
+    "title": "state3",
+    "text": "when asked to create a state, use the notation state def S { state <s1>; state <s2>; state <s3>; transition <name> first <name> accept <name> then <name>; }" "
+  }
+
+]
