@@ -221,6 +221,10 @@ button:hover {
   box-shadow: none;
 }
 
+.file-panel {
+  container-type: inline-size;
+}
+
 .editor-panel {
   position: relative;
 }
@@ -399,7 +403,13 @@ button:hover {
   background: #1e1f22;
   color: #c8cbd0;
   margin-left: auto;
-  max-width: 140px;
+  width: 140px;
+}
+
+@container (max-width: 260px) {
+  .file-panel .tool-select {
+    width: 96px;
+  }
 }
 
 .tool-btn {
@@ -557,11 +567,11 @@ button:hover {
   flex: 1;
   display: none;
   flex-direction: column;
-  gap: 8px;
+  gap: 0;
   border: 1px solid #3c3f41;
   border-radius: 6px;
   background: #1e1f22;
-  padding: 8px;
+  padding: 0;
   margin-bottom: 8px;
   min-height: 200px;
   height: 100%;
@@ -610,6 +620,8 @@ button:hover {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  padding: 8px;
+  border-bottom: 1px solid #2b2d30;
 }
 
 .diagram-status {
