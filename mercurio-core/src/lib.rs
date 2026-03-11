@@ -30,7 +30,7 @@ pub use compile::{
 mod settings;
 pub use settings::{
     ensure_mercurio_paths, load_app_settings, resolve_mercurio_user_dir, resolve_user_local_dir,
-    save_app_settings, AppSettings, MercurioPaths,
+    save_app_settings, AppSettings, MercurioPaths, WindowBoundsSettings, WindowStateSettings,
 };
 
 mod state;
@@ -57,13 +57,16 @@ pub use project_model::{
 mod symbol_index;
 pub use symbol_index::{
     query_library_summary, query_library_symbols, query_project_semantic_element_by_qualified_name,
-    query_project_symbols, query_project_symbols_for_files, query_stdlib_documentation_symbols,
+    query_project_semantic_projection_by_qualified_name, query_project_symbols,
+    query_project_symbols_for_files, query_stdlib_documentation_symbols,
     query_symbol_metatype_mapping, query_symbols_by_metatype, IndexedSemanticElementView,
-    IndexedSymbolView, LibraryIndexSummaryView, SymbolMetatypeMappingView,
+    IndexedSemanticProjectionElementView, IndexedSymbolView, LibraryIndexSummaryView,
+    SymbolMetatypeMappingView,
 };
 
 pub use mercurio_sysml_semantics::semantic_contract::{
-    SemanticElementView, SemanticPredicate, SemanticQuery,
+    SemanticElementProjectionView, SemanticElementView, SemanticFeatureView, SemanticPredicate,
+    SemanticQuery, SemanticValueView,
 };
 pub use workspace::query_semantic;
 

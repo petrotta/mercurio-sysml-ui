@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use mercurio_symbol_index::{SymbolIndexStore, SymbolRecord};
 use mercurio_sysml_pkg::project_model_projection::{
-    collect_inherited_attributes, collect_project_expression_records, resolve_mapped_metatype,
-    symbol_to_attribute_rows, SymbolMetatypeMappingData,
+    collect_direct_metatype_attributes, collect_inherited_attributes,
+    collect_inherited_metatype_attributes, collect_project_expression_records,
+    resolve_mapped_metatype, symbol_to_attribute_rows, SymbolMetatypeMappingData,
 };
 pub use mercurio_sysml_pkg::project_model_projection::{
     ProjectExpressionRecordView, ProjectExpressionRecordsView,
@@ -68,6 +69,8 @@ pub fn get_project_element_attributes(
                 metatype_qname: None,
                 explicit_attributes: Vec::new(),
                 inherited_attributes: Vec::new(),
+                direct_metatype_attributes: Vec::new(),
+                inherited_metatype_attributes: Vec::new(),
                 diagnostics: vec!["Element not found in current project symbol index.".to_string()],
             });
         };
@@ -101,31 +104,47 @@ pub fn get_project_element_attributes(
         symbol.properties_json.as_deref(),
         metatype_qname.as_deref(),
     );
-    let inherited_attributes = match load_stdlib_metatype_index(state, &root) {
-        Ok(Some(index)) => collect_inherited_attributes(
-            &index,
-            metatype_qname.as_deref(),
-            &explicit_attributes,
-            &mut diagnostics,
-        ),
-        Ok(None) => {
-            diagnostics.push(
-                "Inherited attributes unavailable because stdlib metatype index is unresolved."
-                    .to_string(),
-            );
-            Vec::new()
-        }
-        Err(error) => {
-            diagnostics.push(format!("Unable to load stdlib metatype index: {error}"));
-            Vec::new()
-        }
-    };
+    let (direct_metatype_attributes, inherited_metatype_attributes, inherited_attributes) =
+        match load_stdlib_metatype_index(state, &root) {
+            Ok(Some(index)) => {
+                let direct = collect_direct_metatype_attributes(
+                    &index,
+                    metatype_qname.as_deref(),
+                    &mut diagnostics,
+                );
+                let inherited_metatype = collect_inherited_metatype_attributes(
+                    &index,
+                    metatype_qname.as_deref(),
+                    &mut diagnostics,
+                );
+                let inherited = collect_inherited_attributes(
+                    &index,
+                    metatype_qname.as_deref(),
+                    &explicit_attributes,
+                    &mut diagnostics,
+                );
+                (direct, inherited_metatype, inherited)
+            }
+            Ok(None) => {
+                diagnostics.push(
+                    "Inherited attributes unavailable because stdlib metatype index is unresolved."
+                        .to_string(),
+                );
+                (Vec::new(), Vec::new(), Vec::new())
+            }
+            Err(error) => {
+                diagnostics.push(format!("Unable to load stdlib metatype index: {error}"));
+                (Vec::new(), Vec::new(), Vec::new())
+            }
+        };
 
     Ok(ProjectElementAttributesView {
         element_qualified_name,
         metatype_qname: metatype_qname.clone(),
         explicit_attributes,
         inherited_attributes,
+        direct_metatype_attributes,
+        inherited_metatype_attributes,
         diagnostics,
     })
 }
@@ -432,6 +451,12 @@ standard library package KerML {
             Some("Package".to_string()),
         )
         .expect("project element attributes");
+        assert!(!attrs.direct_metatype_attributes.is_empty());
+        assert!(attrs
+            .direct_metatype_attributes
+            .iter()
+            .any(|attr| attr.name == "filterCondition"));
+        assert!(!attrs.inherited_metatype_attributes.is_empty());
 
         let mapped = {
             let store = state.symbol_index.lock().expect("symbol index lock");

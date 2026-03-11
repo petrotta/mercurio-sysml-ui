@@ -332,14 +332,16 @@ fn collect_stdlib_cache_snapshot(
                 .values()
                 .filter_map(|entry| match entry {
                     WorkspaceSnapshotCacheEntry::Stdlib(value) => Some(value),
-                    WorkspaceSnapshotCacheEntry::ProjectSemantic(_) => None,
+                    WorkspaceSnapshotCacheEntry::ProjectSemantic(_)
+                    | WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(_) => None,
                 })
                 .collect::<Vec<_>>();
             let summaries = cache
                 .values()
                 .filter_map(|entry| match entry {
                     WorkspaceSnapshotCacheEntry::Stdlib(value) => Some(value),
-                    WorkspaceSnapshotCacheEntry::ProjectSemantic(_) => None,
+                    WorkspaceSnapshotCacheEntry::ProjectSemantic(_)
+                    | WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(_) => None,
                 })
                 .map(StdlibCacheSummary::from_entry)
                 .collect::<Vec<_>>();

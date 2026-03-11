@@ -554,7 +554,9 @@ fn classification_relationships_from_semantic_attributes(
     out
 }
 
-fn semantic_attributes_to_properties(attributes: &HashMap<String, String>) -> Vec<PropertyItemView> {
+fn semantic_attributes_to_properties(
+    attributes: &HashMap<String, String>,
+) -> Vec<PropertyItemView> {
     let mut keys = attributes.keys().cloned().collect::<Vec<_>>();
     keys.sort();
     let mut properties = Vec::<PropertyItemView>::new();
@@ -1112,7 +1114,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
                 scope: WorkspaceFileScope::Project,
             })
             .collect::<Vec<_>>();
-    let semantic_pipeline = "project-semantic-v2";
+    let semantic_pipeline = "project-semantic-v3";
     let semantic_cache_key = workspace_semantic_cache_key(
         &root,
         &project_semantic_inputs,
@@ -1124,7 +1126,8 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
             .get(&semantic_cache_key)
             .and_then(|entry| match entry {
                 WorkspaceSnapshotCacheEntry::ProjectSemantic(elements) => Some(elements.clone()),
-                WorkspaceSnapshotCacheEntry::Stdlib(_) => None,
+                WorkspaceSnapshotCacheEntry::Stdlib(_)
+                | WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(_) => None,
             })
     } else {
         None
@@ -1340,10 +1343,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
     } else {
         emit_progress(
             "indexing",
-            Some(format!(
-                "indexing {} raw symbols",
-                raw_index_symbols.len()
-            )),
+            Some(format!("indexing {} raw symbols", raw_index_symbols.len())),
             Some(raw_index_symbols.len()),
             Some(raw_index_symbols.len()),
         );
@@ -1621,7 +1621,8 @@ where
             .iter()
             .filter_map(|(key, entry)| match entry {
                 WorkspaceSnapshotCacheEntry::Stdlib(value) => Some((key.clone(), value.clone())),
-                WorkspaceSnapshotCacheEntry::ProjectSemantic(_) => None,
+                WorkspaceSnapshotCacheEntry::ProjectSemantic(_)
+                | WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(_) => None,
             })
             .collect::<HashMap<String, StdlibCache>>()
     };
@@ -1681,7 +1682,10 @@ fn clear_project_semantic_cache_for_root(
     let to_remove = cache
         .iter()
         .filter_map(|(key, entry)| match entry {
-            WorkspaceSnapshotCacheEntry::ProjectSemantic(_) if key.starts_with(&prefix) => {
+            WorkspaceSnapshotCacheEntry::ProjectSemantic(_)
+            | WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(_)
+                if key.starts_with(&prefix) =>
+            {
                 Some(key.clone())
             }
             _ => None,
@@ -2479,10 +2483,7 @@ standard library package KerML {
         )
         .expect("third load");
         assert!(!third.workspace_snapshot_hit);
-        assert!(third
-            .symbols
-            .iter()
-            .any(|symbol| symbol.name == "B"));
+        assert!(third.symbols.iter().any(|symbol| symbol.name == "B"));
 
         let _ = fs::remove_dir_all(root);
     }

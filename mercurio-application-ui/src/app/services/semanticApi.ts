@@ -3,6 +3,7 @@ import type {
   IndexedSymbolView,
   ProjectModelView,
   ProjectElementAttributesView,
+  SemanticElementProjectionResult,
   SemanticElementResult,
   SymbolView,
 } from "../types";
@@ -11,6 +12,11 @@ const SEMANTIC_ELEMENT_CACHE_LIMIT = 256;
 const PROJECT_ELEMENT_ATTRIBUTES_TIMEOUT_MS = 20000;
 const semanticElementCache = new Map<string, SemanticElementResult | null>();
 const semanticElementInFlight = new Map<string, Promise<SemanticElementResult | null>>();
+const semanticProjectionCache = new Map<string, SemanticElementProjectionResult | null>();
+const semanticProjectionInFlight = new Map<
+  string,
+  Promise<SemanticElementProjectionResult | null>
+>();
 
 export type LibrarySymbolsLoadResult = {
   ok: boolean;
@@ -64,6 +70,8 @@ export function clearSemanticElementCache(root?: string): void {
   if (!root) {
     semanticElementCache.clear();
     semanticElementInFlight.clear();
+    semanticProjectionCache.clear();
+    semanticProjectionInFlight.clear();
     return;
   }
   const prefix = `${root.toLowerCase()}\u0000`;
@@ -75,6 +83,16 @@ export function clearSemanticElementCache(root?: string): void {
   for (const key of Array.from(semanticElementInFlight.keys())) {
     if (key.startsWith(prefix)) {
       semanticElementInFlight.delete(key);
+    }
+  }
+  for (const key of Array.from(semanticProjectionCache.keys())) {
+    if (key.startsWith(prefix)) {
+      semanticProjectionCache.delete(key);
+    }
+  }
+  for (const key of Array.from(semanticProjectionInFlight.keys())) {
+    if (key.startsWith(prefix)) {
+      semanticProjectionInFlight.delete(key);
     }
   }
 }
@@ -104,6 +122,44 @@ export async function querySemanticElementByQualifiedName(
       semanticElementInFlight.delete(key);
     });
   semanticElementInFlight.set(key, request);
+  return request;
+}
+
+export async function querySemanticElementProjectionByQualifiedName(
+  root: string,
+  qualifiedName: string,
+  filePath?: string | null,
+): Promise<SemanticElementProjectionResult | null> {
+  const target = (qualifiedName || "").trim();
+  if (!target) return null;
+  const key = semanticElementCacheKey(root, target, filePath);
+  if (semanticProjectionCache.has(key)) {
+    return semanticProjectionCache.get(key) || null;
+  }
+  const existing = semanticProjectionInFlight.get(key);
+  if (existing) {
+    return existing;
+  }
+  const request = callTool<SemanticElementProjectionResult | null>("core.query_semantic_element@v2", {
+    root,
+    qualified_name: target,
+    file_path: filePath || null,
+  })
+    .then((row) => {
+      semanticProjectionCache.delete(key);
+      semanticProjectionCache.set(key, row || null);
+      if (semanticProjectionCache.size > SEMANTIC_ELEMENT_CACHE_LIMIT) {
+        const oldest = semanticProjectionCache.keys().next().value;
+        if (oldest) {
+          semanticProjectionCache.delete(oldest);
+        }
+      }
+      return row || null;
+    })
+    .finally(() => {
+      semanticProjectionInFlight.delete(key);
+    });
+  semanticProjectionInFlight.set(key, request);
   return request;
 }
 

@@ -4,8 +4,23 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize, Default, Clone)]
+pub struct WindowBoundsSettings {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct WindowStateSettings {
+    pub bounds: Option<WindowBoundsSettings>,
+    pub maximized: bool,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct AppSettings {
     pub default_stdlib: Option<String>,
+    pub main_window: Option<WindowStateSettings>,
 }
 
 pub struct MercurioPaths {
