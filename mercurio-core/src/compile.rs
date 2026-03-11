@@ -554,7 +554,9 @@ fn classification_relationships_from_semantic_attributes(
     out
 }
 
-fn semantic_attributes_to_properties(attributes: &HashMap<String, String>) -> Vec<PropertyItemView> {
+fn semantic_attributes_to_properties(
+    attributes: &HashMap<String, String>,
+) -> Vec<PropertyItemView> {
     let mut keys = attributes.keys().cloned().collect::<Vec<_>>();
     keys.sort();
     let mut properties = Vec::<PropertyItemView>::new();
@@ -1341,10 +1343,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
     } else {
         emit_progress(
             "indexing",
-            Some(format!(
-                "indexing {} raw symbols",
-                raw_index_symbols.len()
-            )),
+            Some(format!("indexing {} raw symbols", raw_index_symbols.len())),
             Some(raw_index_symbols.len()),
             Some(raw_index_symbols.len()),
         );
@@ -2484,10 +2483,7 @@ standard library package KerML {
         )
         .expect("third load");
         assert!(!third.workspace_snapshot_hit);
-        assert!(third
-            .symbols
-            .iter()
-            .any(|symbol| symbol.name == "B"));
+        assert!(third.symbols.iter().any(|symbol| symbol.name == "B"));
 
         let _ = fs::remove_dir_all(root);
     }

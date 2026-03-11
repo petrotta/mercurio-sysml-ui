@@ -1,22 +1,25 @@
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::fs::File;
 use std::io;
-use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::path::BaseDirectory;
-use tauri::{Emitter, EventTarget, Manager};
+use tauri::{
+    Emitter, EventTarget, Manager, PhysicalPosition, PhysicalSize, Position, Size, WebviewWindow,
+    Window, WindowEvent,
+};
 use zip::ZipArchive;
-use notify::{Event, RecursiveMode, RecommendedWatcher, Watcher};
 
 mod commands;
 
 use commands::{
-    app_exit, call_tool, list_dir, read_file, show_in_explorer, window_close, window_minimize, window_toggle_maximize,
-    write_file,
+    app_exit, call_tool, list_dir, read_file, show_in_explorer, window_close, window_minimize,
+    window_toggle_maximize, write_file,
 };
 
 use mercurio_core::{
@@ -25,7 +28,8 @@ use mercurio_core::{
     ensure_mercurio_paths, ensure_project_descriptor, list_stdlib_versions_from_root,
     load_app_settings, load_project_descriptor, save_app_settings, write_project_descriptor,
     AppSettings, BackgroundCancelSummary, BackgroundJobsSnapshot, CacheClearSummary,
-    CompileRequest, CompileResponse, CoreState, LibraryConfig, MercurioPaths,
+    CompileRequest, CompileResponse, CoreState, LibraryConfig, MercurioPaths, WindowBoundsSettings,
+    WindowStateSettings,
 };
 
 pub(crate) struct AppState {
@@ -255,7 +259,10 @@ fn start_project_file_watcher(
         return Err("Project root is required".to_string());
     }
     if !root_path.exists() || !root_path.is_dir() {
-        return Err(format!("Project root does not exist or is not a directory: {}", root_path.display()));
+        return Err(format!(
+            "Project root does not exist or is not a directory: {}",
+            root_path.display()
+        ));
     }
     let canonical_root = root_path
         .canonicalize()
@@ -272,25 +279,23 @@ fn start_project_file_watcher(
     let root_key_for_event = root_key.clone();
     let root_path_for_watch = canonical_root.clone();
     let app_for_emit = app.clone();
-    let mut watcher = notify::recommended_watcher(
-        move |result: notify::Result<Event>| {
-            let Ok(event) = result else {
-                return;
-            };
-            let kind = format!("{:?}", event.kind);
-            for path in event.paths {
-                let _ = app_for_emit.emit_to(
-                    EventTarget::webview_window("main"),
-                    "project-files-changed",
-                    ProjectFilesChangedPayload {
-                        root: root_key_for_event.clone(),
-                        path: path.to_string_lossy().to_string(),
-                        kind: kind.to_string(),
-                    },
-                );
-            }
-        },
-    )
+    let watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
+        let Ok(event) = result else {
+            return;
+        };
+        let kind = format!("{:?}", event.kind);
+        for path in event.paths {
+            let _ = app_for_emit.emit_to(
+                EventTarget::webview_window("main"),
+                "project-files-changed",
+                ProjectFilesChangedPayload {
+                    root: root_key_for_event.clone(),
+                    path: path.to_string_lossy().to_string(),
+                    kind: kind.to_string(),
+                },
+            );
+        }
+    })
     .map_err(|error| error.to_string())?;
 
     let mut watcher = watcher;
@@ -299,9 +304,7 @@ fn start_project_file_watcher(
         .map_err(|error| error.to_string())?;
     watchers.insert(
         root_key.clone(),
-        ActiveProjectFileWatcher {
-            _watcher: watcher,
-        },
+        ActiveProjectFileWatcher { _watcher: watcher },
     );
     Ok(true)
 }
@@ -375,6 +378,69 @@ fn set_project_stdlib_path(
     Ok(selected_path.to_string_lossy().to_string())
 }
 
+fn remember_main_window_state(state: &AppState, window: &Window) -> Result<(), String> {
+    let position = window.outer_position().map_err(|e| e.to_string())?;
+    let size = window.outer_size().map_err(|e| e.to_string())?;
+    let maximized = window.is_maximized().map_err(|e| e.to_string())?;
+    let mut settings = state
+        .core
+        .settings
+        .lock()
+        .map_err(|_| "Settings lock poisoned".to_string())?;
+    settings.main_window = Some(WindowStateSettings {
+        bounds: Some(WindowBoundsSettings {
+            x: position.x,
+            y: position.y,
+            width: size.width,
+            height: size.height,
+        }),
+        maximized,
+    });
+    Ok(())
+}
+
+fn persist_main_window_state(state: &AppState, window: &Window) -> Result<(), String> {
+    remember_main_window_state(state, window)?;
+    let settings = state
+        .core
+        .settings
+        .lock()
+        .map_err(|_| "Settings lock poisoned".to_string())?
+        .clone();
+    save_app_settings(&state.settings_path, &settings)
+}
+
+fn restore_main_window_state(state: &AppState, window: &WebviewWindow) -> Result<(), String> {
+    let window_state = state
+        .core
+        .settings
+        .lock()
+        .map_err(|_| "Settings lock poisoned".to_string())?
+        .main_window
+        .clone();
+    let Some(window_state) = window_state else {
+        return Ok(());
+    };
+    if let Some(bounds) = window_state.bounds {
+        if bounds.width > 0 && bounds.height > 0 {
+            window
+                .set_size(Size::Physical(PhysicalSize::new(
+                    bounds.width,
+                    bounds.height,
+                )))
+                .map_err(|e| e.to_string())?;
+        }
+        window
+            .set_position(Position::Physical(PhysicalPosition::new(
+                bounds.x, bounds.y,
+            )))
+            .map_err(|e| e.to_string())?;
+    }
+    if window_state.maximized {
+        window.maximize().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let paths = ensure_mercurio_paths().unwrap_or_else(|err| {
@@ -415,7 +481,30 @@ pub fn run() {
                     eprintln!("mercurio: stdlib extraction failed: {}", err);
                 }
             }
+            if let Some(window) = app.get_webview_window("main") {
+                if let Err(err) = restore_main_window_state(state.inner(), &window) {
+                    eprintln!("mercurio: window state restore failed: {}", err);
+                }
+                if let Err(err) = window.show() {
+                    eprintln!("mercurio: failed to show main window: {}", err);
+                }
+            }
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            let state = window.app_handle().state::<AppState>();
+            match event {
+                WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
+                    let _ = remember_main_window_state(state.inner(), window);
+                }
+                WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed => {
+                    let _ = persist_main_window_state(state.inner(), window);
+                }
+                _ => {}
+            }
         })
         .menu(|app| {
             let open_folder = MenuItemBuilder::with_id("file.open_folder", "Open Folder...")
@@ -449,8 +538,9 @@ pub fn run() {
             let dark_theme =
                 MenuItemBuilder::with_id("settings.theme_dark", "Dark Theme").build(app)?;
             let about = MenuItemBuilder::with_id("help.about", "About").build(app)?;
-            let exit_app =
-                MenuItemBuilder::with_id("file.exit", "Exit").accelerator("CmdOrCtrl+Q").build(app)?;
+            let exit_app = MenuItemBuilder::with_id("file.exit", "Exit")
+                .accelerator("CmdOrCtrl+Q")
+                .build(app)?;
 
             let file_menu = SubmenuBuilder::new(app, "File")
                 .item(&open_folder)

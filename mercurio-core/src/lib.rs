@@ -30,7 +30,7 @@ pub use compile::{
 mod settings;
 pub use settings::{
     ensure_mercurio_paths, load_app_settings, resolve_mercurio_user_dir, resolve_user_local_dir,
-    save_app_settings, AppSettings, MercurioPaths,
+    save_app_settings, AppSettings, MercurioPaths, WindowBoundsSettings, WindowStateSettings,
 };
 
 mod state;

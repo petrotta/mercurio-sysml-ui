@@ -1,5 +1,5 @@
 import "./style.css";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import MonacoEditor, { loader, type OnMount } from "@monaco-editor/react";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -705,6 +705,20 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   const lastAutoBuildAtRef = useRef<number>(0);
   const compileRunIdRef = useRef<number | null>(compileRunId ?? null);
 
+  const syncViewportHeight = useCallback(() => {
+    const viewportHeight =
+      window.visualViewport?.height
+      || window.innerHeight
+      || document.documentElement?.clientHeight
+      || 0;
+    if (viewportHeight > 0) {
+      document.documentElement.style.setProperty("--app-vh", `${Math.round(viewportHeight)}px`);
+    }
+  }, []);
+
+  useLayoutEffect(() => {
+    syncViewportHeight();
+  }, [syncViewportHeight]);
   useEffect(() => {
     dirtyRef.current = dirty;
   }, [dirty]);
@@ -854,6 +868,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
 
   useEffect(() => {
     const handleResize = () => {
+      syncViewportHeight();
       const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 0;
       const nextRight = clampRightPaneWidth(rightPaneWidthRef.current, viewportWidth, leftPaneWidthRef.current);
       const nextLeft = clampLeftPaneWidth(leftPaneWidthRef.current, viewportWidth, nextRight);
@@ -862,9 +877,14 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       editorRef.current?.layout();
     };
     handleResize();
+    const visualViewport = window.visualViewport;
     window.addEventListener("resize", handleResize);
-    return () => window.removeEventListener("resize", handleResize);
-  }, []);
+    visualViewport?.addEventListener("resize", handleResize);
+    return () => {
+      window.removeEventListener("resize", handleResize);
+      visualViewport?.removeEventListener("resize", handleResize);
+    };
+  }, [syncViewportHeight]);
 
   useEffect(() => {
     document.body.classList.toggle("simple-ui-resizing", leftPaneDragging || rightPaneDragging);
@@ -892,17 +912,27 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   }, []);
 
   useEffect(() => {
-    const frame = window.requestAnimationFrame(syncMonacoLayout);
-    const t1 = window.setTimeout(() => window.requestAnimationFrame(syncMonacoLayout), 16);
-    const t2 = window.setTimeout(() => window.requestAnimationFrame(syncMonacoLayout), 120);
-    const t3 = window.setTimeout(() => window.requestAnimationFrame(syncMonacoLayout), 260);
+    const frames: number[] = [];
+    const scheduleSync = () => {
+      const frame = window.requestAnimationFrame(() => {
+        syncViewportHeight();
+        syncMonacoLayout();
+      });
+      frames.push(frame);
+    };
+    scheduleSync();
+    const t1 = window.setTimeout(scheduleSync, 16);
+    const t2 = window.setTimeout(scheduleSync, 120);
+    const t3 = window.setTimeout(scheduleSync, 260);
     return () => {
-      window.cancelAnimationFrame(frame);
+      for (const frame of frames) {
+        window.cancelAnimationFrame(frame);
+      }
       window.clearTimeout(t1);
       window.clearTimeout(t2);
       window.clearTimeout(t3);
     };
-  }, [syncMonacoLayout]);
+  }, [syncMonacoLayout, syncViewportHeight]);
 
   const measureTabsOverflow = useCallback(() => {
     const strip = tabsStripRef.current;
@@ -3426,3 +3456,6 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
     </div>
   );
 }
+
+
+

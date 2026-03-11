@@ -1,14 +1,12 @@
 use mercurio_symbol_index::{SymbolIndexStore, SymbolMetatypeMappingRecord, SymbolRecord};
+use mercurio_sysml_core::parser::Parser;
 use mercurio_sysml_pkg::compile_support::{
     build_workspace_semantic_projection_views, workspace_semantic_cache_key, WorkspaceSemanticInput,
 };
 use mercurio_sysml_pkg::workspace_file::WorkspaceFileScope;
 use mercurio_sysml_pkg::workspace_query::{collect_model_files, collect_project_files};
-use mercurio_sysml_core::parser::Parser;
 use mercurio_sysml_semantics::semantic_contract::{
-    SemanticElementProjectionView,
-    SemanticFeatureView,
-    SemanticValueView,
+    SemanticElementProjectionView, SemanticFeatureView, SemanticValueView,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,6 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::project::load_project_config;
+use crate::project_model_seed::seed_symbol_index_if_empty;
 use crate::state::WorkspaceSnapshotCacheEntry;
 use crate::CoreState;
 
@@ -152,6 +151,7 @@ pub fn query_library_symbols(
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> Result<Vec<IndexedSymbolView>, String> {
+    seed_symbol_index_if_empty(state, &project_root)?;
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(usize::MAX);
     let store = state
@@ -172,6 +172,7 @@ pub fn query_project_symbols(
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> Result<Vec<IndexedSymbolView>, String> {
+    seed_symbol_index_if_empty(state, &project_root)?;
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(usize::MAX);
     let store = state
@@ -192,6 +193,7 @@ pub fn query_project_symbols_for_files(
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> Result<Vec<IndexedSymbolView>, String> {
+    seed_symbol_index_if_empty(state, &project_root)?;
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(usize::MAX);
     let unique_file_paths = file_paths
@@ -358,7 +360,9 @@ pub fn query_project_semantic_projection_by_qualified_name(
         ));
     }
     if !fallback_candidates.is_empty() {
-        return Ok(select_best_semantic_projection_candidate(fallback_candidates));
+        return Ok(select_best_semantic_projection_candidate(
+            fallback_candidates,
+        ));
     }
 
     let elements = match load_or_build_project_semantic_projection_cache(state, &project_root) {
@@ -489,12 +493,8 @@ fn load_or_build_project_semantic_projection_cache(
     if inputs.is_empty() {
         return Ok(std::sync::Arc::new(Vec::new()));
     }
-    let cache_key = workspace_semantic_cache_key(
-        project_root,
-        &inputs,
-        "",
-        "project-semantic-projection-v1",
-    );
+    let cache_key =
+        workspace_semantic_cache_key(project_root, &inputs, "", "project-semantic-projection-v1");
     if let Ok(cache) = state.workspace_snapshot_cache.lock() {
         if let Some(WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(elements)) =
             cache.get(&cache_key)
@@ -521,7 +521,9 @@ fn clear_project_semantic_projection_cache_for_root(
     let to_remove = cache
         .iter()
         .filter_map(|(key, entry)| match entry {
-            WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(_) if key.starts_with(&prefix) => {
+            WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(_)
+                if key.starts_with(&prefix) =>
+            {
                 Some(key.clone())
             }
             _ => None,
@@ -849,6 +851,85 @@ mod tests {
     }
 
     #[test]
+    fn query_symbol_endpoints_seed_from_workspace_ir_cache() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_symbol_index_seed_{stamp}"));
+        let library_dir = root.join("stdlib");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&library_dir).expect("create library dir");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(
+            library_dir.join("KerML.kerml"),
+            "standard library package KerML { package Root { metaclass Action specializes Element {} } }",
+        )
+        .expect("write library file");
+        fs::write(
+            project_dir.join("main.sysml"),
+            "package P { action def DoThing; part def Car; }\n",
+        )
+        .expect("write project file");
+        fs::write(
+            project_dir.join(".project"),
+            format!(
+                "{{\"name\":\"seed\",\"library\":{{\"path\":\"{}\"}},\"src\":[\"**/*.sysml\",\"*.sysml\"]}}",
+                library_dir.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let project_root = project_dir.to_string_lossy().to_string();
+
+        let compile = compile_project_delta_sync(
+            &state,
+            project_root.clone(),
+            42,
+            true,
+            None,
+            Vec::new(),
+            |_| {},
+        )
+        .expect("compile");
+        assert!(compile.ok);
+
+        let library = load_library_symbols_sync(&state, project_root.clone(), None, true)
+            .expect("load library symbols");
+        assert!(library.ok);
+        assert!(!library.symbols.is_empty());
+
+        state.clear_runtime_caches().expect("clear runtime caches");
+
+        let indexed_library =
+            query_library_symbols(&state, project_root.clone(), None, Some(0), Some(10_000))
+                .expect("query cached library symbols");
+        assert!(!indexed_library.is_empty());
+
+        let indexed_project =
+            query_project_symbols(&state, project_root.clone(), None, Some(0), Some(10_000))
+                .expect("query cached project symbols");
+        assert!(indexed_project
+            .iter()
+            .any(|symbol| symbol.qualified_name == "P"));
+
+        let file_project = query_project_symbols_for_files(
+            &state,
+            project_root,
+            vec![project_dir.join("main.sysml").to_string_lossy().to_string()],
+            Some(0),
+            Some(10_000),
+        )
+        .expect("query cached project symbols for file");
+        assert!(file_project
+            .iter()
+            .any(|symbol| symbol.qualified_name == "P"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn query_project_semantic_element_by_qualified_name_uses_semantic_cache() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -965,8 +1046,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir()
-            .join(format!("mercurio_semantic_pkg_metatype_delta_no_symbols_{stamp}"));
+        let root = std::env::temp_dir().join(format!(
+            "mercurio_semantic_pkg_metatype_delta_no_symbols_{stamp}"
+        ));
         let library_dir = root.join("stdlib");
         let project_dir = root.join("project");
         fs::create_dir_all(&library_dir).expect("create library dir");
@@ -1131,18 +1213,21 @@ mod tests {
                 qualified_name: "Example::w".to_string(),
                 metatype_qname: Some("sysml::PartUsage".to_string()),
                 file_path: "C:\\tmp\\Example.sysml".to_string(),
-                features: vec![mercurio_sysml_semantics::semantic_contract::SemanticFeatureView {
-                    name: "name".to_string(),
-                    feature_kind: "attribute".to_string(),
-                    many: false,
-                    containment: false,
-                    declared_type_qname: None,
-                    metamodel_feature_qname: Some("sysml::Element::name".to_string()),
-                    value: mercurio_sysml_semantics::semantic_contract::SemanticValueView::Text {
-                        value: "w".to_string(),
+                features: vec![
+                    mercurio_sysml_semantics::semantic_contract::SemanticFeatureView {
+                        name: "name".to_string(),
+                        feature_kind: "attribute".to_string(),
+                        many: false,
+                        containment: false,
+                        declared_type_qname: None,
+                        metamodel_feature_qname: Some("sysml::Element::name".to_string()),
+                        value:
+                            mercurio_sysml_semantics::semantic_contract::SemanticValueView::Text {
+                                value: "w".to_string(),
+                            },
+                        diagnostics: Vec::new(),
                     },
-                    diagnostics: Vec::new(),
-                }],
+                ],
             };
         {
             let mut cache = state

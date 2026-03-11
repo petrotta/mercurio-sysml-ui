@@ -124,7 +124,7 @@ pub fn get_project_element_attributes(
                     &mut diagnostics,
                 );
                 (direct, inherited_metatype, inherited)
-            },
+            }
             Ok(None) => {
                 diagnostics.push(
                     "Inherited attributes unavailable because stdlib metatype index is unresolved."
@@ -452,12 +452,10 @@ standard library package KerML {
         )
         .expect("project element attributes");
         assert!(!attrs.direct_metatype_attributes.is_empty());
-        assert!(
-            attrs
-                .direct_metatype_attributes
-                .iter()
-                .any(|attr| attr.name == "filterCondition")
-        );
+        assert!(attrs
+            .direct_metatype_attributes
+            .iter()
+            .any(|attr| attr.name == "filterCondition"));
         assert!(!attrs.inherited_metatype_attributes.is_empty());
 
         let mapped = {
