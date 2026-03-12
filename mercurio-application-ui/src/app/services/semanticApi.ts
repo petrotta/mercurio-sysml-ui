@@ -3,6 +3,7 @@ import type {
   IndexedSymbolView,
   ProjectModelView,
   ProjectElementAttributesView,
+  ProjectExpressionRecordsView,
   SemanticElementProjectionResult,
   SemanticElementResult,
   SymbolView,
@@ -235,6 +236,18 @@ export async function getProjectElementAttributes(
 
 export async function getProjectModel(root: string): Promise<ProjectModelView> {
   return callTool<ProjectModelView>("core.get_project_model@v1", { root });
+}
+
+export async function getProjectExpressions(
+  root: string,
+  filePath?: string | null,
+  qualifiedName?: string | null,
+): Promise<ProjectExpressionRecordsView> {
+  return callTool<ProjectExpressionRecordsView>("core.get_project_expressions@v1", {
+    root,
+    file_path: filePath || null,
+    qualified_name: qualifiedName || null,
+  });
 }
 
 export async function getDefaultStdlib(): Promise<string | null> {

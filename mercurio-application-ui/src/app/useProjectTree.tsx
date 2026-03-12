@@ -2,6 +2,18 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { listDirEntries } from "./fileOps";
 import type { FileEntry } from "./types";
 
+function normalizeTreePath(path: string): string {
+  return path.replace(/[\\/]+$/, "").toLowerCase();
+}
+
+function isSameOrChildPath(root: string, candidate: string): boolean {
+  const normalizedRoot = normalizeTreePath(root);
+  const normalizedCandidate = normalizeTreePath(candidate);
+  return normalizedCandidate === normalizedRoot
+    || normalizedCandidate.startsWith(`${normalizedRoot}\\`)
+    || normalizedCandidate.startsWith(`${normalizedRoot}/`);
+}
+
 export function useProjectTree() {
   const [treeEntries, setTreeEntries] = useState<FileEntry[]>([]);
   const [expanded, setExpanded] = useState<Record<string, FileEntry[]>>({});
@@ -18,8 +30,21 @@ export function useProjectTree() {
 
   const refreshRoot = useCallback(async (path: string) => {
     const entries = await listDirEntries(path);
+    const previouslyExpanded = Object.keys(expandedRef.current)
+      .filter((entryPath) => isSameOrChildPath(path, entryPath))
+      .sort((left, right) => left.length - right.length);
+
+    const nextExpanded: Record<string, FileEntry[]> = {};
+    for (const entryPath of previouslyExpanded) {
+      try {
+        nextExpanded[entryPath] = await listDirEntries(entryPath);
+      } catch {
+        // Ignore folders that no longer exist or are temporarily unavailable.
+      }
+    }
+
     setTreeEntries(entries);
-    setExpanded({});
+    setExpanded(nextExpanded);
   }, []);
 
   const toggleExpand = useCallback(async (entry: FileEntry) => {
@@ -34,6 +59,15 @@ export function useProjectTree() {
     }
     const children = await listDirEntries(entry.path);
     setExpanded((prev) => ({ ...prev, [entry.path]: children }));
+  }, []);
+
+  const ensureExpanded = useCallback(async (path: string) => {
+    if (!path || expandedRef.current[path]) return;
+    const children = await listDirEntries(path);
+    setExpanded((prev) => {
+      if (prev[path]) return prev;
+      return { ...prev, [path]: children };
+    });
   }, []);
 
   const expandAll = useCallback(async () => {
@@ -62,5 +96,5 @@ export function useProjectTree() {
     setExpanded({});
   }, []);
 
-  return { treeEntries, expanded, refreshRoot, toggleExpand, expandAll, collapseAll };
+  return { treeEntries, expanded, refreshRoot, toggleExpand, ensureExpanded, expandAll, collapseAll };
 }

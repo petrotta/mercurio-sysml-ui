@@ -2345,7 +2345,6 @@ dependencies = [
 name = "mercurio-sysml-runtime"
 version = "0.1.0"
 dependencies = [
- "mercurio-sysml-gen",
  "serde",
  "serde_json",
 ]

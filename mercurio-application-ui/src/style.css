@@ -487,7 +487,8 @@ body.theme-light .status-build-progress-toggle.active {
     minmax(300px, var(--simple-right-pane-width, 420px));
   gap: 8px;
   padding: 8px;
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 
 .simple-ui-left,
@@ -1558,6 +1559,65 @@ body.theme-light .simple-about-title {
   font-size: 12px;
 }
 
+.simple-new-file-modal {
+  width: min(520px, calc(100vw - 36px));
+  min-height: 220px;
+}
+
+.simple-new-file-body {
+  gap: 12px;
+}
+
+.simple-new-file-meta {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.simple-new-file-meta span:last-child {
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.simple-new-file-field {
+  display: grid;
+  gap: 6px;
+}
+
+.simple-new-file-input-row {
+  display: grid;
+  gap: 10px;
+}
+
+.simple-new-file-input-row input {
+  width: 100%;
+  height: 30px;
+  padding: 0 8px;
+}
+
+.simple-new-file-type-group {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.simple-new-file-type-btn {
+  min-width: 82px;
+}
+
+.simple-new-file-type-btn.active {
+  border-color: #4a83c7;
+  background: #2a3e56;
+  color: #cfe0ff;
+}
+
+body.theme-light .simple-new-file-type-btn.active {
+  border-color: #3f75ba;
+  background: #dce9fb;
+  color: #1f4f85;
+}
+
 .simple-modal-header {
   display: flex;
   align-items: center;
@@ -1836,16 +1896,6 @@ body.theme-light .simple-build-progress-file {
     min-height: 36px;
     padding: 4px 8px;
     align-items: start;
-  }
-
-  .simple-ui-main {
-    grid-template-columns: 1fr;
-    grid-auto-rows: minmax(220px, auto);
-  }
-
-  .simple-ui-left-resizer,
-  .simple-ui-right-resizer {
-    display: none;
   }
 
   .simple-editor-meta {

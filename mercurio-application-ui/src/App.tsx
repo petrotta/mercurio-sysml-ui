@@ -9,6 +9,7 @@ import { RECENTS_KEY, ROOT_STORAGE_KEY, THEME_KEY } from "./app/constants";
 import { useProjectTree } from "./app/useProjectTree";
 import {
   type ProjectFilesChangedEvent,
+  createProjectFile,
   readFileText,
   startProjectFileWatcher,
   stopProjectFileWatcher,
@@ -62,6 +63,17 @@ type FileContextMenuState = {
   path: string;
   x: number;
   y: number;
+  allowNewFile: boolean;
+};
+
+type NewFileExtension = ".sysml" | ".kerml";
+
+type NewFileDialogState = {
+  parentPath: string;
+  name: string;
+  extension: NewFileExtension;
+  error: string;
+  submitting: boolean;
 };
 
 type CacheClearSummary = {
@@ -134,6 +146,26 @@ const AUTO_BUILD_ACTIVE_FILE_KEY = "mercurio.simpleUi.autoBuildActiveFile";
 const AUTO_BUILD_DEBOUNCE_MS = 900;
 const AUTO_BUILD_MIN_INTERVAL_MS = 2500;
 const PARSE_MARKER_OWNER = "mercurio.parse";
+const INVALID_NEW_FILE_NAME_CHARS = /[<>:"/\\|?*]/;
+const UI_ICON = {
+  folder: String.fromCodePoint(0x1F4C1),
+  file: String.fromCodePoint(0x1F4C4),
+  package: String.fromCodePoint(0x1F4E6),
+  namespace: String.fromCodePoint(0x1F9ED),
+  part: String.fromCodePoint(0x1F9E9),
+  action: "\u26A1",
+  function: "\u0192",
+  import: "\u2B07",
+  connector: String.fromCodePoint(0x1F517),
+  property: String.fromCodePoint(0x1F3F7),
+  type: "\u25FC",
+  bullet: "\u2022",
+  settings: "\u2699",
+  check: "\u2713",
+  minimize: "\u2014",
+  maximize: "\u25FB",
+  close: "\u00D7",
+} as const;
 let sysmlLanguageRegistered = false;
 
 function createStdlibOptionId(): string {
@@ -378,23 +410,23 @@ function displayNameForPath(path: string): string {
 }
 
 function treeNodeIcon(isDir: boolean): string {
-  return isDir ? "📁" : "📄";
+  return isDir ? UI_ICON.folder : UI_ICON.file;
 }
 
 function symbolKindIcon(kind: string | null | undefined): string {
   const normalized = (kind || "").toLowerCase();
-  if (normalized.includes("package")) return "📦";
-  if (normalized.includes("namespace")) return "🧭";
-  if (normalized.includes("partdefinition") || normalized.includes("partusage") || normalized === "part") return "🧩";
-  if (normalized.includes("actiondefinition") || normalized.includes("actionusage") || normalized === "action") return "⚡";
-  if (normalized.includes("function")) return "ƒ";
-  if (normalized.includes("import")) return "⬇";
+  if (normalized.includes("package")) return UI_ICON.package;
+  if (normalized.includes("namespace")) return UI_ICON.namespace;
+  if (normalized.includes("partdefinition") || normalized.includes("partusage") || normalized === "part") return UI_ICON.part;
+  if (normalized.includes("actiondefinition") || normalized.includes("actionusage") || normalized === "action") return UI_ICON.action;
+  if (normalized.includes("function")) return UI_ICON.function;
+  if (normalized.includes("import")) return UI_ICON.import;
   if (
     normalized.includes("connector") ||
     normalized.includes("association") ||
     normalized.includes("associationend")
   ) {
-    return "🔗";
+    return UI_ICON.connector;
   }
   if (
     normalized.includes("attribute") ||
@@ -402,7 +434,7 @@ function symbolKindIcon(kind: string | null | undefined): string {
     normalized.includes("property") ||
     normalized.includes("reference")
   ) {
-    return "🏷";
+    return UI_ICON.property;
   }
   if (
     normalized.includes("interface") ||
@@ -410,9 +442,9 @@ function symbolKindIcon(kind: string | null | undefined): string {
     normalized.includes("usage") ||
     normalized.includes("type")
   ) {
-    return "◼";
+    return UI_ICON.type;
   }
-  return "•";
+  return UI_ICON.bullet;
 }
 
 function shortMetatypeName(metatypeQname: string | null | undefined): string {
@@ -513,6 +545,8 @@ function ensureSysmlLanguage(monaco: Parameters<OnMount>[1]): void {
           },
         }],
         [/[{}()[\]]/, "@brackets"],
+        [/\/\/.*$/, "comment"],
+        [/\/\*/, "comment", "@comment"],
         [/@symbols/, {
           cases: {
             "@operators": "operator",
@@ -522,8 +556,6 @@ function ensureSysmlLanguage(monaco: Parameters<OnMount>[1]): void {
         [/\d+(\.\d+)?/, "number"],
         [/".*?"/, "string"],
         [/'[^']*'/, "string"],
-        [/\/\/.*$/, "comment"],
-        [/\/\*/, "comment", "@comment"],
       ],
       comment: [
         [/[^/*]+/, "comment"],
@@ -538,6 +570,11 @@ function ensureSysmlLanguage(monaco: Parameters<OnMount>[1]): void {
 function isSemanticSource(path: string | null | undefined): boolean {
   const value = (path || "").toLowerCase();
   return value.endsWith(".sysml") || value.endsWith(".kerml");
+}
+
+function buildNewSemanticFileName(name: string, extension: NewFileExtension): string {
+  const baseName = name.trim().replace(/\.(sysml|kerml)$/i, "").trim();
+  return `${baseName}${extension}`;
 }
 
 function symbolSelection(symbol: SymbolView): TextSelection {
@@ -605,6 +642,7 @@ export function App() {
   const [dialogStdlibMetaLoading, setDialogStdlibMetaLoading] = useState(false);
   const [tabContextMenu, setTabContextMenu] = useState<TabContextMenuState | null>(null);
   const [fileContextMenu, setFileContextMenu] = useState<FileContextMenuState | null>(null);
+  const [newFileDialog, setNewFileDialog] = useState<NewFileDialogState | null>(null);
   const [tabsOverflow, setTabsOverflow] = useState(false);
   const [tabsOverflowMenuOpen, setTabsOverflowMenuOpen] = useState(false);
   const [dragTabPath, setDragTabPath] = useState<string | null>(null);
@@ -640,6 +678,7 @@ export function App() {
     expanded,
     refreshRoot,
     toggleExpand,
+    ensureExpanded,
     expandAll,
     collapseAll,
   } = useProjectTree();
@@ -687,7 +726,8 @@ export function App() {
   const leftPaneWidthRef = useRef(leftPaneWidth);
   const rightPaneWidthRef = useRef(rightPaneWidth);
   const tabsStripRef = useRef<HTMLDivElement | null>(null);
-const rightPanelRef = useRef<HTMLElement | null>(null);
+  const newFileNameInputRef = useRef<HTMLInputElement | null>(null);
+  const rightPanelRef = useRef<HTMLElement | null>(null);
 const centerPanelRef = useRef<HTMLElement | null>(null);
 const leftPaneDragRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
 const rightPaneDragRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
@@ -1044,6 +1084,24 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [aboutWindowOpen]);
+
+  useEffect(() => {
+    if (!newFileDialog) return;
+    const focusTimer = window.setTimeout(() => {
+      newFileNameInputRef.current?.focus();
+      newFileNameInputRef.current?.select();
+    }, 0);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !newFileDialog.submitting) {
+        setNewFileDialog(null);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.clearTimeout(focusTimer);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [newFileDialog]);
 
   useEffect(() => {
     if (!stdlibManagerOpen) return;
@@ -1807,6 +1865,62 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     }
   }, [setCompileStatus]);
 
+  const openNewFileDialog = useCallback((parentPath: string) => {
+    const trimmed = (parentPath || "").trim();
+    if (!trimmed) return;
+    setTabContextMenu(null);
+    setFileContextMenu(null);
+    setTabsOverflowMenuOpen(false);
+    setNewFileDialog({
+      parentPath: trimmed,
+      name: "",
+      extension: ".sysml",
+      error: "",
+      submitting: false,
+    });
+  }, []);
+
+  const createNewFileFromDialog = useCallback(async () => {
+    if (!newFileDialog || newFileDialog.submitting) return;
+    const activeRoot = rootPath.trim();
+    if (!activeRoot) {
+      setNewFileDialog((prev) => (prev ? { ...prev, error: "Select a project root first." } : prev));
+      return;
+    }
+    const baseName = newFileDialog.name.trim().replace(/\.(sysml|kerml)$/i, "").trim();
+    if (!baseName) {
+      setNewFileDialog((prev) => (prev ? { ...prev, error: "File name is required." } : prev));
+      return;
+    }
+    if (INVALID_NEW_FILE_NAME_CHARS.test(baseName)) {
+      setNewFileDialog((prev) => (
+        prev
+          ? { ...prev, error: "File name contains invalid characters: <>:\"/\\|?*" }
+          : prev
+      ));
+      return;
+    }
+    const fileName = buildNewSemanticFileName(baseName, newFileDialog.extension);
+    setNewFileDialog((prev) => (prev ? { ...prev, error: "", submitting: true } : prev));
+    try {
+      const createdPath = await createProjectFile(activeRoot, newFileDialog.parentPath, fileName);
+      await refreshRoot(activeRoot);
+      await ensureExpanded(newFileDialog.parentPath);
+      setProjectFilesExpanded(true);
+      setNewFileDialog(null);
+      setCompileStatus(`Created file: ${createdPath}`);
+      await openFilePath(createdPath);
+    } catch (error) {
+      const message = String(error);
+      setCompileStatus(`Create file failed: ${message}`);
+      setNewFileDialog((prev) => (
+        prev
+          ? { ...prev, error: `Create file failed: ${message}`, submitting: false }
+          : prev
+      ));
+    }
+  }, [newFileDialog, rootPath, refreshRoot, ensureExpanded, openFilePath, setCompileStatus]);
+
   const toggleProjectFileSymbols = useCallback((filePath: string) => {
     const key = normalizePath(filePath);
     setExpandedFileSymbols((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -2286,6 +2400,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                   path: entry.path,
                   x: event.clientX,
                   y: event.clientY,
+                  allowNewFile: isDir,
                 });
               }}
               title={entry.path}
@@ -2382,6 +2497,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                   path: libraryFilePath,
                   x: event.clientX,
                   y: event.clientY,
+                  allowNewFile: false,
                 });
               }}
               title={libraryFilePath}
@@ -2661,7 +2777,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                     className="ghost menu-bar-entry"
                     onClick={() => { setMenuOpen(null); void runMenuAction("toggle-autobuild-active-file"); }}
                   >
-                    {autoBuildActiveFile ? "✓ " : ""}Autobuild Active File
+                    {autoBuildActiveFile ? `${UI_ICON.check} ` : ""}Autobuild Active File
                   </button>
                   <div className="menu-bar-sep" />
                   <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); void runMenuAction("clear-caches"); }}>Clear Caches</button>
@@ -2704,9 +2820,9 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
         </div>
         <div className="native-titlebar-center" data-tauri-drag-region />
         <div className="native-titlebar-right">
-          <button type="button" className="ghost native-window-btn" onClick={minimizeWindow} title="Minimize" aria-label="Minimize window">—</button>
-          <button type="button" className="ghost native-window-btn" onClick={toggleMaximizeWindow} title="Maximize" aria-label="Maximize or restore window">◻</button>
-          <button type="button" className="ghost native-window-btn close" onClick={closeWindow} title="Exit" aria-label="Exit">×</button>
+          <button type="button" className="ghost native-window-btn" onClick={minimizeWindow} title="Minimize" aria-label="Minimize window">{UI_ICON.minimize}</button>
+          <button type="button" className="ghost native-window-btn" onClick={toggleMaximizeWindow} title="Maximize" aria-label="Maximize or restore window">{UI_ICON.maximize}</button>
+          <button type="button" className="ghost native-window-btn close" onClick={closeWindow} title="Exit" aria-label="Exit">{UI_ICON.close}</button>
         </div>
       </header>
       <header className="titlebar simple-ui-titlebar">
@@ -2767,7 +2883,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                   title="Project files settings"
                   aria-label="Project files settings"
                 >
-                  ⚙
+                  {UI_ICON.settings}
                 </button>
                 {projectFilesSettingsMenuOpen ? (
                   <div className="simple-project-files-settings-menu">
@@ -2779,7 +2895,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                         setProjectFilesSettingsMenuOpen(false);
                       }}
                     >
-                      {projectFilesShowByFile ? "✓ " : "   "}Show by file
+                      {projectFilesShowByFile ? `${UI_ICON.check} ` : "   "}Show by file
                     </button>
                     <button
                       type="button"
@@ -2789,7 +2905,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                         setProjectFilesSettingsMenuOpen(false);
                       }}
                     >
-                      {projectFilesShowByFile ? "   " : "✓ "}Hide files (show elements only)
+                      {projectFilesShowByFile ? "   " : `${UI_ICON.check} `}Hide files (show elements only)
                     </button>
                   </div>
                 ) : null}
@@ -3056,6 +3172,15 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
               ) : null}
               {fileContextMenu && fileContextMenuStyle ? (
                 <div className="simple-tab-context-menu simple-file-context-menu" style={fileContextMenuStyle}>
+                  {fileContextMenu.allowNewFile ? (
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => openNewFileDialog(fileContextMenu.path)}
+                    >
+                      New File...
+                    </button>
+                  ) : null}
                   <button
                     type="button"
                     className="ghost"
@@ -3321,6 +3446,100 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                 ? `Apply writes library.path for ${rootPath}`
                 : "Select a project root before applying a stdlib option."}
             </div>
+          </section>
+        </div>
+      ) : null}
+
+      {newFileDialog ? (
+        <div
+          className="simple-modal-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !newFileDialog.submitting) {
+              setNewFileDialog(null);
+            }
+          }}
+        >
+          <section
+            className="simple-modal simple-new-file-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Create new semantic file"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                void createNewFileFromDialog();
+              }}
+            >
+              <div className="simple-modal-header">
+                <strong>New File</strong>
+                <div className="simple-modal-header-actions">
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={newFileDialog.submitting}
+                    onClick={() => setNewFileDialog(null)}
+                  >
+                    Cancel
+                  </button>
+                  <button type="submit" disabled={newFileDialog.submitting}>
+                    {newFileDialog.submitting ? "Creating..." : "Create"}
+                  </button>
+                </div>
+              </div>
+              <div className="simple-modal-body simple-new-file-body">
+                <div className="simple-new-file-meta muted">
+                  <span>Folder: {displayNameForPath(newFileDialog.parentPath)}</span>
+                  <span title={newFileDialog.parentPath}>{newFileDialog.parentPath}</span>
+                </div>
+                <label className="simple-new-file-field">
+                  <span className="muted">Name</span>
+                  <div className="simple-new-file-input-row">
+                    <input
+                      ref={newFileNameInputRef}
+                      value={newFileDialog.name}
+                      onChange={(event) => setNewFileDialog((prev) => (
+                        prev
+                          ? { ...prev, name: event.target.value, error: "" }
+                          : prev
+                      ))}
+                      placeholder="new-model"
+                      aria-label="New file name"
+                      disabled={newFileDialog.submitting}
+                    />
+                    <div className="simple-new-file-type-group" role="radiogroup" aria-label="New file type">
+                      {([".sysml", ".kerml"] as const).map((extension) => (
+                        <button
+                          key={extension}
+                          type="button"
+                          className={`simple-new-file-type-btn ${newFileDialog.extension === extension ? "active" : ""}`}
+                          onClick={() => setNewFileDialog((prev) => (
+                            prev
+                              ? { ...prev, extension, error: "" }
+                              : prev
+                          ))}
+                          disabled={newFileDialog.submitting}
+                          aria-pressed={newFileDialog.extension === extension}
+                        >
+                          {extension}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </label>
+                {newFileDialog.error ? (
+                  <div className="error">{newFileDialog.error}</div>
+                ) : (
+                  <div className="muted">Creates an empty SysML or KerML source file and opens it in the editor.</div>
+                )}
+              </div>
+              <div className="simple-modal-footer muted">
+                File name: {newFileDialog.name.trim()
+                  ? buildNewSemanticFileName(newFileDialog.name, newFileDialog.extension)
+                  : `new-model${newFileDialog.extension}`}
+              </div>
+            </form>
           </section>
         </div>
       ) : null}

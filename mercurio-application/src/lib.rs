@@ -18,8 +18,8 @@ use zip::ZipArchive;
 mod commands;
 
 use commands::{
-    app_exit, call_tool, list_dir, read_file, show_in_explorer, window_close, window_minimize,
-    window_toggle_maximize, write_file,
+    app_exit, call_tool, create_file, list_dir, read_file, show_in_explorer, window_close,
+    window_minimize, window_toggle_maximize, write_file,
 };
 
 use mercurio_core::{
@@ -596,6 +596,7 @@ pub fn run() {
             list_dir,
             read_file,
             write_file,
+            create_file,
             window_minimize,
             window_toggle_maximize,
             app_exit,

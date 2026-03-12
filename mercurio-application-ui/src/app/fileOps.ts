@@ -17,6 +17,11 @@ export async function listDirEntries(path: string): Promise<FileEntry[]> {
   return entries || [];
 }
 
+export async function createProjectFile(root: string, parent: string, name: string): Promise<string> {
+  const createdPath = await invoke<string>("create_file", { root, parent, name });
+  return createdPath || "";
+}
+
 export async function getAstForPath(path: string): Promise<string> {
   const ast = await invoke<string>("get_ast_for_path", { path });
   return ast || "";

@@ -7,7 +7,7 @@ pub mod fs_ops;
 pub mod tools;
 pub mod window;
 
-pub use fs_ops::{list_dir, read_file, write_file};
+pub use fs_ops::{create_file, list_dir, read_file, write_file};
 pub use tools::call_tool;
 pub use window::{
     app_exit, show_in_explorer, window_close, window_minimize, window_toggle_maximize,

@@ -3,8 +3,9 @@
 //! Intent: keep a minimal file command surface for the simplified UI.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use mercurio_core::resolve_under_root;
 use tauri::command;
 
 use crate::DirEntry;
@@ -50,4 +51,30 @@ pub fn write_file(path: String, content: String) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     fs::write(target, content).map_err(|e| e.to_string())
+}
+
+#[command]
+/// Creates a new empty file under the active project root without overwriting an existing file.
+pub fn create_file(root: String, parent: String, name: String) -> Result<String, String> {
+    let file_name = name.trim();
+    if file_name.is_empty() {
+        return Err("File name is required".to_string());
+    }
+
+    let root_path = PathBuf::from(&root);
+    let parent_path = resolve_under_root(&root_path, Path::new(&parent))?;
+    if !parent_path.is_dir() {
+        return Err("Target folder does not exist".to_string());
+    }
+
+    let new_path = resolve_under_root(&root_path, &parent_path.join(file_name))?;
+    if new_path.exists() {
+        return Err("File already exists".to_string());
+    }
+
+    if let Some(parent_dir) = new_path.parent() {
+        fs::create_dir_all(parent_dir).map_err(|e| e.to_string())?;
+    }
+    fs::write(&new_path, "").map_err(|e| e.to_string())?;
+    Ok(new_path.to_string_lossy().to_string())
 }

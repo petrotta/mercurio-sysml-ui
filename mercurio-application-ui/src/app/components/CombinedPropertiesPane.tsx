@@ -3,6 +3,7 @@ import { getProjectElementAttributes } from "../services/semanticApi";
 import type {
   ProjectElementAttributesView,
   ProjectElementInheritedAttributeView,
+  ProjectExpressionRecordView,
   SemanticElementProjectionResult,
   SemanticFeatureView,
   SemanticValueView,
@@ -16,6 +17,13 @@ type CombinedPropertiesPaneProps = {
   selectedSemanticLoading?: boolean;
   selectedSemanticError?: string;
   onSelectQualifiedName?: (qualifiedName: string) => void;
+};
+
+type PropertyRow = {
+  key: string;
+  label: string;
+  value: string;
+  qname: string | null;
 };
 
 function valueToText(value: SemanticValueView): string {
@@ -138,6 +146,98 @@ function formatAttributeSignature(attribute: ProjectElementInheritedAttributeVie
   }
   const multiplicityText = multiplicity.startsWith("[") ? multiplicity : `[${multiplicity}]`;
   return `${name} : ${declaredType}${multiplicityText}`;
+}
+
+function formatExpressionKind(value: string): string {
+  const normalized = (value || "").trim().replace(/_/g, " ");
+  return normalized || "expression";
+}
+
+function shortQualifiedTail(value: string | null | undefined): string {
+  const trimmed = (value || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+  const segments = splitQualifiedName(trimmed);
+  return segments[segments.length - 1] || trimmed;
+}
+
+function formatProjectExpressionLabel(
+  record: ProjectExpressionRecordView,
+  selectedElementQname: string,
+): string {
+  const slot = (record.slot || "").trim();
+  const kind = formatExpressionKind(record.expression_kind);
+  const owner = (record.owner_qualified_name || "").trim();
+  const ownerPrefix =
+    owner && normalizeLookupKey(owner) !== normalizeLookupKey(selectedElementQname)
+      ? `${shortQualifiedTail(owner)}.`
+      : "";
+
+  if (slot) {
+    return `${ownerPrefix}${slot} (${kind})`;
+  }
+  if (ownerPrefix) {
+    return `${ownerPrefix}${kind}`;
+  }
+  return kind;
+}
+
+function normalizeLookupKey(value: string | null | undefined): string {
+  return (value || "").trim().toLowerCase();
+}
+
+function tailLookupKey(value: string | null | undefined): string {
+  const trimmed = (value || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+  const qualifiedTail = trimmed.split("::").pop() || trimmed;
+  const propertyTail = qualifiedTail.split(".").pop() || qualifiedTail;
+  return normalizeLookupKey(propertyTail);
+}
+
+function semanticFeatureMatchesAttribute(
+  feature: SemanticFeatureView,
+  attribute: ProjectElementInheritedAttributeView,
+): boolean {
+  const attributeQName = normalizeLookupKey(attribute.qualified_name);
+  const attributeName = normalizeLookupKey(attribute.name);
+  const attributeTail = tailLookupKey(attribute.qualified_name || attribute.name);
+  const featureMetamodelQName = normalizeLookupKey(feature.metamodel_feature_qname);
+  const featureName = normalizeLookupKey(feature.name);
+  const featureTail = tailLookupKey(feature.metamodel_feature_qname || feature.name);
+
+  return !!(
+    (attributeQName && featureMetamodelQName === attributeQName)
+    || (attributeName && featureName === attributeName)
+    || (attributeName && featureMetamodelQName.endsWith(`::${attributeName}`))
+    || (attributeTail && featureTail === attributeTail)
+    || (attributeTail && featureName === attributeTail)
+  );
+}
+
+function findExplicitAttributeValue(
+  attribute: ProjectElementInheritedAttributeView,
+  explicitAttributes: ProjectElementAttributesView["explicit_attributes"],
+): string | null {
+  const match = explicitAttributes.find((candidate) => {
+    const attributeQName = normalizeLookupKey(attribute.qualified_name);
+    const attributeName = normalizeLookupKey(attribute.name);
+    const attributeTail = tailLookupKey(attribute.qualified_name || attribute.name);
+    const explicitMetamodelQName = normalizeLookupKey(candidate.metamodel_attribute_qname);
+    const explicitName = normalizeLookupKey(candidate.name);
+    const explicitTail = tailLookupKey(candidate.metamodel_attribute_qname || candidate.name);
+
+    return !!(
+      (attributeQName && explicitMetamodelQName === attributeQName)
+      || (attributeName && explicitName === attributeName)
+      || (attributeTail && explicitTail === attributeTail)
+    );
+  });
+
+  const value = match?.cst_value?.trim() || "";
+  return value || null;
 }
 
 function MetatypeAttributeTable({
@@ -291,11 +391,117 @@ export function CombinedPropertiesPane({
     symbol?.kind,
   ]);
 
+  const directMetatypeAttributes = metatypeAttributes?.direct_metatype_attributes || [];
+  const inheritedMetatypeAttributes =
+    metatypeAttributes?.inherited_metatype_attributes
+    || metatypeAttributes?.inherited_attributes
+    || [];
+  const expressions = metatypeAttributes?.expressions || [];
+  const metatypeAttributeCount = directMetatypeAttributes.length + inheritedMetatypeAttributes.length;
+  const selectedElementQname = (selectedSemanticRow?.qualified_name || symbol?.qualified_name || "").trim();
+
   const rows = useMemo(() => {
-    const out: Array<{ key: string; label: string; value: string; qname: string | null }> = [];
+    const out: PropertyRow[] = [];
     const section = (key: string, title: string) => {
       out.push({ key: `section-${key}`, label: `=== ${title} ===`, value: "", qname: null });
     };
+    const pushSemanticFeatureRows = (title: string, features: SemanticFeatureView[], prefix: string) => {
+      section(prefix, title);
+      if (!features.length) {
+        out.push({ key: `${prefix}-empty`, label: "semantic.type_attributes", value: "-", qname: null });
+        return;
+      }
+      features.forEach((feature, index) => {
+        const text = valueToText(feature.value);
+        const qname = valueToQualifiedName(feature.value);
+        const label = formatSemanticFeatureLabel(feature);
+        out.push({
+          key: `${prefix}-feature-${index}-${feature.name}`,
+          label,
+          value: text,
+          qname,
+        });
+      });
+    };
+    const pushExpressionRows = (
+      title: string,
+      records: ProjectExpressionRecordView[],
+      prefix: string,
+    ) => {
+      if (!records.length) {
+        return;
+      }
+      section(prefix, title);
+      records.forEach((record, index) => {
+        out.push({
+          key: `${prefix}-${index}-${record.qualified_name}`,
+          label: formatProjectExpressionLabel(record, selectedElementQname),
+          value: (record.expression || "").trim() || "-",
+          qname: null,
+        });
+      });
+    };
+
+    if (selectedSemanticRow && (directMetatypeAttributes.length || inheritedMetatypeAttributes.length)) {
+      const allMetatypeAttributes = [...directMetatypeAttributes, ...inheritedMetatypeAttributes];
+      const explicitAttributes = metatypeAttributes?.explicit_attributes || [];
+      const usedSemanticFeatureIndexes = new Set<number>();
+      const seenAttributeKeys = new Set<string>();
+
+      section("metatype", "Metatype Attributes");
+      allMetatypeAttributes.forEach((attribute, index) => {
+        const attributeKey =
+          normalizeLookupKey(attribute.qualified_name)
+          || `${normalizeLookupKey(attribute.declared_on)}|${normalizeLookupKey(attribute.name)}`
+          || `attribute-${index}`;
+        if (seenAttributeKeys.has(attributeKey)) {
+          return;
+        }
+        seenAttributeKeys.add(attributeKey);
+
+        let matchedFeatureIndex = -1;
+        const matchedFeature =
+          selectedSemanticRow.features.find((feature, featureIndex) => {
+            if (usedSemanticFeatureIndexes.has(featureIndex)) {
+              return false;
+            }
+            if (!semanticFeatureMatchesAttribute(feature, attribute)) {
+              return false;
+            }
+            matchedFeatureIndex = featureIndex;
+            return true;
+          })
+          || selectedSemanticRow.features.find((feature, featureIndex) => {
+            if (!semanticFeatureMatchesAttribute(feature, attribute)) {
+              return false;
+            }
+            matchedFeatureIndex = featureIndex;
+            return true;
+          })
+          || null;
+
+        if (matchedFeatureIndex >= 0) {
+          usedSemanticFeatureIndexes.add(matchedFeatureIndex);
+        }
+
+        const explicitValue = findExplicitAttributeValue(attribute, explicitAttributes);
+        out.push({
+          key: `metatype-attribute-${attributeKey}`,
+          label: formatAttributeSignature(attribute),
+          value: matchedFeature ? valueToText(matchedFeature.value) : (explicitValue || "-"),
+          qname: matchedFeature ? valueToQualifiedName(matchedFeature.value) : null,
+        });
+      });
+
+      const remainingSemanticFeatures = selectedSemanticRow.features.filter(
+        (_feature, index) => !usedSemanticFeatureIndexes.has(index),
+      );
+      if (remainingSemanticFeatures.length) {
+        pushSemanticFeatureRows("Additional Semantics", remainingSemanticFeatures, "semantic-extra");
+      }
+      pushExpressionRows("Expressions", expressions, "expressions");
+      return out;
+    }
 
     section("semantic", "Semantics");
     if (selectedSemanticRow) {
@@ -324,16 +530,21 @@ export function CombinedPropertiesPane({
         qname: null,
       });
     }
+    pushExpressionRows("Expressions", expressions, "expressions");
     return out;
-  }, [symbol, selectedSemanticRow, selectedSemanticLoading, selectedSemanticError]);
+  }, [
+    symbol,
+    selectedSemanticRow,
+    selectedSemanticLoading,
+    selectedSemanticError,
+    directMetatypeAttributes,
+    inheritedMetatypeAttributes,
+    expressions,
+    metatypeAttributes?.explicit_attributes,
+    selectedElementQname,
+  ]);
 
   const metatypeQname = (metatypeAttributes?.metatype_qname || "").trim();
-  const directMetatypeAttributes = metatypeAttributes?.direct_metatype_attributes || [];
-  const inheritedMetatypeAttributes =
-    metatypeAttributes?.inherited_metatype_attributes
-    || metatypeAttributes?.inherited_attributes
-    || [];
-  const metatypeAttributeCount = directMetatypeAttributes.length + inheritedMetatypeAttributes.length;
 
   if (!rows.length) {
     return <div className="muted">Select an element to view properties.</div>;

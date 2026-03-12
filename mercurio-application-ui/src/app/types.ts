@@ -232,6 +232,21 @@ export type ExpressionRecordView = {
 
 export type StdlibExpressionRecordView = ExpressionRecordView;
 
+export type ProjectExpressionRecordView = {
+  file_path: string;
+  owner_qualified_name: string;
+  qualified_name: string;
+  slot: string;
+  expression_kind: string;
+  expression: string;
+  pilot_rule_id?: string | null;
+};
+
+export type ProjectExpressionRecordsView = {
+  records: ProjectExpressionRecordView[];
+  diagnostics: string[];
+};
+
 export type StdlibMetamodelView = {
   stdlib_path?: string | null;
   workspace_snapshot_hit: boolean;
@@ -279,7 +294,7 @@ export type ProjectModelView = {
   project_cache_hit: boolean;
   element_count: number;
   elements: ProjectModelElementView[];
-  expression_records?: ExpressionRecordView[];
+  expressions?: ProjectExpressionRecordView[];
   diagnostics: string[];
 };
 
@@ -301,6 +316,7 @@ export type ProjectElementAttributesView = {
   inherited_attributes: ProjectElementInheritedAttributeView[];
   direct_metatype_attributes?: ProjectElementInheritedAttributeView[];
   inherited_metatype_attributes?: ProjectElementInheritedAttributeView[];
+  expressions?: ProjectExpressionRecordView[];
   diagnostics: string[];
 };
 
