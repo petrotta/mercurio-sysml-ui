@@ -71,6 +71,7 @@ pub fn get_project_element_attributes(
                 inherited_attributes: Vec::new(),
                 direct_metatype_attributes: Vec::new(),
                 inherited_metatype_attributes: Vec::new(),
+                expressions: Vec::new(),
                 diagnostics: vec!["Element not found in current project symbol index.".to_string()],
             });
         };
@@ -104,6 +105,17 @@ pub fn get_project_element_attributes(
         symbol.properties_json.as_deref(),
         metatype_qname.as_deref(),
     );
+    let symbol_qualified_name = symbol.qualified_name.clone();
+    let expression_view = get_project_expression_records(state, root.clone())?;
+    let expressions = expression_view
+        .records
+        .into_iter()
+        .filter(|record| {
+            record.owner_qualified_name == symbol_qualified_name
+                || record.qualified_name == symbol_qualified_name
+        })
+        .collect::<Vec<_>>();
+    diagnostics.extend(expression_view.diagnostics);
     let (direct_metatype_attributes, inherited_metatype_attributes, inherited_attributes) =
         match load_stdlib_metatype_index(state, &root) {
             Ok(Some(index)) => {
@@ -145,6 +157,7 @@ pub fn get_project_element_attributes(
         inherited_attributes,
         direct_metatype_attributes,
         inherited_metatype_attributes,
+        expressions,
         diagnostics,
     })
 }
@@ -265,6 +278,14 @@ pub fn get_project_model(state: &CoreState, root: String) -> Result<ProjectModel
         });
     }
     elements.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
+    let expression_view = collect_project_expression_records(
+        elements
+            .iter()
+            .map(|element| element.file_path.as_str())
+            .filter(|path| !path.is_empty()),
+    );
+    let mut diagnostics = expression_view.diagnostics;
+    diagnostics.push("Project model is generated from persisted symbol index.".to_string());
 
     Ok(ProjectModelView {
         stdlib_path: stdlib_path.map(|path| path.to_string_lossy().to_string()),
@@ -272,7 +293,8 @@ pub fn get_project_model(state: &CoreState, root: String) -> Result<ProjectModel
         project_cache_hit: false,
         element_count: elements.len(),
         elements,
-        diagnostics: vec!["Project model is generated from persisted symbol index.".to_string()],
+        expressions: expression_view.records,
+        diagnostics,
     })
 }
 
@@ -352,6 +374,7 @@ mod tests {
         let view = get_project_model(&state, project_dir.to_string_lossy().to_string())
             .expect("get project model");
         assert!(view.element_count > 0);
+        assert!(view.expressions.is_empty());
         assert!(view
             .diagnostics
             .iter()
@@ -370,6 +393,7 @@ mod tests {
         .expect("get element attrs");
         assert_eq!(attrs.element_qualified_name, "P");
         assert!(!attrs.explicit_attributes.is_empty());
+        assert!(attrs.expressions.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }

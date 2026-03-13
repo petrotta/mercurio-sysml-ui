@@ -428,8 +428,11 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
                         "expression_records".to_string(),
                         serde_json::to_value(expressions.records).map_err(|e| e.to_string())?,
                     );
-                    if let Some(err) = expressions.error {
-                        obj.insert("expression_records_error".to_string(), Value::String(err));
+                    if !expressions.diagnostics.is_empty() {
+                        obj.insert(
+                            "expression_records_error".to_string(),
+                            Value::String(expressions.diagnostics.join("\n")),
+                        );
                     }
                 }
                 Ok(value)
