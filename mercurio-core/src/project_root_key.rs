@@ -10,8 +10,8 @@ fn strip_windows_verbatim_prefix(path: &str) -> String {
     path.to_string()
 }
 
-pub(crate) fn canonical_project_root(project_root: &str) -> String {
-    let trimmed = project_root.trim();
+pub(crate) fn normalize_workspace_path(path: &str) -> String {
+    let trimmed = path.trim();
     if trimmed.is_empty() {
         return String::new();
     }
@@ -21,4 +21,16 @@ pub(crate) fn canonical_project_root(project_root: &str) -> String {
         .to_string_lossy()
         .to_string();
     strip_windows_verbatim_prefix(&canonical)
+}
+
+pub(crate) fn normalize_display_path(path: &str) -> String {
+    strip_windows_verbatim_prefix(path)
+}
+
+pub(crate) fn canonical_project_root(project_root: &str) -> String {
+    let trimmed = project_root.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    normalize_workspace_path(trimmed)
 }

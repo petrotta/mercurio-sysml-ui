@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { MutableRefObject } from "react";
 import {
-  INDEX_QUERY_MAX_PAGES,
-  INDEX_QUERY_PAGE_SIZE,
+  INDEX_QUERY_LIMIT,
   POST_COMPILE_SYMBOL_REFRESH_DELAY_MS,
   POST_COMPILE_SYMBOL_REFRESH_RETRIES,
   delay,
@@ -57,20 +56,8 @@ export function useSymbolRefreshController({
   ): Promise<SymbolView[] | null> => {
     if (!path) return [];
     try {
-      if (scopedFilePath) {
-        const indexed = await queryProjectSymbols(path, scopedFilePath, 0, INDEX_QUERY_PAGE_SIZE);
-        return (indexed || []).map((symbol) => indexedToSymbol(symbol, "project"));
-      }
-      const out: SymbolView[] = [];
-      let offset = 0;
-      for (let page = 0; page < INDEX_QUERY_MAX_PAGES; page += 1) {
-        const indexed = await queryProjectSymbols(path, null, offset, INDEX_QUERY_PAGE_SIZE);
-        if (!indexed?.length) break;
-        out.push(...indexed.map((symbol) => indexedToSymbol(symbol, "project")));
-        if (indexed.length < INDEX_QUERY_PAGE_SIZE) break;
-        offset += indexed.length;
-      }
-      return out;
+      const indexed = await queryProjectSymbols(path, scopedFilePath ?? null, 0, INDEX_QUERY_LIMIT);
+      return (indexed || []).map((symbol) => indexedToSymbol(symbol, "project"));
     } catch {
       return null;
     }
@@ -85,7 +72,7 @@ export function useSymbolRefreshController({
     );
     if (!unique.length) return [];
     try {
-      const indexed = await queryProjectSymbolsForFiles(path, unique, 0, INDEX_QUERY_PAGE_SIZE * INDEX_QUERY_MAX_PAGES);
+      const indexed = await queryProjectSymbolsForFiles(path, unique, 0, INDEX_QUERY_LIMIT);
       return (indexed || []).map((symbol) => indexedToSymbol(symbol, "project"));
     } catch {
       return null;
@@ -98,20 +85,8 @@ export function useSymbolRefreshController({
   ): Promise<SymbolView[] | null> => {
     if (!path) return [];
     try {
-      if (scopedFilePath) {
-        const indexed = await queryLibrarySymbols(path, scopedFilePath, 0, INDEX_QUERY_PAGE_SIZE);
-        return (indexed || []).map((symbol) => indexedToSymbol(symbol, "library"));
-      }
-      const out: SymbolView[] = [];
-      let offset = 0;
-      for (let page = 0; page < INDEX_QUERY_MAX_PAGES; page += 1) {
-        const indexed = await queryLibrarySymbols(path, null, offset, INDEX_QUERY_PAGE_SIZE);
-        if (!indexed?.length) break;
-        out.push(...indexed.map((symbol) => indexedToSymbol(symbol, "library")));
-        if (indexed.length < INDEX_QUERY_PAGE_SIZE) break;
-        offset += indexed.length;
-      }
-      return out;
+      const indexed = await queryLibrarySymbols(path, scopedFilePath ?? null, 0, INDEX_QUERY_LIMIT);
+      return (indexed || []).map((symbol) => indexedToSymbol(symbol, "library"));
     } catch {
       return null;
     }
@@ -168,19 +143,21 @@ export function useSymbolRefreshController({
         setActiveLibraryPath(resolvedLibraryPath);
         libraryPathRef.current = resolvedLibraryPath;
       }
-      const indexed = await queryIndexedLibrarySymbols(path);
-      if (indexed) {
+      const loadedSymbols = mergeSymbols(
+        (loaded?.symbols || []).map((symbol) => ({ ...symbol, source_scope: "library" as const })),
+      );
+      if (loadedSymbols.length) {
         appendBuildLogEntries([{
           level: "info",
-          message: `Library load complete (${indexed.length} symbols, files=${loaded?.stdlib_file_count ?? 0}, snapshot_hit=${loaded?.workspace_snapshot_hit ? "yes" : "no"})`,
+          message: `Library load complete (${loadedSymbols.length} symbols, files=${loaded?.stdlib_file_count ?? 0}, snapshot_hit=${loaded?.workspace_snapshot_hit ? "yes" : "no"})`,
         }]);
       } else {
         appendBuildLogEntries([{
           level: "warn",
-          message: "Library load completed, but indexed library query failed.",
+          message: "Library load completed, but returned no symbols.",
         }]);
       }
-      return indexed;
+      return loadedSymbols;
     } catch (error) {
       appendBuildLogEntries([{
         level: "warn",
@@ -229,43 +206,48 @@ export function useSymbolRefreshController({
       level: "info",
       message: `Symbol refresh started (run=post-compile, mode=${filePath ? "file" : "delta"})`,
     }]);
-    const indexedIncoming = await loadProjectSymbolsWithRetry({
-      path: compileRoot,
-      scopedFilePath: filePath,
-      parsedFiles: response?.parsed_files,
-      expectedSymbols: response?.project_symbol_count || 0,
-    });
+    const responseSymbols = Array.isArray(response?.symbols) ? response.symbols : [];
+    let projectRefreshCount = responseSymbols.length;
+    if (!responseSymbols.length && response?.project_symbol_count) {
+      const indexedIncoming = await loadProjectSymbolsWithRetry({
+        path: compileRoot,
+        scopedFilePath: filePath,
+        parsedFiles: response?.parsed_files,
+        expectedSymbols: response?.project_symbol_count || 0,
+      });
+      if (!isCurrentSession()) return;
+      if (indexedIncoming === null) {
+        const message = "Project symbol refresh failed.";
+        setSymbolIndexError(message);
+        setSymbolsStatus("error");
+        showErrorNotification(message);
+        return;
+      }
+
+      projectRefreshCount = indexedIncoming.length;
+      if (indexedIncoming.length > 0 || !response?.project_symbol_count) {
+        setProjectSemanticSymbols((prev) =>
+          filePath
+            ? mergeProjectSymbolsByFile(prev, indexedIncoming, filePath)
+            : mergeProjectSymbolsByParsedFiles(prev, indexedIncoming, response?.parsed_files),
+        );
+      }
+      if (response?.project_symbol_count && indexedIncoming.length === 0) {
+        const message = `Project symbol refresh returned no results after compile (${response.project_symbol_count} expected).`;
+        setSymbolIndexError(message);
+        setSymbolsStatus("error");
+        showErrorNotification(message);
+        return;
+      }
+    }
+
     if (!isCurrentSession()) return;
-    if (indexedIncoming === null) {
-      const message = "Project symbol refresh failed.";
-      setSymbolIndexError(message);
-      setSymbolsStatus("error");
-      showErrorNotification(message);
-      return;
-    }
-
-    const incoming = indexedIncoming || [];
-    if (incoming.length > 0 || !response?.project_symbol_count) {
-      setProjectSemanticSymbols((prev) =>
-        filePath
-          ? mergeProjectSymbolsByFile(prev, incoming, filePath)
-          : mergeProjectSymbolsByParsedFiles(prev, incoming, response?.parsed_files),
-      );
-    }
-
-    if (response?.project_symbol_count && incoming.length === 0) {
-      const message = `Project symbol refresh returned no results after compile (${response.project_symbol_count} expected).`;
-      setSymbolIndexError(message);
-      setSymbolsStatus("error");
-      showErrorNotification(message);
-    } else {
-      setSymbolIndexError("");
-      setSymbolsStatus("ready");
-      appendBuildLogEntries([{
-        level: "info",
-        message: `Project symbols refreshed (${incoming.length} symbols)`,
-      }]);
-    }
+    setSymbolIndexError("");
+    setSymbolsStatus("ready");
+    appendBuildLogEntries([{
+      level: "info",
+      message: `Project symbols refreshed (${projectRefreshCount} symbols)`,
+    }]);
 
     if (!filePath) {
       const previousLibraryPath = libraryPathRef.current;
@@ -274,9 +256,7 @@ export function useSymbolRefreshController({
       if (libraryPathChanged) {
         libraryBootstrapAttemptedRef.current = false;
       }
-      const shouldRefreshLibrary =
-        !librarySemanticSymbols.length
-        || libraryPathChanged;
+      const shouldRefreshLibrary = !librarySemanticSymbols.length || libraryPathChanged;
       if (shouldRefreshLibrary) {
         let libraryIncoming = await queryIndexedLibrarySymbols(compileRoot);
         if (!isCurrentSession()) return;

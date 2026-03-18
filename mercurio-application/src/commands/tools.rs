@@ -10,7 +10,6 @@ use mercurio_core::{
     get_project_model as core_get_project_model, get_stdlib_metamodel as core_get_stdlib_metamodel,
     load_library_symbols_sync as core_load_library_symbols_sync,
     query_library_symbols as core_query_library_symbols,
-    query_project_semantic_element_by_qualified_name as core_query_project_semantic_element_by_qualified_name,
     query_project_semantic_projection_by_qualified_name as core_query_project_semantic_projection_by_qualified_name,
     query_project_symbols as core_query_project_symbols,
     query_project_symbols_for_files as core_query_project_symbols_for_files,
@@ -240,7 +239,7 @@ fn canonical_tool_name(tool: &str) -> String {
             "core.load_library_symbols@v1".to_string()
         }
         "query_semantic_element" | "core.query_semantic_element" => {
-            "core.query_semantic_element@v1".to_string()
+            "core.query_semantic_element@v2".to_string()
         }
         "get_project_model" | "core.get_project_model" => "core.get_project_model@v1".to_string(),
         "get_project_element_attributes" | "core.get_project_element_attributes" => {
@@ -379,22 +378,6 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
             .await
             .map_err(|e| e.to_string())?
             .and_then(|rows| serde_json::to_value(rows).map_err(|e| e.to_string()))
-        }
-        "core.query_semantic_element@v1" => {
-            let root = arg_string(&args, "root")?;
-            let qualified_name = arg_string(&args, "qualified_name")?;
-            let file_path = arg_optional_string(&args, "file_path");
-            tauri::async_runtime::spawn_blocking(move || {
-                core_query_project_semantic_element_by_qualified_name(
-                    &core,
-                    root,
-                    qualified_name,
-                    file_path,
-                )
-            })
-            .await
-            .map_err(|e| e.to_string())?
-            .and_then(|row| serde_json::to_value(row).map_err(|e| e.to_string()))
         }
         "core.query_semantic_element@v2" => {
             let root = arg_string(&args, "root")?;

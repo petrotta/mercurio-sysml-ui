@@ -1,7 +1,22 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use crate::model::{Scope, SymbolMetatypeMappingRecord, SymbolRecord};
+
+fn normalized_path_key(path: &str) -> String {
+    let resolved = PathBuf::from(path)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(path));
+    resolved
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
+fn normalized_root_key(project_root: &str) -> String {
+    normalized_path_key(project_root)
+}
 
 pub trait SymbolIndexStore {
     fn upsert_symbols_for_file(
@@ -206,12 +221,12 @@ impl SymbolIndexStore for InMemorySymbolIndex {
         symbols: Vec<SymbolRecord>,
     ) {
         self.by_project_file
-            .insert((project_root.to_string(), file_path.to_string()), symbols);
+            .insert((normalized_root_key(project_root), file_path.to_string()), symbols);
     }
 
     fn delete_symbols_for_file(&mut self, project_root: &str, file_path: &str) {
         self.by_project_file
-            .remove(&(project_root.to_string(), file_path.to_string()));
+            .remove(&(normalized_root_key(project_root), file_path.to_string()));
     }
 
     fn clear_all(&mut self) {
@@ -222,8 +237,9 @@ impl SymbolIndexStore for InMemorySymbolIndex {
 
     fn symbols_by_metatype(&self, project_root: &str, metatype_qname: &str) -> Vec<SymbolRecord> {
         let mut out = Vec::new();
+        let project_root = normalized_root_key(project_root);
         for ((root, _), items) in &self.by_project_file {
-            if root != project_root {
+            if root != &project_root {
                 continue;
             }
             for symbol in items {
@@ -253,12 +269,13 @@ impl SymbolIndexStore for InMemorySymbolIndex {
         limit: usize,
     ) -> Vec<SymbolRecord> {
         let mut out = Vec::new();
+        let project_root = normalized_root_key(project_root);
         for ((root, file), items) in &self.by_project_file {
-            if root != project_root {
+            if root != &project_root {
                 continue;
             }
             if let Some(target) = file_path {
-                if !file.eq_ignore_ascii_case(target) {
+                if normalized_path_key(file) != normalized_path_key(target) {
                     continue;
                 }
             }
@@ -314,12 +331,13 @@ impl SymbolIndexStore for InMemorySymbolIndex {
         limit: usize,
     ) -> Vec<SymbolRecord> {
         let mut out = Vec::new();
+        let project_root = normalized_root_key(project_root);
         for ((root, file), items) in &self.by_project_file {
-            if root != project_root {
+            if root != &project_root {
                 continue;
             }
             if let Some(target) = file_path {
-                if !file.eq_ignore_ascii_case(target) {
+                if normalized_path_key(file) != normalized_path_key(target) {
                     continue;
                 }
             }
@@ -374,8 +392,9 @@ impl SymbolIndexStore for InMemorySymbolIndex {
         let mut files = HashSet::<String>::new();
         let mut symbol_count = 0usize;
         let mut kinds = HashMap::<String, usize>::new();
+        let project_root = normalized_root_key(project_root);
         for ((root, _), items) in &self.by_project_file {
-            if root != project_root {
+            if root != &project_root {
                 continue;
             }
             for symbol in items {
@@ -399,26 +418,26 @@ impl SymbolIndexStore for InMemorySymbolIndex {
         signature: &str,
     ) -> bool {
         self.stdlib_freshness
-            .get(&(project_root.to_string(), library_key.to_string()))
+            .get(&(normalized_root_key(project_root), library_key.to_string()))
             .map(|known| known == signature)
             .unwrap_or(false)
     }
 
     fn mark_stdlib_indexed(&mut self, project_root: &str, library_key: &str, signature: &str) {
         self.stdlib_freshness.insert(
-            (project_root.to_string(), library_key.to_string()),
+            (normalized_root_key(project_root), library_key.to_string()),
             signature.to_string(),
         );
     }
 
     fn rebuild_symbol_mappings(&mut self, project_root: &str) {
-        self.mappings_by_symbol
-            .retain(|(root, _), _| root != project_root);
+        let project_root = normalized_root_key(project_root);
+        self.mappings_by_symbol.retain(|(root, _), _| root != &project_root);
 
         let mut stdlib_by_qname = HashMap::<String, String>::new();
         let mut project_symbols = Vec::<SymbolRecord>::new();
         for ((root, _), items) in &self.by_project_file {
-            if root != project_root {
+            if root != &project_root {
                 continue;
             }
             for symbol in items {
@@ -475,16 +494,17 @@ impl SymbolIndexStore for InMemorySymbolIndex {
         symbol_qualified_name: &str,
         file_path: Option<&str>,
     ) -> Option<SymbolMetatypeMappingRecord> {
+        let project_root = normalized_root_key(project_root);
         let mut project_symbols = self
             .by_project_file
             .iter()
-            .filter(|((root, _), _)| root == project_root)
+            .filter(|((root, _), _)| root == &project_root)
             .flat_map(|(_, items)| items.iter())
             .filter(|symbol| {
                 symbol.scope == Scope::Project
                     && symbol.qualified_name == symbol_qualified_name
                     && file_path
-                        .map(|path| symbol.file_path.eq_ignore_ascii_case(path))
+                        .map(|path| normalized_path_key(&symbol.file_path) == normalized_path_key(path))
                         .unwrap_or(true)
             })
             .collect::<Vec<_>>();
@@ -496,7 +516,7 @@ impl SymbolIndexStore for InMemorySymbolIndex {
         });
         let symbol = project_symbols.first()?;
         self.mappings_by_symbol
-            .get(&(project_root.to_string(), symbol.id.clone()))
+            .get(&(project_root, symbol.id.clone()))
             .cloned()
     }
 }

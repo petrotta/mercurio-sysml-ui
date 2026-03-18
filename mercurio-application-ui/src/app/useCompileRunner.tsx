@@ -1,5 +1,5 @@
 import { useRef } from "react";
-import { clearSemanticElementCache } from "./services/semanticApi";
+import { clearSemanticProjectionCache } from "./services/semanticApi";
 import type { UnsavedCompileInput } from "./compileShared";
 import { useBuildNotifications } from "./useBuildNotifications";
 import { useCompileJobController } from "./useCompileJobController";
@@ -38,7 +38,7 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
     currentRunIdRef,
     notifications,
     onCompileSuccess: ({ compileRoot, filePath, response, sessionToken }) => {
-      clearSemanticElementCache(compileRoot || undefined);
+      clearSemanticProjectionCache(compileRoot || undefined);
       symbolRefresh.bumpSemanticRefreshVersion();
       symbolRefresh.applyCompileResponseSymbols({ filePath, response });
       void symbolRefresh.refreshAfterCompile({

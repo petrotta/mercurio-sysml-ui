@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  clearSemanticElementCache,
+  clearSemanticProjectionCache,
   querySemanticElementProjectionByQualifiedName,
 } from "./services/semanticApi";
 import type { SemanticElementProjectionResult, SymbolView } from "./types";
@@ -33,7 +33,7 @@ export function useSemanticSelection({
   const lastRequestKeyRef = useRef("");
 
   useEffect(() => {
-    clearSemanticElementCache(rootPath || undefined);
+    clearSemanticProjectionCache(rootPath || undefined);
   }, [rootPath]);
 
   useEffect(() => {

@@ -37,8 +37,7 @@ export type UnsavedCompileInput = {
 
 export type SymbolsStatus = "idle" | "loading" | "ready" | "error";
 
-export const INDEX_QUERY_PAGE_SIZE = 5_000;
-export const INDEX_QUERY_MAX_PAGES = 80;
+export const INDEX_QUERY_LIMIT = 400_000;
 export const COMPILE_REQUEST_DEBOUNCE_MS = 250;
 export const POST_COMPILE_SYMBOL_REFRESH_RETRIES = 6;
 export const POST_COMPILE_SYMBOL_REFRESH_DELAY_MS = 40;

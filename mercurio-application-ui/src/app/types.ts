@@ -242,11 +242,6 @@ export type ProjectExpressionRecordView = {
   pilot_rule_id?: string | null;
 };
 
-export type ProjectExpressionRecordsView = {
-  records: ProjectExpressionRecordView[];
-  diagnostics: string[];
-};
-
 export type StdlibMetamodelView = {
   stdlib_path?: string | null;
   workspace_snapshot_hit: boolean;
@@ -331,13 +326,6 @@ export type SymbolMetatypeMappingView = {
   mapping_source: string;
   confidence: number;
   diagnostic?: string | null;
-};
-
-export type SemanticElementResult = {
-  name: string;
-  qualified_name: string;
-  file_path: string;
-  attributes?: Record<string, string>;
 };
 
 export type SemanticValueView =

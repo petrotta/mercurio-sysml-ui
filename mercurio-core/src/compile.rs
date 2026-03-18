@@ -27,12 +27,12 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use crate::project::load_project_config;
-use crate::project_root_key::canonical_project_root;
+use crate::project_root_key::{canonical_project_root, normalize_display_path};
 use crate::state::{StdlibCache, StdlibSymbol, WorkspaceSnapshotCacheEntry};
 use crate::stdlib::resolve_stdlib_path;
-use crate::symbol_index::query_project_symbols;
+use crate::symbol_index::{query_project_symbols, refresh_project_semantic_lookup};
 use crate::workspace::{collect_model_files, collect_project_files};
-use crate::workspace_ir_cache::persist_workspace_ir_cache;
+use crate::workspace_ir_cache::schedule_workspace_ir_cache_persist;
 use crate::CoreState;
 
 #[cfg(test)]
@@ -688,6 +688,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
     include_symbols: bool,
     emit_progress: F,
 ) -> Result<CompileResponse, String> {
+    let raw_root = root.trim().to_string();
     let root = canonical_project_root(&root);
     let compile_start = Instant::now();
     let root_path = PathBuf::from(&root);
@@ -1240,21 +1241,62 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
             }
         }
     };
+    let display_root_path = PathBuf::from(if raw_root.is_empty() { &root } else { &raw_root });
+    let semantic_elements = Arc::new(
+        semantic_elements
+            .iter()
+            .cloned()
+            .map(|element| normalize_semantic_element_file_path(&display_root_path, element))
+            .collect::<Vec<_>>(),
+    );
+    let semantic_projection = Arc::new(
+        semantic_projection
+            .iter()
+            .cloned()
+            .map(|element| normalize_semantic_projection_file_path(&display_root_path, element))
+            .collect::<Vec<_>>(),
+    );
     if semantic_cache_needs_store || semantic_projection_needs_store {
         if let Ok(mut cache) = state.workspace_snapshot_cache.lock() {
             clear_project_semantic_cache_for_root(&mut cache, &root);
-            cache.insert(
-                semantic_cache_key.clone(),
-                WorkspaceSnapshotCacheEntry::ProjectSemantic(semantic_elements.clone()),
-            );
-            cache.insert(
-                semantic_projection_cache_key.clone(),
-                WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(
-                    semantic_projection.clone(),
-                ),
-            );
+            let mut semantic_cache_keys = vec![semantic_cache_key.clone()];
+            let mut semantic_projection_cache_keys = vec![semantic_projection_cache_key.clone()];
+            if !raw_root.is_empty() && raw_root != root {
+                semantic_cache_keys.push(workspace_semantic_cache_key(
+                    &raw_root,
+                    &project_semantic_inputs,
+                    &stdlib_signature,
+                    semantic_pipeline,
+                ));
+                semantic_projection_cache_keys.push(workspace_semantic_cache_key(
+                    &raw_root,
+                    &project_semantic_inputs,
+                    "",
+                    semantic_projection_pipeline,
+                ));
+            }
+            for key in semantic_cache_keys {
+                cache.insert(
+                    key,
+                    WorkspaceSnapshotCacheEntry::ProjectSemantic(semantic_elements.clone()),
+                );
+            }
+            for key in semantic_projection_cache_keys {
+                cache.insert(
+                    key,
+                    WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(
+                        semantic_projection.clone(),
+                    ),
+                );
+            }
         }
     }
+    let _ = refresh_project_semantic_lookup(
+        state,
+        &root,
+        semantic_elements.as_ref(),
+        semantic_projection.as_ref(),
+    );
     let semantic_total = semantic_elements.len();
     emit_progress(
         "analysis",
@@ -1458,7 +1500,11 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
     } else {
         Some(stdlib_signature.as_str())
     };
-    let _ = persist_workspace_ir_cache(state, &root, persist_signature);
+    schedule_workspace_ir_cache_persist(
+        state.clone(),
+        root.clone(),
+        persist_signature.map(|value| value.to_string()),
+    );
     emit_progress("complete", Some("compile done".to_string()), None, None);
     Ok(response)
 }
@@ -1689,7 +1735,11 @@ pub fn load_library_symbols_sync(
     } else {
         Some(stdlib_signature.as_str())
     };
-    let _ = persist_workspace_ir_cache(state, &root, persist_signature);
+    schedule_workspace_ir_cache_persist(
+        state.clone(),
+        root.clone(),
+        persist_signature.map(|value| value.to_string()),
+    );
     Ok(response)
 }
 
@@ -1776,13 +1826,13 @@ fn clear_project_semantic_cache_for_root(
     cache: &mut HashMap<String, WorkspaceSnapshotCacheEntry>,
     project_root: &str,
 ) {
-    let prefix = format!("project-semantic|{}|", project_root);
+    let canonical_root = canonical_project_root(project_root);
     let to_remove = cache
         .iter()
         .filter_map(|(key, entry)| match entry {
             WorkspaceSnapshotCacheEntry::ProjectSemantic(_)
             | WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(_)
-                if key.starts_with(&prefix) =>
+                if project_semantic_cache_key_matches_root(key, &canonical_root) =>
             {
                 Some(key.clone())
             }
@@ -1792,6 +1842,47 @@ fn clear_project_semantic_cache_for_root(
     for key in to_remove {
         cache.remove(&key);
     }
+}
+
+fn project_semantic_cache_key_matches_root(key: &str, canonical_root: &str) -> bool {
+    let Some(rest) = key.strip_prefix("project-semantic|") else {
+        return false;
+    };
+    let Some((candidate_root, _)) = rest.split_once('|') else {
+        return false;
+    };
+    canonical_project_root(candidate_root) == canonical_root
+}
+
+fn normalize_semantic_element_file_path(
+    project_root: &Path,
+    mut element: mercurio_sysml_semantics::semantic_contract::SemanticElementView,
+) -> mercurio_sysml_semantics::semantic_contract::SemanticElementView {
+    element.file_path = normalize_workspace_file_path(project_root, &element.file_path);
+    element
+}
+
+fn normalize_semantic_projection_file_path(
+    project_root: &Path,
+    mut element: mercurio_sysml_semantics::semantic_contract::SemanticElementProjectionView,
+) -> mercurio_sysml_semantics::semantic_contract::SemanticElementProjectionView {
+    element.file_path = normalize_workspace_file_path(project_root, &element.file_path);
+    element
+}
+
+fn normalize_workspace_file_path(project_root: &Path, file_path: &str) -> String {
+    let path = PathBuf::from(file_path);
+    if path.is_absolute() {
+        let canonical_root = project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.to_path_buf());
+        let canonical_path = path.canonicalize().unwrap_or(path.clone());
+        if let Ok(relative) = canonical_path.strip_prefix(&canonical_root) {
+            return normalize_display_path(&project_root.join(relative).to_string_lossy());
+        }
+        return normalize_display_path(file_path);
+    }
+    normalize_display_path(&project_root.join(path).to_string_lossy())
 }
 
 fn build_symbol_span_seed_from_index(
@@ -3310,8 +3401,7 @@ standard library package KerML {
         assert!(response.ok);
         assert_eq!(response.symbols.len(), 0);
         assert!(response.project_symbol_count > 0);
-        assert_eq!(response.stdlib_duration_ms, 0);
-        assert_eq!(response.stdlib_file_count, 0);
+        assert_eq!(response.library_symbol_count, 0);
 
         let indexed = query_project_symbols(&state, project_root, None, Some(0), Some(10_000))
             .expect("query project symbols");

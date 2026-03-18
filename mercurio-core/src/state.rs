@@ -12,7 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::project_root_key::canonical_project_root;
 use crate::settings::AppSettings;
-use crate::workspace_ir_cache::clear_workspace_ir_cache;
+use crate::workspace_ir_cache::{
+    clear_workspace_ir_cache, flush_pending_workspace_ir_cache_persists,
+};
 
 #[derive(Serialize, Clone)]
 pub struct CompileFileResult {
@@ -39,6 +41,15 @@ pub(crate) type StdlibCache = StdlibSnapshotCacheEntry<StdlibSymbol>;
 pub(crate) type ProjectSemanticCache = Arc<Vec<SemanticElementView>>;
 pub(crate) type ProjectSemanticProjectionCache = Arc<Vec<SemanticElementProjectionView>>;
 
+#[derive(Clone, Default)]
+pub(crate) struct ProjectSemanticLookup {
+    pub(crate) elements_by_file_qname: HashMap<(String, String), SemanticElementView>,
+    pub(crate) best_elements_by_qname: HashMap<String, SemanticElementView>,
+    pub(crate) projections_by_file_qname:
+        HashMap<(String, String), SemanticElementProjectionView>,
+    pub(crate) best_projections_by_qname: HashMap<String, SemanticElementProjectionView>,
+}
+
 #[derive(Clone)]
 pub(crate) enum WorkspaceSnapshotCacheEntry {
     Stdlib(StdlibCache),
@@ -47,6 +58,7 @@ pub(crate) enum WorkspaceSnapshotCacheEntry {
 }
 
 pub(crate) type WorkspaceSnapshotCache = HashMap<String, WorkspaceSnapshotCacheEntry>;
+pub(crate) type ProjectSemanticLookupCache = HashMap<String, ProjectSemanticLookup>;
 
 #[derive(Default)]
 pub(crate) struct WorkspaceState {
@@ -61,6 +73,12 @@ pub(crate) struct BackgroundJobState {
     detail: Option<String>,
     started_at_ms: u128,
     cancel_compile_run_id: Option<u64>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingWorkspaceIrPersist {
+    pub(crate) generation: u64,
+    pub(crate) stdlib_signature: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -90,11 +108,15 @@ pub struct BackgroundCancelSummary {
 #[derive(Clone)]
 pub struct CoreState {
     pub(crate) workspace_snapshot_cache: Arc<Mutex<WorkspaceSnapshotCache>>,
+    pub(crate) project_semantic_lookup_cache: Arc<Mutex<ProjectSemanticLookupCache>>,
     pub(crate) canceled_compiles: Arc<Mutex<HashSet<u64>>>,
     pub(crate) workspace: Arc<Mutex<WorkspaceState>>,
     pub(crate) symbol_index: Arc<Mutex<SymbolIndex>>,
     pub(crate) background_jobs: Arc<Mutex<HashMap<u64, BackgroundJobState>>>,
     pub(crate) next_background_job_id: Arc<AtomicU64>,
+    pub(crate) next_workspace_ir_persist_id: Arc<AtomicU64>,
+    pub(crate) pending_workspace_ir_persists:
+        Arc<Mutex<HashMap<String, PendingWorkspaceIrPersist>>>,
     pub stdlib_root: PathBuf,
     pub settings: Arc<Mutex<AppSettings>>,
 }
@@ -129,11 +151,14 @@ impl CoreState {
         let symbol_index = SymbolIndex::InMemory(InMemorySymbolIndex::default());
         Self {
             workspace_snapshot_cache: Arc::new(Mutex::new(HashMap::new())),
+            project_semantic_lookup_cache: Arc::new(Mutex::new(HashMap::new())),
             canceled_compiles: Arc::new(Mutex::new(HashSet::new())),
             workspace: Arc::new(Mutex::new(WorkspaceState::default())),
             symbol_index: Arc::new(Mutex::new(symbol_index)),
             background_jobs: Arc::new(Mutex::new(HashMap::new())),
             next_background_job_id: Arc::new(AtomicU64::new(1)),
+            next_workspace_ir_persist_id: Arc::new(AtomicU64::new(1)),
+            pending_workspace_ir_persists: Arc::new(Mutex::new(HashMap::new())),
             stdlib_root,
             settings: Arc::new(Mutex::new(settings)),
         }
@@ -226,6 +251,7 @@ impl CoreState {
         &self,
         project_root: Option<&str>,
     ) -> Result<CacheClearSummary, String> {
+        flush_pending_workspace_ir_cache_persists(self, project_root)?;
         let workspace_snapshot_entries = {
             let mut cache = self
                 .workspace_snapshot_cache
@@ -235,6 +261,9 @@ impl CoreState {
             cache.clear();
             count
         };
+        if let Ok(mut lookup_cache) = self.project_semantic_lookup_cache.lock() {
+            lookup_cache.clear();
+        }
         let metamodel_entries = 0usize;
         let (parsed_file_entries, file_mtime_entries) = {
             let mut workspace = self
@@ -264,6 +293,9 @@ impl CoreState {
             canceled.clear();
             count
         };
+        if let Ok(mut pending_persists) = self.pending_workspace_ir_persists.lock() {
+            pending_persists.clear();
+        }
         let project_ir_cache_deleted = match project_root {
             Some(root) => {
                 let canonical_root = canonical_project_root(root);

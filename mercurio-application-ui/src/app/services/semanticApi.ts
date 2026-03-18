@@ -3,16 +3,12 @@ import type {
   IndexedSymbolView,
   ProjectModelView,
   ProjectElementAttributesView,
-  ProjectExpressionRecordsView,
   SemanticElementProjectionResult,
-  SemanticElementResult,
   SymbolView,
 } from "../types";
 
 const SEMANTIC_ELEMENT_CACHE_LIMIT = 256;
 const PROJECT_ELEMENT_ATTRIBUTES_TIMEOUT_MS = 20000;
-const semanticElementCache = new Map<string, SemanticElementResult | null>();
-const semanticElementInFlight = new Map<string, Promise<SemanticElementResult | null>>();
 const semanticProjectionCache = new Map<string, SemanticElementProjectionResult | null>();
 const semanticProjectionInFlight = new Map<
   string,
@@ -34,21 +30,6 @@ function semanticElementCacheKey(root: string, qualifiedName: string, filePath?:
   return `${root.toLowerCase()}\u0000${(filePath || "").toLowerCase()}\u0000${qualifiedName.toLowerCase()}`;
 }
 
-function rememberSemanticElement(
-  key: string,
-  value: SemanticElementResult | null,
-): SemanticElementResult | null {
-  semanticElementCache.delete(key);
-  semanticElementCache.set(key, value);
-  if (semanticElementCache.size > SEMANTIC_ELEMENT_CACHE_LIMIT) {
-    const oldest = semanticElementCache.keys().next().value;
-    if (oldest) {
-      semanticElementCache.delete(oldest);
-    }
-  }
-  return value;
-}
-
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = window.setTimeout(() => {
@@ -67,25 +48,13 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
   });
 }
 
-export function clearSemanticElementCache(root?: string): void {
+export function clearSemanticProjectionCache(root?: string): void {
   if (!root) {
-    semanticElementCache.clear();
-    semanticElementInFlight.clear();
     semanticProjectionCache.clear();
     semanticProjectionInFlight.clear();
     return;
   }
   const prefix = `${root.toLowerCase()}\u0000`;
-  for (const key of Array.from(semanticElementCache.keys())) {
-    if (key.startsWith(prefix)) {
-      semanticElementCache.delete(key);
-    }
-  }
-  for (const key of Array.from(semanticElementInFlight.keys())) {
-    if (key.startsWith(prefix)) {
-      semanticElementInFlight.delete(key);
-    }
-  }
   for (const key of Array.from(semanticProjectionCache.keys())) {
     if (key.startsWith(prefix)) {
       semanticProjectionCache.delete(key);
@@ -96,34 +65,6 @@ export function clearSemanticElementCache(root?: string): void {
       semanticProjectionInFlight.delete(key);
     }
   }
-}
-
-export async function querySemanticElementByQualifiedName(
-  root: string,
-  qualifiedName: string,
-  filePath?: string | null,
-): Promise<SemanticElementResult | null> {
-  const target = (qualifiedName || "").trim();
-  if (!target) return null;
-  const key = semanticElementCacheKey(root, target, filePath);
-  if (semanticElementCache.has(key)) {
-    return semanticElementCache.get(key) || null;
-  }
-  const existing = semanticElementInFlight.get(key);
-  if (existing) {
-    return existing;
-  }
-  const request = callTool<SemanticElementResult | null>("core.query_semantic_element@v1", {
-    root,
-    qualified_name: target,
-    file_path: filePath || null,
-  })
-    .then((row) => rememberSemanticElement(key, row || null))
-    .finally(() => {
-      semanticElementInFlight.delete(key);
-    });
-  semanticElementInFlight.set(key, request);
-  return request;
 }
 
 export async function querySemanticElementProjectionByQualifiedName(
@@ -236,18 +177,6 @@ export async function getProjectElementAttributes(
 
 export async function getProjectModel(root: string): Promise<ProjectModelView> {
   return callTool<ProjectModelView>("core.get_project_model@v1", { root });
-}
-
-export async function getProjectExpressions(
-  root: string,
-  filePath?: string | null,
-  qualifiedName?: string | null,
-): Promise<ProjectExpressionRecordsView> {
-  return callTool<ProjectExpressionRecordsView>("core.get_project_expressions@v1", {
-    root,
-    file_path: filePath || null,
-    qualified_name: qualifiedName || null,
-  });
 }
 
 export async function getDefaultStdlib(): Promise<string | null> {
