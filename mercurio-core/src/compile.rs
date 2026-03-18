@@ -3,7 +3,8 @@ use mercurio_sysml_core::parser::Parser;
 use mercurio_sysml_pkg::compile_support::{
     build_canonical_symbol_rows_by_file, build_compile_workspace_files,
     build_stdlib_snapshot_with_progress as build_stdlib_snapshot_rows_with_progress,
-    build_workspace_semantic_elements_with_selection, collect_stdlib_files,
+    build_workspace_semantic_elements_with_selection, build_workspace_semantic_projection_views,
+    collect_stdlib_files,
     filter_out_library_files, group_prepared_symbols_by_file, is_library_symbol_path,
     load_stdlib_snapshot_with_cache, map_semantic_element_to_projected_symbol,
     normalized_compare_key as normalized_compare_key_shared, prepare_symbols_for_index,
@@ -26,6 +27,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use crate::project::load_project_config;
+use crate::project_root_key::canonical_project_root;
 use crate::state::{StdlibCache, StdlibSymbol, WorkspaceSnapshotCacheEntry};
 use crate::stdlib::resolve_stdlib_path;
 use crate::symbol_index::query_project_symbols;
@@ -310,6 +312,7 @@ fn performance_warnings(
 }
 
 pub fn query_semantic_symbols(state: &CoreState, root: String) -> Result<Vec<SymbolView>, String> {
+    let root = canonical_project_root(&root);
     let indexed = query_project_symbols(state, root.clone(), None, None, None).unwrap_or_default();
     let (semantic_by_file_qname, semantic_by_qname) =
         semantic_attribute_lookups_for_root(state, &root);
@@ -685,6 +688,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
     include_symbols: bool,
     emit_progress: F,
 ) -> Result<CompileResponse, String> {
+    let root = canonical_project_root(&root);
     let compile_start = Instant::now();
     let root_path = PathBuf::from(&root);
     if !root_path.exists() {
@@ -1045,7 +1049,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
         WorkspaceFileSelectionScope::Project,
         target_path.as_deref(),
     );
-    let symbol_spans = build_symbol_span_seed_from_index(state, &root, &project_symbol_files);
+    let mut symbol_spans = build_symbol_span_seed_from_index(state, &root, &project_symbol_files);
     let unresolved_files = if include_library_symbols {
         files.clone()
     } else {
@@ -1114,12 +1118,23 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
                 scope: WorkspaceFileScope::Project,
             })
             .collect::<Vec<_>>();
+    let project_sources_by_file = project_semantic_inputs
+        .iter()
+        .map(|input| (normalized_compare_key(&input.path), input.source.clone()))
+        .collect::<HashMap<_, _>>();
     let semantic_pipeline = "project-semantic-v3";
     let semantic_cache_key = workspace_semantic_cache_key(
         &root,
         &project_semantic_inputs,
         &stdlib_signature,
         semantic_pipeline,
+    );
+    let semantic_projection_pipeline = "project-semantic-projection-v1";
+    let semantic_projection_cache_key = workspace_semantic_cache_key(
+        &root,
+        &project_semantic_inputs,
+        "",
+        semantic_projection_pipeline,
     );
     let semantic_elements = if let Ok(cache) = state.workspace_snapshot_cache.lock() {
         cache
@@ -1132,6 +1147,20 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
     } else {
         None
     };
+    let semantic_projection = if let Ok(cache) = state.workspace_snapshot_cache.lock() {
+        cache
+            .get(&semantic_projection_cache_key)
+            .and_then(|entry| match entry {
+                WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(elements) => {
+                    Some(elements.clone())
+                }
+                WorkspaceSnapshotCacheEntry::Stdlib(_)
+                | WorkspaceSnapshotCacheEntry::ProjectSemantic(_) => None,
+            })
+    } else {
+        None
+    };
+    let mut semantic_cache_needs_store = false;
     let semantic_elements = if let Some(cached) = semantic_elements {
         emit_progress(
             "analysis",
@@ -1141,6 +1170,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
         );
         cached
     } else {
+        semantic_cache_needs_store = true;
         emit_progress(
             "analysis",
             Some(format!(
@@ -1156,15 +1186,75 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
             stdlib_files.len(),
             WorkspaceSemanticSelection::ProjectOnly,
         ));
+        computed
+    };
+    let mut semantic_projection_needs_store = false;
+    let semantic_projection = if let Some(cached) = semantic_projection {
+        cached
+    } else {
+        let projection_inputs = project_semantic_inputs
+            .iter()
+            .filter_map(|input| {
+                let mut parser = Parser::new(&input.source);
+                let _ = parser.parse_root();
+                if !parser.errors().is_empty() {
+                    return None;
+                }
+                Some(WorkspaceSemanticInput {
+                    path: input.path.clone(),
+                    source: input.source.clone(),
+                    scope: input.scope.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        emit_progress(
+            "analysis",
+            Some(format!(
+                "warming semantic projection cache ({} files)",
+                projection_inputs.len()
+            )),
+            Some(0),
+            Some(projection_inputs.len()),
+        );
+        if projection_inputs.is_empty() {
+            Arc::new(Vec::new())
+        } else {
+            match build_workspace_semantic_projection_views(&projection_inputs) {
+                Ok(projection) => {
+                    semantic_projection_needs_store = true;
+                    Arc::new(projection)
+                }
+                Err(error) => {
+                    emit_progress(
+                        "analysis",
+                        Some(format!("semantic projection cache warm failed: {}", error)),
+                        None,
+                        None,
+                    );
+                    eprintln!(
+                        "[compile] semantic projection cache warm failed: {}",
+                        error
+                    );
+                    Arc::new(Vec::new())
+                }
+            }
+        }
+    };
+    if semantic_cache_needs_store || semantic_projection_needs_store {
         if let Ok(mut cache) = state.workspace_snapshot_cache.lock() {
             clear_project_semantic_cache_for_root(&mut cache, &root);
             cache.insert(
                 semantic_cache_key.clone(),
-                WorkspaceSnapshotCacheEntry::ProjectSemantic(computed.clone()),
+                WorkspaceSnapshotCacheEntry::ProjectSemantic(semantic_elements.clone()),
+            );
+            cache.insert(
+                semantic_projection_cache_key.clone(),
+                WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(
+                    semantic_projection.clone(),
+                ),
             );
         }
-        computed
-    };
+    }
     let semantic_total = semantic_elements.len();
     emit_progress(
         "analysis",
@@ -1189,7 +1279,14 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
                 Some(semantic_total),
             );
         }
-        let projected = map_semantic_element_to_projected_symbol(element, &symbol_spans);
+        let mut projected = map_semantic_element_to_projected_symbol(element.clone(), &symbol_spans);
+        repair_projected_symbol_span_from_source(
+            &mut projected,
+            &element,
+            &project_sources_by_file,
+            &symbol_spans,
+        );
+        remember_projected_symbol_span(&mut symbol_spans, &projected);
         let key = format!(
             "{}|{}|{}",
             projected.file_path, projected.qualified_name, projected.name
@@ -1372,6 +1469,7 @@ pub fn load_library_symbols_sync(
     target_path: Option<PathBuf>,
     include_symbols: bool,
 ) -> Result<LibrarySymbolsResponse, String> {
+    let root = canonical_project_root(&root);
     let start = Instant::now();
     let root_path = PathBuf::from(&root);
     if !root_path.exists() {
@@ -1723,6 +1821,123 @@ fn build_symbol_span_seed_from_index(
         }
     }
     out
+}
+
+fn remember_projected_symbol_span(
+    symbol_spans: &mut HashMap<String, SymbolSpan>,
+    symbol: &ProjectedSemanticSymbol,
+) {
+    if symbol.start_line == 0 || symbol.start_col == 0 {
+        return;
+    }
+    symbol_spans.entry(symbol_key(&symbol.file_path, &symbol.qualified_name)).or_insert(
+        SymbolSpan {
+            start_line: symbol.start_line,
+            start_col: symbol.start_col,
+            end_line: symbol.end_line.max(symbol.start_line),
+            end_col: symbol.end_col.max(symbol.start_col),
+        },
+    );
+}
+
+fn repair_projected_symbol_span_from_source(
+    projected: &mut ProjectedSemanticSymbol,
+    element: &mercurio_sysml_semantics::semantic_contract::SemanticElementView,
+    sources_by_file: &HashMap<String, String>,
+    symbol_spans: &HashMap<String, SymbolSpan>,
+) {
+    if projected.start_line > 0 && projected.start_col > 0 {
+        return;
+    }
+    if !projected.kind.eq_ignore_ascii_case("OwnedEnd") {
+        return;
+    }
+    let name = projected.name.trim();
+    if name.is_empty() {
+        return;
+    }
+    let file_key = normalized_compare_key(Path::new(&projected.file_path));
+    let Some(source) = sources_by_file.get(&file_key) else {
+        return;
+    };
+    let owner_qname = element
+        .attributes
+        .get("mercurio::owner")
+        .or_else(|| element.attributes.get("element::owner"))
+        .or_else(|| element.attributes.get("emf::owner"))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    let owner_span = owner_qname.and_then(|qname| {
+        symbol_spans
+            .get(&symbol_key(&projected.file_path, qname))
+            .copied()
+    });
+    if let Some(span) = find_owned_end_span_in_source(source, name, owner_span) {
+        projected.start_line = span.start_line;
+        projected.start_col = span.start_col;
+        projected.end_line = span.end_line;
+        projected.end_col = span.end_col;
+    }
+}
+
+fn find_owned_end_span_in_source(
+    source: &str,
+    name: &str,
+    owner_span: Option<SymbolSpan>,
+) -> Option<SymbolSpan> {
+    let line_ranges = owner_span
+        .map(|span| vec![(span.start_line, span.end_line.max(span.start_line))])
+        .unwrap_or_else(|| vec![(1, source.lines().count().max(1) as u32)]);
+    for (start_line, end_line) in line_ranges {
+        for (index, line) in source.lines().enumerate() {
+            let line_number = index as u32 + 1;
+            if line_number < start_line || line_number > end_line {
+                continue;
+            }
+            let Some(end_offset) = find_word_after(line, "end", 0) else {
+                continue;
+            };
+            let Some(name_offset) = find_word_after(line, name, end_offset + 3) else {
+                continue;
+            };
+            let start_col = line[..name_offset].chars().count() as u32 + 1;
+            let end_col = start_col + name.chars().count() as u32;
+            return Some(SymbolSpan {
+                start_line: line_number,
+                start_col,
+                end_line: line_number,
+                end_col,
+            });
+        }
+    }
+    None
+}
+
+fn find_word_after(line: &str, needle: &str, min_offset: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    let mut search_from = min_offset.min(line.len());
+    while let Some(relative) = line[search_from..].find(needle) {
+        let absolute = search_from + relative;
+        let before = if absolute == 0 {
+            None
+        } else {
+            line[..absolute].chars().next_back()
+        };
+        let after = line[absolute + needle.len()..].chars().next();
+        let is_word_start = before.map(is_identifier_char).unwrap_or(false);
+        let is_word_end = after.map(is_identifier_char).unwrap_or(false);
+        if !is_word_start && !is_word_end {
+            return Some(absolute);
+        }
+        search_from = absolute + needle.len();
+    }
+    None
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
@@ -2403,6 +2618,62 @@ standard library package KerML {
                 .qualified_name
                 .ends_with("KerML::Root::AnnotatingElement")
         }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compile_workspace_warms_semantic_projection_cache() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_projection_cache_{stamp}"));
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(
+            project_dir.join("main.sysml"),
+            "package P { action def DoThing; }\n",
+        )
+        .expect("write project file");
+        fs::write(
+            project_dir.join(".project"),
+            "{\"name\":\"projection-cache\",\"src\":[\"*.sysml\"]}",
+        )
+        .expect("write project descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let project_root = project_dir.to_string_lossy().to_string();
+        let response = compile_workspace_sync(
+            &state,
+            project_root.clone(),
+            1,
+            true,
+            None,
+            Vec::new(),
+            |_| {},
+        )
+        .expect("compile response");
+
+        assert!(response.ok);
+
+        let cache = state
+            .workspace_snapshot_cache
+            .lock()
+            .expect("workspace cache lock");
+        let root_prefix = format!("project-semantic|{}|", project_root);
+        let projection_entry = cache.iter().find_map(|(key, entry)| match entry {
+            WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(elements)
+                if key.starts_with(&root_prefix) =>
+            {
+                Some(elements.clone())
+            }
+            _ => None,
+        });
+        let projection_entry = projection_entry.expect("projection cache entry");
+        let main_file = project_dir.join("main.sysml").to_string_lossy().to_string();
+        assert!(!projection_entry.is_empty());
+        assert!(projection_entry.iter().any(|element| element.file_path == main_file));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3306,6 +3577,70 @@ standard library package KerML {
         assert_eq!(symbol.start_col, 2);
         assert_eq!(symbol.end_line, 12);
         assert_eq!(symbol.end_col, 5);
+    }
+
+    #[test]
+    fn repair_projected_symbol_span_falls_back_to_owned_end_source_line() {
+        let source = "\
+package ConnectionTest {
+  abstract connection def C {
+    part p;
+    end end1;
+    end end2;
+    end end3;
+  }
+}
+";
+        let mut attrs = HashMap::new();
+        attrs.insert("emf::owner".to_string(), "ConnectionTest::C".to_string());
+        let element = SemanticElementView {
+            name: "end3".to_string(),
+            qualified_name: "ConnectionTest::C::end3".to_string(),
+            metatype_qname: Some("sysml::Feature".to_string()),
+            file_path: "ConnectionTest.sysml".to_string(),
+            attributes: attrs,
+        };
+        let mut projected = ProjectedSemanticSymbol {
+            file_path: "ConnectionTest.sysml".to_string(),
+            name: "end3".to_string(),
+            qualified_name: "ConnectionTest::C::end3".to_string(),
+            kind: "OwnedEnd".to_string(),
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            end_col: 0,
+            doc: None,
+            supertypes: Vec::new(),
+            relationships: Vec::new(),
+            is_public: true,
+            properties: Vec::new(),
+        };
+        let mut symbol_spans = HashMap::new();
+        symbol_spans.insert(
+            symbol_key("ConnectionTest.sysml", "ConnectionTest::C"),
+            SymbolSpan {
+                start_line: 2,
+                start_col: 3,
+                end_line: 7,
+                end_col: 4,
+            },
+        );
+        let sources_by_file = HashMap::from([(
+            normalized_compare_key(Path::new("ConnectionTest.sysml")),
+            source.to_string(),
+        )]);
+
+        repair_projected_symbol_span_from_source(
+            &mut projected,
+            &element,
+            &sources_by_file,
+            &symbol_spans,
+        );
+
+        assert_eq!(projected.start_line, 6);
+        assert_eq!(projected.start_col, 9);
+        assert_eq!(projected.end_line, 6);
+        assert_eq!(projected.end_col, 13);
     }
 
     #[test]

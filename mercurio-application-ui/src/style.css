@@ -3,6 +3,7 @@
   color: #d7dae0;
   background: #1e1f22;
   --app-vh: 100vh;
+  --simple-properties-header-bg: rgba(43, 47, 51, 0.96);
 }
 
 * {
@@ -20,6 +21,7 @@ body {
 body.theme-light {
   background: #f2f4f7;
   color: #1e1f22;
+  --simple-properties-header-bg: rgba(232, 237, 244, 0.96);
 }
 
 #root {
@@ -628,6 +630,57 @@ body.theme-light .simple-right-splitter:hover::after {
   min-height: 0;
   overflow: auto;
   padding: 6px;
+}
+
+.simple-ui-scroll,
+.simple-properties-scroll-region {
+  scrollbar-width: thin;
+  scrollbar-color: #6f7680 #2b2f33;
+}
+
+.simple-ui-scroll::-webkit-scrollbar,
+.simple-properties-scroll-region::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.simple-ui-scroll::-webkit-scrollbar-track,
+.simple-properties-scroll-region::-webkit-scrollbar-track {
+  background: #2b2f33;
+  border-radius: 999px;
+}
+
+.simple-ui-scroll::-webkit-scrollbar-thumb,
+.simple-properties-scroll-region::-webkit-scrollbar-thumb {
+  background: #6f7680;
+  border-radius: 999px;
+  border: 2px solid #2b2f33;
+}
+
+.simple-ui-scroll::-webkit-scrollbar-thumb:hover,
+.simple-properties-scroll-region::-webkit-scrollbar-thumb:hover {
+  background: #878f9a;
+}
+
+body.theme-light .simple-ui-scroll,
+body.theme-light .simple-properties-scroll-region {
+  scrollbar-color: #9aa3af #d9dee6;
+}
+
+body.theme-light .simple-ui-scroll::-webkit-scrollbar-track,
+body.theme-light .simple-properties-scroll-region::-webkit-scrollbar-track {
+  background: #d9dee6;
+}
+
+body.theme-light .simple-ui-scroll::-webkit-scrollbar-thumb,
+body.theme-light .simple-properties-scroll-region::-webkit-scrollbar-thumb {
+  background: #9aa3af;
+  border-color: #d9dee6;
+}
+
+body.theme-light .simple-ui-scroll::-webkit-scrollbar-thumb:hover,
+body.theme-light .simple-properties-scroll-region::-webkit-scrollbar-thumb:hover {
+  background: #7f8894;
 }
 
 .simple-ui-left-resizer,

@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 pub use mercurio_sysml_pkg::parser_tools::{ParseErrorView, ParseErrorsPayload, ParseTreeNodeView};
 
+pub const DIAGRAM_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct DiagramFile {
     #[serde(default = "default_diagram_version")]
@@ -106,7 +108,7 @@ pub fn resolve_under_root(root: &Path, target: &Path) -> Result<PathBuf, String>
 }
 
 fn default_diagram_version() -> u32 {
-    1
+    DIAGRAM_SCHEMA_VERSION
 }
 
 fn default_diagram_type() -> DiagramType {
@@ -115,7 +117,7 @@ fn default_diagram_type() -> DiagramType {
 
 fn normalize_diagram(diagram: &mut DiagramFile) {
     if diagram.version == 0 {
-        diagram.version = 1;
+        diagram.version = DIAGRAM_SCHEMA_VERSION;
     }
     for node in &mut diagram.nodes {
         if node.name.trim().is_empty() {

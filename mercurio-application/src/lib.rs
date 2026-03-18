@@ -28,8 +28,8 @@ use mercurio_core::{
     ensure_mercurio_paths, ensure_project_descriptor, list_stdlib_versions_from_root,
     load_app_settings, load_project_descriptor, save_app_settings, write_project_descriptor,
     AppSettings, BackgroundCancelSummary, BackgroundJobsSnapshot, CacheClearSummary,
-    CompileRequest, CompileResponse, CoreState, LibraryConfig, MercurioPaths, WindowBoundsSettings,
-    WindowStateSettings,
+    CompileRequest, CompileResponse, CoreState, LibraryConfig, MercurioPaths,
+    WindowBoundsSettings, WindowStateSettings,
 };
 
 pub(crate) struct AppState {

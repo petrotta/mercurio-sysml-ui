@@ -14,6 +14,7 @@ pub use project::{
     ProjectDescriptorUpdate, ProjectDescriptorView,
 };
 
+mod project_root_key;
 mod workspace;
 mod workspace_ir_cache;
 

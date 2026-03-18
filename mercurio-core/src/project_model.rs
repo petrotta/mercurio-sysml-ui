@@ -19,6 +19,7 @@ use mercurio_sysml_semantics::stdlib::MetatypeIndex;
 
 use crate::project::load_project_config;
 use crate::project_model_seed::seed_symbol_index_if_empty;
+use crate::project_root_key::canonical_project_root;
 use crate::state::{CoreState, WorkspaceSnapshotCacheEntry};
 use crate::stdlib::resolve_stdlib_path;
 
@@ -50,6 +51,7 @@ pub fn get_project_element_attributes(
     element_qualified_name: String,
     symbol_kind: Option<String>,
 ) -> Result<ProjectElementAttributesView, String> {
+    let root = canonical_project_root(&root);
     let root_path = PathBuf::from(&root);
     if !root_path.exists() {
         return Err("Root path does not exist".to_string());
@@ -217,6 +219,7 @@ fn normalize_compare_key(path: &std::path::Path) -> String {
 }
 
 pub fn get_project_model(state: &CoreState, root: String) -> Result<ProjectModelView, String> {
+    let root = canonical_project_root(&root);
     let root_path = PathBuf::from(&root);
     if !root_path.exists() {
         return Err("Root path does not exist".to_string());
@@ -302,6 +305,7 @@ pub fn get_project_expression_records(
     state: &CoreState,
     root: String,
 ) -> Result<ProjectExpressionRecordsView, String> {
+    let root = canonical_project_root(&root);
     let root_path = PathBuf::from(&root);
     if !root_path.exists() {
         return Err("Root path does not exist".to_string());

@@ -1,13 +1,15 @@
 use mercurio_symbol_index::{Scope, SymbolIndexStore, SymbolRecord};
+use mercurio_sysml_semantics::semantic_contract::SemanticElementProjectionView;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::CoreState;
+use crate::project_root_key::canonical_project_root;
+use crate::{state::WorkspaceSnapshotCacheEntry, CoreState};
 
-const WORKSPACE_IR_SCHEMA_VERSION: u32 = 1;
+const WORKSPACE_IR_SCHEMA_VERSION: u32 = 2;
 const WORKSPACE_IR_CACHE_FILE_NAME: &str = "workspace-ir-v1.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +20,8 @@ struct WorkspaceIrCache {
     written_at_unix_ms: u128,
     stdlib_signature: Option<String>,
     symbols: Vec<SymbolRecord>,
+    #[serde(default)]
+    semantic_projections: Vec<SemanticElementProjectionView>,
 }
 
 fn normalized_path_key(path: &str) -> String {
@@ -31,7 +35,7 @@ fn normalized_path_key(path: &str) -> String {
 }
 
 fn cache_file_path(project_root: &str) -> PathBuf {
-    PathBuf::from(project_root)
+    PathBuf::from(canonical_project_root(project_root))
         .join(".mercurio")
         .join("cache")
         .join(WORKSPACE_IR_CACHE_FILE_NAME)
@@ -70,6 +74,7 @@ pub(crate) fn persist_workspace_ir_cache(
     project_root: &str,
     stdlib_signature: Option<&str>,
 ) -> Result<(), String> {
+    let project_root = canonical_project_root(project_root);
     if project_root.trim().is_empty() {
         return Err("Project root is empty".to_string());
     }
@@ -78,8 +83,8 @@ pub(crate) fn persist_workspace_ir_cache(
             .symbol_index
             .lock()
             .map_err(|_| "Symbol index lock poisoned".to_string())?;
-        let mut rows = store.project_symbols(project_root, None);
-        rows.extend(store.library_symbols(project_root, None));
+        let mut rows = store.project_symbols(&project_root, None);
+        rows.extend(store.library_symbols(&project_root, None));
         rows
     };
     symbols.sort_by(|a, b| {
@@ -91,6 +96,33 @@ pub(crate) fn persist_workspace_ir_cache(
             .then(a.kind.cmp(&b.kind))
     });
     symbols.dedup_by(|left, right| left.id == right.id);
+    let semantic_projections = {
+        let root_prefix = format!("project-semantic|{}|", project_root);
+        let mut by_file_and_qname = BTreeMap::<(String, String), SemanticElementProjectionView>::new();
+        let cache = state
+            .workspace_snapshot_cache
+            .lock()
+            .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
+        for (key, entry) in cache.iter() {
+            if !key.starts_with(&root_prefix) {
+                continue;
+            }
+            let WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(elements) = entry else {
+                continue;
+            };
+            for element in elements.iter() {
+                let dedupe_key = (element.file_path.clone(), element.qualified_name.clone());
+                let should_replace = by_file_and_qname
+                    .get(&dedupe_key)
+                    .map(|existing| existing.features.len() < element.features.len())
+                    .unwrap_or(true);
+                if should_replace {
+                    by_file_and_qname.insert(dedupe_key, element.clone());
+                }
+            }
+        }
+        by_file_and_qname.into_values().collect::<Vec<_>>()
+    };
 
     let written_at_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -103,9 +135,10 @@ pub(crate) fn persist_workspace_ir_cache(
         written_at_unix_ms,
         stdlib_signature: stdlib_signature.map(|value| value.to_string()),
         symbols,
+        semantic_projections,
     };
     let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|e| e.to_string())?;
-    let path = cache_file_path(project_root);
+    let path = cache_file_path(&project_root);
     write_atomic(&path, &bytes)
 }
 
@@ -113,7 +146,8 @@ pub(crate) fn seed_symbol_index_from_workspace_ir_cache(
     state: &CoreState,
     project_root: &str,
 ) -> Result<bool, String> {
-    let Some(cache) = read_cache_file(project_root)? else {
+    let project_root = canonical_project_root(project_root);
+    let Some(cache) = read_cache_file(&project_root)? else {
         return Ok(false);
     };
     if cache.schema_version != WORKSPACE_IR_SCHEMA_VERSION {
@@ -122,7 +156,7 @@ pub(crate) fn seed_symbol_index_from_workspace_ir_cache(
     if cache.engine_version != env!("CARGO_PKG_VERSION") {
         return Ok(false);
     }
-    if normalized_path_key(&cache.project_root) != normalized_path_key(project_root) {
+    if normalized_path_key(&cache.project_root) != normalized_path_key(&project_root) {
         return Ok(false);
     }
     if cache.symbols.is_empty() {
@@ -151,24 +185,40 @@ pub(crate) fn seed_symbol_index_from_workspace_ir_cache(
         .lock()
         .map_err(|_| "Symbol index lock poisoned".to_string())?;
     for (file_path, rows) in grouped {
-        store.upsert_symbols_for_file(project_root, &file_path, rows);
+        store.upsert_symbols_for_file(&project_root, &file_path, rows);
     }
     if let Some(signature) = cache.stdlib_signature.as_deref() {
         if !signature.trim().is_empty() {
             for library_key in stdlib_keys {
-                store.mark_stdlib_indexed(project_root, &library_key, signature);
+                store.mark_stdlib_indexed(&project_root, &library_key, signature);
             }
         }
     }
-    store.rebuild_symbol_mappings(project_root);
+    store.rebuild_symbol_mappings(&project_root);
+    drop(store);
+
+    if !cache.semantic_projections.is_empty() {
+        let mut workspace_cache = state
+            .workspace_snapshot_cache
+            .lock()
+            .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
+        let key = format!("project-semantic|{}|workspace-ir", project_root);
+        workspace_cache.insert(
+            key,
+            WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(std::sync::Arc::new(
+                cache.semantic_projections,
+            )),
+        );
+    }
     Ok(true)
 }
 
 pub(crate) fn clear_workspace_ir_cache(project_root: &str) -> Result<bool, String> {
+    let project_root = canonical_project_root(project_root);
     if project_root.trim().is_empty() {
         return Ok(false);
     }
-    let path = cache_file_path(project_root);
+    let path = cache_file_path(&project_root);
     if !path.exists() {
         return Ok(false);
     }
@@ -179,7 +229,7 @@ pub(crate) fn clear_workspace_ir_cache(project_root: &str) -> Result<bool, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::AppSettings;
+    use crate::{settings::AppSettings, state::WorkspaceSnapshotCacheEntry};
     use mercurio_symbol_index::SymbolIndexStore;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -221,6 +271,20 @@ mod tests {
         }
     }
 
+    fn projection(file_path: &str, qualified_name: &str) -> SemanticElementProjectionView {
+        SemanticElementProjectionView {
+            name: qualified_name
+                .rsplit("::")
+                .next()
+                .unwrap_or(qualified_name)
+                .to_string(),
+            qualified_name: qualified_name.to_string(),
+            file_path: file_path.to_string(),
+            metatype_qname: Some("sysml::Package".to_string()),
+            features: vec![],
+        }
+    }
+
     #[test]
     fn workspace_ir_cache_round_trips_into_symbol_index() {
         let stamp = SystemTime::now()
@@ -258,6 +322,18 @@ mod tests {
             );
             store.rebuild_symbol_mappings(&project_root);
         }
+        {
+            let mut workspace_cache = state
+                .workspace_snapshot_cache
+                .lock()
+                .expect("workspace cache lock");
+            workspace_cache.insert(
+                format!("project-semantic|{}|typed", project_root),
+                WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(std::sync::Arc::new(vec![
+                    projection("main.sysml", "Demo::Main"),
+                ])),
+            );
+        }
         persist_workspace_ir_cache(&state, &project_root, Some("sig-a"))
             .expect("persist workspace cache");
 
@@ -275,6 +351,24 @@ mod tests {
             assert_eq!(store.project_symbols(&project_root, None).len(), 1);
             assert_eq!(store.library_symbols(&project_root, None).len(), 1);
             assert!(store.is_stdlib_index_fresh(&project_root, "stdlib-key", "sig-a"));
+        }
+        {
+            let workspace_cache = state
+                .workspace_snapshot_cache
+                .lock()
+                .expect("workspace cache lock");
+            let restored_projection = workspace_cache.iter().find_map(|(key, entry)| match entry {
+                WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(elements)
+                    if key.starts_with(&format!("project-semantic|{}|", project_root)) =>
+                {
+                    Some(elements.clone())
+                }
+                _ => None,
+            });
+            let restored_projection = restored_projection.expect("restored projection cache");
+            assert!(restored_projection
+                .iter()
+                .any(|element| element.qualified_name == "Demo::Main"));
         }
 
         let _ = fs::remove_dir_all(&root);

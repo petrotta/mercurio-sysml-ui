@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::project_root_key::canonical_project_root;
 use crate::settings::AppSettings;
 use crate::workspace_ir_cache::clear_workspace_ir_cache;
 
@@ -264,7 +265,10 @@ impl CoreState {
             count
         };
         let project_ir_cache_deleted = match project_root {
-            Some(root) => clear_workspace_ir_cache(root)?,
+            Some(root) => {
+                let canonical_root = canonical_project_root(root);
+                clear_workspace_ir_cache(&canonical_root)?
+            }
             None => false,
         };
         Ok(CacheClearSummary {

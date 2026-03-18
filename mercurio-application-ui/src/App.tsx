@@ -176,6 +176,13 @@ function normalizePath(path: string | null | undefined): string {
   return (path || "").replace(/\//g, "\\").toLowerCase();
 }
 
+function stdlibVersionFromPath(path: string | null | undefined): string {
+  const trimmed = `${path || ""}`.trim();
+  if (!trimmed) return "";
+  const parts = trimmed.split(/[\\/]+/).filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : "";
+}
+
 function symbolIdentity(symbol: SymbolView): string {
   return `${normalizePath(symbol.file_path)}|${symbol.qualified_name || symbol.name}|${symbol.start_line}|${symbol.start_col}`;
 }
@@ -635,6 +642,7 @@ export function App() {
   const [menuOpen, setMenuOpen] = useState<"file" | "build" | "settings" | "help" | null>(null);
   const [stdlibManagerOpen, setStdlibManagerOpen] = useState(false);
   const [aboutWindowOpen, setAboutWindowOpen] = useState(false);
+  const [metamodelSchemaVersion, setMetamodelSchemaVersion] = useState<string | null>(null);
   const [projectFilesSettingsMenuOpen, setProjectFilesSettingsMenuOpen] = useState(false);
   const [stdlibPathOptions, setStdlibPathOptions] = useState<StdlibPathOption[]>(() => readStdlibPathOptions());
   const [dialogActiveStdlibPath, setDialogActiveStdlibPath] = useState("");
@@ -689,7 +697,9 @@ export function App() {
     compileRunId,
     compileToast,
     runCompile,
+    cancelCompile,
     symbols,
+    symbolsStatus,
     unresolved,
     parsedFiles,
     parseErrorPaths,
@@ -699,6 +709,8 @@ export function App() {
     clearBuildLogs,
     buildProgress,
     activeLibraryPath,
+    symbolIndexError,
+    semanticRefreshVersion,
   } = useCompileRunner({ rootPath });
   const [buildClockTick, setBuildClockTick] = useState(0);
 
@@ -710,6 +722,7 @@ export function App() {
     rootPath,
     semanticSelectedQname,
     selectedSymbol,
+    semanticRefreshVersion,
   });
 
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
@@ -829,6 +842,10 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   }, [rootPath, refreshRoot]);
 
   useEffect(() => {
+    if (autoBuildTimerRef.current !== undefined) {
+      window.clearTimeout(autoBuildTimerRef.current);
+      autoBuildTimerRef.current = undefined;
+    }
     setActiveFilePath(null);
     setOpenTabs([]);
     setSelectedSymbol(null);
@@ -847,6 +864,8 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       editorRef.current.setValue("");
     }
   }, [rootPath]);
+
+  const effectiveTreeError = treeError || (symbolsStatus === "error" ? symbolIndexError : "");
 
   useEffect(() => {
     return () => {
@@ -905,6 +924,29 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       window.clearInterval(timer);
     };
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    void Promise.allSettled([
+      rootPath ? getProjectModel(rootPath) : Promise.resolve(null),
+      getDefaultStdlib(),
+    ])
+      .then((results) => {
+        if (!active) return;
+        const projectModel = results[0].status === "fulfilled" ? results[0].value : null;
+        const defaultStdlib = results[1].status === "fulfilled" ? results[1].value : null;
+        const resolvedStdlibPath = (projectModel?.stdlib_path || activeLibraryPath || "").trim();
+        const version = stdlibVersionFromPath(resolvedStdlibPath) || (defaultStdlib || "").trim();
+        setMetamodelSchemaVersion(version || null);
+      })
+      .catch(() => {
+        if (!active) return;
+        setMetamodelSchemaVersion(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [rootPath, activeLibraryPath]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -1382,12 +1424,19 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
 
   const applyRootPath = useCallback((candidatePath: string) => {
     const next = candidatePath.trim();
+    if (autoBuildTimerRef.current !== undefined) {
+      window.clearTimeout(autoBuildTimerRef.current);
+      autoBuildTimerRef.current = undefined;
+    }
+    if (compileRunIdRef.current) {
+      void cancelCompile();
+    }
     setRootPath(next);
     if (next) {
       window.localStorage?.setItem(ROOT_STORAGE_KEY, next);
       setRecentProjects((prev) => pushRecentProject(next, prev));
     }
-  }, []);
+  }, [cancelCompile]);
 
   const saveActiveFile = useCallback(async (): Promise<boolean> => {
     if (!activeFilePath) return false;
@@ -2934,7 +2983,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
               </button>
             </div>
           </div>
-          {treeError ? <div className="simple-tree-toolbar-error error">{treeError}</div> : null}
+          {effectiveTreeError ? <div className="simple-tree-toolbar-error error">{effectiveTreeError}</div> : null}
           <div className="simple-ui-scroll">
             {rootPath ? (
               <>
@@ -2962,7 +3011,11 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                           ) : null}
                         </div>
                       ) : (
-                        <div className="muted">No project symbols indexed.</div>
+                        <div className={effectiveTreeError ? "error" : "muted"}>
+                          {symbolsStatus === "loading"
+                            ? "Loading project symbols..."
+                            : (effectiveTreeError || "No project symbols indexed.")}
+                        </div>
                       )
                     )
                   ) : null}
@@ -3250,6 +3303,11 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                         renderLineHighlight: "line",
                         fontSize: 13,
                         automaticLayout: true,
+                        scrollbar: {
+                          vertical: "hidden",
+                          horizontal: "hidden",
+                          alwaysConsumeMouseWheel: false,
+                        },
                       }}
                     />
                   </div>
@@ -3574,6 +3632,8 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
               <div className="simple-about-grid">
                 <span className="muted">Project Root</span>
                 <span title={rootPath || "No root selected"}>{rootPath || "-"}</span>
+                <span className="muted">Metamodel Schema</span>
+                <span>{metamodelSchemaVersion ?? "-"}</span>
                 <span className="muted">Theme</span>
                 <span>{appTheme}</span>
                 <span className="muted">Build</span>

@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use crate::project::load_project_config;
 use crate::project_model_seed::seed_symbol_index_if_empty;
+use crate::project_root_key::canonical_project_root;
 use crate::state::WorkspaceSnapshotCacheEntry;
 use crate::CoreState;
 
@@ -118,6 +119,7 @@ pub fn query_symbols_by_metatype(
     project_root: String,
     metatype_qname: String,
 ) -> Result<Vec<IndexedSymbolView>, String> {
+    let project_root = canonical_project_root(&project_root);
     let store = state
         .symbol_index
         .lock()
@@ -151,6 +153,7 @@ pub fn query_library_symbols(
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> Result<Vec<IndexedSymbolView>, String> {
+    let project_root = canonical_project_root(&project_root);
     seed_symbol_index_if_empty(state, &project_root)?;
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(usize::MAX);
@@ -172,6 +175,7 @@ pub fn query_project_symbols(
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> Result<Vec<IndexedSymbolView>, String> {
+    let project_root = canonical_project_root(&project_root);
     seed_symbol_index_if_empty(state, &project_root)?;
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(usize::MAX);
@@ -193,6 +197,7 @@ pub fn query_project_symbols_for_files(
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> Result<Vec<IndexedSymbolView>, String> {
+    let project_root = canonical_project_root(&project_root);
     seed_symbol_index_if_empty(state, &project_root)?;
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(usize::MAX);
@@ -232,6 +237,7 @@ pub fn query_library_summary(
     state: &CoreState,
     project_root: String,
 ) -> Result<LibraryIndexSummaryView, String> {
+    let project_root = canonical_project_root(&project_root);
     let store = state
         .symbol_index
         .lock()
@@ -250,6 +256,7 @@ pub fn query_symbol_metatype_mapping(
     symbol_qualified_name: String,
     file_path: Option<String>,
 ) -> Result<Option<SymbolMetatypeMappingView>, String> {
+    let project_root = canonical_project_root(&project_root);
     let store = state
         .symbol_index
         .lock()
@@ -265,6 +272,8 @@ pub fn query_project_semantic_element_by_qualified_name(
     qualified_name: String,
     file_path: Option<String>,
 ) -> Result<Option<IndexedSemanticElementView>, String> {
+    let project_root = canonical_project_root(&project_root);
+    seed_symbol_index_if_empty(state, &project_root)?;
     let target = qualified_name.trim();
     if target.is_empty() {
         return Ok(None);
@@ -318,6 +327,8 @@ pub fn query_project_semantic_projection_by_qualified_name(
     qualified_name: String,
     file_path: Option<String>,
 ) -> Result<Option<IndexedSemanticProjectionElementView>, String> {
+    let project_root = canonical_project_root(&project_root);
+    seed_symbol_index_if_empty(state, &project_root)?;
     let target = qualified_name.trim();
     if target.is_empty() {
         return Ok(None);
@@ -1256,6 +1267,192 @@ mod tests {
     }
 
     #[test]
+    fn query_project_semantic_projection_returns_fresh_rows_after_recompile() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_projection_refresh_{stamp}"));
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        let main_file = project_dir.join("main.sysml");
+        fs::write(
+            &main_file,
+            "package P { action def OldAction; }\n",
+        )
+        .expect("write initial project file");
+        fs::write(
+            project_dir.join(".project"),
+            "{\"name\":\"projection-refresh\",\"src\":[\"*.sysml\"]}",
+        )
+        .expect("write project descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let project_root = project_dir.to_string_lossy().to_string();
+
+        let first_compile = compile_workspace_sync(
+            &state,
+            project_root.clone(),
+            1,
+            true,
+            None,
+            Vec::new(),
+            |_| {},
+        )
+        .expect("first compile");
+        assert!(first_compile.ok);
+
+        let old_row = query_project_semantic_projection_by_qualified_name(
+            &state,
+            project_root.clone(),
+            "P::OldAction".to_string(),
+            Some(main_file.to_string_lossy().to_string()),
+        )
+        .expect("query old projection")
+        .expect("old projection row");
+        assert_eq!(old_row.qualified_name, "P::OldAction");
+
+        fs::write(
+            &main_file,
+            "package P { action def NewAction; }\n",
+        )
+        .expect("write updated project file");
+        let second_compile = compile_project_delta_sync(
+            &state,
+            project_root.clone(),
+            2,
+            true,
+            None,
+            Vec::new(),
+            |_| {},
+        )
+        .expect("second compile");
+        assert!(second_compile.ok);
+
+        let old_after_recompile = query_project_semantic_projection_by_qualified_name(
+            &state,
+            project_root.clone(),
+            "P::OldAction".to_string(),
+            Some(main_file.to_string_lossy().to_string()),
+        )
+        .expect("query stale projection");
+        assert!(old_after_recompile.is_none());
+
+        let new_row = query_project_semantic_projection_by_qualified_name(
+            &state,
+            project_root.clone(),
+            "P::NewAction".to_string(),
+            Some(main_file.to_string_lossy().to_string()),
+        )
+        .expect("query new projection")
+        .expect("new projection row");
+        assert_eq!(new_row.qualified_name, "P::NewAction");
+        assert!(new_row.features.iter().any(|feature| feature.name == "name"));
+
+        let cache = state
+            .workspace_snapshot_cache
+            .lock()
+            .expect("workspace cache lock");
+        let root_prefix = format!("project-semantic|{}|", project_root);
+        assert!(cache.iter().any(|(key, entry)| {
+            key.starts_with(&root_prefix)
+                && matches!(
+                    entry,
+                    WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(_)
+                )
+        }));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_project_semantic_projection_seeds_from_workspace_ir_cache() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_projection_seed_{stamp}"));
+        fs::create_dir_all(&root).expect("create root");
+        let project_root = root.to_string_lossy().to_string();
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+
+        {
+            let mut store = state.symbol_index.lock().expect("index lock");
+            store.upsert_symbols_for_file(
+                &project_root,
+                "main.sysml",
+                vec![mercurio_symbol_index::SymbolRecord {
+                    id: "p1".to_string(),
+                    project_root: project_root.clone(),
+                    library_key: None,
+                    scope: mercurio_symbol_index::Scope::Project,
+                    name: "Main".to_string(),
+                    qualified_name: "Demo::Main".to_string(),
+                    parent_qualified_name: Some("Demo".to_string()),
+                    kind: "Package".to_string(),
+                    metatype_qname: Some("sysml::Package".to_string()),
+                    file_path: "main.sysml".to_string(),
+                    start_line: 1,
+                    start_col: 1,
+                    end_line: 1,
+                    end_col: 1,
+                    doc_text: None,
+                    properties_json: None,
+                }],
+            );
+            store.rebuild_symbol_mappings(&project_root);
+        }
+        {
+            let mut cache = state
+                .workspace_snapshot_cache
+                .lock()
+                .expect("workspace cache lock");
+            cache.insert(
+                format!("project-semantic|{}|typed", project_root),
+                WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(std::sync::Arc::new(vec![
+                    mercurio_sysml_semantics::semantic_contract::SemanticElementProjectionView {
+                        name: "Main".to_string(),
+                        qualified_name: "Demo::Main".to_string(),
+                        metatype_qname: Some("sysml::Package".to_string()),
+                        file_path: "main.sysml".to_string(),
+                        features: vec![
+                            mercurio_sysml_semantics::semantic_contract::SemanticFeatureView {
+                                name: "name".to_string(),
+                                feature_kind: "attribute".to_string(),
+                                many: false,
+                                containment: false,
+                                declared_type_qname: None,
+                                metamodel_feature_qname: Some("sysml::Element::name".to_string()),
+                                value: mercurio_sysml_semantics::semantic_contract::SemanticValueView::Text {
+                                    value: "Main".to_string(),
+                                },
+                                diagnostics: Vec::new(),
+                            },
+                        ],
+                    },
+                ])),
+            );
+        }
+        crate::workspace_ir_cache::persist_workspace_ir_cache(&state, &project_root, None)
+            .expect("persist workspace cache");
+        state.clear_runtime_caches().expect("clear runtime caches");
+
+        let found = query_project_semantic_projection_by_qualified_name(
+            &state,
+            project_root.clone(),
+            "Demo::Main".to_string(),
+            Some("main.sysml".to_string()),
+        )
+        .expect("semantic projection query")
+        .expect("semantic projection row");
+        assert_eq!(found.qualified_name, "Demo::Main");
+        assert_eq!(found.features.len(), 1);
+        assert_eq!(found.features[0].name, "name");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn query_project_symbols_for_files_returns_combined_rows() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1301,6 +1498,66 @@ mod tests {
         .expect("batch query");
         assert!(rows.iter().any(|row| row.qualified_name == "LeftPkg"));
         assert!(rows.iter().any(|row| row.qualified_name == "RightPkg"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_symbol_queries_accept_raw_and_canonical_roots() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_root_canonical_{stamp}"));
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(project_dir.join("main.sysml"), "package P { part def A; }\n")
+            .expect("write project file");
+        fs::write(
+            project_dir.join(".project"),
+            "{\"name\":\"canonical-root\",\"src\":[\"*.sysml\"]}",
+        )
+        .expect("write descriptor");
+
+        let raw_project_root = project_dir.join(".").to_string_lossy().to_string();
+        let canonical_project_root = project_dir
+            .canonicalize()
+            .expect("canonicalize project root")
+            .to_string_lossy()
+            .to_string();
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+
+        let response = compile_project_delta_sync(
+            &state,
+            raw_project_root.clone(),
+            333,
+            true,
+            None,
+            Vec::new(),
+            |_| {},
+        )
+        .expect("compile");
+        assert!(response.ok);
+
+        let canonical_rows = query_project_symbols(
+            &state,
+            canonical_project_root.clone(),
+            None,
+            Some(0),
+            Some(10_000),
+        )
+        .expect("canonical root query");
+        assert!(canonical_rows.iter().any(|row| row.qualified_name == "P"));
+
+        let raw_rows = query_project_symbols(
+            &state,
+            raw_project_root,
+            None,
+            Some(0),
+            Some(10_000),
+        )
+        .expect("raw root query");
+        assert!(raw_rows.iter().any(|row| row.qualified_name == "P"));
 
         let _ = fs::remove_dir_all(root);
     }

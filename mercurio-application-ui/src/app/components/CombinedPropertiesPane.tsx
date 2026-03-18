@@ -26,6 +26,80 @@ type PropertyRow = {
   qname: string | null;
 };
 
+type PropertySection = {
+  key: string;
+  label: string;
+  rows: PropertyRow[];
+};
+
+function dedupePropertyRows(rows: PropertyRow[]): PropertyRow[] {
+  const out: PropertyRow[] = [];
+  const seenSectionLabels = new Set<string>();
+  const seenRowSignaturesBySection = new Map<string, Set<string>>();
+  let currentSection = "";
+
+  rows.forEach((row) => {
+    if (row.label.startsWith("===")) {
+      currentSection = row.label;
+      if (seenSectionLabels.has(currentSection)) {
+        return;
+      }
+      seenSectionLabels.add(currentSection);
+      out.push(row);
+      if (!seenRowSignaturesBySection.has(currentSection)) {
+        seenRowSignaturesBySection.set(currentSection, new Set<string>());
+      }
+      return;
+    }
+
+    const sectionRows = seenRowSignaturesBySection.get(currentSection) || new Set<string>();
+    const signature = `${row.label}\u0000${row.value}\u0000${row.qname || ""}`;
+    if (sectionRows.has(signature)) {
+      return;
+    }
+    sectionRows.add(signature);
+    seenRowSignaturesBySection.set(currentSection, sectionRows);
+    out.push(row);
+  });
+
+  return out;
+}
+
+function buildPropertySections(rows: PropertyRow[]): PropertySection[] {
+  const sections: PropertySection[] = [];
+  let currentSection: PropertySection | null = null;
+
+  rows.forEach((row) => {
+    if (row.label.startsWith("===")) {
+      const label = row.label.replace(/^===\s*|\s*===$/g, "").trim();
+      currentSection = {
+        key: row.key,
+        label,
+        rows: [],
+      };
+      sections.push(currentSection);
+      return;
+    }
+
+    if (!currentSection) {
+      currentSection = {
+        key: "section-default",
+        label: "",
+        rows: [],
+      };
+      sections.push(currentSection);
+    }
+    currentSection.rows.push(row);
+  });
+
+  return sections;
+}
+
+function isEmptyPropertyValue(row: PropertyRow): boolean {
+  const value = (row.value || "").trim();
+  return !value || value === "-";
+}
+
 function valueToText(value: SemanticValueView): string {
   switch (value.kind) {
     case "null":
@@ -317,6 +391,7 @@ export function CombinedPropertiesPane({
   const [metatypeAttributesLoading, setMetatypeAttributesLoading] = useState(false);
   const [metatypeAttributesError, setMetatypeAttributesError] = useState("");
   const [metatypePopupOpen, setMetatypePopupOpen] = useState(false);
+  const [hideEmptyAttributes, setHideEmptyAttributes] = useState(false);
   const metatypeRequestSeqRef = useRef(0);
   const propColDragActiveRef = useRef(false);
   const propTableRef = useRef<HTMLDivElement | null>(null);
@@ -356,34 +431,28 @@ export function CombinedPropertiesPane({
     const seq = ++metatypeRequestSeqRef.current;
     setMetatypeAttributesLoading(true);
     setMetatypeAttributesError("");
-    const timer = window.setTimeout(() => {
-      void getProjectElementAttributes(rootPath, elementQname, symbolKind || null)
-        .then((payload) => {
-          if (metatypeRequestSeqRef.current !== seq) return;
-          setMetatypeAttributes(payload || null);
-          if (!payload?.metatype_qname) {
-            const diagnostic = (payload?.diagnostics || []).find((item) =>
-              item.toLowerCase().includes("metatype"),
-            );
-            setMetatypeAttributesError(diagnostic || "Metatype is unresolved for this element.");
-          } else {
-            setMetatypeAttributesError("");
-          }
-        })
-        .catch((error) => {
-          if (metatypeRequestSeqRef.current !== seq) return;
-          setMetatypeAttributes(null);
-          setMetatypeAttributesError(`Failed to load metatype attributes: ${String(error)}`);
-        })
-        .finally(() => {
-          if (metatypeRequestSeqRef.current !== seq) return;
-          setMetatypeAttributesLoading(false);
-        });
-    }, 120);
-
-    return () => {
-      window.clearTimeout(timer);
-    };
+    void getProjectElementAttributes(rootPath, elementQname, symbolKind || null)
+      .then((payload) => {
+        if (metatypeRequestSeqRef.current !== seq) return;
+        setMetatypeAttributes(payload || null);
+        if (!payload?.metatype_qname) {
+          const diagnostic = (payload?.diagnostics || []).find((item) =>
+            item.toLowerCase().includes("metatype"),
+          );
+          setMetatypeAttributesError(diagnostic || "Metatype is unresolved for this element.");
+        } else {
+          setMetatypeAttributesError("");
+        }
+      })
+      .catch((error) => {
+        if (metatypeRequestSeqRef.current !== seq) return;
+        setMetatypeAttributes(null);
+        setMetatypeAttributesError(`Failed to load metatype attributes: ${String(error)}`);
+      })
+      .finally(() => {
+        if (metatypeRequestSeqRef.current !== seq) return;
+        setMetatypeAttributesLoading(false);
+      });
   }, [
     rootPath,
     selectedSemanticRow?.qualified_name,
@@ -399,6 +468,11 @@ export function CombinedPropertiesPane({
   const expressions = metatypeAttributes?.expressions || [];
   const metatypeAttributeCount = directMetatypeAttributes.length + inheritedMetatypeAttributes.length;
   const selectedElementQname = (selectedSemanticRow?.qualified_name || symbol?.qualified_name || "").trim();
+  const resolvedMetatypeQname = (
+    selectedSemanticRow?.metatype_qname
+    || metatypeAttributes?.metatype_qname
+    || ""
+  ).trim();
 
   const rows = useMemo(() => {
     const out: PropertyRow[] = [];
@@ -500,7 +574,7 @@ export function CombinedPropertiesPane({
         pushSemanticFeatureRows("Additional Semantics", remainingSemanticFeatures, "semantic-extra");
       }
       pushExpressionRows("Expressions", expressions, "expressions");
-      return out;
+      return dedupePropertyRows(out);
     }
 
     section("semantic", "Semantics");
@@ -531,7 +605,7 @@ export function CombinedPropertiesPane({
       });
     }
     pushExpressionRows("Expressions", expressions, "expressions");
-    return out;
+    return dedupePropertyRows(out);
   }, [
     symbol,
     selectedSemanticRow,
@@ -541,14 +615,66 @@ export function CombinedPropertiesPane({
     inheritedMetatypeAttributes,
     expressions,
     metatypeAttributes?.explicit_attributes,
+    resolvedMetatypeQname,
     selectedElementQname,
   ]);
+
+  const sections = useMemo(() => buildPropertySections(rows), [rows]);
+  const visibleSections = useMemo(() => {
+    if (!hideEmptyAttributes) {
+      return sections;
+    }
+    return sections
+      .map((section) => ({
+        ...section,
+        rows: section.rows.filter((row) => !isEmptyPropertyValue(row)),
+      }))
+      .filter((section) => section.rows.length > 0 || !section.label);
+  }, [hideEmptyAttributes, sections]);
 
   const metatypeQname = (metatypeAttributes?.metatype_qname || "").trim();
 
   if (!rows.length) {
     return <div className="muted">Select an element to view properties.</div>;
   }
+
+  const renderPropertyRow = (row: PropertyRow) => (
+    <div
+      key={row.key}
+      style={{
+        display: "grid",
+        gridTemplateColumns: "var(--combined-prop-key-col) 6px minmax(0,1fr)",
+        borderTop: "1px solid rgba(127,127,127,0.25)",
+      }}
+    >
+      <div
+        style={{
+          padding: "4px 6px",
+          whiteSpace: "nowrap",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+        }}
+      >
+        {row.label}
+      </div>
+      <div />
+      <div style={{ padding: "4px 6px", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+        {row.qname && onSelectQualifiedName ? (
+          <button
+            type="button"
+            className="ghost"
+            style={{ padding: 0, font: "inherit", textDecoration: "underline" }}
+            onClick={() => onSelectQualifiedName(row.qname as string)}
+            title={`Select ${row.qname} in project tree`}
+          >
+            {row.value || "-"}
+          </button>
+        ) : (
+          row.value || "-"
+        )}
+      </div>
+    </div>
+  );
 
   return (
     <>
@@ -598,24 +724,57 @@ export function CombinedPropertiesPane({
           </section>
         </div>
       ) : null}
-      <div style={{ height: "100%", overflow: "auto", fontFamily: "Consolas, monospace", fontSize: 12 }}>
-        <div style={{ display: "flex", justifyContent: "flex-end", paddingBottom: 6 }}>
-          <button
-            type="button"
-            className="ghost"
-            onClick={() => setMetatypePopupOpen(true)}
-            disabled={!symbol || metatypeAttributesLoading || !metatypeQname}
-            title={
-              metatypeAttributesLoading
-                ? "Loading metatype attributes..."
-                : metatypeQname
-                  ? `Show direct and inherited attributes for ${metatypeQname}`
-                  : (metatypeAttributesError || "Metatype is unresolved for this element.")
-            }
-          >
-            Metatype Attributes
-            {metatypeAttributeCount ? ` (${metatypeAttributeCount})` : ""}
-          </button>
+      <div
+        className="simple-properties-scroll-region"
+        style={{ height: "100%", overflow: "auto", fontFamily: "Consolas, monospace", fontSize: 12 }}
+      >
+        <div style={{ display: "grid", gap: 6, paddingBottom: 6 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
+            <button
+              type="button"
+              className="ghost"
+              onClick={() => setHideEmptyAttributes((value) => !value)}
+              title={hideEmptyAttributes ? "Show attributes with no value" : "Hide attributes with no value"}
+            >
+              {hideEmptyAttributes ? "Show Empty Attributes" : "Hide Empty Attributes"}
+            </button>
+            <button
+              type="button"
+              className="ghost"
+              onClick={() => setMetatypePopupOpen(true)}
+              disabled={!symbol || metatypeAttributesLoading || !metatypeQname}
+              title={
+                metatypeAttributesLoading
+                  ? "Loading metatype attributes..."
+                  : metatypeQname
+                    ? `Show direct and inherited attributes for ${metatypeQname}`
+                    : (metatypeAttributesError || "Metatype is unresolved for this element.")
+              }
+            >
+              Metatype Attributes
+              {metatypeAttributeCount ? ` (${metatypeAttributeCount})` : ""}
+            </button>
+          </div>
+          {resolvedMetatypeQname ? (
+            <div style={{ display: "grid", gap: 2 }}>
+              <strong>semantic.metatype</strong>
+              <div>
+                {onSelectQualifiedName && resolvedMetatypeQname.includes("::") && !/\s/.test(resolvedMetatypeQname) ? (
+                  <button
+                    type="button"
+                    className="ghost"
+                    style={{ padding: 0, font: "inherit", textDecoration: "underline" }}
+                    onClick={() => onSelectQualifiedName(resolvedMetatypeQname)}
+                    title={`Select ${resolvedMetatypeQname} in project tree`}
+                  >
+                    {resolvedMetatypeQname}
+                  </button>
+                ) : (
+                  resolvedMetatypeQname
+                )}
+              </div>
+            </div>
+          ) : null}
         </div>
         <div
           ref={propTableRef}
@@ -634,7 +793,10 @@ export function CombinedPropertiesPane({
               gridTemplateColumns: "var(--combined-prop-key-col) 6px minmax(0,1fr)",
               fontWeight: 700,
               borderBottom: "1px solid currentColor",
-              background: "rgba(127,127,127,0.12)",
+              background: "var(--simple-properties-header-bg)",
+              position: "sticky",
+              top: 0,
+              zIndex: 2,
             }}
           >
             <div style={{ padding: "4px 6px" }}>Property</div>
@@ -648,40 +810,53 @@ export function CombinedPropertiesPane({
             />
             <div style={{ padding: "4px 6px" }}>Value</div>
           </div>
-          {rows.map((row) => (
-            <div
-              key={row.key}
-              style={{ display: "grid", gridTemplateColumns: "var(--combined-prop-key-col) 6px minmax(0,1fr)", borderTop: "1px solid rgba(127,127,127,0.25)" }}
-            >
-              <div
-                style={{
-                  padding: "4px 6px",
-                  whiteSpace: row.label.startsWith("===") ? "normal" : "nowrap",
-                  overflow: "hidden",
-                  textOverflow: "ellipsis",
-                  fontWeight: row.label.startsWith("===") ? 700 : 400,
-                }}
-              >
-                {row.label}
-              </div>
-              <div />
-              <div style={{ padding: "4px 6px", whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
-                {row.qname && onSelectQualifiedName ? (
-                  <button
-                    type="button"
-                    className="ghost"
-                    style={{ padding: 0, font: "inherit", textDecoration: "underline" }}
-                    onClick={() => onSelectQualifiedName(row.qname as string)}
-                    title={`Select ${row.qname} in project tree`}
+          {visibleSections.map((section) => {
+            if (section.label === "Additional Semantics") {
+              return (
+                <details key={section.key} style={{ borderTop: "1px solid rgba(127,127,127,0.25)" }}>
+                  <summary
+                    style={{
+                      cursor: "pointer",
+                      padding: "4px 6px",
+                      fontWeight: 700,
+                      listStyle: "none",
+                      userSelect: "none",
+                    }}
                   >
-                    {row.value || "-"}
-                  </button>
-                ) : (
-                  row.value || "-"
-                )}
+                    === {section.label} ===
+                  </summary>
+                  {section.rows.map(renderPropertyRow)}
+                </details>
+              );
+            }
+
+            return (
+              <div key={section.key}>
+                {section.label ? (
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "var(--combined-prop-key-col) 6px minmax(0,1fr)",
+                      borderTop: "1px solid rgba(127,127,127,0.25)",
+                    }}
+                  >
+                    <div
+                      style={{
+                        padding: "4px 6px",
+                        fontWeight: 700,
+                        whiteSpace: "normal",
+                      }}
+                    >
+                      === {section.label} ===
+                    </div>
+                    <div />
+                    <div />
+                  </div>
+                ) : null}
+                {section.rows.map(renderPropertyRow)}
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
     </>
