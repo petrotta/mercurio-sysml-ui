@@ -6,6 +6,8 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { RECENTS_KEY, ROOT_STORAGE_KEY, THEME_KEY } from "./app/constants";
+import { formatFileDiagnostic } from "./app/compileShared";
+import { normalizePathKey as normalizePath } from "./app/pathUtils";
 import { useProjectTree } from "./app/useProjectTree";
 import {
   type ProjectFilesChangedEvent,
@@ -15,17 +17,22 @@ import {
   stopProjectFileWatcher,
 } from "./app/fileOps";
 import { useCompileRunner } from "./app/useCompileRunner";
-import { useSemanticSelection } from "./app/useSemanticSelection";
 import {
   getDefaultStdlib,
   getExpressionsView,
   getProjectModel,
-  type ExpressionEvaluationResult,
 } from "./app/services/semanticApi";
 import { PropertiesPanel } from "./app/components/PropertiesPanel";
 import { ParseErrorsPanel } from "./app/components/ParseErrorsPanel";
-import { parseErrorLocation } from "./app/parseErrors";
-import type { FileEntry, ProjectExpressionRecordView, SymbolView } from "./app/types";
+import type {
+  FileDiagnosticView,
+  ProjectExpressionRecordView,
+  SymbolView,
+  ExpressionEvaluationResult,
+} from "./app/contracts";
+import type {
+  FileEntry,
+} from "./app/types";
 
 loader.config({ paths: { vs: "/monaco/vs" } });
 
@@ -152,7 +159,7 @@ const PROJECT_FILES_SHOW_BY_FILE_KEY = "mercurio.simpleUi.projectFilesShowByFile
 const AUTO_BUILD_ACTIVE_FILE_KEY = "mercurio.simpleUi.autoBuildActiveFile";
 const AUTO_BUILD_DEBOUNCE_MS = 900;
 const AUTO_BUILD_MIN_INTERVAL_MS = 2500;
-const PARSE_MARKER_OWNER = "mercurio.parse";
+const FILE_DIAGNOSTIC_MARKER_OWNER = "mercurio.diagnostics";
 const INVALID_NEW_FILE_NAME_CHARS = /[<>:"/\\|?*]/;
 const UI_ICON = {
   folder: String.fromCodePoint(0x1F4C1),
@@ -179,10 +186,6 @@ function createStdlibOptionId(): string {
   return `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
 }
 
-function normalizePath(path: string | null | undefined): string {
-  return (path || "").replace(/\//g, "\\").toLowerCase();
-}
-
 function stdlibVersionFromPath(path: string | null | undefined): string {
   const trimmed = `${path || ""}`.trim();
   if (!trimmed) return "";
@@ -191,6 +194,8 @@ function stdlibVersionFromPath(path: string | null | undefined): string {
 }
 
 function symbolIdentity(symbol: SymbolView): string {
+  const backendId = `${symbol.symbol_id || ""}`.trim();
+  if (backendId) return backendId;
   return `${normalizePath(symbol.file_path)}|${symbol.qualified_name || symbol.name}|${symbol.start_line}|${symbol.start_col}`;
 }
 
@@ -476,9 +481,9 @@ function symbolKindLabel(symbol: SymbolView): string {
   return symbol.kind || "?";
 }
 
-function parseErrorToMarker(
+function fileDiagnosticToMarker(
   monaco: Parameters<OnMount>[1],
-  message: string,
+  diagnostic: FileDiagnosticView,
 ): {
   startLineNumber: number;
   startColumn: number;
@@ -487,15 +492,14 @@ function parseErrorToMarker(
   message: string;
   severity: number;
 } {
-  const loc = parseErrorLocation(message);
-  const line = Math.max(1, loc?.line || 1);
-  const col = Math.max(1, loc?.col || 1);
+  const line = Math.max(1, diagnostic.line || 1);
+  const col = Math.max(1, diagnostic.column || 1);
   return {
     startLineNumber: line,
     startColumn: col,
     endLineNumber: line,
     endColumn: col + 1,
-    message,
+    message: formatFileDiagnostic(diagnostic),
     severity: monaco.MarkerSeverity.Error,
   };
 }
@@ -653,7 +657,6 @@ export function App() {
   const [dirty, setDirty] = useState(false);
   const [cursorPos, setCursorPos] = useState<{ line: number; col: number } | null>(null);
   const [selectedSymbol, setSelectedSymbol] = useState<SymbolView | null>(null);
-  const [semanticSelectedQname, setSemanticSelectedQname] = useState("");
   const [harnessRuns, setHarnessRuns] = useState<HarnessRun[]>([]);
   const [backgroundJobs, setBackgroundJobs] = useState<BackgroundJobsSnapshot>({
     total: 0,
@@ -750,9 +753,8 @@ export function App() {
     cancelCompile,
     symbols,
     symbolsStatus,
-    unresolved,
     parsedFiles,
-    parseErrorPaths,
+    fileDiagnosticPaths,
     progressUiUpdates,
     droppedCompileRequests,
     buildLogEntries,
@@ -762,18 +764,14 @@ export function App() {
     symbolIndexError,
     semanticRefreshVersion,
   } = useCompileRunner({ rootPath });
+  const unresolvedCount = useMemo(
+    () => compileToast.fileDiagnostics.reduce(
+      (count, bucket) => count + bucket.diagnostics.filter((diagnostic) => diagnostic.source === "semantic").length,
+      0,
+    ),
+    [compileToast.fileDiagnostics],
+  );
   const [buildClockTick, setBuildClockTick] = useState(0);
-
-  const {
-    selectedSemanticRow,
-    selectedSemanticLoading,
-    selectedSemanticError,
-  } = useSemanticSelection({
-    rootPath,
-    semanticSelectedQname,
-    selectedSymbol,
-    semanticRefreshVersion,
-  });
 
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
@@ -899,7 +897,6 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     setActiveFilePath(null);
     setOpenTabs([]);
     setSelectedSymbol(null);
-    setSemanticSelectedQname("");
     setExpandedFileSymbols({});
     setExpandedLibraryFiles({});
     setCollapsedSymbolNodes({});
@@ -1288,14 +1285,13 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     if (!model) return;
     const activeKey = normalizePath(activeFilePath);
     if (!activeKey) {
-      monaco.editor.setModelMarkers(model, PARSE_MARKER_OWNER, []);
+      monaco.editor.setModelMarkers(model, FILE_DIAGNOSTIC_MARKER_OWNER, []);
       return;
     }
-    const bucket = compileToast.parseErrors.find((entry) => normalizePath(entry.path) === activeKey);
-    const parseMessages = (bucket?.errors || []).filter((message) => !message.trim().toLowerCase().startsWith("[semantic "));
-    const markers = parseMessages.map((message) => parseErrorToMarker(monaco, message));
-    monaco.editor.setModelMarkers(model, PARSE_MARKER_OWNER, markers);
-  }, [activeFilePath, compileToast.parseErrors]);
+    const bucket = compileToast.fileDiagnostics.find((entry) => normalizePath(entry.path) === activeKey);
+    const markers = (bucket?.diagnostics || []).map((diagnostic) => fileDiagnosticToMarker(monaco, diagnostic));
+    monaco.editor.setModelMarkers(model, FILE_DIAGNOSTIC_MARKER_OWNER, markers);
+  }, [activeFilePath, compileToast.fileDiagnostics]);
 
   const applySelection = useCallback((selection: TextSelection | null | undefined) => {
     if (!selection || !editorRef.current) return;
@@ -1353,7 +1349,6 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     if (activeFilePath && normalizePath(activeFilePath) === pathKey) {
       if (!options?.preserveSymbolSelection) {
         setSelectedSymbol(null);
-        setSemanticSelectedQname("");
       }
       if (selection) {
         applySelection(selection);
@@ -1365,7 +1360,6 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     if (existing) {
       if (!options?.preserveSymbolSelection) {
         setSelectedSymbol(null);
-        setSemanticSelectedQname("");
       }
       activateEditorTab(existing, selection);
       return;
@@ -1386,7 +1380,6 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       });
       if (!options?.preserveSymbolSelection) {
         setSelectedSymbol(null);
-        setSemanticSelectedQname("");
       }
       activateEditorTab(tab, selection);
     } catch (error) {
@@ -1409,7 +1402,6 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     const tab = openTabs.find((entry) => normalizePath(entry.path) === pathKey);
     if (!tab) return;
     setSelectedSymbol(null);
-    setSemanticSelectedQname("");
     activateEditorTab(tab);
   }, [activeFilePath, persistActiveEditorBuffer, openTabs, activateEditorTab]);
 
@@ -1433,13 +1425,11 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     const fallback = nextTabs[Math.max(0, index - 1)] || nextTabs[0] || null;
     if (fallback) {
       setSelectedSymbol(null);
-      setSemanticSelectedQname("");
       activateEditorTab(fallback);
       return;
     }
     setActiveFilePath(null);
     setSelectedSymbol(null);
-    setSemanticSelectedQname("");
     contentRef.current = "";
     dirtyRef.current = false;
     setDirty(false);
@@ -1466,7 +1456,6 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     setOpenTabs([keepTab]);
     if (!activeFilePath || normalizePath(activeFilePath) !== keepKey) {
       setSelectedSymbol(null);
-      setSemanticSelectedQname("");
       activateEditorTab(keepTab);
     }
     setTabContextMenu(null);
@@ -1487,7 +1476,6 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     setOpenTabs([]);
     setActiveFilePath(null);
     setSelectedSymbol(null);
-    setSemanticSelectedQname("");
     contentRef.current = "";
     dirtyRef.current = false;
     setDirty(false);
@@ -1994,7 +1982,6 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
 
   const selectSymbol = useCallback(async (symbol: SymbolView) => {
     setSelectedSymbol(symbol);
-    setSemanticSelectedQname(symbol.qualified_name || "");
     await openFilePath(symbol.file_path, symbolSelection(symbol), { preserveSymbolSelection: true });
   }, [openFilePath]);
 
@@ -2005,16 +1992,15 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     void selectSymbol(target);
   }, [projectSymbols, selectSymbol, symbols]);
 
-  const openParseError = useCallback((path: string, message: string) => {
-    const loc = parseErrorLocation(message);
-    const selection: TextSelection | undefined = loc
-      ? {
-          startLine: loc.line,
-          startCol: loc.col,
-          endLine: loc.line,
-          endCol: loc.col + 1,
-        }
-      : undefined;
+  const openDiagnostic = useCallback((path: string, diagnostic: FileDiagnosticView) => {
+    const line = Math.max(1, diagnostic.line || 1);
+    const col = Math.max(1, diagnostic.column || 1);
+    const selection: TextSelection = {
+      startLine: line,
+      startCol: col,
+      endLine: line,
+      endCol: col + 1,
+    };
     void openFilePath(path, selection);
   }, [openFilePath]);
 
@@ -2502,7 +2488,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
       const isOpen = !!expanded[entry.path];
       const fileKey = normalizePath(entry.path);
       const active = !isDir && normalizePath(activeFilePath) === fileKey;
-      const hasParseError = parseErrorPaths.has(fileKey);
+      const hasParseError = fileDiagnosticPaths.has(fileKey);
       const fileSymbols = isDir ? [] : (symbolsByFile.get(fileKey) || []);
       const symbolCount = fileSymbols.length;
       const isSymbolOpen = !isDir && !!expandedFileSymbols[fileKey];
@@ -2607,7 +2593,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
   }, [
     expanded,
     activeFilePath,
-    parseErrorPaths,
+    fileDiagnosticPaths,
     symbolsByFile,
     expandedFileSymbols,
     expandedProjectFileSymbolOverflow,
@@ -3481,7 +3467,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                     <div className="simple-editor-meta">
                       <span>Symbols in file: {activeFileSymbols.length}</span>
                       <span>Parsed files: {parsedFiles.length}</span>
-                      <span>Unresolved: {unresolved.length}</span>
+                      <span>Unresolved: {unresolvedCount}</span>
                     </div>
                   </div>
                   <div className="editor-host" id="monaco-root">
@@ -3780,9 +3766,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
           <PropertiesPanel
             rootPath={rootPath}
             selectedSymbol={selectedSymbol}
-            selectedSemanticRow={selectedSemanticRow}
-            selectedSemanticLoading={selectedSemanticLoading}
-            selectedSemanticError={selectedSemanticError}
+            semanticRefreshVersion={semanticRefreshVersion}
             onSelectQualifiedName={selectQualifiedName}
           />
           <div
@@ -3803,7 +3787,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
             normalizePath={normalizePath}
             displayNameForPath={displayNameForPath}
             toggleParseErrorFile={toggleParseErrorFile}
-            openParseError={openParseError}
+            openDiagnostic={openDiagnostic}
           />
         </aside>
       </main>
@@ -4060,7 +4044,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
           {cursorPos && activeFilePath ? <span>Ln {cursorPos.line}, Col {cursorPos.col}</span> : null}
           <span title={backgroundJobsTitle}>Jobs: {backgroundJobs.total}</span>
           <span>Project symbols: {projectSymbols.length}</span>
-          <span>Unresolved: {unresolved.length}</span>
+          <span>Unresolved: {unresolvedCount}</span>
           <span>UI updates: {progressUiUpdates}</span>
           <span>Dropped compiles: {droppedCompileRequests}</span>
         </div>

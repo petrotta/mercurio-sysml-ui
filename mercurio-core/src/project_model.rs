@@ -1,5 +1,5 @@
-use std::fs;
 use std::collections::HashSet;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -17,13 +17,44 @@ pub use mercurio_sysml_semantics::semantic_project_model_contract::{
     ProjectModelElementView, ProjectModelView,
 };
 use mercurio_sysml_semantics::stdlib::MetatypeIndex;
+use serde::{Deserialize, Serialize};
 
 use crate::project::load_project_config;
 use crate::project_model_seed::seed_symbol_index_if_empty;
 use crate::project_root_key::canonical_project_root;
 use crate::state::{CoreState, WorkspaceSnapshotCacheEntry};
 use crate::stdlib::resolve_stdlib_path;
+use crate::symbol_index::{
+    query_project_semantic_projection_by_qualified_name, IndexedSemanticProjectionElementView,
+};
 use crate::workspace::collect_project_files;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectElementPropertyRowView {
+    pub key: String,
+    pub label: String,
+    pub value: String,
+    pub qualified_name: Option<String>,
+    pub is_empty: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectElementPropertySectionView {
+    pub key: String,
+    pub label: String,
+    pub collapsible: bool,
+    pub rows: Vec<ProjectElementPropertyRowView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectElementPropertySectionsView {
+    pub element_qualified_name: String,
+    pub metatype_qname: Option<String>,
+    pub direct_metatype_attributes: Vec<ProjectElementInheritedAttributeView>,
+    pub inherited_metatype_attributes: Vec<ProjectElementInheritedAttributeView>,
+    pub sections: Vec<ProjectElementPropertySectionView>,
+    pub diagnostics: Vec<String>,
+}
 
 fn resolve_symbol_metatype(
     store: &dyn SymbolIndexStore,
@@ -162,6 +193,54 @@ pub fn get_project_element_attributes(
         direct_metatype_attributes,
         inherited_metatype_attributes,
         expressions,
+        diagnostics,
+    })
+}
+
+pub fn get_project_element_property_sections(
+    state: &CoreState,
+    root: String,
+    element_qualified_name: String,
+    file_path: Option<String>,
+    symbol_kind: Option<String>,
+) -> Result<ProjectElementPropertySectionsView, String> {
+    let attrs = get_project_element_attributes(
+        state,
+        root.clone(),
+        element_qualified_name.clone(),
+        symbol_kind,
+    )?;
+    let semantic_projection = query_project_semantic_projection_by_qualified_name(
+        state,
+        root,
+        element_qualified_name.clone(),
+        file_path,
+    )?;
+
+    let mut diagnostics = attrs.diagnostics.clone();
+    let resolved_metatype_qname = semantic_projection
+        .as_ref()
+        .and_then(|projection| projection.metatype_qname.clone())
+        .or_else(|| attrs.metatype_qname.clone());
+    let direct_metatype_attributes = attrs.direct_metatype_attributes.clone();
+    let inherited_metatype_attributes = if !attrs.inherited_metatype_attributes.is_empty() {
+        attrs.inherited_metatype_attributes.clone()
+    } else {
+        attrs.inherited_attributes.clone()
+    };
+    let sections = build_project_element_property_sections(
+        semantic_projection.as_ref(),
+        &attrs,
+        &element_qualified_name,
+        &mut diagnostics,
+    );
+
+    Ok(ProjectElementPropertySectionsView {
+        element_qualified_name,
+        metatype_qname: resolved_metatype_qname,
+        direct_metatype_attributes,
+        inherited_metatype_attributes,
+        sections,
         diagnostics,
     })
 }
@@ -341,6 +420,553 @@ pub fn get_project_model(state: &CoreState, root: String) -> Result<ProjectModel
         expressions: expression_view.records,
         diagnostics,
     })
+}
+
+fn build_project_element_property_sections(
+    semantic_projection: Option<&IndexedSemanticProjectionElementView>,
+    attrs: &ProjectElementAttributesView,
+    selected_element_qname: &str,
+    diagnostics: &mut Vec<String>,
+) -> Vec<ProjectElementPropertySectionView> {
+    let direct_metatype_attributes = attrs.direct_metatype_attributes.as_slice();
+    let inherited_metatype_attributes = if !attrs.inherited_metatype_attributes.is_empty() {
+        attrs.inherited_metatype_attributes.as_slice()
+    } else {
+        attrs.inherited_attributes.as_slice()
+    };
+    let expressions = attrs.expressions.as_slice();
+
+    if let Some(projection) = semantic_projection {
+        if !direct_metatype_attributes.is_empty() || !inherited_metatype_attributes.is_empty() {
+            return build_metatype_reconciled_sections(
+                projection,
+                attrs,
+                selected_element_qname,
+                direct_metatype_attributes,
+                inherited_metatype_attributes,
+                expressions,
+            );
+        }
+        return build_semantic_fallback_sections(
+            Some(projection),
+            expressions,
+            selected_element_qname,
+            None,
+        );
+    }
+
+    let message = if attrs
+        .diagnostics
+        .iter()
+        .any(|line| line.contains("Element not found"))
+    {
+        "No semantic row in EMF cache. Run Compile to refresh.".to_string()
+    } else {
+        diagnostics.push("No semantic row in EMF cache. Run Compile to refresh.".to_string());
+        "No semantic row in EMF cache. Run Compile to refresh.".to_string()
+    };
+    build_semantic_fallback_sections(None, expressions, selected_element_qname, Some(message))
+}
+
+fn build_metatype_reconciled_sections(
+    projection: &IndexedSemanticProjectionElementView,
+    attrs: &ProjectElementAttributesView,
+    selected_element_qname: &str,
+    direct_metatype_attributes: &[ProjectElementInheritedAttributeView],
+    inherited_metatype_attributes: &[ProjectElementInheritedAttributeView],
+    expressions: &[ProjectExpressionRecordView],
+) -> Vec<ProjectElementPropertySectionView> {
+    let mut used_semantic_feature_indexes = HashSet::<usize>::new();
+    let mut seen_attribute_keys = HashSet::<String>::new();
+    let mut metatype_rows = Vec::<ProjectElementPropertyRowView>::new();
+    let mut all_metatype_attributes = Vec::<ProjectElementInheritedAttributeView>::new();
+    all_metatype_attributes.extend_from_slice(direct_metatype_attributes);
+    all_metatype_attributes.extend_from_slice(inherited_metatype_attributes);
+
+    for (index, attribute) in all_metatype_attributes.iter().enumerate() {
+        let normalized_attribute_qname = normalize_lookup_key(&attribute.qualified_name);
+        let attribute_key = if !normalized_attribute_qname.is_empty() {
+            normalized_attribute_qname
+        } else {
+            let declared_on = normalize_lookup_key(&attribute.declared_on);
+            let name = normalize_lookup_key(&attribute.name);
+            if declared_on.is_empty() && name.is_empty() {
+                format!("attribute-{index}")
+            } else {
+                format!("{declared_on}|{name}")
+            }
+        };
+        if !seen_attribute_keys.insert(attribute_key.clone()) {
+            continue;
+        }
+
+        let mut matched_feature_index = None;
+        let mut matched_feature = None;
+        for (feature_index, feature) in projection.features.iter().enumerate() {
+            if used_semantic_feature_indexes.contains(&feature_index) {
+                continue;
+            }
+            if semantic_feature_matches_attribute(feature, attribute) {
+                matched_feature_index = Some(feature_index);
+                matched_feature = Some(feature);
+                break;
+            }
+        }
+        if matched_feature.is_none() {
+            for (feature_index, feature) in projection.features.iter().enumerate() {
+                if semantic_feature_matches_attribute(feature, attribute) {
+                    matched_feature_index = Some(feature_index);
+                    matched_feature = Some(feature);
+                    break;
+                }
+            }
+        }
+        if let Some(feature_index) = matched_feature_index {
+            used_semantic_feature_indexes.insert(feature_index);
+        }
+
+        let explicit_value = find_explicit_attribute_value(attribute, &attrs.explicit_attributes);
+        let row_value = matched_feature
+            .map(|feature| semantic_value_to_text(&feature.value))
+            .or(explicit_value)
+            .unwrap_or_else(|| "-".to_string());
+        let qualified_name =
+            matched_feature.and_then(|feature| semantic_value_to_qualified_name(&feature.value));
+        metatype_rows.push(project_element_property_row(
+            format!("metatype-attribute-{attribute_key}"),
+            format_attribute_signature(attribute),
+            row_value,
+            qualified_name,
+        ));
+    }
+
+    let mut sections = vec![ProjectElementPropertySectionView {
+        key: "metatype".to_string(),
+        label: "Metatype Attributes".to_string(),
+        collapsible: false,
+        rows: metatype_rows,
+    }];
+
+    let remaining_semantic_rows = projection
+        .features
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !used_semantic_feature_indexes.contains(index))
+        .map(|(index, feature)| {
+            project_element_property_row(
+                format!("semantic-extra-feature-{index}-{}", feature.name),
+                format_semantic_feature_label(feature),
+                semantic_value_to_text(&feature.value),
+                semantic_value_to_qualified_name(&feature.value),
+            )
+        })
+        .collect::<Vec<_>>();
+    if !remaining_semantic_rows.is_empty() {
+        sections.push(ProjectElementPropertySectionView {
+            key: "semantic-extra".to_string(),
+            label: "Additional Semantics".to_string(),
+            collapsible: true,
+            rows: remaining_semantic_rows,
+        });
+    }
+
+    if !expressions.is_empty() {
+        sections.push(ProjectElementPropertySectionView {
+            key: "expressions".to_string(),
+            label: "Expressions".to_string(),
+            collapsible: false,
+            rows: build_expression_rows(expressions, selected_element_qname),
+        });
+    }
+
+    sections
+}
+
+fn build_semantic_fallback_sections(
+    projection: Option<&IndexedSemanticProjectionElementView>,
+    expressions: &[ProjectExpressionRecordView],
+    selected_element_qname: &str,
+    missing_message: Option<String>,
+) -> Vec<ProjectElementPropertySectionView> {
+    let semantic_rows = if let Some(projection) = projection {
+        if projection.features.is_empty() {
+            vec![project_element_property_row(
+                "semantic-empty".to_string(),
+                "semantic.type_attributes".to_string(),
+                "-".to_string(),
+                None,
+            )]
+        } else {
+            projection
+                .features
+                .iter()
+                .enumerate()
+                .map(|(index, feature)| {
+                    project_element_property_row(
+                        format!("semantic-feature-{index}-{}", feature.name),
+                        format_semantic_feature_label(feature),
+                        semantic_value_to_text(&feature.value),
+                        semantic_value_to_qualified_name(&feature.value),
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+    } else {
+        vec![project_element_property_row(
+            "semantic-status".to_string(),
+            "semantic.status".to_string(),
+            missing_message.unwrap_or_else(|| "Select an element".to_string()),
+            None,
+        )]
+    };
+
+    let mut sections = vec![ProjectElementPropertySectionView {
+        key: "semantic".to_string(),
+        label: "Semantics".to_string(),
+        collapsible: false,
+        rows: semantic_rows,
+    }];
+    if !expressions.is_empty() {
+        sections.push(ProjectElementPropertySectionView {
+            key: "expressions".to_string(),
+            label: "Expressions".to_string(),
+            collapsible: false,
+            rows: build_expression_rows(expressions, selected_element_qname),
+        });
+    }
+    sections
+}
+
+fn build_expression_rows(
+    expressions: &[ProjectExpressionRecordView],
+    selected_element_qname: &str,
+) -> Vec<ProjectElementPropertyRowView> {
+    expressions
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            project_element_property_row(
+                format!("expression-{index}-{}", record.qualified_name),
+                format_project_expression_label(record, selected_element_qname),
+                {
+                    let expression = record.expression.trim();
+                    if expression.is_empty() {
+                        "-".to_string()
+                    } else {
+                        expression.to_string()
+                    }
+                },
+                None,
+            )
+        })
+        .collect()
+}
+
+fn project_element_property_row(
+    key: String,
+    label: String,
+    value: String,
+    qualified_name: Option<String>,
+) -> ProjectElementPropertyRowView {
+    let is_empty = {
+        let trimmed = value.trim();
+        trimmed.is_empty() || trimmed == "-"
+    };
+    ProjectElementPropertyRowView {
+        key,
+        label,
+        value,
+        qualified_name,
+        is_empty,
+    }
+}
+
+fn semantic_value_to_text(
+    value: &mercurio_sysml_semantics::semantic_contract::SemanticValueView,
+) -> String {
+    use mercurio_sysml_semantics::semantic_contract::SemanticValueView;
+
+    match value {
+        SemanticValueView::Null => "-".to_string(),
+        SemanticValueView::Text { value } => value.clone(),
+        SemanticValueView::Bool { value } => {
+            if *value {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        SemanticValueView::I64 { value } => value.to_string(),
+        SemanticValueView::U64 { value } => value.to_string(),
+        SemanticValueView::F64 { value } => value.to_string(),
+        SemanticValueView::Enum { literal, .. } => literal.clone(),
+        SemanticValueView::Ref {
+            qualified_name,
+            proxy_text,
+            ..
+        } => qualified_name
+            .as_deref()
+            .or(proxy_text.as_deref())
+            .unwrap_or("-")
+            .to_string(),
+        SemanticValueView::List { items } => {
+            let joined = items
+                .iter()
+                .map(semantic_value_to_text)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if joined.trim().is_empty() {
+                "-".to_string()
+            } else {
+                joined
+            }
+        }
+    }
+}
+
+fn semantic_value_to_qualified_name(
+    value: &mercurio_sysml_semantics::semantic_contract::SemanticValueView,
+) -> Option<String> {
+    use mercurio_sysml_semantics::semantic_contract::SemanticValueView;
+
+    match value {
+        SemanticValueView::Ref {
+            qualified_name,
+            proxy_text,
+            ..
+        } => sanitize_qualified_name(qualified_name.as_deref().or(proxy_text.as_deref())),
+        SemanticValueView::List { items } => {
+            let refs = items
+                .iter()
+                .filter_map(|item| match item {
+                    SemanticValueView::Ref {
+                        qualified_name,
+                        proxy_text,
+                        ..
+                    } => {
+                        sanitize_qualified_name(qualified_name.as_deref().or(proxy_text.as_deref()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if refs.len() == 1 {
+                refs.into_iter().next()
+            } else {
+                None
+            }
+        }
+        SemanticValueView::Text { value } => sanitize_qualified_name(Some(value.as_str())),
+        _ => None,
+    }
+}
+
+fn sanitize_qualified_name(value: Option<&str>) -> Option<String> {
+    let qname = value?.trim();
+    if qname.is_empty() || !qname.contains("::") || qname.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(qname.to_string())
+}
+
+fn split_qualified_name(value: &str) -> Vec<&str> {
+    value
+        .split("::")
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn format_feature_qname(value: &str) -> Option<String> {
+    let segments = split_qualified_name(value);
+    if segments.is_empty() {
+        return None;
+    }
+    if segments.len() == 1 {
+        return Some(segments[0].to_string());
+    }
+    let owner = segments.get(segments.len() - 2)?;
+    let property = segments.last()?;
+    Some(format!("{owner}.{property}"))
+}
+
+fn format_semantic_feature_label(
+    feature: &mercurio_sysml_semantics::semantic_contract::SemanticFeatureView,
+) -> String {
+    let metamodel_feature_qname = feature
+        .metamodel_feature_qname
+        .as_deref()
+        .unwrap_or("")
+        .trim();
+    if !metamodel_feature_qname.is_empty() {
+        if let Some(formatted) = format_feature_qname(metamodel_feature_qname) {
+            return formatted;
+        }
+    }
+
+    let feature_name = feature.name.trim();
+    let declared_type_qname = feature.declared_type_qname.as_deref().unwrap_or("").trim();
+    if !declared_type_qname.is_empty() && !feature_name.is_empty() {
+        let type_segments = split_qualified_name(declared_type_qname);
+        if let Some(short_type_name) = type_segments.last() {
+            return format!("{short_type_name}.{feature_name}");
+        }
+    }
+
+    if !feature_name.is_empty() {
+        if let Some(formatted) = format_feature_qname(feature_name) {
+            return formatted;
+        }
+        return feature_name.to_string();
+    }
+
+    "(unnamed)".to_string()
+}
+
+fn format_attribute_signature(attribute: &ProjectElementInheritedAttributeView) -> String {
+    let name = attribute.name.trim();
+    let name = if name.is_empty() { "(unnamed)" } else { name };
+    let declared_type = attribute.declared_type.as_deref().unwrap_or("").trim();
+    let multiplicity = attribute.multiplicity.as_deref().unwrap_or("").trim();
+    if declared_type.is_empty() {
+        return name.to_string();
+    }
+    if multiplicity.is_empty() {
+        return format!("{name} : {declared_type}");
+    }
+    let multiplicity_text = if multiplicity.starts_with('[') {
+        multiplicity.to_string()
+    } else {
+        format!("[{multiplicity}]")
+    };
+    format!("{name} : {declared_type}{multiplicity_text}")
+}
+
+fn format_expression_kind(value: &str) -> String {
+    let normalized = value.trim().replace('_', " ");
+    if normalized.is_empty() {
+        "expression".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn short_qualified_tail(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let segments = split_qualified_name(trimmed);
+    segments.last().copied().unwrap_or(trimmed).to_string()
+}
+
+fn format_project_expression_label(
+    record: &ProjectExpressionRecordView,
+    selected_element_qname: &str,
+) -> String {
+    let slot = record.slot.trim();
+    let kind = format_expression_kind(&record.expression_kind);
+    let owner = record.owner_qualified_name.trim();
+    let owner_prefix = if !owner.is_empty()
+        && normalize_lookup_key(owner) != normalize_lookup_key(selected_element_qname)
+    {
+        format!("{}.", short_qualified_tail(owner))
+    } else {
+        String::new()
+    };
+
+    if !slot.is_empty() {
+        return format!("{owner_prefix}{slot} ({kind})");
+    }
+    if !owner_prefix.is_empty() {
+        return format!("{owner_prefix}{kind}");
+    }
+    kind
+}
+
+fn normalize_lookup_key(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn tail_lookup_key(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let qualified_tail = trimmed.rsplit("::").next().unwrap_or(trimmed);
+    let property_tail = qualified_tail.rsplit('.').next().unwrap_or(qualified_tail);
+    normalize_lookup_key(property_tail)
+}
+
+fn semantic_feature_matches_attribute(
+    feature: &mercurio_sysml_semantics::semantic_contract::SemanticFeatureView,
+    attribute: &ProjectElementInheritedAttributeView,
+) -> bool {
+    let attribute_qname = normalize_lookup_key(&attribute.qualified_name);
+    let attribute_name = normalize_lookup_key(&attribute.name);
+    let attribute_tail = tail_lookup_key(if !attribute.qualified_name.is_empty() {
+        &attribute.qualified_name
+    } else {
+        &attribute.name
+    });
+    let feature_metamodel_qname =
+        normalize_lookup_key(feature.metamodel_feature_qname.as_deref().unwrap_or(""));
+    let feature_name = normalize_lookup_key(&feature.name);
+    let feature_tail = tail_lookup_key(
+        if feature
+            .metamodel_feature_qname
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        {
+            feature.metamodel_feature_qname.as_deref().unwrap_or("")
+        } else {
+            &feature.name
+        },
+    );
+
+    (!attribute_qname.is_empty() && feature_metamodel_qname == attribute_qname)
+        || (!attribute_name.is_empty() && feature_name == attribute_name)
+        || (!attribute_name.is_empty()
+            && feature_metamodel_qname.ends_with(&format!("::{attribute_name}")))
+        || (!attribute_tail.is_empty() && feature_tail == attribute_tail)
+        || (!attribute_tail.is_empty() && feature_name == attribute_tail)
+}
+
+fn find_explicit_attribute_value(
+    attribute: &ProjectElementInheritedAttributeView,
+    explicit_attributes: &[ProjectModelAttributeView],
+) -> Option<String> {
+    let attribute_qname = normalize_lookup_key(&attribute.qualified_name);
+    let attribute_name = normalize_lookup_key(&attribute.name);
+    let attribute_tail = tail_lookup_key(if !attribute.qualified_name.is_empty() {
+        &attribute.qualified_name
+    } else {
+        &attribute.name
+    });
+    let matched = explicit_attributes.iter().find(|candidate| {
+        let explicit_metamodel_qname =
+            normalize_lookup_key(candidate.metamodel_attribute_qname.as_deref().unwrap_or(""));
+        let explicit_name = normalize_lookup_key(&candidate.name);
+        let explicit_tail = tail_lookup_key(
+            if candidate
+                .metamodel_attribute_qname
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            {
+                candidate.metamodel_attribute_qname.as_deref().unwrap_or("")
+            } else {
+                &candidate.name
+            },
+        );
+        (!attribute_qname.is_empty() && explicit_metamodel_qname == attribute_qname)
+            || (!attribute_name.is_empty() && explicit_name == attribute_name)
+            || (!attribute_tail.is_empty() && explicit_tail == attribute_tail)
+    })?;
+    let value = matched.cst_value.as_deref().unwrap_or("").trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 pub fn get_project_expression_records(

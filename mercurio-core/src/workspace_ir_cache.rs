@@ -110,7 +110,8 @@ pub(crate) fn persist_workspace_ir_cache(
         if !raw_project_root.is_empty() && raw_project_root != project_root {
             root_prefixes.push(format!("project-semantic|{}|", raw_project_root));
         }
-        let mut by_file_and_qname = BTreeMap::<(String, String), SemanticElementProjectionView>::new();
+        let mut by_file_and_qname =
+            BTreeMap::<(String, String), SemanticElementProjectionView>::new();
         let cache = state
             .workspace_snapshot_cache
             .lock()
@@ -201,11 +202,7 @@ pub(crate) fn schedule_workspace_ir_cache_persist(
         let _ = persist_workspace_ir_cache(&state, &project_root, stdlib_signature.as_deref());
 
         if let Ok(mut pending) = state.pending_workspace_ir_persists.lock() {
-            if pending
-                .get(&project_root)
-                .map(|entry| entry.generation)
-                == Some(generation)
-            {
+            if pending.get(&project_root).map(|entry| entry.generation) == Some(generation) {
                 pending.remove(&project_root);
             }
         }
@@ -333,7 +330,8 @@ pub(crate) fn seed_symbol_index_from_workspace_ir_cache(
             );
         }
     }
-    let _ = refresh_project_semantic_lookup(state, &project_root, &[], semantic_projections.as_slice());
+    let _ =
+        refresh_project_semantic_lookup(state, &project_root, &[], semantic_projections.as_slice());
     Ok(true)
 }
 

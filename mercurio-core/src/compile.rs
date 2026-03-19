@@ -4,9 +4,9 @@ use mercurio_sysml_pkg::compile_support::{
     build_canonical_symbol_rows_by_file, build_compile_workspace_files,
     build_stdlib_snapshot_with_progress as build_stdlib_snapshot_rows_with_progress,
     build_workspace_semantic_elements_with_selection, build_workspace_semantic_projection_views,
-    collect_stdlib_files,
-    filter_out_library_files, group_prepared_symbols_by_file, is_library_symbol_path,
-    load_stdlib_snapshot_with_cache, map_semantic_element_to_projected_symbol,
+    collect_stdlib_files, filter_out_library_files, group_prepared_symbols_by_file,
+    is_library_symbol_path, load_stdlib_snapshot_with_cache,
+    map_semantic_element_to_projected_symbol,
     normalized_compare_key as normalized_compare_key_shared, prepare_symbols_for_index,
     select_workspace_files, stdlib_signature_key, workspace_semantic_cache_key, PreparedScope,
     ProjectedPropertyValue, ProjectedSemanticSymbol, RawIndexSymbol, StdlibSymbolRow,
@@ -38,12 +38,13 @@ use crate::CoreState;
 #[cfg(test)]
 use mercurio_sysml_semantics::semantic_contract::SemanticElementView;
 
-pub use crate::state::CompileFileResult;
+pub use crate::state::{CompileDiagnosticView, CompileFileResult};
 
 #[derive(Serialize)]
 pub struct CompileResponse {
     pub ok: bool,
     pub files: Vec<CompileFileResult>,
+    pub file_diagnostics: Vec<CompileFileDiagnosticsView>,
     pub parse_error_categories: Vec<ParseErrorCategoryView>,
     pub performance_warnings: Vec<String>,
     pub symbols: Vec<SymbolView>,
@@ -77,6 +78,12 @@ pub struct LibrarySymbolsResponse {
 pub struct ParseErrorCategoryView {
     pub category: String,
     pub count: usize,
+}
+
+#[derive(Serialize, Clone)]
+pub struct CompileFileDiagnosticsView {
+    pub path: String,
+    pub diagnostics: Vec<CompileDiagnosticView>,
 }
 
 #[derive(Serialize, Clone)]
@@ -270,14 +277,33 @@ fn categorize_parse_error(message: &str) -> String {
     "other".to_string()
 }
 
+fn offset_to_line_col(text: &str, offset: usize) -> (usize, usize) {
+    let safe = offset.min(text.len());
+    let mut line = 1usize;
+    let mut col = 1usize;
+    for ch in text[..safe].chars() {
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
 fn summarize_parse_error_categories(files: &[CompileFileResult]) -> Vec<ParseErrorCategoryView> {
     let mut categories = HashMap::<String, usize>::new();
     for file in files {
         if file.ok {
             continue;
         }
-        for message in &file.errors {
-            let key = categorize_parse_error(message);
+        for diagnostic in &file.errors {
+            let key = if diagnostic.kind.trim().is_empty() {
+                categorize_parse_error(&diagnostic.message)
+            } else {
+                diagnostic.kind.trim().to_string()
+            };
             *categories.entry(key).or_insert(0) += 1;
         }
     }
@@ -286,6 +312,56 @@ fn summarize_parse_error_categories(files: &[CompileFileResult]) -> Vec<ParseErr
         .map(|(category, count)| ParseErrorCategoryView { category, count })
         .collect::<Vec<_>>();
     out.sort_by(|a, b| b.count.cmp(&a.count).then(a.category.cmp(&b.category)));
+    out
+}
+
+fn build_file_diagnostics(
+    files: &[CompileFileResult],
+    unresolved: &[UnresolvedRefView],
+) -> Vec<CompileFileDiagnosticsView> {
+    let mut by_path = HashMap::<String, Vec<CompileDiagnosticView>>::new();
+    for file in files {
+        if file.errors.is_empty() {
+            continue;
+        }
+        by_path
+            .entry(file.path.clone())
+            .or_default()
+            .extend(file.errors.iter().cloned());
+    }
+    for issue in unresolved {
+        by_path
+            .entry(issue.file_path.clone())
+            .or_default()
+            .push(CompileDiagnosticView {
+                message: issue.message.clone(),
+                line: usize::try_from(issue.line.max(1)).unwrap_or(1),
+                column: usize::try_from(issue.column.max(1)).unwrap_or(1),
+                kind: issue
+                    .code
+                    .as_ref()
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("semantic")
+                    .to_string(),
+                source: "semantic".to_string(),
+            });
+    }
+    let mut out = by_path
+        .into_iter()
+        .map(|(path, mut diagnostics)| {
+            diagnostics.sort_by(|left, right| {
+                left.line
+                    .cmp(&right.line)
+                    .then(left.column.cmp(&right.column))
+                    .then(left.source.cmp(&right.source))
+                    .then(left.kind.cmp(&right.kind))
+                    .then(left.message.cmp(&right.message))
+            });
+            CompileFileDiagnosticsView { path, diagnostics }
+        })
+        .collect::<Vec<_>>();
+    out.sort_by(|left, right| left.path.cmp(&right.path));
     out
 }
 
@@ -856,7 +932,17 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
             let errors = parser
                 .errors()
                 .iter()
-                .map(|e| e.message.clone())
+                .map(|error| {
+                    let message = error.message.clone();
+                    let (line, column) = offset_to_line_col(&content, error.span.start as usize);
+                    CompileDiagnosticView {
+                        kind: categorize_parse_error(&message),
+                        message,
+                        line,
+                        column,
+                        source: "parse".to_string(),
+                    }
+                })
                 .collect::<Vec<_>>();
             let ok = errors.is_empty();
             if !ok {
@@ -891,6 +977,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
         let analysis_duration_ms = 0;
         let stdlib_duration_ms = 0;
         let total_duration_ms = compile_start.elapsed().as_millis();
+        let file_diagnostics = build_file_diagnostics(&file_results, &[]);
         let parse_error_categories = summarize_parse_error_categories(&file_results);
         let performance_warnings = performance_warnings(
             parse_duration_ms,
@@ -901,6 +988,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
         return Ok(CompileResponse {
             ok: false,
             files: file_results,
+            file_diagnostics,
             parse_error_categories,
             performance_warnings,
             symbols: Vec::new(),
@@ -1232,16 +1320,17 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
                         None,
                         None,
                     );
-                    eprintln!(
-                        "[compile] semantic projection cache warm failed: {}",
-                        error
-                    );
+                    eprintln!("[compile] semantic projection cache warm failed: {}", error);
                     Arc::new(Vec::new())
                 }
             }
         }
     };
-    let display_root_path = PathBuf::from(if raw_root.is_empty() { &root } else { &raw_root });
+    let display_root_path = PathBuf::from(if raw_root.is_empty() {
+        &root
+    } else {
+        &raw_root
+    });
     let semantic_elements = Arc::new(
         semantic_elements
             .iter()
@@ -1321,7 +1410,8 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
                 Some(semantic_total),
             );
         }
-        let mut projected = map_semantic_element_to_projected_symbol(element.clone(), &symbol_spans);
+        let mut projected =
+            map_semantic_element_to_projected_symbol(element.clone(), &symbol_spans);
         repair_projected_symbol_span_from_source(
             &mut projected,
             &element,
@@ -1435,6 +1525,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
 
     let parse_duration_ms = parse_start.elapsed().as_millis();
     let total_duration_ms = compile_start.elapsed().as_millis();
+    let file_diagnostics = build_file_diagnostics(&file_results, &unresolved);
     let parse_error_categories = summarize_parse_error_categories(&file_results);
     let performance_warnings = performance_warnings(
         parse_duration_ms,
@@ -1446,6 +1537,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
     let response = CompileResponse {
         ok: file_results.iter().all(|f| f.ok),
         files: file_results,
+        file_diagnostics,
         parse_error_categories,
         performance_warnings,
         symbols: response_symbols,
@@ -1921,14 +2013,14 @@ fn remember_projected_symbol_span(
     if symbol.start_line == 0 || symbol.start_col == 0 {
         return;
     }
-    symbol_spans.entry(symbol_key(&symbol.file_path, &symbol.qualified_name)).or_insert(
-        SymbolSpan {
+    symbol_spans
+        .entry(symbol_key(&symbol.file_path, &symbol.qualified_name))
+        .or_insert(SymbolSpan {
             start_line: symbol.start_line,
             start_col: symbol.start_col,
             end_line: symbol.end_line.max(symbol.start_line),
             end_col: symbol.end_col.max(symbol.start_col),
-        },
-    );
+        });
 }
 
 fn repair_projected_symbol_span_from_source(
@@ -2764,7 +2856,9 @@ standard library package KerML {
         let projection_entry = projection_entry.expect("projection cache entry");
         let main_file = project_dir.join("main.sysml").to_string_lossy().to_string();
         assert!(!projection_entry.is_empty());
-        assert!(projection_entry.iter().any(|element| element.file_path == main_file));
+        assert!(projection_entry
+            .iter()
+            .any(|element| element.file_path == main_file));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3840,6 +3934,19 @@ package ConnectionTest {
 
         assert!(!response.ok);
         assert!(!response.parse_error_categories.is_empty());
+        assert!(!response.file_diagnostics.is_empty());
+        let file_errors = response
+            .files
+            .iter()
+            .flat_map(|file| file.errors.iter())
+            .collect::<Vec<_>>();
+        assert!(!file_errors.is_empty());
+        assert!(file_errors.iter().all(|error| error.line >= 1));
+        assert!(file_errors.iter().all(|error| error.column >= 1));
+        assert!(file_errors
+            .iter()
+            .all(|error| !error.kind.trim().is_empty()));
+        assert!(file_errors.iter().all(|error| error.source == "parse"));
         let total_categorized = response
             .parse_error_categories
             .iter()
@@ -3883,6 +3990,11 @@ package ConnectionTest {
         .expect("compile response");
 
         assert!(!response.unresolved.is_empty());
+        assert!(response
+            .file_diagnostics
+            .iter()
+            .flat_map(|entry| entry.diagnostics.iter())
+            .any(|diagnostic| diagnostic.source == "semantic"));
         assert!(response
             .unresolved
             .iter()

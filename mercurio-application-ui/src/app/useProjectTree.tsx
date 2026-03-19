@@ -1,18 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listDirEntries } from "./fileOps";
+import { isPathWithin } from "./pathUtils";
 import type { FileEntry } from "./types";
-
-function normalizeTreePath(path: string): string {
-  return path.replace(/[\\/]+$/, "").toLowerCase();
-}
-
-function isSameOrChildPath(root: string, candidate: string): boolean {
-  const normalizedRoot = normalizeTreePath(root);
-  const normalizedCandidate = normalizeTreePath(candidate);
-  return normalizedCandidate === normalizedRoot
-    || normalizedCandidate.startsWith(`${normalizedRoot}\\`)
-    || normalizedCandidate.startsWith(`${normalizedRoot}/`);
-}
 
 export function useProjectTree() {
   const [treeEntries, setTreeEntries] = useState<FileEntry[]>([]);
@@ -31,7 +20,7 @@ export function useProjectTree() {
   const refreshRoot = useCallback(async (path: string) => {
     const entries = await listDirEntries(path);
     const previouslyExpanded = Object.keys(expandedRef.current)
-      .filter((entryPath) => isSameOrChildPath(path, entryPath))
+      .filter((entryPath) => isPathWithin(entryPath, path))
       .sort((left, right) => left.length - right.length);
 
     const nextExpanded: Record<string, FileEntry[]> = {};

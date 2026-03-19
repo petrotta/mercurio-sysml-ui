@@ -17,10 +17,19 @@ use crate::workspace_ir_cache::{
 };
 
 #[derive(Serialize, Clone)]
+pub struct CompileDiagnosticView {
+    pub message: String,
+    pub line: usize,
+    pub column: usize,
+    pub kind: String,
+    pub source: String,
+}
+
+#[derive(Serialize, Clone)]
 pub struct CompileFileResult {
     pub path: String,
     pub ok: bool,
-    pub errors: Vec<String>,
+    pub errors: Vec<CompileDiagnosticView>,
     pub symbol_count: usize,
 }
 
@@ -45,8 +54,7 @@ pub(crate) type ProjectSemanticProjectionCache = Arc<Vec<SemanticElementProjecti
 pub(crate) struct ProjectSemanticLookup {
     pub(crate) elements_by_file_qname: HashMap<(String, String), SemanticElementView>,
     pub(crate) best_elements_by_qname: HashMap<String, SemanticElementView>,
-    pub(crate) projections_by_file_qname:
-        HashMap<(String, String), SemanticElementProjectionView>,
+    pub(crate) projections_by_file_qname: HashMap<(String, String), SemanticElementProjectionView>,
     pub(crate) best_projections_by_qname: HashMap<String, SemanticElementProjectionView>,
 }
 

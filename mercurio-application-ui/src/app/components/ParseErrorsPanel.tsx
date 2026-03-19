@@ -1,4 +1,6 @@
+import { formatFileDiagnostic } from "../compileShared";
 import type { CompileToast } from "../useCompileRunner";
+import type { FileDiagnosticView } from "../contracts";
 
 type ParseErrorsPanelProps = {
   compileToast: CompileToast;
@@ -7,7 +9,7 @@ type ParseErrorsPanelProps = {
   normalizePath: (path: string) => string;
   displayNameForPath: (path: string) => string;
   toggleParseErrorFile: (path: string) => void;
-  openParseError: (path: string, message: string) => void;
+  openDiagnostic: (path: string, diagnostic: FileDiagnosticView) => void;
 };
 
 export function ParseErrorsPanel({
@@ -17,9 +19,9 @@ export function ParseErrorsPanel({
   normalizePath,
   displayNameForPath,
   toggleParseErrorFile,
-  openParseError,
+  openDiagnostic,
 }: ParseErrorsPanelProps) {
-  const hasParseErrors = compileToast.parseErrors.length > 0;
+  const hasFileDiagnostics = compileToast.fileDiagnostics.length > 0;
   const hasWorkspaceErrors = workspaceErrors.length > 0;
 
   return (
@@ -36,15 +38,20 @@ export function ParseErrorsPanel({
             ))}
           </div>
         ) : null}
-        {hasParseErrors ? (
+        {hasFileDiagnostics ? (
           <div className="simple-error-section">
-            <div className="simple-error-section-title">Parse Errors ({compileToast.parseErrors.length})</div>
-            {compileToast.parseErrors.slice(0, 30).map((entry) => {
+            <div className="simple-error-section-title">File Diagnostics ({compileToast.fileDiagnostics.length})</div>
+            {compileToast.fileDiagnostics.slice(0, 30).map((entry) => {
               const normalizedPath = normalizePath(entry.path);
               const isCollapsed = !!collapsedParseErrorFiles[normalizedPath];
-              const errors = entry.errors || [];
+              const diagnostics = entry.diagnostics || [];
+              const parseCount = diagnostics.filter((diagnostic) => diagnostic.source === "parse").length;
+              const semanticCount = diagnostics.length - parseCount;
               const errorFile = displayNameForPath(entry.path);
-              const displayPath = `${errorFile} (${errors.length})`;
+              const parts: string[] = [];
+              if (parseCount) parts.push(`${parseCount} parse`);
+              if (semanticCount) parts.push(`${semanticCount} semantic`);
+              const displayPath = `${errorFile} (${parts.join(", ") || diagnostics.length})`;
               return (
                 <div key={entry.path} className="simple-error-group">
                   <div className="simple-error-group-header">
@@ -63,23 +70,25 @@ export function ParseErrorsPanel({
                       type="button"
                       className="ghost simple-error-path"
                       onClick={() => {
-                        const first = errors[0] || "";
-                        openParseError(entry.path, first);
+                        const first = diagnostics[0];
+                        if (first) {
+                          openDiagnostic(entry.path, first);
+                        }
                       }}
                       title={entry.path}
                     >
                       {displayPath}
                     </button>
                   </div>
-                  {!isCollapsed ? errors.map((message, idx) => (
+                  {!isCollapsed ? diagnostics.map((diagnostic, idx) => (
                     <button
                       key={`${entry.path}:${idx}`}
                       type="button"
                       className="ghost simple-error-message"
-                      onClick={() => openParseError(entry.path, message)}
-                      title={message}
+                      onClick={() => openDiagnostic(entry.path, diagnostic)}
+                      title={formatFileDiagnostic(diagnostic)}
                     >
-                      {message}
+                      {formatFileDiagnostic(diagnostic)}
                     </button>
                   )) : null}
                 </div>
@@ -87,8 +96,8 @@ export function ParseErrorsPanel({
             })}
           </div>
         ) : null}
-        {!hasParseErrors && !hasWorkspaceErrors ? (
-          <div className="muted">No parse or workspace errors from latest compile.</div>
+        {!hasFileDiagnostics && !hasWorkspaceErrors ? (
+          <div className="muted">No file or workspace diagnostics from latest compile.</div>
         ) : null}
       </div>
     </div>

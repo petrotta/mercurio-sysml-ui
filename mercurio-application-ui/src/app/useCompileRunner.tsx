@@ -1,5 +1,4 @@
 import { useRef } from "react";
-import { clearSemanticProjectionCache } from "./services/semanticApi";
 import type { UnsavedCompileInput } from "./compileShared";
 import { useBuildNotifications } from "./useBuildNotifications";
 import { useCompileJobController } from "./useCompileJobController";
@@ -37,14 +36,10 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
     sessionTokenRef,
     currentRunIdRef,
     notifications,
-    onCompileSuccess: ({ compileRoot, filePath, response, sessionToken }) => {
-      clearSemanticProjectionCache(compileRoot || undefined);
+    onCompileSuccess: ({ compileRoot, sessionToken }) => {
       symbolRefresh.bumpSemanticRefreshVersion();
-      symbolRefresh.applyCompileResponseSymbols({ filePath, response });
       void symbolRefresh.refreshAfterCompile({
         compileRoot,
-        filePath,
-        response,
         sessionToken,
       });
     },
@@ -60,9 +55,8 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
     cancelCompile: compileJobs.cancelCompile,
     symbols: symbolRefresh.symbols,
     symbolsStatus: symbolRefresh.symbolsStatus,
-    unresolved: compileJobs.unresolved,
     parsedFiles: compileJobs.parsedFiles,
-    parseErrorPaths: compileJobs.parseErrorPaths,
+    fileDiagnosticPaths: compileJobs.fileDiagnosticPaths,
     progressUiUpdates: notifications.progressUiUpdates,
     droppedCompileRequests: compileJobs.droppedCompileRequests,
     buildLogEntries: notifications.buildLogEntries,

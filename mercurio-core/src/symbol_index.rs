@@ -189,7 +189,9 @@ fn build_project_semantic_lookup(
             .map(|current| semantic_element_score(element) > semantic_element_score(current))
             .unwrap_or(true);
         if replace_best_entry {
-            lookup.best_elements_by_qname.insert(qname_key, element.clone());
+            lookup
+                .best_elements_by_qname
+                .insert(qname_key, element.clone());
         }
     }
 
@@ -1184,11 +1186,8 @@ mod tests {
         let project_dir = root.join("project");
         fs::create_dir_all(&project_dir).expect("create project dir");
         let main_file = project_dir.join("main.sysml");
-        fs::write(
-            &main_file,
-            "package P { action def OldAction; }\n",
-        )
-        .expect("write initial project file");
+        fs::write(&main_file, "package P { action def OldAction; }\n")
+            .expect("write initial project file");
         fs::write(
             project_dir.join(".project"),
             "{\"name\":\"projection-refresh\",\"src\":[\"*.sysml\"]}",
@@ -1220,11 +1219,8 @@ mod tests {
         .expect("old projection row");
         assert_eq!(old_row.qualified_name, "P::OldAction");
 
-        fs::write(
-            &main_file,
-            "package P { action def NewAction; }\n",
-        )
-        .expect("write updated project file");
+        fs::write(&main_file, "package P { action def NewAction; }\n")
+            .expect("write updated project file");
         let second_compile = compile_project_delta_sync(
             &state,
             project_root.clone(),
@@ -1255,7 +1251,10 @@ mod tests {
         .expect("query new projection")
         .expect("new projection row");
         assert_eq!(new_row.qualified_name, "P::NewAction");
-        assert!(new_row.features.iter().any(|feature| feature.name == "name"));
+        assert!(new_row
+            .features
+            .iter()
+            .any(|feature| feature.name == "name"));
 
         let cache = state
             .workspace_snapshot_cache
@@ -1419,8 +1418,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("mercurio_root_canonical_{stamp}"));
         let project_dir = root.join("project");
         fs::create_dir_all(&project_dir).expect("create project dir");
-        fs::write(project_dir.join("main.sysml"), "package P { part def A; }\n")
-            .expect("write project file");
+        fs::write(
+            project_dir.join("main.sysml"),
+            "package P { part def A; }\n",
+        )
+        .expect("write project file");
         fs::write(
             project_dir.join(".project"),
             "{\"name\":\"canonical-root\",\"src\":[\"*.sysml\"]}",
@@ -1457,14 +1459,8 @@ mod tests {
         .expect("canonical root query");
         assert!(canonical_rows.iter().any(|row| row.qualified_name == "P"));
 
-        let raw_rows = query_project_symbols(
-            &state,
-            raw_project_root,
-            None,
-            Some(0),
-            Some(10_000),
-        )
-        .expect("raw root query");
+        let raw_rows = query_project_symbols(&state, raw_project_root, None, Some(0), Some(10_000))
+            .expect("raw root query");
         assert!(raw_rows.iter().any(|row| row.qualified_name == "P"));
 
         let _ = fs::remove_dir_all(root);

@@ -1,21 +1,17 @@
 import { CombinedPropertiesPane } from "./CombinedPropertiesPane";
-import type { SemanticElementProjectionResult, SymbolView } from "../types";
+import type { SymbolView } from "../contracts";
 
 type PropertiesPanelProps = {
   rootPath: string;
   selectedSymbol: SymbolView | null;
-  selectedSemanticRow: SemanticElementProjectionResult | null;
-  selectedSemanticLoading: boolean;
-  selectedSemanticError: string;
+  semanticRefreshVersion: number;
   onSelectQualifiedName: (qualifiedName: string) => void;
 };
 
 export function PropertiesPanel({
   rootPath,
   selectedSymbol,
-  selectedSemanticRow,
-  selectedSemanticLoading,
-  selectedSemanticError,
+  semanticRefreshVersion,
   onSelectQualifiedName,
 }: PropertiesPanelProps) {
   return (
@@ -25,9 +21,7 @@ export function PropertiesPanel({
         <CombinedPropertiesPane
           rootPath={rootPath}
           selectedSymbols={selectedSymbol ? [selectedSymbol] : null}
-          selectedSemanticRow={selectedSemanticRow}
-          selectedSemanticLoading={selectedSemanticLoading}
-          selectedSemanticError={selectedSemanticError}
+          semanticRefreshVersion={semanticRefreshVersion}
           onSelectQualifiedName={onSelectQualifiedName}
         />
       </div>

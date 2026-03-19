@@ -17,15 +17,16 @@ pub use project::{
 mod project_root_key;
 mod workspace;
 mod workspace_ir_cache;
+mod workspace_symbols;
 
 mod compile;
 pub use compile::{
     cancel_compile, compile_project_delta_sync, compile_project_delta_sync_with_options,
-    compile_workspace_sync, load_library_symbols_sync, query_semantic_symbols, CompileFileResult,
-    CompileProgressPayload, CompileRequest, CompileResponse, LibrarySymbolsRequest,
-    LibrarySymbolsResponse, ParseErrorCategoryView, PropertyItemView, PropertyValueView,
-    RelationshipView, SymbolView, TypeRefPartView, TypeRefView, UnresolvedRefView, UnsavedFile,
-    UnsavedFileInput,
+    compile_workspace_sync, load_library_symbols_sync, query_semantic_symbols,
+    CompileFileDiagnosticsView, CompileFileResult, CompileProgressPayload, CompileRequest,
+    CompileResponse, LibrarySymbolsRequest, LibrarySymbolsResponse, ParseErrorCategoryView,
+    PropertyItemView, PropertyValueView, RelationshipView, SymbolView, TypeRefPartView,
+    TypeRefView, UnresolvedRefView, UnsavedFile, UnsavedFileInput,
 };
 
 mod settings;
@@ -37,7 +38,7 @@ pub use settings::{
 mod state;
 pub use state::{
     BackgroundCancelSummary, BackgroundJobView, BackgroundJobsSnapshot, CacheClearSummary,
-    CoreState,
+    CompileDiagnosticView, CoreState,
 };
 
 mod stdlib;
@@ -49,17 +50,20 @@ pub use stdlib::{
 mod project_model;
 mod project_model_seed;
 pub use project_model::{
-    evaluate_project_expression, get_project_element_attributes, get_project_expression_records,
-    get_project_expressions_view, get_project_model,
-    ProjectElementAttributesView, ProjectElementInheritedAttributeView,
+    evaluate_project_expression, get_project_element_attributes,
+    get_project_element_property_sections, get_project_expression_records,
+    get_project_expressions_view, get_project_model, ProjectElementAttributesView,
+    ProjectElementInheritedAttributeView, ProjectElementPropertyRowView,
+    ProjectElementPropertySectionView, ProjectElementPropertySectionsView,
     ProjectExpressionRecordView, ProjectExpressionRecordsView, ProjectModelAttributeView,
     ProjectModelElementView, ProjectModelView,
 };
 
 mod symbol_index;
 pub use symbol_index::{
-    query_library_summary, query_library_symbols, query_project_semantic_projection_by_qualified_name,
-    query_project_symbols, query_project_symbols_for_files, query_stdlib_documentation_symbols,
+    query_library_summary, query_library_symbols,
+    query_project_semantic_projection_by_qualified_name, query_project_symbols,
+    query_project_symbols_for_files, query_stdlib_documentation_symbols,
     query_symbol_metatype_mapping, query_symbols_by_metatype, IndexedSemanticElementView,
     IndexedSemanticProjectionElementView, IndexedSymbolView, LibraryIndexSummaryView,
     SymbolMetatypeMappingView,
@@ -70,6 +74,7 @@ pub use mercurio_sysml_semantics::semantic_contract::{
     SemanticQuery, SemanticValueView,
 };
 pub use workspace::query_semantic;
+pub use workspace_symbols::{get_workspace_symbol_snapshot, WorkspaceSymbolSnapshotView};
 
 mod export;
 pub use export::export_model_to_path;

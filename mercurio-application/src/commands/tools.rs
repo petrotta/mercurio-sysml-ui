@@ -7,9 +7,11 @@ use tauri::command;
 use mercurio_core::{
     evaluate_project_expression as core_evaluate_project_expression,
     get_project_element_attributes as core_get_project_element_attributes,
+    get_project_element_property_sections as core_get_project_element_property_sections,
     get_project_expression_records as core_get_project_expression_records,
     get_project_expressions_view as core_get_project_expressions_view,
     get_project_model as core_get_project_model, get_stdlib_metamodel as core_get_stdlib_metamodel,
+    get_workspace_symbol_snapshot as core_get_workspace_symbol_snapshot,
     load_library_symbols_sync as core_load_library_symbols_sync,
     query_library_symbols as core_query_library_symbols,
     query_project_semantic_projection_by_qualified_name as core_query_project_semantic_projection_by_qualified_name,
@@ -253,12 +255,18 @@ fn canonical_tool_name(tool: &str) -> String {
         "load_library_symbols" | "core.load_library_symbols" => {
             "core.load_library_symbols@v1".to_string()
         }
+        "get_workspace_symbol_snapshot" | "core.get_workspace_symbol_snapshot" => {
+            "core.get_workspace_symbol_snapshot@v1".to_string()
+        }
         "query_semantic_element" | "core.query_semantic_element" => {
             "core.query_semantic_element@v2".to_string()
         }
         "get_project_model" | "core.get_project_model" => "core.get_project_model@v1".to_string(),
         "get_project_element_attributes" | "core.get_project_element_attributes" => {
             "core.get_project_element_attributes@v1".to_string()
+        }
+        "get_project_element_property_sections" | "core.get_project_element_property_sections" => {
+            "core.get_project_element_property_sections@v1".to_string()
         }
         "get_project_expressions" | "core.get_project_expressions" => {
             "core.get_project_expressions@v1".to_string()
@@ -403,6 +411,16 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
             .map_err(|e| e.to_string())?
             .and_then(|rows| serde_json::to_value(rows).map_err(|e| e.to_string()))
         }
+        "core.get_workspace_symbol_snapshot@v1" => {
+            let root = arg_string(&args, "root")?;
+            let hydrate_library = arg_bool(&args, "hydrate_library", true);
+            tauri::async_runtime::spawn_blocking(move || {
+                core_get_workspace_symbol_snapshot(&core, root, hydrate_library)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|view| serde_json::to_value(view).map_err(|e| e.to_string()))
+        }
         "core.query_semantic_element@v2" => {
             let root = arg_string(&args, "root")?;
             let qualified_name = arg_string(&args, "qualified_name")?;
@@ -451,7 +469,12 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
             let qualified_name = arg_optional_string(&args, "qualified_name");
             let xtext_export_path = arg_optional_string(&args, "xtext_export_path");
             tauri::async_runtime::spawn_blocking(move || {
-                core_get_project_expressions_view(root, file_path, qualified_name, xtext_export_path)
+                core_get_project_expressions_view(
+                    root,
+                    file_path,
+                    qualified_name,
+                    xtext_export_path,
+                )
             })
             .await
             .map_err(|e| e.to_string())?
@@ -505,6 +528,24 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
             .await
             .map_err(|e| e.to_string())?
             .and_then(|attrs| serde_json::to_value(attrs).map_err(|e| e.to_string()))
+        }
+        "core.get_project_element_property_sections@v1" => {
+            let root = arg_string(&args, "root")?;
+            let element_qualified_name = arg_string(&args, "element_qualified_name")?;
+            let file_path = arg_optional_string(&args, "file_path");
+            let symbol_kind = arg_optional_string(&args, "symbol_kind");
+            tauri::async_runtime::spawn_blocking(move || {
+                core_get_project_element_property_sections(
+                    &core,
+                    root,
+                    element_qualified_name,
+                    file_path,
+                    symbol_kind,
+                )
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|view| serde_json::to_value(view).map_err(|e| e.to_string()))
         }
         "core.get_stdlib_metamodel@v1" => {
             let root = arg_string(&args, "root")?;

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type { MutableRefObject } from "react";
 import type { CompileProgressPayload } from "./compileShared";
+import type { FileDiagnosticsBucket } from "./contracts";
 import {
   APP_LOG_EVENT,
   formatBackendLogTimestamp,
@@ -17,7 +18,7 @@ export type CompileToast = {
   open: boolean;
   ok: boolean | null;
   lines: string[];
-  parseErrors: Array<{ path: string; errors: string[] }>;
+  fileDiagnostics: FileDiagnosticsBucket[];
   workspaceErrors: string[];
   details: string[];
   parsedFiles: string[];
@@ -52,7 +53,7 @@ export function useBuildNotifications({ currentRunIdRef }: UseBuildNotifications
     open: false,
     ok: null,
     lines: [],
-    parseErrors: [],
+    fileDiagnostics: [],
     workspaceErrors: [],
     details: [],
     parsedFiles: [],
@@ -193,7 +194,7 @@ export function useBuildNotifications({ currentRunIdRef }: UseBuildNotifications
       open: false,
       ok: null,
       lines: [],
-      parseErrors: [],
+      fileDiagnostics: [],
       workspaceErrors: [],
       details: [],
       parsedFiles: [],
@@ -242,7 +243,7 @@ export function useBuildNotifications({ currentRunIdRef }: UseBuildNotifications
       open: true,
       ok: null,
       lines: ["starting..."],
-      parseErrors: [],
+      fileDiagnostics: [],
       workspaceErrors: [],
       details: [],
       parsedFiles: [],
@@ -253,13 +254,13 @@ export function useBuildNotifications({ currentRunIdRef }: UseBuildNotifications
   const finishCompile = useCallback(({
     ok,
     filePath,
-    parseErrors,
+    fileDiagnostics,
     details,
     parsedFiles,
   }: {
     ok: boolean;
     filePath?: string;
-    parseErrors: Array<{ path: string; errors: string[] }>;
+    fileDiagnostics: FileDiagnosticsBucket[];
     details: string[];
     parsedFiles: string[];
   }) => {
@@ -272,7 +273,7 @@ export function useBuildNotifications({ currentRunIdRef }: UseBuildNotifications
       ...prev,
       ok,
       open: true,
-      parseErrors,
+      fileDiagnostics,
       workspaceErrors: prev.workspaceErrors,
       details,
       parsedFiles,

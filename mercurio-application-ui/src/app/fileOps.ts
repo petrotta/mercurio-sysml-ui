@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { FileEntry, ParseTreeNodeView } from "./types";
+import type { ParseTreeNodeView } from "./contracts";
+import type { FileEntry } from "./types";
 
 export type ProjectFilesChangedEvent = {
   root: string;

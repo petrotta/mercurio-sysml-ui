@@ -3,13 +3,18 @@ import type { MutableRefObject } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   COMPILE_REQUEST_DEBOUNCE_MS,
-  buildCompileErrorBuckets,
   compileRequestKey,
   normalizePathKey,
-  type CompileResponse,
   type UnsavedCompileInput,
 } from "./compileShared";
-import type { UnresolvedIssue } from "./types";
+import type { CompileResponse, FileDiagnosticsBucket } from "./contracts";
+
+function countSemanticDiagnostics(fileDiagnostics: FileDiagnosticsBucket[]): number {
+  return fileDiagnostics.reduce(
+    (count, bucket) => count + bucket.diagnostics.filter((diagnostic) => diagnostic.source === "semantic").length,
+    0,
+  );
+}
 
 type UseCompileJobControllerOptions = {
   rootPath: string;
@@ -26,7 +31,7 @@ type UseCompileJobControllerOptions = {
     finishCompile: (args: {
       ok: boolean;
       filePath?: string;
-      parseErrors: Array<{ path: string; errors: string[] }>;
+      fileDiagnostics: FileDiagnosticsBucket[];
       details: string[];
       parsedFiles: string[];
     }) => void;
@@ -35,9 +40,7 @@ type UseCompileJobControllerOptions = {
   };
   onCompileSuccess: (args: {
     compileRoot: string;
-    filePath?: string;
     runId: number;
-    response: CompileResponse;
     sessionToken: number;
   }) => void;
 };
@@ -51,9 +54,8 @@ export function useCompileJobController({
 }: UseCompileJobControllerOptions) {
   const [compileRunId, setCompileRunId] = useState<number | null>(null);
   const [droppedCompileRequests, setDroppedCompileRequests] = useState(0);
-  const [unresolved, setUnresolved] = useState<UnresolvedIssue[]>([]);
   const [parsedFiles, setParsedFiles] = useState<string[]>([]);
-  const [parseErrorPaths, setParseErrorPaths] = useState<Set<string>>(new Set());
+  const [fileDiagnosticPaths, setFileDiagnosticPaths] = useState<Set<string>>(new Set());
 
   const runCompileRef = useRef<(filePath?: string, unsavedInputs?: UnsavedCompileInput[]) => Promise<boolean>>(async () => false);
   const pendingCompileRequestRef = useRef<{ filePath?: string; unsavedInputs: UnsavedCompileInput[] } | null>(null);
@@ -71,9 +73,8 @@ export function useCompileJobController({
     currentRunIdRef.current = null;
     setCompileRunId(null);
     setDroppedCompileRequests(0);
-    setUnresolved([]);
     setParsedFiles([]);
-    setParseErrorPaths(new Set());
+    setFileDiagnosticPaths(new Set());
     notifications.resetForRoot(rootPath);
   }, [currentRunIdRef, notifications, rootPath]);
 
@@ -139,7 +140,7 @@ export function useCompileJobController({
           run_id: runId,
           allow_parse_errors: true,
           file: filePath,
-          include_symbols: true,
+          include_symbols: false,
           unsaved,
         },
       });
@@ -147,13 +148,12 @@ export function useCompileJobController({
         return false;
       }
 
-      const nextUnresolved = response?.unresolved || [];
-      setUnresolved(nextUnresolved);
       const nextParsedFiles = response?.parsed_files || [];
       setParsedFiles(nextParsedFiles);
 
-      const parseErrors = buildCompileErrorBuckets(response?.files || [], nextUnresolved);
-      setParseErrorPaths(new Set(parseErrors.map((file) => normalizePathKey(file.path))));
+      const fileDiagnostics = response?.file_diagnostics || [];
+      setFileDiagnosticPaths(new Set(fileDiagnostics.map((file) => normalizePathKey(file.path))));
+      const unresolvedCount = countSemanticDiagnostics(fileDiagnostics);
 
       const details: string[] = [];
       if (typeof response?.parse_duration_ms === "number") {
@@ -178,26 +178,23 @@ export function useCompileJobController({
         details.push(`Warning: ${warning}`);
       }
       details.push(`Unsaved overlays: ${unsaved.length}`);
-      details.push(`Symbols in compile response: ${response?.symbols?.length || 0}`);
-      details.push(`Unresolved: ${nextUnresolved.length}`);
+      details.push(`Unresolved: ${unresolvedCount}`);
 
       const ok = !!response?.ok;
       notifications.finishCompile({
         ok,
         filePath,
-        parseErrors,
+        fileDiagnostics,
         details,
         parsedFiles: nextParsedFiles,
       });
       notifications.appendBuildLogEntries([{
         level: ok ? "info" : "warn",
-        message: `Compile finished (run=${runId}, ok=${ok}, parsed=${nextParsedFiles.length}, unresolved=${nextUnresolved.length}, total=${response?.total_duration_ms ?? 0}ms)`,
+        message: `Compile finished (run=${runId}, ok=${ok}, parsed=${nextParsedFiles.length}, unresolved=${unresolvedCount}, total=${response?.total_duration_ms ?? 0}ms)`,
       }]);
       onCompileSuccess({
         compileRoot,
-        filePath,
         runId,
-        response,
         sessionToken,
       });
       return ok;
@@ -234,9 +231,8 @@ export function useCompileJobController({
     compileRunId,
     runCompile,
     cancelCompile,
-    unresolved,
     parsedFiles,
-    parseErrorPaths,
+    fileDiagnosticPaths,
     droppedCompileRequests,
   };
 }

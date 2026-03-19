@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "generate:core-contracts": "node scripts/generate-core-contracts.mjs",
     "check:semantic-authority": "node scripts/check-semantic-authority.cjs",
     "test:path-utils": "tsc --pretty false --module esnext --target ES2022 --moduleResolution bundler --outDir .tmp-path-tests src/app/pathUtils.ts src/app/pathUtils.spec.ts && node .tmp-path-tests/pathUtils.spec.js && node -e \"require('fs').rmSync('.tmp-path-tests',{recursive:true,force:true})\"",
     "postinstall": "node scripts/copy-monaco.cjs"
