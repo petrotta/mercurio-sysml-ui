@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use tauri::command;
 
 use mercurio_core::{
+    evaluate_project_expression as core_evaluate_project_expression,
     get_project_element_attributes as core_get_project_element_attributes,
     get_project_expression_records as core_get_project_expression_records,
+    get_project_expressions_view as core_get_project_expressions_view,
     get_project_model as core_get_project_model, get_stdlib_metamodel as core_get_stdlib_metamodel,
     load_library_symbols_sync as core_load_library_symbols_sync,
     query_library_symbols as core_query_library_symbols,
@@ -30,6 +32,19 @@ pub struct ToolCallResult {
     pub ok: bool,
     pub result: Option<Value>,
     pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ExpressionEvaluationResult {
+    expression: String,
+    result: String,
+}
+
+#[derive(Serialize)]
+struct ExpressionsToolView {
+    records: Value,
+    diagnostics: Vec<String>,
+    evaluation: Option<ExpressionEvaluationResult>,
 }
 
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -245,8 +260,17 @@ fn canonical_tool_name(tool: &str) -> String {
         "get_project_element_attributes" | "core.get_project_element_attributes" => {
             "core.get_project_element_attributes@v1".to_string()
         }
+        "get_project_expressions" | "core.get_project_expressions" => {
+            "core.get_project_expressions@v1".to_string()
+        }
+        "get_expressions_view" | "core.get_expressions_view" => {
+            "core.get_expressions_view@v1".to_string()
+        }
         "get_stdlib_metamodel" | "core.get_stdlib_metamodel" => {
             "core.get_stdlib_metamodel@v1".to_string()
+        }
+        "evaluate_expression" | "core.evaluate_expression" => {
+            "core.evaluate_expression@v1".to_string()
         }
 
         // Stdlib aliases (unversioned)
@@ -421,6 +445,51 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
                 Ok(value)
             })
         }
+        "core.get_project_expressions@v1" => {
+            let root = arg_string(&args, "root")?;
+            let file_path = arg_optional_string(&args, "file_path");
+            let qualified_name = arg_optional_string(&args, "qualified_name");
+            let xtext_export_path = arg_optional_string(&args, "xtext_export_path");
+            tauri::async_runtime::spawn_blocking(move || {
+                core_get_project_expressions_view(root, file_path, qualified_name, xtext_export_path)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|view| serde_json::to_value(view).map_err(|e| e.to_string()))
+        }
+        "core.get_expressions_view@v1" => {
+            let root = arg_string(&args, "root")?;
+            let expression = arg_optional_string(&args, "expression")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            let file_path = arg_optional_string(&args, "file_path");
+            let qualified_name = arg_optional_string(&args, "qualified_name");
+            let xtext_export_path = arg_optional_string(&args, "xtext_export_path");
+            tauri::async_runtime::spawn_blocking(move || {
+                let view = core_get_project_expressions_view(
+                    root.clone(),
+                    file_path,
+                    qualified_name,
+                    xtext_export_path,
+                )?;
+                let evaluation = if let Some(expression) = expression {
+                    Some(ExpressionEvaluationResult {
+                        result: core_evaluate_project_expression(root, expression.clone())?,
+                        expression,
+                    })
+                } else {
+                    None
+                };
+                serde_json::to_value(ExpressionsToolView {
+                    records: serde_json::to_value(view.records).map_err(|e| e.to_string())?,
+                    diagnostics: view.diagnostics,
+                    evaluation,
+                })
+                .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| e.to_string())?
+        }
         "core.get_project_element_attributes@v1" => {
             let root = arg_string(&args, "root")?;
             let element_qualified_name = arg_string(&args, "element_qualified_name")?;
@@ -443,6 +512,17 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
                 .await
                 .map_err(|e| e.to_string())?
                 .and_then(|model| serde_json::to_value(model).map_err(|e| e.to_string()))
+        }
+        "core.evaluate_expression@v1" => {
+            let root = arg_string(&args, "root")?;
+            let expression = arg_string(&args, "expression")?;
+            tauri::async_runtime::spawn_blocking(move || {
+                let result = core_evaluate_project_expression(root, expression.clone())?;
+                serde_json::to_value(ExpressionEvaluationResult { expression, result })
+                    .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| e.to_string())?
         }
         _ => Err(format!("Unknown tool '{}'", tool)),
     }

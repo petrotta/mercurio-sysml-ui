@@ -16,11 +16,13 @@ use tauri::{
 use zip::ZipArchive;
 
 mod commands;
+mod logging;
 
 use commands::{
     app_exit, call_tool, create_file, list_dir, read_file, show_in_explorer, window_close,
     window_minimize, window_toggle_maximize, write_file,
 };
+use logging::{get_logs, log_event, log_frontend, set_app_handle};
 
 use mercurio_core::{
     cancel_compile as core_cancel_compile,
@@ -156,9 +158,13 @@ async fn compile_project_delta(
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|| "<project>".to_string());
     let unsaved_count = unsaved.len();
-    eprintln!(
-        "[compile] start run_id={} root={} target={} include_symbols={} unsaved={}",
-        run_id, root_for_log, target_for_log, include_symbols, unsaved_count
+    log_event(
+        "INFO",
+        "compile",
+        format!(
+            "start run_id={} root={} target={} include_symbols={} unsaved={}",
+            run_id, root_for_log, target_for_log, include_symbols, unsaved_count
+        ),
     );
     let core = state.core.clone();
     let app_handle = app.clone();
@@ -184,21 +190,29 @@ async fn compile_project_delta(
     .map_err(|e| e.to_string())?;
     match &result {
         Ok(response) => {
-            eprintln!(
-                "[compile] done run_id={} ok={} parse_failed={} parsed_files={} unresolved={} total_ms={} parse_ms={} analysis_ms={} stdlib_ms={}",
-                run_id,
-                response.ok,
-                response.parse_failed,
-                response.parsed_files.len(),
-                response.unresolved.len(),
-                response.total_duration_ms,
-                response.parse_duration_ms,
-                response.analysis_duration_ms,
-                response.stdlib_duration_ms,
+            log_event(
+                "INFO",
+                "compile",
+                format!(
+                    "done run_id={} ok={} parse_failed={} parsed_files={} unresolved={} total_ms={} parse_ms={} analysis_ms={} stdlib_ms={}",
+                    run_id,
+                    response.ok,
+                    response.parse_failed,
+                    response.parsed_files.len(),
+                    response.unresolved.len(),
+                    response.total_duration_ms,
+                    response.parse_duration_ms,
+                    response.analysis_duration_ms,
+                    response.stdlib_duration_ms,
+                ),
             );
         }
         Err(error) => {
-            eprintln!("[compile] error run_id={} error={}", run_id, error);
+            log_event(
+                "ERROR",
+                "compile",
+                format!("error run_id={} error={}", run_id, error),
+            );
         }
     }
     result
@@ -206,7 +220,7 @@ async fn compile_project_delta(
 
 #[tauri::command]
 fn cancel_compile(state: tauri::State<'_, AppState>, run_id: u64) -> Result<(), String> {
-    eprintln!("[compile] cancel requested run_id={}", run_id);
+    log_event("WARN", "compile", format!("cancel requested run_id={}", run_id));
     core_cancel_compile(&state.core, run_id)
 }
 
@@ -222,9 +236,13 @@ fn cancel_background_jobs(
     state: tauri::State<'_, AppState>,
 ) -> Result<BackgroundCancelSummary, String> {
     let summary = state.core.cancel_background_jobs()?;
-    eprintln!(
-        "[jobs] cancel requested active={} cancelable={} compile_cancel_requests={}",
-        summary.active_jobs, summary.cancelable_jobs, summary.compile_cancel_requests
+    log_event(
+        "WARN",
+        "jobs",
+        format!(
+            "cancel requested active={} cancelable={} compile_cancel_requests={}",
+            summary.active_jobs, summary.cancelable_jobs, summary.compile_cancel_requests
+        ),
     );
     Ok(summary)
 }
@@ -235,15 +253,19 @@ fn clear_all_caches(
     root: Option<String>,
 ) -> Result<CacheClearSummary, String> {
     let summary = state.core.clear_runtime_caches_for_root(root.as_deref())?;
-    eprintln!(
-        "[cache] cleared workspace_snapshot={} metamodel={} parsed_files={} mtimes={} canceled={} symbol_index_cleared={} project_ir_deleted={}",
-        summary.workspace_snapshot_entries,
-        summary.metamodel_entries,
-        summary.parsed_file_entries,
-        summary.file_mtime_entries,
-        summary.canceled_compile_entries,
-        summary.symbol_index_cleared,
-        summary.project_ir_cache_deleted,
+    log_event(
+        "INFO",
+        "cache",
+        format!(
+            "cleared workspace_snapshot={} metamodel={} parsed_files={} mtimes={} canceled={} symbol_index_cleared={} project_ir_deleted={}",
+            summary.workspace_snapshot_entries,
+            summary.metamodel_entries,
+            summary.parsed_file_entries,
+            summary.file_mtime_entries,
+            summary.canceled_compile_entries,
+            summary.symbol_index_cleared,
+            summary.project_ir_cache_deleted,
+        ),
     );
     Ok(summary)
 }
@@ -444,7 +466,11 @@ fn restore_main_window_state(state: &AppState, window: &WebviewWindow) -> Result
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let paths = ensure_mercurio_paths().unwrap_or_else(|err| {
-        eprintln!("mercurio: failed to initialize user data dir: {}", err);
+        log_event(
+            "ERROR",
+            "app",
+            format!("failed to initialize user data dir: {}", err),
+        );
         let fallback_root = env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(".mercurio");
@@ -468,7 +494,17 @@ pub fn run() {
             settings_path: paths.settings_path.clone(),
             project_file_watchers: Mutex::new(HashMap::new()),
         })
-        .setup(|app| {
+        .setup(move |app| {
+            set_app_handle(app.handle().clone());
+            log_event(
+                "INFO",
+                "app",
+                format!(
+                    "application starting stdlib_root={} settings_path={}",
+                    paths.stdlib_root.display(),
+                    paths.settings_path.display()
+                ),
+            );
             let state = app.state::<AppState>();
             if let Ok(mut settings) = state.core.settings.lock() {
                 let handle = app.handle();
@@ -478,17 +514,18 @@ pub fn run() {
                     &state.settings_path,
                     &mut settings,
                 ) {
-                    eprintln!("mercurio: stdlib extraction failed: {}", err);
+                    log_event("ERROR", "stdlib", format!("extraction failed: {}", err));
                 }
             }
             if let Some(window) = app.get_webview_window("main") {
                 if let Err(err) = restore_main_window_state(state.inner(), &window) {
-                    eprintln!("mercurio: window state restore failed: {}", err);
+                    log_event("ERROR", "window", format!("state restore failed: {}", err));
                 }
                 if let Err(err) = window.show() {
-                    eprintln!("mercurio: failed to show main window: {}", err);
+                    log_event("ERROR", "window", format!("failed to show main window: {}", err));
                 }
             }
+            log_event("INFO", "app", "startup complete".to_string());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -527,6 +564,13 @@ pub fn run() {
             let clear_caches = MenuItemBuilder::with_id("build.clear_caches", "Clear Caches")
                 .accelerator("Ctrl+Shift+K")
                 .build(app)?;
+            let show_logs = MenuItemBuilder::with_id("view.show_logs", "Show Logs")
+                .accelerator("Ctrl+Alt+L")
+                .build(app)?;
+            let show_expressions =
+                MenuItemBuilder::with_id("view.show_expressions", "Show Expressions")
+                    .accelerator("Ctrl+Alt+E")
+                    .build(app)?;
             let select_stdlib_path =
                 MenuItemBuilder::with_id("settings.select_stdlib_path", "Select Stdlib Path...")
                     .build(app)?;
@@ -555,6 +599,10 @@ pub fn run() {
                 .separator()
                 .item(&clear_caches)
                 .build()?;
+            let view_menu = SubmenuBuilder::new(app, "View")
+                .item(&show_logs)
+                .item(&show_expressions)
+                .build()?;
             let settings_menu = SubmenuBuilder::new(app, "Settings")
                 .item(&select_stdlib_path)
                 .separator()
@@ -568,6 +616,7 @@ pub fn run() {
             MenuBuilder::new(app)
                 .item(&file_menu)
                 .item(&build_menu)
+                .item(&view_menu)
                 .item(&settings_menu)
                 .item(&help_menu)
                 .build()
@@ -580,6 +629,8 @@ pub fn run() {
                 "build.compile_project" => Some("compile-workspace"),
                 "build.compile_file" => Some("compile-file"),
                 "build.clear_caches" => Some("clear-caches"),
+                "view.show_logs" => Some("show-logs"),
+                "view.show_expressions" => Some("show-expressions"),
                 "settings.select_stdlib_path" => Some("select-stdlib-path"),
                 "settings.theme_toggle" => Some("theme-toggle"),
                 "settings.theme_light" => Some("theme-light"),
@@ -611,6 +662,8 @@ pub fn run() {
             stop_project_file_watcher,
             set_project_stdlib_path,
             call_tool,
+            get_logs,
+            log_frontend,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

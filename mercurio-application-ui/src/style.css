@@ -1381,6 +1381,234 @@ body.theme-light .simple-harness {
   border-top-color: #d3dae6;
 }
 
+.simple-tooling {
+  border-top: 1px solid #2d3034;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+  overflow: hidden;
+}
+
+body.theme-light .simple-tooling {
+  border-top-color: #d3dae6;
+}
+
+.simple-tooling-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.simple-tooling-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.simple-tool-tab-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  border: 1px solid #34383f;
+  border-radius: 8px;
+  padding: 2px;
+  background: #1e2227;
+}
+
+body.theme-light .simple-tool-tab-group {
+  border-color: #d7deea;
+  background: #eef3fa;
+}
+
+.simple-tool-tab {
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 6px;
+}
+
+.simple-tool-tab.active,
+.simple-tool-tab-group.active .simple-tool-tab {
+  background: #304355;
+  border-color: #4a83c7;
+  color: #dce8ff;
+}
+
+body.theme-light .simple-tool-tab.active,
+body.theme-light .simple-tool-tab-group.active .simple-tool-tab {
+  background: #dce9fb;
+  border-color: #3f75ba;
+  color: #214d81;
+}
+
+.simple-tool-tab-close {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.simple-tooling-actions {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.simple-tooling-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.simple-log-tool {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow: hidden;
+}
+
+.simple-expression-tool {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 8px;
+  overflow: hidden;
+}
+
+.simple-expression-editor {
+  display: grid;
+  gap: 6px;
+  min-height: 0;
+}
+
+.simple-expression-input {
+  width: 100%;
+  min-height: 96px;
+  resize: vertical;
+  border-radius: 8px;
+  border: 1px solid #34383f;
+  background: #101215;
+  color: inherit;
+  padding: 10px 12px;
+  font: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+body.theme-light .simple-expression-input {
+  background: #ffffff;
+  border-color: #ccd5e2;
+}
+
+.simple-expression-input:focus {
+  outline: 1px solid #5b8def;
+  border-color: #5b8def;
+}
+
+.simple-expression-hint {
+  font-size: 12px;
+}
+
+.simple-expression-results {
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid #2d3034;
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: grid;
+  align-content: start;
+  gap: 10px;
+}
+
+body.theme-light .simple-expression-results {
+  border-color: #d3dae6;
+}
+
+.simple-expression-grid {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  gap: 6px 12px;
+  align-items: start;
+}
+
+.simple-expression-grid > span:last-child,
+.simple-expression-grid > span:nth-child(2n) {
+  min-width: 0;
+  word-break: break-word;
+}
+
+.simple-expression-problems {
+  display: grid;
+  gap: 6px;
+}
+
+.simple-expression-library {
+  display: grid;
+  gap: 8px;
+  min-height: 0;
+}
+
+.simple-expression-library-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.simple-expression-records {
+  display: grid;
+  gap: 6px;
+}
+
+.simple-expression-record {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid #2d3034;
+  border-radius: 8px;
+}
+
+body.theme-light .simple-expression-record {
+  border-color: #d3dae6;
+}
+
+.simple-expression-record-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  font-size: 12px;
+}
+
+.simple-expression-record-text {
+  justify-content: flex-start;
+  text-align: left;
+  padding: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.simple-expression-problem {
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(160, 32, 32, 0.16);
+  border: 1px solid rgba(200, 72, 72, 0.35);
+}
+
+body.theme-light .simple-expression-problem {
+  background: rgba(204, 76, 76, 0.08);
+  border-color: rgba(204, 76, 76, 0.24);
+}
+
 .simple-harness-resizer {
   width: 100%;
   height: 10px;
@@ -1483,6 +1711,22 @@ body.theme-light .simple-harness-bar {
   gap: 6px;
 }
 
+.simple-error-section {
+  display: grid;
+  gap: 6px;
+}
+
+.simple-error-section-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #9aa3ad;
+}
+
+body.theme-light .simple-error-section-title {
+  color: #66788f;
+}
+
 .simple-error-group {
   border: 1px solid #3a3d41;
   border-radius: 6px;
@@ -1539,6 +1783,10 @@ body.theme-light .simple-error-group {
   color: #f48f8f;
   font-family: "Cascadia Mono", "Consolas", monospace;
   font-size: 12px;
+}
+
+.simple-error-static-message {
+  width: 100%;
 }
 
 .simple-modal-backdrop {
@@ -1793,17 +2041,18 @@ body.theme-light .simple-stdlib-active-tag {
   z-index: 40;
   border: 1px solid #3a3d41;
   border-radius: 8px;
-  background: rgba(25, 28, 31, 0.94);
-  backdrop-filter: blur(4px);
+  background: #171a1d;
   display: flex;
   flex-direction: column;
   gap: 4px;
   padding: 8px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.34);
 }
 
 body.theme-light .simple-build-progress-panel {
   border-color: #cfd5df;
-  background: rgba(247, 249, 253, 0.96);
+  background: #f7f9fd;
+  box-shadow: 0 10px 28px rgba(24, 42, 73, 0.12);
 }
 
 .simple-build-progress-header {
@@ -1902,7 +2151,7 @@ body.theme-light .simple-build-progress-file {
 
 .simple-build-progress-row {
   display: grid;
-  grid-template-columns: 76px 46px minmax(0, 1fr);
+  grid-template-columns: 92px 46px 72px minmax(0, 1fr);
   gap: 6px;
   align-items: start;
 }
@@ -1920,8 +2169,19 @@ body.theme-light .simple-build-progress-file {
 }
 
 .simple-build-progress-at,
-.simple-build-progress-level {
+.simple-build-progress-level,
+.simple-build-progress-kind {
   white-space: nowrap;
+}
+
+.simple-build-progress-kind {
+  color: #9aa0a6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+body.theme-light .simple-build-progress-kind {
+  color: #5e6775;
 }
 
 .simple-build-progress-message {

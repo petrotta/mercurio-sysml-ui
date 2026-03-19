@@ -49,7 +49,8 @@ pub use stdlib::{
 mod project_model;
 mod project_model_seed;
 pub use project_model::{
-    get_project_element_attributes, get_project_expression_records, get_project_model,
+    evaluate_project_expression, get_project_element_attributes, get_project_expression_records,
+    get_project_expressions_view, get_project_model,
     ProjectElementAttributesView, ProjectElementInheritedAttributeView,
     ProjectExpressionRecordView, ProjectExpressionRecordsView, ProjectModelAttributeView,
     ProjectModelElementView, ProjectModelView,

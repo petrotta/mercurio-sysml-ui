@@ -2283,6 +2283,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "time",
  "zip 0.6.6",
 ]
 
@@ -2323,6 +2324,9 @@ dependencies = [
  "mercurio-sysml-runtime",
  "mercurio-sysml-semantic-adapter",
  "mercurio-sysml-semantics",
+ "mercurio-sysml-session",
+ "mercurio-sysml-workspace",
+ "mercurio-sysml-xtext",
  "serde",
  "serde_json",
  "walkdir",
@@ -2367,6 +2371,36 @@ dependencies = [
  "serde",
  "serde_json",
  "zip 2.4.2",
+]
+
+[[package]]
+name = "mercurio-sysml-session"
+version = "0.1.0"
+dependencies = [
+ "mercurio-sysml-core",
+ "mercurio-sysml-semantics",
+ "mercurio-sysml-workspace",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "mercurio-sysml-workspace"
+version = "0.1.0"
+dependencies = [
+ "mercurio-sysml-core",
+ "mercurio-sysml-semantics",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "mercurio-sysml-xtext"
+version = "0.1.0"
+dependencies = [
+ "mercurio-sysml-semantics",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

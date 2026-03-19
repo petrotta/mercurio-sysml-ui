@@ -2,6 +2,14 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type { MutableRefObject } from "react";
 import type { CompileProgressPayload } from "./compileShared";
+import {
+  APP_LOG_EVENT,
+  formatBackendLogTimestamp,
+  getBackendLogs,
+  logFrontendEvent,
+  normalizeBackendLogLevel,
+  type BackendLogRecord,
+} from "./services/logger";
 
 const BUILD_LOG_MAX = 240;
 
@@ -10,6 +18,7 @@ export type CompileToast = {
   ok: boolean | null;
   lines: string[];
   parseErrors: Array<{ path: string; errors: string[] }>;
+  workspaceErrors: string[];
   details: string[];
   parsedFiles: string[];
 };
@@ -17,6 +26,8 @@ export type CompileToast = {
 export type BuildLogEntry = {
   id: number;
   at: string;
+  timestampUtc?: string;
+  kind: string;
   level: "info" | "warn" | "error";
   message: string;
 };
@@ -42,6 +53,7 @@ export function useBuildNotifications({ currentRunIdRef }: UseBuildNotifications
     ok: null,
     lines: [],
     parseErrors: [],
+    workspaceErrors: [],
     details: [],
     parsedFiles: [],
   });
@@ -62,33 +74,62 @@ export function useBuildNotifications({ currentRunIdRef }: UseBuildNotifications
   const progressLatestDetailRef = useRef("");
   const progressLineBufferRef = useRef<string[]>([]);
   const buildLogIdRef = useRef(0);
+  const lastSeenBackendLogSeqRef = useRef(0);
   const buildStartedAtRef = useRef<number | null>(null);
   const progressStageRef = useRef("idle");
   const progressFileRef = useRef<string | null>(null);
   const progressLastEventAtRef = useRef<number | null>(null);
   const progressEventCountRef = useRef(0);
 
-  const appendBuildLogEntries = useCallback((
+  const appendLocalBuildLogEntries = useCallback((
     entries: Array<{ level: "info" | "warn" | "error"; message: string }>,
   ) => {
     if (!entries.length) return;
     const stamped = entries.map((entry) => ({
       id: ++buildLogIdRef.current,
-      at: new Date().toLocaleTimeString(),
+      at: formatBackendLogTimestamp(new Date().toISOString()),
+      timestampUtc: new Date().toISOString(),
+      kind: "build",
       level: entry.level,
       message: entry.message,
     }));
     setBuildLogEntries((prev) => [...prev, ...stamped].slice(-BUILD_LOG_MAX));
-    for (const entry of stamped) {
-      if (entry.level === "error") {
-        console.error(`[build][${entry.at}] ${entry.message}`);
-      } else if (entry.level === "warn") {
-        console.warn(`[build][${entry.at}] ${entry.message}`);
-      } else {
-        console.info(`[build][${entry.at}] ${entry.message}`);
-      }
-    }
   }, []);
+
+  const appendBackendLogRecords = useCallback((records: BackendLogRecord[]) => {
+    if (!records.length) return;
+    const fresh = [...records]
+      .filter((record) => Number.isFinite(record.seq) && record.seq > lastSeenBackendLogSeqRef.current)
+      .sort((left, right) => left.seq - right.seq);
+    if (!fresh.length) return;
+    lastSeenBackendLogSeqRef.current = fresh[fresh.length - 1]?.seq ?? lastSeenBackendLogSeqRef.current;
+    setBuildLogEntries((prev) => [
+      ...prev,
+      ...fresh.map((record) => ({
+        id: record.seq,
+        at: formatBackendLogTimestamp(record.timestamp_utc),
+        timestampUtc: record.timestamp_utc,
+        kind: (record.kind || "app").trim() || "app",
+        level: normalizeBackendLogLevel(record.level),
+        message: record.message,
+      })),
+    ].slice(-BUILD_LOG_MAX));
+  }, []);
+
+  const appendBuildLogEntries = useCallback((
+    entries: Array<{ level: "info" | "warn" | "error"; message: string }>,
+  ) => {
+    if (!entries.length) return;
+    for (const entry of entries) {
+      void logFrontendEvent({
+        level: entry.level,
+        kind: "build",
+        message: entry.message,
+      }).catch(() => {
+        appendLocalBuildLogEntries([entry]);
+      });
+    }
+  }, [appendLocalBuildLogEntries]);
 
   const clearBuildLogs = useCallback(() => {
     setBuildLogEntries([]);
@@ -153,6 +194,7 @@ export function useBuildNotifications({ currentRunIdRef }: UseBuildNotifications
       ok: null,
       lines: [],
       parseErrors: [],
+      workspaceErrors: [],
       details: [],
       parsedFiles: [],
     });
@@ -201,6 +243,7 @@ export function useBuildNotifications({ currentRunIdRef }: UseBuildNotifications
       ok: null,
       lines: ["starting..."],
       parseErrors: [],
+      workspaceErrors: [],
       details: [],
       parsedFiles: [],
     });
@@ -230,6 +273,7 @@ export function useBuildNotifications({ currentRunIdRef }: UseBuildNotifications
       ok,
       open: true,
       parseErrors,
+      workspaceErrors: prev.workspaceErrors,
       details,
       parsedFiles,
     }));
@@ -251,6 +295,9 @@ export function useBuildNotifications({ currentRunIdRef }: UseBuildNotifications
       ok: false,
       open: true,
       lines: [...prev.lines, `failed: ${String(error)}`].slice(-8),
+      workspaceErrors: prev.workspaceErrors.includes(String(error))
+        ? prev.workspaceErrors
+        : [...prev.workspaceErrors, String(error)].slice(-12),
     }));
   }, [flushProgressUi]);
 
@@ -269,10 +316,32 @@ export function useBuildNotifications({ currentRunIdRef }: UseBuildNotifications
       open: true,
       ok: false,
       lines: [...prev.lines, text].slice(-8),
+      workspaceErrors: prev.workspaceErrors.includes(text)
+        ? prev.workspaceErrors
+        : [...prev.workspaceErrors, text].slice(-12),
       details: prev.details.includes(text) ? prev.details : [...prev.details, text].slice(-12),
     }));
     appendBuildLogEntries([{ level: "error", message: text }]);
   }, [appendBuildLogEntries]);
+
+  useEffect(() => {
+    let disposed = false;
+    void getBackendLogs()
+      .then((records) => {
+        if (!disposed) {
+          appendBackendLogRecords(records);
+        }
+      })
+      .catch(() => {});
+    const unlistenPromise = listen<BackendLogRecord>(APP_LOG_EVENT, (event) => {
+      if (!event.payload) return;
+      appendBackendLogRecords([event.payload]);
+    });
+    return () => {
+      disposed = true;
+      unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
+    };
+  }, [appendBackendLogRecords]);
 
   useEffect(() => {
     const unlistenPromise = listen<CompileProgressPayload>("compile-progress", (event) => {

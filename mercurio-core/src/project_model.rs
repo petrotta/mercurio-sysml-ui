@@ -1,3 +1,4 @@
+use std::fs;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,6 +23,7 @@ use crate::project_model_seed::seed_symbol_index_if_empty;
 use crate::project_root_key::canonical_project_root;
 use crate::state::{CoreState, WorkspaceSnapshotCacheEntry};
 use crate::stdlib::resolve_stdlib_path;
+use crate::workspace::collect_project_files;
 
 fn resolve_symbol_metatype(
     store: &dyn SymbolIndexStore,
@@ -162,6 +164,46 @@ pub fn get_project_element_attributes(
         expressions,
         diagnostics,
     })
+}
+
+pub fn get_project_expressions_view(
+    root: String,
+    file_path: Option<String>,
+    qualified_name: Option<String>,
+    xtext_export_path: Option<String>,
+) -> Result<ProjectExpressionRecordsView, String> {
+    let root_path = PathBuf::from(&root);
+    if !root_path.exists() {
+        return Err("Root path does not exist".to_string());
+    }
+    mercurio_sysml_pkg::mcp_api::get_project_expressions_view(
+        root_path.as_path(),
+        file_path.as_deref(),
+        qualified_name.as_deref(),
+        xtext_export_path.as_deref(),
+    )
+}
+
+pub fn evaluate_project_expression(root: String, expression: String) -> Result<String, String> {
+    let root_path = PathBuf::from(&root);
+    if !root_path.exists() {
+        return Err("Root path does not exist".to_string());
+    }
+
+    let project_config = load_project_config(&root_path).ok().flatten();
+    let src_patterns = project_config
+        .as_ref()
+        .and_then(|config| config.src.as_deref())
+        .unwrap_or(&[]);
+    let project_files = collect_project_files(&root_path, src_patterns)?;
+    let mut project_sources = Vec::<String>::new();
+    for path in project_files {
+        project_sources.push(
+            fs::read_to_string(&path)
+                .map_err(|error| format!("Failed to read '{}': {}", path.display(), error))?,
+        );
+    }
+    mercurio_sysml_pkg::expression_eval::eval_expression_in_sources(&project_sources, &expression)
 }
 
 fn load_stdlib_metatype_index(

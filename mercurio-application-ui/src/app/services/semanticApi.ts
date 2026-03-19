@@ -3,6 +3,7 @@ import type {
   IndexedSymbolView,
   ProjectModelView,
   ProjectElementAttributesView,
+  ProjectExpressionRecordView,
   SemanticElementProjectionResult,
   SymbolView,
 } from "../types";
@@ -24,6 +25,17 @@ export type LibrarySymbolsLoadResult = {
   stdlib_duration_ms: number;
   stdlib_file_count: number;
   total_duration_ms: number;
+};
+
+export type ExpressionEvaluationResult = {
+  expression: string;
+  result: string;
+};
+
+export type ExpressionsToolView = {
+  records: ProjectExpressionRecordView[];
+  diagnostics: string[];
+  evaluation?: ExpressionEvaluationResult | null;
 };
 
 function semanticElementCacheKey(root: string, qualifiedName: string, filePath?: string | null): string {
@@ -181,4 +193,11 @@ export async function getProjectModel(root: string): Promise<ProjectModelView> {
 
 export async function getDefaultStdlib(): Promise<string | null> {
   return callTool<string | null>("stdlib.get_default@v1", {});
+}
+
+export async function getExpressionsView(root: string, expression?: string | null): Promise<ExpressionsToolView> {
+  return callTool<ExpressionsToolView>("core.get_expressions_view@v1", {
+    root,
+    expression: expression || null,
+  });
 }

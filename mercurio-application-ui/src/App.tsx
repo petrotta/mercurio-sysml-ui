@@ -1,5 +1,5 @@
 import "./style.css";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import MonacoEditor, { loader, type OnMount } from "@monaco-editor/react";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -16,11 +16,16 @@ import {
 } from "./app/fileOps";
 import { useCompileRunner } from "./app/useCompileRunner";
 import { useSemanticSelection } from "./app/useSemanticSelection";
-import { getDefaultStdlib, getProjectModel } from "./app/services/semanticApi";
+import {
+  getDefaultStdlib,
+  getExpressionsView,
+  getProjectModel,
+  type ExpressionEvaluationResult,
+} from "./app/services/semanticApi";
 import { PropertiesPanel } from "./app/components/PropertiesPanel";
 import { ParseErrorsPanel } from "./app/components/ParseErrorsPanel";
 import { parseErrorLocation } from "./app/parseErrors";
-import type { FileEntry, SymbolView } from "./app/types";
+import type { FileEntry, ProjectExpressionRecordView, SymbolView } from "./app/types";
 
 loader.config({ paths: { vs: "/monaco/vs" } });
 
@@ -40,6 +45,8 @@ type HarnessRun = {
   progressUpdates: number;
   at: string;
 };
+
+type ToolTabId = "runs" | "logs" | "expressions";
 
 type SymbolTreeNode = {
   symbol: SymbolView;
@@ -139,7 +146,7 @@ const MAIN_LAYOUT_NON_CONTENT_WIDTH = 32;
 const MAX_RECENT_PROJECTS = 12;
 const RECENT_PROJECT_BROWSE_VALUE = "__browse__";
 const BUILD_PROGRESS_VISIBLE_KEY = "mercurio.simpleUi.buildProgressVisible";
-const HARNESS_COLLAPSED_KEY = "mercurio.simpleUi.harnessCollapsed";
+const EXPRESSIONS_TAB_VISIBLE_KEY = "mercurio.simpleUi.expressionsTabVisible";
 const STDLIB_PATH_OPTIONS_KEY = "mercurio.simpleUi.stdlibPathOptions";
 const PROJECT_FILES_SHOW_BY_FILE_KEY = "mercurio.simpleUi.projectFilesShowByFile";
 const AUTO_BUILD_ACTIVE_FILE_KEY = "mercurio.simpleUi.autoBuildActiveFile";
@@ -595,6 +602,35 @@ function symbolSelection(symbol: SymbolView): TextSelection {
   return { startLine, startCol, endLine, endCol };
 }
 
+const BuildLogList = memo(function BuildLogList({
+  entries,
+}: {
+  entries: Array<{
+    id: number;
+    at: string;
+    timestampUtc?: string;
+    kind: string;
+    level: "info" | "warn" | "error";
+    message: string;
+  }>;
+}) {
+  if (!entries.length) {
+    return <div className="muted">No build events yet.</div>;
+  }
+  return (
+    <>
+      {entries.slice(-120).map((entry) => (
+        <div key={entry.id} className={`simple-build-progress-row ${entry.level}`}>
+          <span className="simple-build-progress-at" title={entry.timestampUtc || entry.at}>{entry.at}</span>
+          <span className="simple-build-progress-level">{entry.level}</span>
+          <span className="simple-build-progress-kind" title={entry.kind}>{entry.kind}</span>
+          <span className="simple-build-progress-message">{entry.message}</span>
+        </div>
+      ))}
+    </>
+  );
+});
+
 export function App() {
   const initialViewportWidth =
     window.innerWidth
@@ -619,9 +655,6 @@ export function App() {
   const [selectedSymbol, setSelectedSymbol] = useState<SymbolView | null>(null);
   const [semanticSelectedQname, setSemanticSelectedQname] = useState("");
   const [harnessRuns, setHarnessRuns] = useState<HarnessRun[]>([]);
-  const [harnessCollapsed, setHarnessCollapsed] = useState<boolean>(() =>
-    window.localStorage?.getItem(HARNESS_COLLAPSED_KEY) === "1",
-  );
   const [backgroundJobs, setBackgroundJobs] = useState<BackgroundJobsSnapshot>({
     total: 0,
     cancelable: 0,
@@ -639,7 +672,7 @@ export function App() {
     window.localStorage?.getItem(PROJECT_FILES_SHOW_BY_FILE_KEY) !== "0",
   );
   const [libraryFilesExpanded, setLibraryFilesExpanded] = useState(true);
-  const [menuOpen, setMenuOpen] = useState<"file" | "build" | "settings" | "help" | null>(null);
+  const [menuOpen, setMenuOpen] = useState<"file" | "build" | "view" | "settings" | "help" | null>(null);
   const [stdlibManagerOpen, setStdlibManagerOpen] = useState(false);
   const [aboutWindowOpen, setAboutWindowOpen] = useState(false);
   const [metamodelSchemaVersion, setMetamodelSchemaVersion] = useState<string | null>(null);
@@ -658,6 +691,23 @@ export function App() {
   const [buildProgressVisible, setBuildProgressVisible] = useState<boolean>(() =>
     window.localStorage?.getItem(BUILD_PROGRESS_VISIBLE_KEY) !== "0",
   );
+  const [expressionsTabVisible, setExpressionsTabVisible] = useState<boolean>(() =>
+    window.localStorage?.getItem(EXPRESSIONS_TAB_VISIBLE_KEY) !== "0",
+  );
+  const [activeToolTab, setActiveToolTab] = useState<ToolTabId>(() => {
+    const logsVisible = window.localStorage?.getItem(BUILD_PROGRESS_VISIBLE_KEY) !== "0";
+    if (logsVisible) return "logs";
+    const expressionsVisible = window.localStorage?.getItem(EXPRESSIONS_TAB_VISIBLE_KEY) !== "0";
+    return expressionsVisible ? "expressions" : "runs";
+  });
+  const [expressionInput, setExpressionInput] = useState("1 + 2 * 3");
+  const [expressionResult, setExpressionResult] = useState<ExpressionEvaluationResult | null>(null);
+  const [expressionPending, setExpressionPending] = useState(false);
+  const [expressionRequestError, setExpressionRequestError] = useState("");
+  const [projectExpressions, setProjectExpressions] = useState<ProjectExpressionRecordView[]>([]);
+  const [projectExpressionsDiagnostics, setProjectExpressionsDiagnostics] = useState<string[]>([]);
+  const [projectExpressionsLoading, setProjectExpressionsLoading] = useState(false);
+  const [projectExpressionsError, setProjectExpressionsError] = useState("");
   const [autoBuildActiveFile, setAutoBuildActiveFile] = useState<boolean>(() =>
     window.localStorage?.getItem(AUTO_BUILD_ACTIVE_FILE_KEY) === "1",
   );
@@ -866,6 +916,17 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   }, [rootPath]);
 
   const effectiveTreeError = treeError || (symbolsStatus === "error" ? symbolIndexError : "");
+  const rightPanelWorkspaceErrors = useMemo(() => {
+    const seen = new Set<string>();
+    const next: string[] = [];
+    for (const message of [effectiveTreeError, ...compileToast.workspaceErrors]) {
+      const text = `${message || ""}`.trim();
+      if (!text || seen.has(text)) continue;
+      seen.add(text);
+      next.push(text);
+    }
+    return next;
+  }, [compileToast.workspaceErrors, effectiveTreeError]);
 
   useEffect(() => {
     return () => {
@@ -893,6 +954,10 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   }, [buildProgressVisible]);
 
   useEffect(() => {
+    window.localStorage?.setItem(EXPRESSIONS_TAB_VISIBLE_KEY, expressionsTabVisible ? "1" : "0");
+  }, [expressionsTabVisible]);
+
+  useEffect(() => {
     window.localStorage?.setItem(AUTO_BUILD_ACTIVE_FILE_KEY, autoBuildActiveFile ? "1" : "0");
   }, [autoBuildActiveFile]);
 
@@ -901,8 +966,49 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   }, [compileRunId]);
 
   useEffect(() => {
-    window.localStorage?.setItem(HARNESS_COLLAPSED_KEY, harnessCollapsed ? "1" : "0");
-  }, [harnessCollapsed]);
+    if (activeToolTab === "logs" && !buildProgressVisible) {
+      setActiveToolTab(expressionsTabVisible ? "expressions" : "runs");
+      return;
+    }
+    if (activeToolTab === "expressions" && !expressionsTabVisible) {
+      setActiveToolTab(buildProgressVisible ? "logs" : "runs");
+    }
+  }, [activeToolTab, buildProgressVisible, expressionsTabVisible]);
+
+  useEffect(() => {
+    if (!rootPath || !expressionsTabVisible) {
+      setProjectExpressions([]);
+      setProjectExpressionsDiagnostics([]);
+      setProjectExpressionsError("");
+      setProjectExpressionsLoading(false);
+      return;
+    }
+    let active = true;
+    setProjectExpressionsLoading(true);
+    setProjectExpressionsError("");
+    void getExpressionsView(rootPath).then(
+      (view) => {
+        if (!active) return;
+        setProjectExpressions(view.records || []);
+        setProjectExpressionsDiagnostics(view.diagnostics || []);
+        setExpressionResult(view.evaluation || null);
+      },
+      (error) => {
+        if (!active) return;
+        setProjectExpressions([]);
+        setProjectExpressionsDiagnostics([]);
+        setProjectExpressionsError(String(error));
+        setExpressionResult(null);
+      },
+    ).finally(() => {
+      if (active) {
+        setProjectExpressionsLoading(false);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [expressionsTabVisible, rootPath]);
 
   useEffect(() => {
     let active = true;
@@ -1686,6 +1792,14 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       case "clear-caches":
         await clearAllCaches();
         return;
+      case "show-logs":
+        setBuildProgressVisible(true);
+        setActiveToolTab("logs");
+        return;
+      case "show-expressions":
+        setExpressionsTabVisible(true);
+        setActiveToolTab("expressions");
+        return;
       case "select-stdlib-path": {
         setStdlibManagerOpen(true);
         return;
@@ -1717,6 +1831,9 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     compileProject,
     compileActiveFile,
     clearAllCaches,
+    setBuildProgressVisible,
+    setExpressionsTabVisible,
+    setActiveToolTab,
     setStdlibManagerOpen,
     setAboutWindowOpen,
     toggleTheme,
@@ -2658,12 +2775,10 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
       }) as CSSProperties,
     [rightPanelSplitRatio],
   );
-  const centerHarnessSizeStyle = useMemo(() => {
-    const collapsedRatio = harnessCollapsed
-      ? Math.min(0.07, centerHarnessSplitRatio)
-      : centerHarnessSplitRatio;
-    return `${Math.round(collapsedRatio * 100)}%`;
-  }, [harnessCollapsed, centerHarnessSplitRatio]);
+  const centerHarnessSizeStyle = useMemo(
+    () => `${Math.round(centerHarnessSplitRatio * 100)}%`,
+    [centerHarnessSplitRatio],
+  );
   const centerLayoutStyle = useMemo(
     () =>
       ({
@@ -2700,7 +2815,8 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
     }
     lines.push("");
     for (const entry of buildLogEntries) {
-      lines.push(`${entry.at}\t${entry.level.toUpperCase()}\t${entry.message}`);
+      const timestamp = entry.timestampUtc || entry.at;
+      lines.push(`${timestamp}\t${entry.level.toUpperCase()}\t${entry.kind}\t${entry.message}`);
     }
     return lines.join("\n");
   }, [
@@ -2722,6 +2838,77 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
       setCompileStatus("Copy failed");
     }
   }, [buildProgressText, setCompileStatus]);
+  const openToolTab = useCallback((tab: ToolTabId) => {
+    if (tab === "logs") {
+      setBuildProgressVisible(true);
+    }
+    if (tab === "expressions") {
+      setExpressionsTabVisible(true);
+    }
+    setActiveToolTab(tab);
+  }, []);
+  const refreshProjectExpressions = useCallback(async () => {
+    if (!rootPath) {
+      setProjectExpressions([]);
+      setProjectExpressionsDiagnostics([]);
+      setProjectExpressionsError("");
+      return;
+    }
+    setProjectExpressionsLoading(true);
+    setProjectExpressionsError("");
+    try {
+      const view = await getExpressionsView(rootPath);
+      setProjectExpressions(view.records || []);
+      setProjectExpressionsDiagnostics(view.diagnostics || []);
+      setExpressionResult(view.evaluation || null);
+      setCompileStatus(`Loaded ${view.records?.length || 0} project expressions`);
+    } catch (error) {
+      const message = String(error);
+      setProjectExpressions([]);
+      setProjectExpressionsDiagnostics([]);
+      setProjectExpressionsError(message);
+      setExpressionResult(null);
+      setCompileStatus(`Project expressions failed: ${message}`);
+    } finally {
+      setProjectExpressionsLoading(false);
+    }
+  }, [rootPath, setCompileStatus]);
+  const evaluateExpressionInput = useCallback(async () => {
+    if (!rootPath) {
+      setExpressionResult(null);
+      setExpressionRequestError("");
+      setCompileStatus("Select a project root first");
+      return;
+    }
+    const source = expressionInput.trim();
+    if (!source) {
+      setExpressionResult(null);
+      setExpressionRequestError("");
+      setCompileStatus("Enter an expression");
+      return;
+    }
+    setExpressionPending(true);
+    setExpressionRequestError("");
+    try {
+      const view = await getExpressionsView(rootPath, source);
+      setProjectExpressions(view.records || []);
+      setProjectExpressionsDiagnostics(view.diagnostics || []);
+      setProjectExpressionsError("");
+      setExpressionResult(view.evaluation || null);
+      setCompileStatus(`Expression result: ${view.evaluation?.result || "-"}`);
+    } catch (error) {
+      const message = String(error);
+      setExpressionRequestError(message);
+      setCompileStatus(`Expression evaluation failed: ${message}`);
+    } finally {
+      setExpressionPending(false);
+    }
+  }, [expressionInput, rootPath, setCompileStatus]);
+  const clearExpressionTool = useCallback(() => {
+    setExpressionInput("");
+    setExpressionResult(null);
+    setExpressionRequestError("");
+  }, []);
 
   const backgroundJobsTitle = useMemo(() => {
     if (!backgroundJobs.jobs.length) {
@@ -2767,9 +2954,17 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
     });
   }, [setCompileStatus]);
 
-  const toggleBuildProgressVisibility = useCallback(() => {
-    setBuildProgressVisible((prev) => !prev);
-  }, []);
+  const closeToolTab = useCallback((tab: ToolTabId) => {
+    if (tab === "logs") {
+      setBuildProgressVisible(false);
+      setActiveToolTab((prev) => (prev === "logs" ? (expressionsTabVisible ? "expressions" : "runs") : prev));
+      return;
+    }
+    if (tab === "expressions") {
+      setExpressionsTabVisible(false);
+      setActiveToolTab((prev) => (prev === "expressions" ? (buildProgressVisible ? "logs" : "runs") : prev));
+    }
+  }, [buildProgressVisible, expressionsTabVisible]);
 
   return (
     <div className="app-shell simple-ui-shell">
@@ -2830,6 +3025,25 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                   </button>
                   <div className="menu-bar-sep" />
                   <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); void runMenuAction("clear-caches"); }}>Clear Caches</button>
+                </div>
+              ) : null}
+            </div>
+            <div className="menu-bar-item">
+              <button
+                type="button"
+                className={`ghost menu-bar-trigger ${menuOpen === "view" ? "active" : ""}`}
+                onClick={() => setMenuOpen((prev) => (prev === "view" ? null : "view"))}
+              >
+                View
+              </button>
+              {menuOpen === "view" ? (
+                <div className="menu-bar-dropdown">
+                  <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); openToolTab("logs"); }}>
+                    {buildProgressVisible ? `${UI_ICON.check} ` : ""}Show Logs
+                  </button>
+                  <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); openToolTab("expressions"); }}>
+                    {expressionsTabVisible ? `${UI_ICON.check} ` : ""}Show Expressions
+                  </button>
                 </div>
               ) : null}
             </div>
@@ -3320,52 +3534,232 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                   className={`simple-harness-resizer ${centerHarnessSplitDragging ? "active" : ""}`}
                   role="separator"
                   aria-orientation="horizontal"
-                  aria-label="Resize build history"
+                  aria-label="Resize tooling area"
                   onPointerDown={handleCenterHarnessResizerPointerDown}
                   onPointerMove={handleCenterHarnessResizerPointerMove}
                   onPointerUp={stopCenterHarnessResizerDrag}
                   onPointerCancel={stopCenterHarnessResizerDrag}
                 />
-                <div className="simple-harness">
-                  <div className="panel-header simple-harness-header">
-                    <button
-                      type="button"
-                      className="ghost simple-harness-toggle"
-                      onClick={() => setHarnessCollapsed((prev) => !prev)}
-                      title={harnessCollapsed ? "Expand harness" : "Collapse harness"}
-                      aria-label={harnessCollapsed ? "Expand build history" : "Collapse build history"}
-                    >
-                      <span className="simple-harness-caret">{harnessCollapsed ? ">" : "v"}</span>
-                      <strong>Build History</strong>
-                    </button>
-                  </div>
-                  {!harnessCollapsed ? (
-                    <div className="simple-harness-runs">
-                      <div className="muted">
-                        avg {Math.round(harnessAvgDuration)} ms | max {Math.round(harnessMaxDuration)} ms | ui updates {progressUiUpdates} | dropped requests {droppedCompileRequests} | budget failures {harnessBudgetFailures}
-                      </div>
-                      {harnessRuns.length ? (
-                        harnessRuns.map((run) => {
-                          const width = `${Math.max(6, Math.round((run.durationMs / harnessMaxDuration) * 100))}%`;
-                          const runOk = run.ok && run.budgetOk;
-                          return (
-                            <div key={run.id} className="simple-harness-row">
-                              <span>{run.at}</span>
-                              <span>{run.kind}</span>
-                              <span className={runOk ? "ok" : "error"}>{runOk ? "ok" : "fail"}</span>
-                              <span>{Math.round(run.durationMs)} ms</span>
-                              <span>{run.progressUpdates} ui</span>
-                              <div className="simple-harness-bar">
-                                <div className={`simple-harness-bar-fill ${runOk ? "ok" : "error"}`} style={{ width }} />
-                              </div>
-                            </div>
-                          );
-                        })
-                      ) : (
-                        <div className="muted">No runs yet.</div>
-                      )}
+                <div className="simple-tooling">
+                  <div className="panel-header simple-tooling-header">
+                    <div className="simple-tooling-tabs" role="tablist" aria-label="Tooling tabs">
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={activeToolTab === "runs"}
+                        className={`ghost simple-tool-tab ${activeToolTab === "runs" ? "active" : ""}`}
+                        onClick={() => setActiveToolTab("runs")}
+                      >
+                        Runs
+                      </button>
+                      {buildProgressVisible ? (
+                        <div className={`simple-tool-tab-group ${activeToolTab === "logs" ? "active" : ""}`}>
+                          <button
+                            type="button"
+                            role="tab"
+                            aria-selected={activeToolTab === "logs"}
+                            className={`ghost simple-tool-tab ${activeToolTab === "logs" ? "active" : ""}`}
+                            onClick={() => openToolTab("logs")}
+                          >
+                            Logs
+                          </button>
+                          <button
+                            type="button"
+                            className="ghost simple-tool-tab-close"
+                            onClick={() => closeToolTab("logs")}
+                            title="Close Logs tab"
+                            aria-label="Close Logs tab"
+                          >
+                            x
+                          </button>
+                        </div>
+                      ) : null}
+                      {expressionsTabVisible ? (
+                        <div className={`simple-tool-tab-group ${activeToolTab === "expressions" ? "active" : ""}`}>
+                          <button
+                            type="button"
+                            role="tab"
+                            aria-selected={activeToolTab === "expressions"}
+                            className={`ghost simple-tool-tab ${activeToolTab === "expressions" ? "active" : ""}`}
+                            onClick={() => openToolTab("expressions")}
+                          >
+                            Expressions
+                          </button>
+                          <button
+                            type="button"
+                            className="ghost simple-tool-tab-close"
+                            onClick={() => closeToolTab("expressions")}
+                            title="Close Expressions tab"
+                            aria-label="Close Expressions tab"
+                          >
+                            x
+                          </button>
+                        </div>
+                      ) : null}
                     </div>
-                  ) : null}
+                    <div className="simple-tooling-actions">
+                      {activeToolTab === "logs" ? (
+                        <>
+                          <button type="button" className="ghost" onClick={() => void copyBuildProgress()}>
+                            Copy Logs
+                          </button>
+                          <button type="button" className="ghost" onClick={clearBuildLogs}>
+                            Clear
+                          </button>
+                        </>
+                      ) : null}
+                      {activeToolTab === "expressions" ? (
+                        <>
+                          <button
+                            type="button"
+                            className="ghost"
+                            onClick={() => void evaluateExpressionInput()}
+                            disabled={expressionPending}
+                          >
+                            {expressionPending ? "Evaluating..." : "Evaluate"}
+                          </button>
+                          <button type="button" className="ghost" onClick={clearExpressionTool} disabled={expressionPending}>
+                            Clear
+                          </button>
+                          <button
+                            type="button"
+                            className="ghost"
+                            onClick={() => void refreshProjectExpressions()}
+                            disabled={projectExpressionsLoading || !rootPath}
+                          >
+                            {projectExpressionsLoading ? "Refreshing..." : "Refresh"}
+                          </button>
+                        </>
+                      ) : null}
+                    </div>
+                  </div>
+                  <div className="simple-tooling-body">
+                    {activeToolTab === "logs" ? (
+                      <div className="simple-log-tool" role="tabpanel" aria-label="Logs tool">
+                        <div className="simple-build-progress-status muted">{compileStatus}</div>
+                        <div className="simple-build-progress-meta muted">
+                          <span>run {buildProgress.runId ?? "-"}</span>
+                          <span>stage {buildProgress.stage}</span>
+                          <span>events {buildProgress.eventCount}</span>
+                          <span>elapsed {formatDurationMs(buildElapsedMs)}</span>
+                          <span>last event {formatDurationMs(buildIdleMs)} ago</span>
+                        </div>
+                        {buildStalledHint ? (
+                          <div className="simple-build-progress-stalled">{buildStalledHint}</div>
+                        ) : null}
+                        {buildProgress.file ? (
+                          <div className="simple-build-progress-file">{buildProgress.file}</div>
+                        ) : null}
+                        <div className="simple-build-progress-list">
+                          <BuildLogList entries={buildLogEntries} />
+                        </div>
+                      </div>
+                    ) : activeToolTab === "expressions" ? (
+                      <div className="simple-expression-tool" role="tabpanel" aria-label="Expressions tool">
+                        <label className="simple-expression-editor">
+                          <span className="muted">Expression</span>
+                          <textarea
+                            className="simple-expression-input"
+                            value={expressionInput}
+                            onChange={(event) => setExpressionInput(event.target.value)}
+                            onKeyDown={(event) => {
+                              if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+                                event.preventDefault();
+                                void evaluateExpressionInput();
+                              }
+                            }}
+                            spellCheck={false}
+                            placeholder="Type an expression like 1 + 2 * 3"
+                          />
+                        </label>
+                        <div className="simple-expression-hint muted">Press Ctrl+Enter to evaluate.</div>
+                        <div className="simple-expression-results">
+                          {expressionRequestError ? (
+                            <div className="error">{expressionRequestError}</div>
+                          ) : null}
+                          {expressionResult ? (
+                            <div className="simple-expression-grid">
+                              <span className="muted">Expression</span>
+                              <span>{expressionResult.expression}</span>
+                              <span className="muted">Result</span>
+                              <span>{expressionResult.result}</span>
+                            </div>
+                          ) : (
+                            <div className="muted">Enter an expression and evaluate it against the current project.</div>
+                          )}
+                          <div className="simple-expression-library">
+                            <div className="simple-expression-library-header">
+                              <strong>Project Expressions</strong>
+                              <span className="muted">{projectExpressions.length} rows</span>
+                            </div>
+                            {projectExpressionsError ? (
+                              <div className="simple-expression-problem error">{projectExpressionsError}</div>
+                            ) : null}
+                            {projectExpressionsDiagnostics.length ? (
+                              <div className="simple-expression-problems">
+                                {projectExpressionsDiagnostics.map((message) => (
+                                  <div key={message} className="muted">{message}</div>
+                                ))}
+                              </div>
+                            ) : null}
+                            {projectExpressions.length ? (
+                              <div className="simple-expression-records">
+                                {projectExpressions.map((record) => (
+                                  <div
+                                    key={`${record.file_path}|${record.owner_qualified_name}|${record.qualified_name}|${record.slot}|${record.expression}`}
+                                    className="simple-expression-record"
+                                  >
+                                    <div className="simple-expression-record-meta">
+                                      <span>{displayNameForPath(record.file_path)}</span>
+                                      <span>{record.owner_qualified_name}</span>
+                                      <span>{record.slot}</span>
+                                      <span>{record.expression_kind}</span>
+                                    </div>
+                                    <button
+                                      type="button"
+                                      className="ghost simple-expression-record-text"
+                                      onClick={() => setExpressionInput(record.expression)}
+                                      title="Use this expression"
+                                    >
+                                      {record.expression}
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : !projectExpressionsLoading && !projectExpressionsError ? (
+                              <div className="muted">No project expressions available.</div>
+                            ) : null}
+                          </div>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="simple-harness-runs" role="tabpanel" aria-label="Runs tool">
+                        <div className="muted">
+                          avg {Math.round(harnessAvgDuration)} ms | max {Math.round(harnessMaxDuration)} ms | ui updates {progressUiUpdates} | dropped requests {droppedCompileRequests} | budget failures {harnessBudgetFailures}
+                        </div>
+                        {harnessRuns.length ? (
+                          harnessRuns.map((run) => {
+                            const width = `${Math.max(6, Math.round((run.durationMs / harnessMaxDuration) * 100))}%`;
+                            const runOk = run.ok && run.budgetOk;
+                            return (
+                              <div key={run.id} className="simple-harness-row">
+                                <span>{run.at}</span>
+                                <span>{run.kind}</span>
+                                <span className={runOk ? "ok" : "error"}>{runOk ? "ok" : "fail"}</span>
+                                <span>{Math.round(run.durationMs)} ms</span>
+                                <span>{run.progressUpdates} ui</span>
+                                <div className="simple-harness-bar">
+                                  <div className={`simple-harness-bar-fill ${runOk ? "ok" : "error"}`} style={{ width }} />
+                                </div>
+                              </div>
+                            );
+                          })
+                        ) : (
+                          <div className="muted">No runs yet.</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </div>
               </>
             ) : null}
@@ -3404,6 +3798,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
           />
           <ParseErrorsPanel
             compileToast={compileToast}
+            workspaceErrors={rightPanelWorkspaceErrors}
             collapsedParseErrorFiles={collapsedParseErrorFiles}
             normalizePath={normalizePath}
             displayNameForPath={displayNameForPath}
@@ -3647,73 +4042,11 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
         </div>
       ) : null}
 
-      {buildProgressVisible ? (
-        <section className="simple-build-progress-panel" aria-label="Build progress panel">
-          <div className="simple-build-progress-header">
-            <strong>Build Progress</strong>
-            <span className={`simple-build-progress-state ${compileRunId ? "running" : "idle"} ${buildStalled ? "stalled" : ""}`}>
-              {buildStalled ? "stalled" : (compileRunId ? "running" : "idle")}
-            </span>
-            <button
-              type="button"
-              className="ghost"
-              onClick={toggleBuildProgressVisibility}
-              title="Hide Build Progress"
-              aria-label="Hide Build Progress"
-            >
-              -
-            </button>
-            <button type="button" className="ghost" onClick={() => void copyBuildProgress()}>
-              Copy Logs
-            </button>
-            <button type="button" className="ghost" onClick={clearBuildLogs}>
-              Clear
-            </button>
-          </div>
-          <div className="simple-build-progress-status muted">{compileStatus}</div>
-          <div className="simple-build-progress-meta muted">
-            <span>run {buildProgress.runId ?? "-"}</span>
-            <span>stage {buildProgress.stage}</span>
-            <span>events {buildProgress.eventCount}</span>
-            <span>elapsed {formatDurationMs(buildElapsedMs)}</span>
-            <span>last event {formatDurationMs(buildIdleMs)} ago</span>
-          </div>
-          {buildStalledHint ? (
-            <div className="simple-build-progress-stalled">{buildStalledHint}</div>
-          ) : null}
-          {buildProgress.file ? (
-            <div className="simple-build-progress-file">{buildProgress.file}</div>
-          ) : null}
-          <div className="simple-build-progress-list">
-            {buildLogEntries.length ? (
-              buildLogEntries.slice(-120).map((entry) => (
-                <div key={entry.id} className={`simple-build-progress-row ${entry.level}`}>
-                  <span className="simple-build-progress-at">{entry.at}</span>
-                  <span className="simple-build-progress-level">{entry.level}</span>
-                  <span className="simple-build-progress-message">{entry.message}</span>
-                </div>
-              ))
-            ) : (
-              <div className="muted">No build events yet.</div>
-            )}
-          </div>
-        </section>
-      ) : null}
-
       <footer className="statusbar">
         <div className="status-left">
           <span>Root: {rootPath || "<none>"}</span>
         </div>
         <div className="status-right">
-          <button
-            type="button"
-            className={`ghost status-build-progress-toggle ${buildProgressVisible ? "active" : ""}`}
-            onClick={toggleBuildProgressVisibility}
-            title={buildProgressVisible ? "Hide Build Progress" : "Show Build Progress"}
-            aria-label={buildProgressVisible ? "Hide Build Progress" : "Show Build Progress"}
-          >
-            BP
-          </button>
           <button
             type="button"
             className={`ghost status-build-progress-toggle ${backgroundJobs.cancelable ? "active" : ""}`}
