@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -50,6 +51,7 @@ pub trait SymbolIndexStore {
         qualified_name: &str,
         symbol_kind: Option<&str>,
     ) -> Option<SymbolRecord>;
+    fn has_project_symbols(&self, project_root: &str) -> bool;
     fn stdlib_documentation_symbols(&self, library_key: &str) -> Vec<SymbolRecord>;
     fn library_summary(&self, project_root: &str) -> (usize, usize, Vec<(String, usize)>);
     fn is_stdlib_index_fresh(&self, project_root: &str, library_key: &str, signature: &str)
@@ -186,6 +188,12 @@ impl SymbolIndexStore for SymbolIndex {
         }
     }
 
+    fn has_project_symbols(&self, project_root: &str) -> bool {
+        match self {
+            SymbolIndex::InMemory(store) => store.has_project_symbols(project_root),
+        }
+    }
+
     fn rebuild_symbol_mappings(&mut self, project_root: &str) {
         match self {
             SymbolIndex::InMemory(store) => store.rebuild_symbol_mappings(project_root),
@@ -209,6 +217,8 @@ impl SymbolIndexStore for SymbolIndex {
 #[derive(Default)]
 pub struct InMemorySymbolIndex {
     by_project_file: HashMap<(String, String), Vec<SymbolRecord>>,
+    project_symbols_cache: RefCell<HashMap<String, Vec<SymbolRecord>>>,
+    library_symbols_cache: RefCell<HashMap<String, Vec<SymbolRecord>>>,
     stdlib_freshness: HashMap<(String, String), String>,
     mappings_by_symbol: HashMap<(String, String), SymbolMetatypeMappingRecord>,
 }
@@ -220,17 +230,33 @@ impl SymbolIndexStore for InMemorySymbolIndex {
         file_path: &str,
         symbols: Vec<SymbolRecord>,
     ) {
+        let normalized_root = normalized_root_key(project_root);
         self.by_project_file
-            .insert((normalized_root_key(project_root), file_path.to_string()), symbols);
+            .insert((normalized_root.clone(), file_path.to_string()), symbols);
+        self.project_symbols_cache
+            .borrow_mut()
+            .remove(&normalized_root);
+        self.library_symbols_cache
+            .borrow_mut()
+            .remove(&normalized_root);
     }
 
     fn delete_symbols_for_file(&mut self, project_root: &str, file_path: &str) {
+        let normalized_root = normalized_root_key(project_root);
         self.by_project_file
-            .remove(&(normalized_root_key(project_root), file_path.to_string()));
+            .remove(&(normalized_root.clone(), file_path.to_string()));
+        self.project_symbols_cache
+            .borrow_mut()
+            .remove(&normalized_root);
+        self.library_symbols_cache
+            .borrow_mut()
+            .remove(&normalized_root);
     }
 
     fn clear_all(&mut self) {
         self.by_project_file.clear();
+        self.project_symbols_cache.borrow_mut().clear();
+        self.library_symbols_cache.borrow_mut().clear();
         self.stdlib_freshness.clear();
         self.mappings_by_symbol.clear();
     }
@@ -268,29 +294,62 @@ impl SymbolIndexStore for InMemorySymbolIndex {
         offset: usize,
         limit: usize,
     ) -> Vec<SymbolRecord> {
-        let mut out = Vec::new();
         let project_root = normalized_root_key(project_root);
-        for ((root, file), items) in &self.by_project_file {
-            if root != &project_root {
-                continue;
-            }
-            if let Some(target) = file_path {
+        let cached_library_symbols = if file_path.is_none() {
+            self.library_symbols_cache
+                .borrow()
+                .get(&project_root)
+                .cloned()
+        } else {
+            None
+        };
+        let out = if let Some(target) = file_path {
+            let mut out = Vec::new();
+            for ((root, file), items) in &self.by_project_file {
+                if root != &project_root {
+                    continue;
+                }
                 if normalized_path_key(file) != normalized_path_key(target) {
                     continue;
                 }
-            }
-            for symbol in items {
-                if symbol.scope == Scope::Stdlib {
-                    out.push(symbol.clone());
+                for symbol in items {
+                    if symbol.scope == Scope::Stdlib {
+                        out.push(symbol.clone());
+                    }
                 }
             }
-        }
-        out.sort_by(|a, b| {
-            a.file_path
-                .cmp(&b.file_path)
-                .then(a.start_line.cmp(&b.start_line))
-                .then(a.start_col.cmp(&b.start_col))
-        });
+            out.sort_by(|a, b| {
+                a.file_path
+                    .cmp(&b.file_path)
+                    .then(a.start_line.cmp(&b.start_line))
+                    .then(a.start_col.cmp(&b.start_col))
+            });
+            out
+        } else if let Some(cached) = cached_library_symbols {
+            cached
+        } else {
+            let mut out = Vec::new();
+            for ((root, _), items) in &self.by_project_file {
+                if root != &project_root {
+                    continue;
+                }
+                for symbol in items {
+                    if symbol.scope == Scope::Stdlib {
+                        out.push(symbol.clone());
+                    }
+                }
+            }
+            out.sort_by(|a, b| {
+                a.file_path
+                    .cmp(&b.file_path)
+                    .then(a.start_line.cmp(&b.start_line))
+                    .then(a.start_col.cmp(&b.start_col))
+            });
+            self.library_symbols_cache
+                .borrow_mut()
+                .insert(project_root.clone(), out.clone());
+            out
+        };
         if offset >= out.len() {
             return Vec::new();
         }
@@ -330,29 +389,62 @@ impl SymbolIndexStore for InMemorySymbolIndex {
         offset: usize,
         limit: usize,
     ) -> Vec<SymbolRecord> {
-        let mut out = Vec::new();
         let project_root = normalized_root_key(project_root);
-        for ((root, file), items) in &self.by_project_file {
-            if root != &project_root {
-                continue;
-            }
-            if let Some(target) = file_path {
+        let cached_project_symbols = if file_path.is_none() {
+            self.project_symbols_cache
+                .borrow()
+                .get(&project_root)
+                .cloned()
+        } else {
+            None
+        };
+        let out = if let Some(target) = file_path {
+            let mut out = Vec::new();
+            for ((root, file), items) in &self.by_project_file {
+                if root != &project_root {
+                    continue;
+                }
                 if normalized_path_key(file) != normalized_path_key(target) {
                     continue;
                 }
-            }
-            for symbol in items {
-                if symbol.scope == Scope::Project {
-                    out.push(symbol.clone());
+                for symbol in items {
+                    if symbol.scope == Scope::Project {
+                        out.push(symbol.clone());
+                    }
                 }
             }
-        }
-        out.sort_by(|a, b| {
-            a.file_path
-                .cmp(&b.file_path)
-                .then(a.start_line.cmp(&b.start_line))
-                .then(a.start_col.cmp(&b.start_col))
-        });
+            out.sort_by(|a, b| {
+                a.file_path
+                    .cmp(&b.file_path)
+                    .then(a.start_line.cmp(&b.start_line))
+                    .then(a.start_col.cmp(&b.start_col))
+            });
+            out
+        } else if let Some(cached) = cached_project_symbols {
+            cached
+        } else {
+            let mut out = Vec::new();
+            for ((root, _), items) in &self.by_project_file {
+                if root != &project_root {
+                    continue;
+                }
+                for symbol in items {
+                    if symbol.scope == Scope::Project {
+                        out.push(symbol.clone());
+                    }
+                }
+            }
+            out.sort_by(|a, b| {
+                a.file_path
+                    .cmp(&b.file_path)
+                    .then(a.start_line.cmp(&b.start_line))
+                    .then(a.start_col.cmp(&b.start_col))
+            });
+            self.project_symbols_cache
+                .borrow_mut()
+                .insert(project_root.clone(), out.clone());
+            out
+        };
         if offset >= out.len() {
             return Vec::new();
         }
@@ -386,6 +478,16 @@ impl SymbolIndexStore for InMemorySymbolIndex {
                 .then(a.start_col.cmp(&b.start_col))
         });
         out.into_iter().next()
+    }
+
+    fn has_project_symbols(&self, project_root: &str) -> bool {
+        let project_root = normalized_root_key(project_root);
+        if let Some(cached) = self.project_symbols_cache.borrow().get(&project_root) {
+            return !cached.is_empty();
+        }
+        self.by_project_file.iter().any(|((root, _), items)| {
+            root == &project_root && items.iter().any(|symbol| symbol.scope == Scope::Project)
+        })
     }
 
     fn library_summary(&self, project_root: &str) -> (usize, usize, Vec<(String, usize)>) {
@@ -432,7 +534,8 @@ impl SymbolIndexStore for InMemorySymbolIndex {
 
     fn rebuild_symbol_mappings(&mut self, project_root: &str) {
         let project_root = normalized_root_key(project_root);
-        self.mappings_by_symbol.retain(|(root, _), _| root != &project_root);
+        self.mappings_by_symbol
+            .retain(|(root, _), _| root != &project_root);
 
         let mut stdlib_by_qname = HashMap::<String, String>::new();
         let mut project_symbols = Vec::<SymbolRecord>::new();
@@ -504,7 +607,9 @@ impl SymbolIndexStore for InMemorySymbolIndex {
                 symbol.scope == Scope::Project
                     && symbol.qualified_name == symbol_qualified_name
                     && file_path
-                        .map(|path| normalized_path_key(&symbol.file_path) == normalized_path_key(path))
+                        .map(|path| {
+                            normalized_path_key(&symbol.file_path) == normalized_path_key(path)
+                        })
                         .unwrap_or(true)
             })
             .collect::<Vec<_>>();
@@ -696,5 +801,95 @@ mod tests {
         assert_eq!(mapping.mapping_source, "unresolved");
         assert!(mapping.target_symbol_id.is_none());
         assert_eq!(mapping.resolved_metatype_qname.as_deref(), Some("Action"));
+    }
+
+    #[test]
+    fn root_symbol_caches_populate_and_invalidate_on_mutation() {
+        let mut store = InMemorySymbolIndex::default();
+        let root_key = normalized_root_key("p1");
+
+        store.upsert_symbols_for_file(
+            "p1",
+            "Kernel.kerml",
+            vec![symbol(
+                "m1",
+                "p1",
+                Some("stdlib@1"),
+                Scope::Stdlib,
+                "Metaclass",
+                None,
+                "Kernel.kerml",
+            )],
+        );
+        store.upsert_symbols_for_file(
+            "p1",
+            "a.sysml",
+            vec![symbol(
+                "a1",
+                "p1",
+                None,
+                Scope::Project,
+                "ActionDef",
+                Some("m1"),
+                "a.sysml",
+            )],
+        );
+
+        assert!(!store.project_symbols_cache.borrow().contains_key(&root_key));
+        assert!(!store.library_symbols_cache.borrow().contains_key(&root_key));
+
+        let initial_project = store.project_symbols("p1", None);
+        let initial_library = store.library_symbols("p1", None);
+        assert_eq!(initial_project.len(), 1);
+        assert_eq!(initial_library.len(), 1);
+        assert!(store.project_symbols_cache.borrow().contains_key(&root_key));
+        assert!(store.library_symbols_cache.borrow().contains_key(&root_key));
+
+        store.upsert_symbols_for_file(
+            "p1",
+            "b.sysml",
+            vec![
+                symbol(
+                    "a2",
+                    "p1",
+                    None,
+                    Scope::Project,
+                    "ActionDef",
+                    Some("m1"),
+                    "b.sysml",
+                ),
+                symbol(
+                    "d1",
+                    "p1",
+                    Some("stdlib@1"),
+                    Scope::Stdlib,
+                    "Documentation",
+                    None,
+                    "Docs.kerml",
+                ),
+            ],
+        );
+
+        assert!(!store.project_symbols_cache.borrow().contains_key(&root_key));
+        assert!(!store.library_symbols_cache.borrow().contains_key(&root_key));
+
+        let updated_project = store.project_symbols("p1", None);
+        let updated_library = store.library_symbols("p1", None);
+        assert_eq!(updated_project.len(), 2);
+        assert_eq!(updated_library.len(), 2);
+        assert!(store.project_symbols_cache.borrow().contains_key(&root_key));
+        assert!(store.library_symbols_cache.borrow().contains_key(&root_key));
+
+        store.delete_symbols_for_file("p1", "b.sysml");
+
+        assert!(!store.project_symbols_cache.borrow().contains_key(&root_key));
+        assert!(!store.library_symbols_cache.borrow().contains_key(&root_key));
+
+        let deleted_project = store.project_symbols("p1", None);
+        let deleted_library = store.library_symbols("p1", None);
+        assert_eq!(deleted_project.len(), 1);
+        assert_eq!(deleted_library.len(), 1);
+        assert!(store.project_symbols_cache.borrow().contains_key(&root_key));
+        assert!(store.library_symbols_cache.borrow().contains_key(&root_key));
     }
 }

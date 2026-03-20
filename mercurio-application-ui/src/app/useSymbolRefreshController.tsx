@@ -4,7 +4,7 @@ import {
   indexedToSymbol,
   type SymbolsStatus,
 } from "./compileShared";
-import type { SymbolView } from "./contracts";
+import type { SymbolView, WorkspaceSymbolSnapshotResult } from "./contracts";
 import { getWorkspaceSymbolSnapshot } from "./services/semanticApi";
 
 type UseSymbolRefreshControllerOptions = {
@@ -34,21 +34,59 @@ export function useSymbolRefreshController({
     [projectSemanticSymbols, librarySemanticSymbols],
   );
 
+  const resetWorkspaceSymbols = useCallback(() => {
+    setProjectSemanticSymbols([]);
+    setLibrarySemanticSymbols([]);
+    setActiveLibraryPath("");
+    setSymbolIndexError("");
+    setSymbolsStatus("idle");
+  }, []);
+
+  const applyWorkspaceSnapshot = useCallback(({
+    snapshot,
+    sessionToken,
+    reason,
+  }: {
+    snapshot: Pick<WorkspaceSymbolSnapshotResult, "project_symbols" | "library_symbols" | "library_path" | "diagnostics">;
+    sessionToken: number;
+    reason: "startup-cache" | "startup-reconcile" | "post-compile";
+  }): boolean => {
+    if (sessionTokenRef.current !== sessionToken) return false;
+    const nextProjectSymbols = (snapshot?.project_symbols || []).map((symbol) => indexedToSymbol(symbol));
+    const nextLibrarySymbols = (snapshot?.library_symbols || []).map((symbol) => indexedToSymbol(symbol));
+    setProjectSemanticSymbols(nextProjectSymbols);
+    setLibrarySemanticSymbols(nextLibrarySymbols);
+    setActiveLibraryPath((snapshot?.library_path || "").trim());
+    setSymbolIndexError("");
+    setSymbolsStatus("ready");
+    const diagnostics = snapshot?.diagnostics || [];
+    if (diagnostics.length) {
+      appendBuildLogEntries(diagnostics.map((message) => ({
+        level: "warn" as const,
+        message,
+      })));
+    }
+    appendBuildLogEntries([{
+      level: "info",
+      message: `Workspace symbol snapshot complete (${reason}, project=${nextProjectSymbols.length}, library=${nextLibrarySymbols.length})`,
+    }]);
+    setSemanticRefreshVersion((prev) => prev + 1);
+    return true;
+  }, [appendBuildLogEntries, sessionTokenRef]);
+
   const loadWorkspaceSymbols = useCallback(async ({
     path,
     sessionToken,
     reason,
+    hydrateLibrary,
   }: {
     path: string;
     sessionToken: number;
-    reason: "startup" | "post-compile";
+    reason: "startup-cache" | "startup-reconcile" | "post-compile";
+    hydrateLibrary: boolean;
   }): Promise<boolean> => {
     if (!path) {
-      setProjectSemanticSymbols([]);
-      setLibrarySemanticSymbols([]);
-      setActiveLibraryPath("");
-      setSymbolsStatus("idle");
-      setSymbolIndexError("");
+      resetWorkspaceSymbols();
       return true;
     }
 
@@ -60,28 +98,17 @@ export function useSymbolRefreshController({
     }]);
 
     try {
-      const snapshot = await getWorkspaceSymbolSnapshot(path, true);
+      const snapshot = await getWorkspaceSymbolSnapshot(path, hydrateLibrary);
       if (!isCurrentSession()) return false;
-
-      const nextProjectSymbols = (snapshot?.project_symbols || []).map((symbol) => indexedToSymbol(symbol));
-      const nextLibrarySymbols = (snapshot?.library_symbols || []).map((symbol) => indexedToSymbol(symbol));
-
-      setProjectSemanticSymbols(nextProjectSymbols);
-      setLibrarySemanticSymbols(nextLibrarySymbols);
-      setActiveLibraryPath((snapshot?.library_path || "").trim());
-      setSymbolIndexError("");
-      setSymbolsStatus("ready");
-
-      const diagnostics = snapshot?.diagnostics || [];
-      if (diagnostics.length) {
-        appendBuildLogEntries(diagnostics.map((message) => ({
-          level: "warn" as const,
-          message,
-        })));
-      }
+      const applied = applyWorkspaceSnapshot({
+        snapshot,
+        sessionToken,
+        reason,
+      });
+      if (!applied) return false;
       appendBuildLogEntries([{
         level: "info",
-        message: `Workspace symbol snapshot complete (project=${nextProjectSymbols.length}, library=${nextLibrarySymbols.length}, hydrated=${snapshot?.library_hydrated ? "yes" : "no"})`,
+        message: `Workspace symbol hydration source=${snapshot?.library_hydrated ? "live" : "cached-or-indexed"}`,
       }]);
       return true;
     } catch (error) {
@@ -93,11 +120,45 @@ export function useSymbolRefreshController({
       appendBuildLogEntries([{ level: "error", message }]);
       return false;
     }
-  }, [appendBuildLogEntries, sessionTokenRef, showErrorNotification]);
+  }, [appendBuildLogEntries, applyWorkspaceSnapshot, resetWorkspaceSymbols, sessionTokenRef, showErrorNotification]);
 
   const bumpSemanticRefreshVersion = useCallback(() => {
     setSemanticRefreshVersion((prev) => prev + 1);
   }, []);
+
+  const loadStartupSymbols = useCallback(async ({
+    path,
+    sessionToken,
+  }: {
+    path: string;
+    sessionToken: number;
+  }) => {
+    await loadWorkspaceSymbols({
+      path,
+      sessionToken,
+      reason: "startup-cache",
+      hydrateLibrary: false,
+    });
+  }, [loadWorkspaceSymbols]);
+
+  const refreshWorkspaceSymbols = useCallback(async ({
+    compileRoot,
+    sessionToken,
+    reason,
+    hydrateLibrary,
+  }: {
+    compileRoot: string;
+    sessionToken: number;
+    reason: "startup-reconcile" | "post-compile";
+    hydrateLibrary?: boolean;
+  }) => {
+    await loadWorkspaceSymbols({
+      path: compileRoot,
+      sessionToken,
+      reason,
+      hydrateLibrary: hydrateLibrary ?? true,
+    });
+  }, [loadWorkspaceSymbols]);
 
   const refreshAfterCompile = useCallback(async ({
     compileRoot,
@@ -106,43 +167,18 @@ export function useSymbolRefreshController({
     compileRoot: string;
     sessionToken: number;
   }) => {
-    await loadWorkspaceSymbols({
-      path: compileRoot,
+    await refreshWorkspaceSymbols({
+      compileRoot,
       sessionToken,
       reason: "post-compile",
+      hydrateLibrary: true,
     });
-  }, [loadWorkspaceSymbols]);
+  }, [refreshWorkspaceSymbols]);
 
   useEffect(() => {
-    const sessionToken = sessionTokenRef.current;
-    let active = true;
-    setProjectSemanticSymbols([]);
-    setLibrarySemanticSymbols([]);
-    setSymbolIndexError("");
-    setActiveLibraryPath("");
-    if (!rootPath) {
-      setSymbolsStatus("idle");
-      return () => {
-        active = false;
-      };
-    }
-
-    void (async () => {
-      const loaded = await loadWorkspaceSymbols({
-        path: rootPath,
-        sessionToken,
-        reason: "startup",
-      });
-      if (!active || sessionTokenRef.current !== sessionToken) return;
-      if (!loaded && symbolsStatus !== "error") {
-        setSymbolsStatus("error");
-      }
-    })();
-
-    return () => {
-      active = false;
-    };
-  }, [loadWorkspaceSymbols, rootPath, sessionTokenRef]);
+    if (rootPath) return;
+    resetWorkspaceSymbols();
+  }, [resetWorkspaceSymbols, rootPath]);
 
   return {
     symbols,
@@ -150,7 +186,11 @@ export function useSymbolRefreshController({
     symbolIndexError,
     activeLibraryPath,
     semanticRefreshVersion,
+    applyWorkspaceSnapshot,
+    resetWorkspaceSymbols,
+    loadStartupSymbols,
     bumpSemanticRefreshVersion,
+    refreshWorkspaceSymbols,
     refreshAfterCompile,
   };
 }

@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::project_model_seed::seed_symbol_index_if_empty;
-use crate::project_root_key::canonical_project_root;
+use crate::project_root_key::{canonical_project_root, normalize_display_path};
 use crate::state::{ProjectSemanticLookup, WorkspaceSnapshotCacheEntry};
 use crate::workspace_ir_cache::seed_semantic_projection_cache_from_workspace_ir_cache;
 use crate::CoreState;
@@ -70,6 +70,7 @@ pub struct IndexedSemanticProjectionElementView {
 }
 
 fn to_view(record: SymbolRecord) -> IndexedSymbolView {
+    let file_path = normalize_symbol_display_path(&record);
     IndexedSymbolView {
         id: record.id,
         project_root: record.project_root,
@@ -83,13 +84,29 @@ fn to_view(record: SymbolRecord) -> IndexedSymbolView {
         parent_qualified_name: record.parent_qualified_name,
         kind: record.kind,
         metatype_qname: record.metatype_qname,
-        file_path: record.file_path,
+        file_path,
         start_line: record.start_line,
         start_col: record.start_col,
         end_line: record.end_line,
         end_col: record.end_col,
         doc_text: record.doc_text,
     }
+}
+
+fn normalize_symbol_display_path(record: &SymbolRecord) -> String {
+    let file_path = record.file_path.trim();
+    if file_path.is_empty() {
+        return String::new();
+    }
+    let path = Path::new(file_path);
+    if path.is_absolute() {
+        return normalize_display_path(file_path);
+    }
+    if record.scope == mercurio_symbol_index::Scope::Project {
+        let absolute = Path::new(&record.project_root).join(path);
+        return normalize_display_path(&absolute.to_string_lossy());
+    }
+    normalize_display_path(file_path)
 }
 
 fn to_mapping_view(record: SymbolMetatypeMappingRecord) -> SymbolMetatypeMappingView {
@@ -281,15 +298,18 @@ pub fn query_stdlib_documentation_symbols(
         .collect())
 }
 
-pub fn query_library_symbols(
+pub(crate) fn query_library_symbols_impl(
     state: &CoreState,
     project_root: String,
     file_path: Option<String>,
     offset: Option<usize>,
     limit: Option<usize>,
+    ensure_seeded: bool,
 ) -> Result<Vec<IndexedSymbolView>, String> {
     let project_root = canonical_project_root(&project_root);
-    seed_symbol_index_if_empty(state, &project_root)?;
+    if ensure_seeded {
+        seed_symbol_index_if_empty(state, &project_root)?;
+    }
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(usize::MAX);
     let store = state
@@ -303,15 +323,28 @@ pub fn query_library_symbols(
         .collect())
 }
 
-pub fn query_project_symbols(
+pub fn query_library_symbols(
     state: &CoreState,
     project_root: String,
     file_path: Option<String>,
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> Result<Vec<IndexedSymbolView>, String> {
+    query_library_symbols_impl(state, project_root, file_path, offset, limit, true)
+}
+
+pub(crate) fn query_project_symbols_impl(
+    state: &CoreState,
+    project_root: String,
+    file_path: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    ensure_seeded: bool,
+) -> Result<Vec<IndexedSymbolView>, String> {
     let project_root = canonical_project_root(&project_root);
-    seed_symbol_index_if_empty(state, &project_root)?;
+    if ensure_seeded {
+        seed_symbol_index_if_empty(state, &project_root)?;
+    }
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(usize::MAX);
     let store = state
@@ -323,6 +356,16 @@ pub fn query_project_symbols(
         .into_iter()
         .map(to_view)
         .collect())
+}
+
+pub fn query_project_symbols(
+    state: &CoreState,
+    project_root: String,
+    file_path: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<Vec<IndexedSymbolView>, String> {
+    query_project_symbols_impl(state, project_root, file_path, offset, limit, true)
 }
 
 pub fn query_project_symbols_for_files(
@@ -459,8 +502,13 @@ pub fn query_project_semantic_projection_by_qualified_name(
         return Ok(Some(projection_element_to_indexed_view(projection)));
     }
 
-    query_project_semantic_element_by_qualified_name(state, project_root, qualified_name, file_path)
-        .map(|legacy| legacy.map(fallback_projection_view_from_legacy_element))
+    if let Some(legacy) =
+        query_project_semantic_element_by_qualified_name(state, project_root.clone(), qualified_name.clone(), file_path.clone())?
+    {
+        return Ok(Some(fallback_projection_view_from_legacy_element(legacy)));
+    }
+
+    fallback_projection_view_from_symbol_index(state, &project_root, &qualified_name, file_path)
 }
 
 fn fallback_projection_view_from_legacy_element(
@@ -507,6 +555,58 @@ fn fallback_projection_view_from_legacy_element(
         file_path: element.file_path,
         metatype_qname,
         features,
+    }
+}
+
+fn fallback_projection_view_from_symbol_index(
+    state: &CoreState,
+    project_root: &str,
+    qualified_name: &str,
+    file_path: Option<String>,
+) -> Result<Option<IndexedSemanticProjectionElementView>, String> {
+    let requested_file_key = file_path
+        .as_deref()
+        .map(|value| normalized_compare_key(Path::new(value)));
+    let store = state
+        .symbol_index
+        .lock()
+        .map_err(|_| "Symbol index lock poisoned".to_string())?;
+    let mut candidates = store
+        .project_symbols(project_root, None)
+        .into_iter()
+        .filter(|symbol| symbol.qualified_name == qualified_name)
+        .filter(|symbol| {
+            requested_file_key
+                .as_ref()
+                .map(|requested| {
+                    normalized_compare_key(Path::new(&normalize_symbol_display_path(symbol)))
+                        == *requested
+                })
+                .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then(a.start_line.cmp(&b.start_line))
+            .then(a.start_col.cmp(&b.start_col))
+    });
+    Ok(candidates
+        .into_iter()
+        .next()
+        .map(fallback_projection_view_from_symbol))
+}
+
+fn fallback_projection_view_from_symbol(
+    symbol: SymbolRecord,
+) -> IndexedSemanticProjectionElementView {
+    let file_path = normalize_symbol_display_path(&symbol);
+    IndexedSemanticProjectionElementView {
+        name: symbol.name,
+        qualified_name: symbol.qualified_name,
+        file_path,
+        metatype_qname: symbol.metatype_qname,
+        features: Vec::new(),
     }
 }
 
@@ -594,7 +694,8 @@ mod tests {
     use super::*;
     use crate::{
         compile_project_delta_sync, compile_project_delta_sync_with_options,
-        compile_workspace_sync, load_library_symbols_sync, settings::AppSettings, CoreState,
+        compile_workspace_sync, load_library_symbols_sync,
+        project_root_key::normalize_workspace_path, settings::AppSettings, CoreState,
     };
     use std::fs;
     use std::path::Path;
@@ -844,7 +945,9 @@ mod tests {
         assert!(library.ok);
         assert!(!library.symbols.is_empty());
 
-        state.clear_runtime_caches().expect("clear runtime caches");
+        state
+            .clear_in_memory_caches_for_tests()
+            .expect("clear runtime caches");
 
         let indexed_library =
             query_library_symbols(&state, project_root.clone(), None, Some(0), Some(10_000))
@@ -1209,8 +1312,7 @@ mod tests {
         let project_dir = root.join("project");
         fs::create_dir_all(&project_dir).expect("create project dir");
         let main_file = project_dir.join("main.sysml");
-        fs::write(&main_file, "package P { action def DoThing; }\n")
-            .expect("write project file");
+        fs::write(&main_file, "package P { action def DoThing; }\n").expect("write project file");
         fs::write(
             project_dir.join(".project"),
             "{\"name\":\"projection-rehydrate\",\"src\":[\"*.sysml\"]}",
@@ -1441,7 +1543,9 @@ mod tests {
         }
         crate::workspace_ir_cache::persist_workspace_ir_cache(&state, &project_root, None)
             .expect("persist workspace cache");
-        state.clear_runtime_caches().expect("clear runtime caches");
+        state
+            .clear_in_memory_caches_for_tests()
+            .expect("clear runtime caches");
 
         let found = query_project_semantic_projection_by_qualified_name(
             &state,
@@ -1454,6 +1558,62 @@ mod tests {
         assert_eq!(found.qualified_name, "Demo::Main");
         assert_eq!(found.features.len(), 1);
         assert_eq!(found.features[0].name, "name");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_project_semantic_projection_falls_back_to_symbol_index_when_semantic_cache_is_empty() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_projection_symbol_fallback_{stamp}"));
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        let main_file = project_dir.join("main.sysml");
+        fs::write(&main_file, "package P { part def A; }\n").expect("write project file");
+
+        let project_root = project_dir.to_string_lossy().to_string();
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        {
+            let mut store = state.symbol_index.lock().expect("index lock");
+            store.upsert_symbols_for_file(
+                &project_root,
+                "main.sysml",
+                vec![mercurio_symbol_index::SymbolRecord {
+                    id: "p1".to_string(),
+                    project_root: project_root.clone(),
+                    library_key: None,
+                    scope: mercurio_symbol_index::Scope::Project,
+                    name: "P".to_string(),
+                    qualified_name: "P".to_string(),
+                    parent_qualified_name: None,
+                    kind: "Package".to_string(),
+                    metatype_qname: Some("sysml::Package".to_string()),
+                    file_path: "main.sysml".to_string(),
+                    start_line: 1,
+                    start_col: 1,
+                    end_line: 1,
+                    end_col: 1,
+                    doc_text: None,
+                    properties_json: None,
+                }],
+            );
+            store.rebuild_symbol_mappings(&project_root);
+        }
+
+        let found = query_project_semantic_projection_by_qualified_name(
+            &state,
+            project_root,
+            "P".to_string(),
+            Some(main_file.to_string_lossy().to_string()),
+        )
+        .expect("semantic projection query")
+        .expect("fallback projection row");
+        assert_eq!(found.qualified_name, "P");
+        assert_eq!(found.metatype_qname.as_deref(), Some("sysml::Package"));
+        assert!(found.features.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1557,10 +1717,68 @@ mod tests {
         )
         .expect("canonical root query");
         assert!(canonical_rows.iter().any(|row| row.qualified_name == "P"));
+        assert!(canonical_rows
+            .iter()
+            .all(|row| Path::new(&row.file_path).is_absolute()));
 
         let raw_rows = query_project_symbols(&state, raw_project_root, None, Some(0), Some(10_000))
             .expect("raw root query");
         assert!(raw_rows.iter().any(|row| row.qualified_name == "P"));
+        assert!(raw_rows
+            .iter()
+            .all(|row| Path::new(&row.file_path).is_absolute()));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn query_project_symbols_resolves_relative_file_paths_to_project_absolute_paths() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_symbol_query_paths_{stamp}"));
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        let main_file = project_dir.join("main.sysml");
+        fs::write(&main_file, "package P {}\n").expect("write project file");
+
+        let project_root = project_dir.to_string_lossy().to_string();
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        {
+            let mut store = state.symbol_index.lock().expect("index lock");
+            store.upsert_symbols_for_file(
+                &project_root,
+                "main.sysml",
+                vec![mercurio_symbol_index::SymbolRecord {
+                    id: "p1".to_string(),
+                    project_root: project_root.clone(),
+                    library_key: None,
+                    scope: mercurio_symbol_index::Scope::Project,
+                    name: "P".to_string(),
+                    qualified_name: "P".to_string(),
+                    parent_qualified_name: None,
+                    kind: "Package".to_string(),
+                    metatype_qname: Some("sysml::Package".to_string()),
+                    file_path: "main.sysml".to_string(),
+                    start_line: 1,
+                    start_col: 1,
+                    end_line: 1,
+                    end_col: 1,
+                    doc_text: None,
+                    properties_json: None,
+                }],
+            );
+            store.rebuild_symbol_mappings(&project_root);
+        }
+
+        let rows = query_project_symbols(&state, project_root, None, Some(0), Some(10_000))
+            .expect("query project symbols");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            normalize_workspace_path(&rows[0].file_path),
+            normalize_workspace_path(&main_file.to_string_lossy())
+        );
 
         let _ = fs::remove_dir_all(root);
     }

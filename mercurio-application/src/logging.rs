@@ -1,13 +1,22 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use tauri::{Emitter, EventTarget};
 use time::macros::format_description;
 use time::OffsetDateTime;
 
+use mercurio_core::resolve_mercurio_user_dir;
+
 const LOG_BUFFER_LIMIT: usize = 2000;
 const LOG_EVENT_NAME: &str = "app-log";
+const LOG_DIRECTORY_NAME: &str = "logs";
+const LOG_FILE_NAME: &str = "app.log";
+const LOG_FILE_BACKUP_NAME: &str = "app.log.1";
+const LOG_FILE_MAX_BYTES: u64 = 5 * 1024 * 1024;
 const TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] =
     format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
 
@@ -62,6 +71,42 @@ fn current_timestamp_utc() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00.000Z".to_string())
 }
 
+fn log_directory_path() -> PathBuf {
+    resolve_mercurio_user_dir().join(LOG_DIRECTORY_NAME)
+}
+
+fn log_file_path() -> PathBuf {
+    log_directory_path().join(LOG_FILE_NAME)
+}
+
+fn rotate_log_file_if_needed(path: &PathBuf) -> Result<(), String> {
+    let Ok(metadata) = fs::metadata(path) else {
+        return Ok(());
+    };
+    if metadata.len() < LOG_FILE_MAX_BYTES {
+        return Ok(());
+    }
+    let backup = log_directory_path().join(LOG_FILE_BACKUP_NAME);
+    if backup.exists() {
+        fs::remove_file(&backup).map_err(|e| e.to_string())?;
+    }
+    fs::rename(path, backup).map_err(|e| e.to_string())
+}
+
+fn persist_log_record(record: &AppLogRecord) -> Result<(), String> {
+    let log_dir = log_directory_path();
+    fs::create_dir_all(&log_dir).map_err(|e| e.to_string())?;
+    let path = log_file_path();
+    rotate_log_file_if_needed(&path)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
+    let payload = serde_json::to_string(record).map_err(|e| e.to_string())?;
+    writeln!(file, "{payload}").map_err(|e| e.to_string())
+}
+
 fn emit_log_record(record: &AppLogRecord) {
     let handle = app_handle_store()
         .lock()
@@ -100,6 +145,13 @@ pub fn log_event(level: &str, kind: &str, message: String) {
             buffer.pop_front();
         }
         buffer.push_back(record.clone());
+    }
+    if let Err(error) = persist_log_record(&record) {
+        eprintln!(
+            "[{}] [WARN] [logging] failed to persist log record: {}",
+            current_timestamp_utc(),
+            error
+        );
     }
     eprintln!(
         "[{}] [{}] [{}] {}",

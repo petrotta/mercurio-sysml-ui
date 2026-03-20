@@ -52,6 +52,16 @@ export function useCompileJobController({
   notifications,
   onCompileSuccess,
 }: UseCompileJobControllerOptions) {
+  const {
+    setCompileStatus,
+    appendBuildLogEntries,
+    resetForRoot,
+    updateRunState,
+    startCompile,
+    finishCompile,
+    failCompile,
+    requestCancel,
+  } = notifications;
   const [compileRunId, setCompileRunId] = useState<number | null>(null);
   const [droppedCompileRequests, setDroppedCompileRequests] = useState(0);
   const [parsedFiles, setParsedFiles] = useState<string[]>([]);
@@ -75,13 +85,13 @@ export function useCompileJobController({
     setDroppedCompileRequests(0);
     setParsedFiles([]);
     setFileDiagnosticPaths(new Set());
-    notifications.resetForRoot(rootPath);
-  }, [currentRunIdRef, notifications, rootPath]);
+    resetForRoot(rootPath);
+  }, [currentRunIdRef, resetForRoot, rootPath]);
 
   useEffect(() => {
     currentRunIdRef.current = compileRunId;
-    notifications.updateRunState(compileRunId);
-  }, [compileRunId, currentRunIdRef, notifications]);
+    updateRunState(compileRunId);
+  }, [compileRunId, currentRunIdRef, updateRunState]);
 
   const runCompile = useCallback(async (
     filePath?: string,
@@ -97,7 +107,7 @@ export function useCompileJobController({
       requestKey === lastCompileRequestKeyRef.current
       && now - lastCompileRequestAtRef.current < COMPILE_REQUEST_DEBOUNCE_MS
     ) {
-      notifications.appendBuildLogEntries([{ level: "info", message: "Compile request skipped: duplicate request window." }]);
+      appendBuildLogEntries([{ level: "info", message: "Compile request skipped: duplicate request window." }]);
       return false;
     }
     lastCompileRequestKeyRef.current = requestKey;
@@ -111,8 +121,8 @@ export function useCompileJobController({
           content: entry.content,
         })),
       };
-      notifications.setCompileStatus("Compile: running (latest request queued)");
-      notifications.appendBuildLogEntries([{ level: "warn", message: "Compile request queued: compile already running." }]);
+      setCompileStatus("Compile: running (latest request queued)");
+      appendBuildLogEntries([{ level: "warn", message: "Compile request queued: compile already running." }]);
       return false;
     }
 
@@ -120,7 +130,7 @@ export function useCompileJobController({
     const isCurrentRun = () => isCurrentSession() && currentRunIdRef.current === runId;
     currentRunIdRef.current = runId;
     setCompileRunId(runId);
-    notifications.startCompile(runId, filePath);
+    startCompile(runId, filePath);
     try {
       const unsavedByPath = new Map<string, { path: string; content: string }>();
       for (const entry of unsavedInputs || []) {
@@ -129,7 +139,7 @@ export function useCompileJobController({
         unsavedByPath.set(normalizePathKey(path), { path, content: entry.content ?? "" });
       }
       const unsaved = Array.from(unsavedByPath.values());
-      notifications.appendBuildLogEntries([{
+      appendBuildLogEntries([{
         level: "info",
         message: `Compile start (run=${runId}, mode=${filePath ? "file" : "project"}, unsaved=${unsaved.length})`,
       }]);
@@ -181,14 +191,14 @@ export function useCompileJobController({
       details.push(`Unresolved: ${unresolvedCount}`);
 
       const ok = !!response?.ok;
-      notifications.finishCompile({
+      finishCompile({
         ok,
         filePath,
         fileDiagnostics,
         details,
         parsedFiles: nextParsedFiles,
       });
-      notifications.appendBuildLogEntries([{
+      appendBuildLogEntries([{
         level: ok ? "info" : "warn",
         message: `Compile finished (run=${runId}, ok=${ok}, parsed=${nextParsedFiles.length}, unresolved=${unresolvedCount}, total=${response?.total_duration_ms ?? 0}ms)`,
       }]);
@@ -199,8 +209,8 @@ export function useCompileJobController({
       });
       return ok;
     } catch (error) {
-      notifications.failCompile(error);
-      notifications.appendBuildLogEntries([{ level: "error", message: `Compile failed (run=${runId}): ${String(error)}` }]);
+      failCompile(error);
+      appendBuildLogEntries([{ level: "error", message: `Compile failed (run=${runId}): ${String(error)}` }]);
       return false;
     } finally {
       if (isCurrentSession()) {
@@ -215,7 +225,17 @@ export function useCompileJobController({
         }
       }
     }
-  }, [currentRunIdRef, notifications, onCompileSuccess, rootPath, sessionTokenRef]);
+  }, [
+    appendBuildLogEntries,
+    currentRunIdRef,
+    failCompile,
+    finishCompile,
+    onCompileSuccess,
+    rootPath,
+    sessionTokenRef,
+    setCompileStatus,
+    startCompile,
+  ]);
 
   useEffect(() => {
     runCompileRef.current = runCompile;
@@ -223,9 +243,9 @@ export function useCompileJobController({
 
   const cancelCompile = useCallback(async () => {
     if (!compileRunId) return;
-    notifications.requestCancel(compileRunId);
+    requestCancel(compileRunId);
     await invoke("cancel_compile", { run_id: compileRunId }).catch(() => {});
-  }, [compileRunId, notifications]);
+  }, [compileRunId, requestCancel]);
 
   return {
     compileRunId,

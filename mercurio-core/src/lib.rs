@@ -18,6 +18,7 @@ mod project_root_key;
 mod workspace;
 mod workspace_ir_cache;
 mod workspace_symbols;
+mod workspace_tree;
 
 mod compile;
 pub use compile::{
@@ -74,7 +75,13 @@ pub use mercurio_sysml_semantics::semantic_contract::{
     SemanticQuery, SemanticValueView,
 };
 pub use workspace::query_semantic;
-pub use workspace_symbols::{get_workspace_symbol_snapshot, WorkspaceSymbolSnapshotView};
+pub use workspace_symbols::{
+    get_workspace_startup_snapshot, get_workspace_symbol_snapshot, WorkspaceStartupSnapshotView,
+    WorkspaceSymbolSnapshotView,
+};
+pub use workspace_tree::{
+    get_workspace_tree_snapshot, WorkspaceTreeEntryView, WorkspaceTreeSnapshotView,
+};
 
 mod export;
 pub use export::export_model_to_path;

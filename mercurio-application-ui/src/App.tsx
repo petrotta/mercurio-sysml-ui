@@ -7,8 +7,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { RECENTS_KEY, ROOT_STORAGE_KEY, THEME_KEY } from "./app/constants";
 import { formatFileDiagnostic } from "./app/compileShared";
-import { normalizePathKey as normalizePath } from "./app/pathUtils";
-import { useProjectTree } from "./app/useProjectTree";
+import { isPathWithin, normalizePathKey as normalizePath } from "./app/pathUtils";
+import { useFileTree, useProjectTree } from "./app/useProjectTree";
+import { logFrontendEvent } from "./app/services/logger";
 import {
   type ProjectFilesChangedEvent,
   createProjectFile,
@@ -21,10 +22,13 @@ import {
   getDefaultStdlib,
   getExpressionsView,
   getProjectModel,
+  getWorkspaceStartupSnapshot,
+  getWorkspaceTreeSnapshot,
 } from "./app/services/semanticApi";
 import { PropertiesPanel } from "./app/components/PropertiesPanel";
 import { ParseErrorsPanel } from "./app/components/ParseErrorsPanel";
 import type {
+  CacheClearSummary,
   FileDiagnosticView,
   ProjectExpressionRecordView,
   SymbolView,
@@ -88,16 +92,6 @@ type NewFileDialogState = {
   extension: NewFileExtension;
   error: string;
   submitting: boolean;
-};
-
-type CacheClearSummary = {
-  workspace_snapshot_entries: number;
-  metamodel_entries: number;
-  parsed_file_entries: number;
-  file_mtime_entries: number;
-  canceled_compile_entries: number;
-  symbol_index_cleared?: boolean;
-  project_ir_cache_deleted?: boolean;
 };
 
 type BackgroundJobView = {
@@ -428,6 +422,14 @@ function displayNameForPath(path: string): string {
   return path.split(/[\\/]/).pop() || path;
 }
 
+function toFileEntry(path: string, name: string, isDir: boolean): FileEntry {
+  return {
+    path,
+    name,
+    is_dir: isDir,
+  };
+}
+
 function treeNodeIcon(isDir: boolean): string {
   return isDir ? UI_ICON.folder : UI_ICON.file;
 }
@@ -735,18 +737,33 @@ export function App() {
   const shouldShowTabDropdown = tabsOverflow || openTabs.length > TAB_DROPDOWN_THRESHOLD;
 
   const {
+    rootPath: projectTreeRootPath,
     treeEntries,
     expanded,
+    hydrateTree: hydrateProjectTree,
     refreshRoot,
     toggleExpand,
     ensureExpanded,
     expandAll,
     collapseAll,
   } = useProjectTree();
+  const {
+    rootPath: libraryTreeRootPath,
+    treeEntries: libraryTreeEntries,
+    expanded: expandedLibraryDirs,
+    manifestEntries: libraryTreeManifest,
+    hydrateTree: hydrateLibraryTree,
+    refreshRoot: refreshLibraryTree,
+    toggleExpand: toggleLibraryDir,
+    expandAll: expandAllLibraryTree,
+    collapseAll: collapseLibraryTree,
+  } = useFileTree();
 
   const {
+    sessionToken,
     compileStatus,
     setCompileStatus,
+    showErrorNotification,
     compileRunId,
     compileToast,
     runCompile,
@@ -763,6 +780,8 @@ export function App() {
     activeLibraryPath,
     symbolIndexError,
     semanticRefreshVersion,
+    applyWorkspaceSnapshot,
+    resetWorkspaceSymbols,
   } = useCompileRunner({ rootPath });
   const unresolvedCount = useMemo(
     () => compileToast.fileDiagnostics.reduce(
@@ -801,10 +820,13 @@ const rightPanelSplitDragRef = useRef<{
 const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; startRatio: number } | null>(null);
   const projectFilesChangedTimerRef = useRef<number | undefined>(undefined);
   const projectWatcherRootRef = useRef("");
+  const libraryFilesChangedTimerRef = useRef<number | undefined>(undefined);
+  const libraryWatcherRootRef = useRef("");
   const projectFilesSettingsButtonRef = useRef<HTMLDivElement | null>(null);
   const autoBuildTimerRef = useRef<number | undefined>(undefined);
   const lastAutoBuildAtRef = useRef<number>(0);
   const compileRunIdRef = useRef<number | null>(compileRunId ?? null);
+  const workspaceStartupRequestRef = useRef(0);
 
   const syncViewportHeight = useCallback(() => {
     const viewportHeight =
@@ -873,21 +895,165 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     window.localStorage?.setItem(PROJECT_FILES_SHOW_BY_FILE_KEY, projectFilesShowByFile ? "1" : "0");
   }, [projectFilesShowByFile]);
 
+  const reportStartupEvent = useCallback((
+    level: "info" | "warn" | "error",
+    message: string,
+  ) => {
+    const text = `${message || ""}`.trim();
+    if (!text) return;
+    void logFrontendEvent({
+      level,
+      kind: "startup",
+      message: text,
+    }).catch(() => {});
+  }, []);
+
+  const loadLiveWorkspaceTrees = useCallback(async (
+    path: string,
+  ): Promise<boolean> => {
+    const trimmed = (path || "").trim();
+    const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+    const requestId = workspaceStartupRequestRef.current + 1;
+    workspaceStartupRequestRef.current = requestId;
+    if (!trimmed) {
+      hydrateProjectTree("", []);
+      hydrateLibraryTree("", []);
+      resetWorkspaceSymbols();
+      return true;
+    }
+
+    const snapshot = await getWorkspaceTreeSnapshot(trimmed);
+    if (workspaceStartupRequestRef.current !== requestId) return false;
+    const canonicalProjectRoot = (snapshot.project_root || trimmed).trim();
+    const durationMs = Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt);
+
+    hydrateProjectTree(
+      canonicalProjectRoot,
+      (snapshot.project_tree || []).map((entry) => toFileEntry(entry.path, entry.name, !!entry.is_dir)),
+    );
+    hydrateLibraryTree(
+      (snapshot.library_path || "").trim(),
+      (snapshot.library_tree || []).map((entry) => toFileEntry(entry.path, entry.name, !!entry.is_dir)),
+    );
+    setTreeError("");
+    reportStartupEvent(
+      "info",
+      `workspace tree loaded root=${canonicalProjectRoot} duration_ms=${durationMs} project_entries=${snapshot.project_tree?.length || 0} library_entries=${snapshot.library_tree?.length || 0}`,
+    );
+    return true;
+  }, [hydrateLibraryTree, hydrateProjectTree, reportStartupEvent, resetWorkspaceSymbols]);
+
+  const loadCachedWorkspaceSymbols = useCallback(async (
+    path: string,
+  ): Promise<boolean> => {
+    const trimmed = (path || "").trim();
+    const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+    if (!trimmed) {
+      resetWorkspaceSymbols();
+      return true;
+    }
+    const snapshot = await getWorkspaceStartupSnapshot(trimmed, false, true);
+    const durationMs = Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt);
+    const diagnostics = snapshot?.diagnostics || [];
+    const backendTimings = snapshot?.timings;
+    const symbolTimings = snapshot?.symbol_timings;
+    for (const diagnostic of diagnostics) {
+      if (/(failed|error)/i.test(`${diagnostic || ""}`)) {
+        showErrorNotification(diagnostic);
+      }
+    }
+    reportStartupEvent(
+      snapshot?.cache_hit ? "info" : "warn",
+      `workspace startup snapshot duration_ms=${durationMs} cache_hit=${snapshot?.cache_hit ? "true" : "false"} project_symbols=${snapshot?.project_symbols?.length || 0} library_symbols=${snapshot?.library_symbols?.length || 0} project_semantic_projections=${snapshot?.project_semantic_projection_count || 0} diagnostics=${diagnostics.length}`,
+    );
+    if (backendTimings) {
+      const frontendOverheadMs = Math.max(0, durationMs - (backendTimings.total_duration_ms || 0));
+      reportStartupEvent(
+        "info",
+        `workspace startup backend timings total_ms=${backendTimings.total_duration_ms} frontend_overhead_ms=${frontendOverheadMs} cache_load_ms=${backendTimings.cache_load_ms} cache_seed_symbol_index_ms=${backendTimings.cache_seed_symbol_index_ms} cache_seed_projection_ms=${backendTimings.cache_seed_projection_ms} project_tree_collect_ms=${backendTimings.project_tree_collect_ms} symbol_snapshot_ms=${backendTimings.symbol_snapshot_ms} library_tree_collect_ms=${backendTimings.library_tree_collect_ms}`,
+      );
+    }
+    if (symbolTimings) {
+      reportStartupEvent(
+        "info",
+        `workspace symbol snapshot timings total_ms=${symbolTimings.total_duration_ms} seed_symbol_index_ms=${symbolTimings.seed_symbol_index_ms} project_query_ms=${symbolTimings.project_query_ms} library_query_ms=${symbolTimings.library_query_ms} library_hydration_ms=${symbolTimings.library_hydration_ms} library_requery_ms=${symbolTimings.library_requery_ms} library_metadata_ms=${symbolTimings.library_metadata_ms}`,
+      );
+    }
+    if (snapshot?.cache_hit) {
+      applyWorkspaceSnapshot({
+        snapshot,
+        sessionToken,
+        reason: "startup-cache",
+      });
+      setCompileStatus("Startup: workspace cache loaded");
+      return true;
+    }
+    setCompileStatus("Startup: no workspace cache; compiling project");
+    reportStartupEvent("warn", `workspace cache miss root=${trimmed}; compile fallback starting`);
+    const ok = await runCompile();
+    reportStartupEvent(
+      ok ? "info" : "warn",
+      `workspace compile fallback completed root=${trimmed} ok=${ok ? "true" : "false"}`,
+    );
+    return ok;
+  }, [
+    applyWorkspaceSnapshot,
+    reportStartupEvent,
+    resetWorkspaceSymbols,
+    runCompile,
+    sessionToken,
+    setCompileStatus,
+    showErrorNotification,
+  ]);
+
   useEffect(() => {
     if (!rootPath) {
       setTreeError("");
+      workspaceStartupRequestRef.current += 1;
+      hydrateProjectTree("", []);
+      hydrateLibraryTree("", []);
+      resetWorkspaceSymbols();
       return;
     }
     let active = true;
     setTreeError("");
-    void refreshRoot(rootPath).catch((error) => {
-      if (!active) return;
-      setTreeError(`Failed to load project tree: ${String(error)}`);
-    });
+    void (async () => {
+      const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+      reportStartupEvent("info", `startup sequence begin root=${rootPath}`);
+      try {
+        await loadLiveWorkspaceTrees(rootPath);
+        if (!active) return;
+        const startupOk = await loadCachedWorkspaceSymbols(rootPath);
+        if (!active) return;
+        const durationMs = Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt);
+        reportStartupEvent(
+          startupOk ? "info" : "warn",
+          `startup sequence complete root=${rootPath} duration_ms=${durationMs} ok=${startupOk ? "true" : "false"}`,
+        );
+      } catch (error) {
+        if (!active) return;
+        const message = `Startup failed: ${String(error)}`;
+        setTreeError(message);
+        setCompileStatus(message);
+        showErrorNotification(message);
+        reportStartupEvent("error", `${message} root=${rootPath}`);
+      }
+    })();
     return () => {
       active = false;
+      workspaceStartupRequestRef.current += 1;
     };
-  }, [rootPath, refreshRoot]);
+  }, [
+    hydrateLibraryTree,
+    hydrateProjectTree,
+    loadCachedWorkspaceSymbols,
+    loadLiveWorkspaceTrees,
+    reportStartupEvent,
+    resetWorkspaceSymbols,
+    rootPath,
+    setCompileStatus,
+    showErrorNotification,
+  ]);
 
   useEffect(() => {
     if (autoBuildTimerRef.current !== undefined) {
@@ -899,6 +1065,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     setSelectedSymbol(null);
     setExpandedFileSymbols({});
     setExpandedLibraryFiles({});
+    collapseLibraryTree();
     setCollapsedSymbolNodes({});
     setExpandedProjectElementsOverflow(false);
     setExpandedProjectFileSymbolOverflow({});
@@ -910,7 +1077,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       suppressDirtyRef.current = true;
       editorRef.current.setValue("");
     }
-  }, [rootPath]);
+  }, [collapseLibraryTree, rootPath]);
 
   const effectiveTreeError = treeError || (symbolsStatus === "error" ? symbolIndexError : "");
   const rightPanelWorkspaceErrors = useMemo(() => {
@@ -1641,16 +1808,14 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       return;
     }
     try {
-      const summary = await invoke<CacheClearSummary>("clear_all_caches", {
-        root: rootPath || null,
-      });
-      setCompileStatus(
-        `Caches cleared (snapshot ${summary.workspace_snapshot_entries}, metamodel ${summary.metamodel_entries}, parsed ${summary.parsed_file_entries}${summary.symbol_index_cleared ? ", symbol index" : ""}${summary.project_ir_cache_deleted ? ", project IR" : ""})`,
-      );
+        const summary = await invoke<CacheClearSummary>("clear_all_caches");
+        setCompileStatus(
+          `Caches cleared (snapshot ${summary.workspace_snapshot_entries}, semantic ${summary.project_semantic_lookup_entries}, parsed ${summary.parsed_file_entries}, project disk ${summary.workspace_ir_cache_files_deleted}, stdlib disk ${summary.stdlib_index_cache_files_deleted}${summary.symbol_index_cleared ? ", symbol index" : ""})`,
+        );
     } catch (error) {
       setCompileStatus(`Clear caches failed: ${String(error)}`);
     }
-  }, [compileRunId, rootPath, setCompileStatus]);
+  }, [compileRunId, setCompileStatus]);
 
   const addStdlibPathOption = useCallback(() => {
     setStdlibPathOptions((prev) => [
@@ -1853,6 +2018,27 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     projectFilesChangedTimerRef.current = timer;
   }, [refreshRoot, rootPath, normalizeWatchedPath]);
 
+  const scheduleLibraryTreeRefresh = useCallback(() => {
+    if (libraryFilesChangedTimerRef.current !== undefined) {
+      window.clearTimeout(libraryFilesChangedTimerRef.current);
+    }
+    const timer = window.setTimeout(() => {
+      libraryFilesChangedTimerRef.current = undefined;
+      const watchRoot = libraryWatcherRootRef.current;
+      const activeRoot = libraryTreeRootPath;
+      if (!watchRoot || !activeRoot) {
+        return;
+      }
+      if (normalizeWatchedPath(watchRoot) !== normalizeWatchedPath(activeRoot)) {
+        return;
+      }
+      void refreshLibraryTree(activeRoot).catch(() => {
+        if (!activeRoot) return;
+      });
+    }, 250);
+    libraryFilesChangedTimerRef.current = timer;
+  }, [libraryTreeRootPath, normalizeWatchedPath, refreshLibraryTree]);
+
   useEffect(() => {
     const unlistenPromise = listen<string>("menu-action", (event) => {
       const action = `${event.payload || ""}`;
@@ -1865,35 +2051,89 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   }, [runMenuAction]);
 
   useEffect(() => {
-    if (!rootPath) {
+    const projectRoot = projectTreeRootPath || rootPath;
+    const libraryRoot = libraryTreeRootPath;
+    const projectKey = normalizeWatchedPath(projectRoot);
+    const libraryKey = normalizeWatchedPath(libraryRoot);
+    const libraryCoveredByProject =
+      !!projectKey
+      && !!libraryKey
+      && (libraryKey === projectKey || libraryKey.startsWith(`${projectKey}/`));
+
+    if (!projectRoot) {
       if (projectWatcherRootRef.current) {
         void stopProjectFileWatcher(projectWatcherRootRef.current);
       }
+      if (libraryWatcherRootRef.current) {
+        void stopProjectFileWatcher(libraryWatcherRootRef.current);
+      }
       projectWatcherRootRef.current = "";
+      libraryWatcherRootRef.current = "";
       if (projectFilesChangedTimerRef.current !== undefined) {
         window.clearTimeout(projectFilesChangedTimerRef.current);
         projectFilesChangedTimerRef.current = undefined;
+      }
+      if (libraryFilesChangedTimerRef.current !== undefined) {
+        window.clearTimeout(libraryFilesChangedTimerRef.current);
+        libraryFilesChangedTimerRef.current = undefined;
       }
       return;
     }
 
     if (
       projectWatcherRootRef.current
-      && normalizeWatchedPath(projectWatcherRootRef.current) !== normalizeWatchedPath(rootPath)
+      && normalizeWatchedPath(projectWatcherRootRef.current) !== projectKey
     ) {
       void stopProjectFileWatcher(projectWatcherRootRef.current);
     }
-    projectWatcherRootRef.current = rootPath;
-    const targetRoot = rootPath;
-    void startProjectFileWatcher(rootPath).catch((error) => {
-      setCompileStatus(`Filesystem watcher failed to start: ${String(error)}`);
+    projectWatcherRootRef.current = projectRoot;
+    void startProjectFileWatcher(projectRoot).catch((error) => {
+      const message = `Filesystem watcher failed to start: ${String(error)}`;
+      setCompileStatus(message);
+      showErrorNotification(message);
     });
+
+    if (libraryCoveredByProject || !libraryRoot) {
+      if (libraryWatcherRootRef.current) {
+        void stopProjectFileWatcher(libraryWatcherRootRef.current);
+      }
+      libraryWatcherRootRef.current = "";
+    } else {
+      if (
+        libraryWatcherRootRef.current
+        && normalizeWatchedPath(libraryWatcherRootRef.current) !== libraryKey
+      ) {
+        void stopProjectFileWatcher(libraryWatcherRootRef.current);
+      }
+      libraryWatcherRootRef.current = libraryRoot;
+      void startProjectFileWatcher(libraryRoot).catch((error) => {
+        const message = `Library watcher failed to start: ${String(error)}`;
+        setCompileStatus(message);
+        showErrorNotification(message);
+      });
+    }
 
     const unlistenPromise = listen<ProjectFilesChangedEvent>("project-files-changed", (event) => {
       const payload = event.payload;
-      if (!payload || !payload.root) return;
-      if (normalizeWatchedPath(payload.root) !== normalizeWatchedPath(targetRoot)) return;
-      scheduleProjectTreeRefresh();
+      const changedRoot = normalizeWatchedPath(payload?.root || "");
+      const changedPath = normalizeWatchedPath(payload?.path || "");
+      const projectAffected =
+        (!!projectKey && changedRoot === projectKey)
+        || (!!projectRoot && !!changedPath && isPathWithin(changedPath, projectRoot));
+      const libraryAffected =
+        (!!libraryKey && changedRoot === libraryKey)
+        || (!!libraryRoot && !!changedPath && isPathWithin(changedPath, libraryRoot));
+
+      if (projectAffected) {
+        scheduleProjectTreeRefresh();
+        if (libraryCoveredByProject && libraryKey) {
+          scheduleLibraryTreeRefresh();
+        }
+        return;
+      }
+      if (!libraryCoveredByProject && libraryAffected) {
+        scheduleLibraryTreeRefresh();
+      }
     });
 
     return () => {
@@ -1902,9 +2142,29 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
         window.clearTimeout(projectFilesChangedTimerRef.current);
         projectFilesChangedTimerRef.current = undefined;
       }
-      void stopProjectFileWatcher(targetRoot);
+      if (libraryFilesChangedTimerRef.current !== undefined) {
+        window.clearTimeout(libraryFilesChangedTimerRef.current);
+        libraryFilesChangedTimerRef.current = undefined;
+      }
+      if (projectWatcherRootRef.current) {
+        void stopProjectFileWatcher(projectWatcherRootRef.current);
+        projectWatcherRootRef.current = "";
+      }
+      if (libraryWatcherRootRef.current) {
+        void stopProjectFileWatcher(libraryWatcherRootRef.current);
+        libraryWatcherRootRef.current = "";
+      }
     };
-  }, [rootPath, scheduleProjectTreeRefresh, setCompileStatus, normalizeWatchedPath]);
+  }, [
+    libraryTreeRootPath,
+    normalizeWatchedPath,
+    projectTreeRootPath,
+    rootPath,
+    scheduleLibraryTreeRefresh,
+    scheduleProjectTreeRefresh,
+    setCompileStatus,
+    showErrorNotification,
+  ]);
 
   const projectSymbols = useMemo(
     () => symbols.filter((symbol) => symbol.source_scope !== "library"),
@@ -1956,11 +2216,10 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   }, [librarySymbols]);
 
   const libraryFilePaths = useMemo(() => {
-    return Array.from(librarySymbolsByFile.values())
-      .map((bucket) => bucket[0]?.file_path)
-      .filter((value): value is string => !!value)
-      .sort((a, b) => a.localeCompare(b));
-  }, [librarySymbolsByFile]);
+    return libraryTreeManifest
+      .filter((entry) => !entry.is_dir)
+      .map((entry) => entry.path);
+  }, [libraryTreeManifest]);
   const activeStdlibPath = useMemo(
     () => (dialogActiveStdlibPath || activeLibraryPath || "").trim(),
     [dialogActiveStdlibPath, activeLibraryPath],
@@ -2112,6 +2371,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     setTreeError("");
     try {
       await expandAll();
+      await expandAllLibraryTree();
       setProjectFilesExpanded(true);
       setLibraryFilesExpanded(true);
       setExpandedFileSymbols(() => {
@@ -2147,17 +2407,18 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     } catch (error) {
       setTreeError(`Failed to expand tree: ${String(error)}`);
     }
-  }, [rootPath, expandAll, symbolsByFile, libraryFilePaths]);
+  }, [rootPath, expandAll, expandAllLibraryTree, symbolsByFile, libraryFilePaths]);
 
   const collapseAllTreeElements = useCallback(() => {
     collapseAll();
+    collapseLibraryTree();
     setExpandedFileSymbols({});
     setExpandedLibraryFiles({});
     setCollapsedSymbolNodes({});
     setExpandedProjectElementsOverflow(false);
     setExpandedProjectFileSymbolOverflow({});
     setExpandedLibraryFileSymbolOverflow({});
-  }, [collapseAll]);
+  }, [collapseAll, collapseLibraryTree]);
 
   const handleLeftPaneResizerPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
@@ -2604,41 +2865,68 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
     renderContainedSymbols,
   ]);
 
-  const renderLibraryTree = useCallback((): ReactNode => {
-    return libraryFilePaths.map((libraryFilePath) => {
-      const fileKey = normalizePath(libraryFilePath);
-      const fileSymbols = librarySymbolsByFile.get(fileKey) || [];
-      const isOpen = !!expandedLibraryFiles[fileKey];
-      const symbolRoots = isOpen ? buildSymbolOwnershipTree(fileSymbols) : [];
-      const expandedOverflow = !!expandedLibraryFileSymbolOverflow[fileKey];
+  const renderLibraryTree = useCallback((entries: FileEntry[], depth = 0): ReactNode => {
+    return entries.map((entry) => {
+      const key = entry.path;
+      const isDir = entry.is_dir;
+      const fileKey = normalizePath(entry.path);
+      const isOpen = isDir ? !!expandedLibraryDirs[entry.path] : !!expandedLibraryFiles[fileKey];
+      const active = !isDir && normalizePath(activeFilePath) === fileKey;
+      const fileSymbols = isDir ? [] : (librarySymbolsByFile.get(fileKey) || []);
+      const symbolRoots = !isDir && isOpen ? buildSymbolOwnershipTree(fileSymbols) : [];
+      const expandedOverflow = !isDir && !!expandedLibraryFileSymbolOverflow[fileKey];
       const renderLimit = expandedOverflow
         ? Math.max(FILE_SYMBOL_RENDER_LIMIT, fileSymbols.length + 1)
         : FILE_SYMBOL_RENDER_LIMIT;
       const renderBudget = { remaining: renderLimit };
-      const shownSymbols = isOpen
-        ? renderContainedSymbols(symbolRoots, 30, renderBudget)
+      const shownSymbols = !isDir && isOpen
+        ? renderContainedSymbols(symbolRoots, 30 + depth * 14, renderBudget)
         : [];
       const shownSymbolCount = renderLimit - renderBudget.remaining;
-      const displayName = libraryFilePath.split(/[\\/]/).pop() || libraryFilePath;
 
       return (
-        <div key={libraryFilePath}>
-          <div className="simple-tree-row">
-            <button
-              type="button"
-              className="ghost simple-tree-toggle"
-              onClick={() => {
-                toggleLibraryFileSymbols(libraryFilePath);
-              }}
-              title={isOpen ? "Hide symbols" : "Show symbols"}
-            >
-              {isOpen ? "v" : ">"}
-            </button>
+        <div key={key}>
+          <div
+            className={`simple-tree-row ${active ? "active" : ""}`}
+            style={{ paddingLeft: `${8 + depth * 14}px` }}
+          >
+            {isDir ? (
+              <button
+                type="button"
+                className="ghost simple-tree-toggle"
+                onClick={() => {
+                  void toggleLibraryDir(entry);
+                }}
+                title={isOpen ? "Collapse" : "Expand"}
+              >
+                {isOpen ? "v" : ">"}
+              </button>
+            ) : (
+              fileSymbols.length > 0 ? (
+                <button
+                  type="button"
+                  className="ghost simple-tree-toggle"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    toggleLibraryFileSymbols(entry.path);
+                  }}
+                  title={isOpen ? "Hide symbols" : "Show symbols"}
+                >
+                  {isOpen ? "v" : ">"}
+                </button>
+              ) : (
+                <span className="simple-tree-toggle-placeholder" />
+              )
+            )}
             <button
               type="button"
               className="ghost simple-tree-entry"
               onClick={() => {
-                void openFilePath(libraryFilePath);
+                if (isDir) {
+                  void toggleLibraryDir(entry);
+                } else {
+                  void openFilePath(entry.path);
+                }
               }}
               onContextMenu={(event) => {
                 event.preventDefault();
@@ -2646,30 +2934,35 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                 setTabContextMenu(null);
                 setTabsOverflowMenuOpen(false);
                 setFileContextMenu({
-                  path: libraryFilePath,
+                  path: entry.path,
                   x: event.clientX,
                   y: event.clientY,
                   allowNewFile: false,
                 });
               }}
-              title={libraryFilePath}
+              title={entry.path}
             >
-              <span className="simple-tree-icon file">{treeNodeIcon(false)}</span>
-              <span className="simple-tree-label">{displayName}</span>
-              <span className="simple-tree-count">{fileSymbols.length}</span>
+              <span className={`simple-tree-icon ${isDir ? "dir" : "file"}`}>
+                {treeNodeIcon(isDir)}
+              </span>
+              <span className="simple-tree-label">{entry.name}</span>
+              {!isDir ? <span className="simple-tree-count">{fileSymbols.length}</span> : null}
             </button>
           </div>
-          {isOpen && shownSymbols.length ? (
+          {isDir && isOpen && expandedLibraryDirs[entry.path]?.length
+            ? renderLibraryTree(expandedLibraryDirs[entry.path], depth + 1)
+            : null}
+          {!isDir && isOpen && shownSymbols.length ? (
             <div className="simple-tree-symbols">
               {shownSymbols}
               {fileSymbols.length > shownSymbolCount ? (
                 <button
                   type="button"
                   className="ghost simple-tree-symbol-more simple-tree-symbol-more-btn muted"
-                  style={{ paddingLeft: "30px" }}
+                  style={{ paddingLeft: `${30 + depth * 14}px` }}
                   onClick={(event) => {
                     event.stopPropagation();
-                    showAllLibraryFileSymbols(libraryFilePath);
+                    showAllLibraryFileSymbols(entry.path);
                   }}
                   title={`Show ${fileSymbols.length - shownSymbolCount} more symbols`}
                 >
@@ -2682,14 +2975,16 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
       );
     });
   }, [
-    libraryFilePaths,
-    librarySymbolsByFile,
-    expandedLibraryFiles,
+    activeFilePath,
+    expandedLibraryDirs,
     expandedLibraryFileSymbolOverflow,
-    toggleLibraryFileSymbols,
-    showAllLibraryFileSymbols,
-    renderContainedSymbols,
+    expandedLibraryFiles,
+    librarySymbolsByFile,
     openFilePath,
+    renderContainedSymbols,
+    showAllLibraryFileSymbols,
+    toggleLibraryDir,
+    toggleLibraryFileSymbols,
   ]);
 
   const harnessMaxDuration = useMemo(
@@ -3236,7 +3531,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                   </div>
                   {libraryFilesExpanded ? (
                     libraryFilePaths.length ? (
-                      renderLibraryTree()
+                      renderLibraryTree(libraryTreeEntries)
                     ) : (
                       <div className="muted">No library files indexed.</div>
                     )

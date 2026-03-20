@@ -11,7 +11,9 @@ use mercurio_core::{
     get_project_expression_records as core_get_project_expression_records,
     get_project_expressions_view as core_get_project_expressions_view,
     get_project_model as core_get_project_model, get_stdlib_metamodel as core_get_stdlib_metamodel,
+    get_workspace_startup_snapshot as core_get_workspace_startup_snapshot,
     get_workspace_symbol_snapshot as core_get_workspace_symbol_snapshot,
+    get_workspace_tree_snapshot as core_get_workspace_tree_snapshot,
     load_library_symbols_sync as core_load_library_symbols_sync,
     query_library_symbols as core_query_library_symbols,
     query_project_semantic_projection_by_qualified_name as core_query_project_semantic_projection_by_qualified_name,
@@ -258,6 +260,12 @@ fn canonical_tool_name(tool: &str) -> String {
         "get_workspace_symbol_snapshot" | "core.get_workspace_symbol_snapshot" => {
             "core.get_workspace_symbol_snapshot@v1".to_string()
         }
+        "get_workspace_startup_snapshot" | "core.get_workspace_startup_snapshot" => {
+            "core.get_workspace_startup_snapshot@v1".to_string()
+        }
+        "get_workspace_tree_snapshot" | "core.get_workspace_tree_snapshot" => {
+            "core.get_workspace_tree_snapshot@v1".to_string()
+        }
         "query_semantic_element" | "core.query_semantic_element" => {
             "core.query_semantic_element@v2".to_string()
         }
@@ -416,6 +424,26 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
             let hydrate_library = arg_bool(&args, "hydrate_library", true);
             tauri::async_runtime::spawn_blocking(move || {
                 core_get_workspace_symbol_snapshot(&core, root, hydrate_library)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|view| serde_json::to_value(view).map_err(|e| e.to_string()))
+        }
+        "core.get_workspace_startup_snapshot@v1" => {
+            let root = arg_string(&args, "root")?;
+            let hydrate_library = arg_bool(&args, "hydrate_library", true);
+            let prefer_cache = arg_bool(&args, "prefer_cache", true);
+            tauri::async_runtime::spawn_blocking(move || {
+                core_get_workspace_startup_snapshot(&core, root, hydrate_library, prefer_cache)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|view| serde_json::to_value(view).map_err(|e| e.to_string()))
+        }
+        "core.get_workspace_tree_snapshot@v1" => {
+            let root = arg_string(&args, "root")?;
+            tauri::async_runtime::spawn_blocking(move || {
+                core_get_workspace_tree_snapshot(&core, root)
             })
             .await
             .map_err(|e| e.to_string())?

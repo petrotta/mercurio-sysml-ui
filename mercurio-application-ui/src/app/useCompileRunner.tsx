@@ -1,5 +1,4 @@
-import { useRef } from "react";
-import type { UnsavedCompileInput } from "./compileShared";
+import { useCallback, useRef } from "react";
 import { useBuildNotifications } from "./useBuildNotifications";
 import { useCompileJobController } from "./useCompileJobController";
 import { useSymbolRefreshController } from "./useSymbolRefreshController";
@@ -31,27 +30,35 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
     appendBuildLogEntries: notifications.appendBuildLogEntries,
     showErrorNotification: notifications.showErrorNotification,
   });
+  const handleCompileSuccess = useCallback(({
+    compileRoot,
+    sessionToken,
+  }: {
+    compileRoot: string;
+    runId: number;
+    sessionToken: number;
+  }) => {
+    void symbolRefresh.refreshAfterCompile({
+      compileRoot,
+      sessionToken,
+    });
+  }, [symbolRefresh.refreshAfterCompile]);
   const compileJobs = useCompileJobController({
     rootPath,
     sessionTokenRef,
     currentRunIdRef,
     notifications,
-    onCompileSuccess: ({ compileRoot, sessionToken }) => {
-      symbolRefresh.bumpSemanticRefreshVersion();
-      void symbolRefresh.refreshAfterCompile({
-        compileRoot,
-        sessionToken,
-      });
-    },
+    onCompileSuccess: handleCompileSuccess,
   });
 
   return {
+    sessionToken: sessionTokenRef.current,
     compileStatus: notifications.compileStatus,
     setCompileStatus: notifications.setCompileStatus,
+    showErrorNotification: notifications.showErrorNotification,
     compileRunId: compileJobs.compileRunId,
     compileToast: notifications.compileToast,
-    runCompile: (filePath?: string, unsavedInputs?: UnsavedCompileInput[]) =>
-      compileJobs.runCompile(filePath, unsavedInputs),
+    runCompile: compileJobs.runCompile,
     cancelCompile: compileJobs.cancelCompile,
     symbols: symbolRefresh.symbols,
     symbolsStatus: symbolRefresh.symbolsStatus,
@@ -65,5 +72,9 @@ export function useCompileRunner({ rootPath }: UseCompileRunnerOptions) {
     activeLibraryPath: symbolRefresh.activeLibraryPath,
     symbolIndexError: symbolRefresh.symbolIndexError,
     semanticRefreshVersion: symbolRefresh.semanticRefreshVersion,
+    applyWorkspaceSnapshot: symbolRefresh.applyWorkspaceSnapshot,
+    resetWorkspaceSymbols: symbolRefresh.resetWorkspaceSymbols,
+    loadStartupSymbols: symbolRefresh.loadStartupSymbols,
+    refreshWorkspaceSymbols: symbolRefresh.refreshWorkspaceSymbols,
   };
 }

@@ -9,11 +9,26 @@ const outputPath = resolve(projectRoot, "src", "app", "generated", "core-contrac
 const STRUCT_SPECS = [
   {
     rustPath: resolve(workspaceRoot, "mercurio-core", "src", "state.rs"),
+    rustName: "CacheClearSummary",
+    tsName: "CacheClearSummary",
+  },
+  {
+    rustPath: resolve(workspaceRoot, "mercurio-core", "src", "state.rs"),
     rustName: "CompileDiagnosticView",
     tsName: "ParseDiagnosticView",
     fieldOverrides: {
       source: '"parse" | "semantic"',
     },
+  },
+  {
+    rustPath: resolve(workspaceRoot, "mercurio-core", "src", "workspace_tree.rs"),
+    rustName: "WorkspaceTreeEntryView",
+    tsName: "WorkspaceTreeEntryView",
+  },
+  {
+    rustPath: resolve(workspaceRoot, "mercurio-core", "src", "workspace_tree.rs"),
+    rustName: "WorkspaceTreeSnapshotView",
+    tsName: "WorkspaceTreeSnapshotResult",
   },
   {
     rustPath: resolve(workspaceRoot, "mercurio-core", "src", "compile.rs"),
@@ -49,8 +64,23 @@ const STRUCT_SPECS = [
   },
   {
     rustPath: resolve(workspaceRoot, "mercurio-core", "src", "workspace_symbols.rs"),
+    rustName: "WorkspaceSymbolSnapshotTimingsView",
+    tsName: "WorkspaceSymbolSnapshotTimingsView",
+  },
+  {
+    rustPath: resolve(workspaceRoot, "mercurio-core", "src", "workspace_symbols.rs"),
     rustName: "WorkspaceSymbolSnapshotView",
     tsName: "WorkspaceSymbolSnapshotResult",
+  },
+  {
+    rustPath: resolve(workspaceRoot, "mercurio-core", "src", "workspace_symbols.rs"),
+    rustName: "WorkspaceStartupSnapshotTimingsView",
+    tsName: "WorkspaceStartupSnapshotTimingsView",
+  },
+  {
+    rustPath: resolve(workspaceRoot, "mercurio-core", "src", "workspace_symbols.rs"),
+    rustName: "WorkspaceStartupSnapshotView",
+    tsName: "WorkspaceStartupSnapshotResult",
   },
   {
     rustPath: resolve(

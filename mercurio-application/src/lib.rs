@@ -30,8 +30,8 @@ use mercurio_core::{
     ensure_mercurio_paths, ensure_project_descriptor, list_stdlib_versions_from_root,
     load_app_settings, load_project_descriptor, save_app_settings, write_project_descriptor,
     AppSettings, BackgroundCancelSummary, BackgroundJobsSnapshot, CacheClearSummary,
-    CompileRequest, CompileResponse, CoreState, LibraryConfig, MercurioPaths,
-    WindowBoundsSettings, WindowStateSettings,
+    CompileRequest, CompileResponse, CoreState, LibraryConfig, MercurioPaths, WindowBoundsSettings,
+    WindowStateSettings,
 };
 
 pub(crate) struct AppState {
@@ -220,7 +220,11 @@ async fn compile_project_delta(
 
 #[tauri::command]
 fn cancel_compile(state: tauri::State<'_, AppState>, run_id: u64) -> Result<(), String> {
-    log_event("WARN", "compile", format!("cancel requested run_id={}", run_id));
+    log_event(
+        "WARN",
+        "compile",
+        format!("cancel requested run_id={}", run_id),
+    );
     core_cancel_compile(&state.core, run_id)
 }
 
@@ -248,23 +252,21 @@ fn cancel_background_jobs(
 }
 
 #[tauri::command]
-fn clear_all_caches(
-    state: tauri::State<'_, AppState>,
-    root: Option<String>,
-) -> Result<CacheClearSummary, String> {
-    let summary = state.core.clear_runtime_caches_for_root(root.as_deref())?;
+fn clear_all_caches(state: tauri::State<'_, AppState>) -> Result<CacheClearSummary, String> {
+    let summary = state.core.clear_runtime_caches()?;
     log_event(
         "INFO",
         "cache",
         format!(
-            "cleared workspace_snapshot={} metamodel={} parsed_files={} mtimes={} canceled={} symbol_index_cleared={} project_ir_deleted={}",
+            "cleared workspace_snapshot={} semantic_lookup={} parsed_files={} mtimes={} canceled={} pending_persists={} workspace_ir_deleted={} symbol_index_cleared={}",
             summary.workspace_snapshot_entries,
-            summary.metamodel_entries,
+            summary.project_semantic_lookup_entries,
             summary.parsed_file_entries,
             summary.file_mtime_entries,
             summary.canceled_compile_entries,
+            summary.pending_workspace_ir_persists,
+            summary.workspace_ir_cache_files_deleted,
             summary.symbol_index_cleared,
-            summary.project_ir_cache_deleted,
         ),
     );
     Ok(summary)
@@ -392,10 +394,7 @@ fn set_project_stdlib_path(
     descriptor.config.stdlib = None;
     let _ = write_project_descriptor(&root_path, &descriptor)?;
 
-    let root_key = root_path.to_string_lossy().to_string();
-    let _ = state
-        .core
-        .clear_runtime_caches_for_root(Some(root_key.as_str()));
+    let _ = state.core.clear_runtime_caches();
 
     Ok(selected_path.to_string_lossy().to_string())
 }
@@ -522,7 +521,11 @@ pub fn run() {
                     log_event("ERROR", "window", format!("state restore failed: {}", err));
                 }
                 if let Err(err) = window.show() {
-                    log_event("ERROR", "window", format!("failed to show main window: {}", err));
+                    log_event(
+                        "ERROR",
+                        "window",
+                        format!("failed to show main window: {}", err),
+                    );
                 }
             }
             log_event("INFO", "app", "startup complete".to_string());

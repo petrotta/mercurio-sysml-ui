@@ -10,10 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::project_root_key::canonical_project_root;
 use crate::settings::AppSettings;
+use crate::stdlib::clear_all_persisted_stdlib_indexes;
 use crate::workspace_ir_cache::{
-    clear_workspace_ir_cache, flush_pending_workspace_ir_cache_persists,
+    clear_all_workspace_ir_caches, flush_pending_workspace_ir_cache_persists,
 };
 
 #[derive(Serialize, Clone)]
@@ -132,12 +132,14 @@ pub struct CoreState {
 #[derive(Serialize, Clone, Copy)]
 pub struct CacheClearSummary {
     pub workspace_snapshot_entries: usize,
-    pub metamodel_entries: usize,
+    pub project_semantic_lookup_entries: usize,
     pub parsed_file_entries: usize,
     pub file_mtime_entries: usize,
     pub canceled_compile_entries: usize,
+    pub pending_workspace_ir_persists: usize,
+    pub workspace_ir_cache_files_deleted: usize,
+    pub stdlib_index_cache_files_deleted: usize,
     pub symbol_index_cleared: bool,
-    pub project_ir_cache_deleted: bool,
 }
 
 pub struct BackgroundJobHandle {
@@ -252,14 +254,12 @@ impl CoreState {
     }
 
     pub fn clear_runtime_caches(&self) -> Result<CacheClearSummary, String> {
-        self.clear_runtime_caches_for_root(None)
-    }
-
-    pub fn clear_runtime_caches_for_root(
-        &self,
-        project_root: Option<&str>,
-    ) -> Result<CacheClearSummary, String> {
-        flush_pending_workspace_ir_cache_persists(self, project_root)?;
+        let pending_workspace_ir_persists = self
+            .pending_workspace_ir_persists
+            .lock()
+            .map_err(|_| "Pending workspace IR persist lock poisoned".to_string())?
+            .len();
+        flush_pending_workspace_ir_cache_persists(self, None)?;
         let workspace_snapshot_entries = {
             let mut cache = self
                 .workspace_snapshot_cache
@@ -269,10 +269,15 @@ impl CoreState {
             cache.clear();
             count
         };
-        if let Ok(mut lookup_cache) = self.project_semantic_lookup_cache.lock() {
+        let project_semantic_lookup_entries = {
+            let mut lookup_cache = self
+                .project_semantic_lookup_cache
+                .lock()
+                .map_err(|_| "Project semantic lookup cache lock poisoned".to_string())?;
+            let count = lookup_cache.len();
             lookup_cache.clear();
-        }
-        let metamodel_entries = 0usize;
+            count
+        };
         let (parsed_file_entries, file_mtime_entries) = {
             let mut workspace = self
                 .workspace
@@ -304,22 +309,44 @@ impl CoreState {
         if let Ok(mut pending_persists) = self.pending_workspace_ir_persists.lock() {
             pending_persists.clear();
         }
-        let project_ir_cache_deleted = match project_root {
-            Some(root) => {
-                let canonical_root = canonical_project_root(root);
-                clear_workspace_ir_cache(&canonical_root)?
-            }
-            None => false,
-        };
+        let workspace_ir_cache_files_deleted = clear_all_workspace_ir_caches()?;
+        let stdlib_index_cache_files_deleted = clear_all_persisted_stdlib_indexes()?;
         Ok(CacheClearSummary {
             workspace_snapshot_entries,
-            metamodel_entries,
+            project_semantic_lookup_entries,
             parsed_file_entries,
             file_mtime_entries,
             canceled_compile_entries,
+            pending_workspace_ir_persists,
+            workspace_ir_cache_files_deleted,
+            stdlib_index_cache_files_deleted,
             symbol_index_cleared,
-            project_ir_cache_deleted,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_in_memory_caches_for_tests(&self) -> Result<(), String> {
+        flush_pending_workspace_ir_cache_persists(self, None)?;
+        if let Ok(mut cache) = self.workspace_snapshot_cache.lock() {
+            cache.clear();
+        }
+        if let Ok(mut lookup_cache) = self.project_semantic_lookup_cache.lock() {
+            lookup_cache.clear();
+        }
+        if let Ok(mut workspace) = self.workspace.lock() {
+            workspace.file_cache.clear();
+            workspace.file_mtimes.clear();
+        }
+        if let Ok(mut symbol_index) = self.symbol_index.lock() {
+            symbol_index.clear_all();
+        }
+        if let Ok(mut canceled) = self.canceled_compiles.lock() {
+            canceled.clear();
+        }
+        if let Ok(mut pending) = self.pending_workspace_ir_persists.lock() {
+            pending.clear();
+        }
+        Ok(())
     }
 }
 

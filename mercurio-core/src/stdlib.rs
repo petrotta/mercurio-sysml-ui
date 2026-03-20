@@ -1,16 +1,51 @@
+use mercurio_symbol_index::{Scope, SymbolIndexStore, SymbolRecord};
 use mercurio_sysml_core::vfs::Vfs;
+use mercurio_sysml_pkg::compile_support::{collect_stdlib_files, stdlib_signature_key};
+use mercurio_sysml_semantics::semantic_contract::SemanticElementProjectionView;
 use mercurio_sysml_semantics::stdlib::{
     build_metatype_index, load_stdlib_from_path, MetatypeIndex, MetatypeInfo, TypeId,
 };
-use serde::Serialize;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::project::load_project_config;
+use crate::project_root_key::{canonical_project_root, normalize_workspace_path};
+use crate::settings::resolve_mercurio_user_dir;
 use crate::state::{CoreState, StdlibCache, WorkspaceSnapshotCacheEntry};
+use crate::workspace_tree::{collect_tree_manifest, WorkspaceTreeEntryView};
 use mercurio_sysml_pkg::mercurio_sysml_semantic_adapter::{ingest_text, Language};
+
+const STDLIB_INDEX_SCHEMA_VERSION: u32 = 1;
+const STDLIB_INDEX_CACHE_FILE_NAME: &str = "stdlib-index-v1.json";
+const STDLIB_INDEX_ROOT_REGISTRY_FILE_NAME: &str = "cache-stdlib-roots.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedStdlibIndex {
+    schema_version: u32,
+    engine_version: String,
+    stdlib_root: String,
+    signature: String,
+    #[serde(default)]
+    library_tree: Vec<WorkspaceTreeEntryView>,
+    #[serde(default)]
+    symbols: Vec<SymbolRecord>,
+    #[serde(default)]
+    semantic_projections: Vec<SemanticElementProjectionView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedStdlibIndexSymbolsOnly {
+    schema_version: u32,
+    engine_version: String,
+    stdlib_root: String,
+    signature: String,
+    #[serde(default)]
+    symbols: Vec<SymbolRecord>,
+}
 
 pub fn list_stdlib_versions_from_root(stdlib_root: &Path) -> Result<Vec<String>, String> {
     mercurio_sysml_pkg::workspace_config::list_stdlib_versions_from_root(stdlib_root)
@@ -32,6 +67,419 @@ pub(crate) fn resolve_stdlib_path(
             override_id,
             project_root,
         ),
+    )
+}
+
+fn canonical_stdlib_root(stdlib_root: &Path) -> String {
+    normalize_workspace_path(&stdlib_root.to_string_lossy())
+}
+
+fn stdlib_index_cache_file_path(stdlib_root: &Path) -> PathBuf {
+    PathBuf::from(canonical_stdlib_root(stdlib_root))
+        .join(".mercurio")
+        .join("cache")
+        .join(STDLIB_INDEX_CACHE_FILE_NAME)
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, bytes).map_err(|e| e.to_string())?;
+    if path.exists() {
+        fs::remove_file(path).map_err(|e| e.to_string())?;
+    }
+    match fs::rename(&tmp_path, path) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = fs::remove_file(&tmp_path);
+            Err(err.to_string())
+        }
+    }
+}
+
+fn read_persisted_stdlib_index(stdlib_root: &Path) -> Result<Option<PersistedStdlibIndex>, String> {
+    let path = stdlib_index_cache_file_path(stdlib_root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let parsed = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    Ok(Some(parsed))
+}
+
+fn read_persisted_stdlib_index_symbols_only(
+    stdlib_root: &Path,
+) -> Result<Option<PersistedStdlibIndexSymbolsOnly>, String> {
+    let path = stdlib_index_cache_file_path(stdlib_root);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let parsed = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    Ok(Some(parsed))
+}
+
+fn read_validated_persisted_stdlib_index(
+    stdlib_root: &Path,
+    signature: &str,
+) -> Result<Option<PersistedStdlibIndex>, String> {
+    let Some(cache) = read_persisted_stdlib_index(stdlib_root)? else {
+        return Ok(None);
+    };
+    if cache.schema_version != STDLIB_INDEX_SCHEMA_VERSION {
+        return Ok(None);
+    }
+    if cache.engine_version != env!("CARGO_PKG_VERSION") {
+        return Ok(None);
+    }
+    if cache.signature != signature {
+        return Ok(None);
+    }
+    if canonical_stdlib_root(stdlib_root) != canonical_stdlib_root(Path::new(&cache.stdlib_root)) {
+        return Ok(None);
+    }
+    Ok(Some(cache))
+}
+
+fn read_validated_persisted_stdlib_index_symbols_only(
+    stdlib_root: &Path,
+    signature: &str,
+) -> Result<Option<PersistedStdlibIndexSymbolsOnly>, String> {
+    let Some(cache) = read_persisted_stdlib_index_symbols_only(stdlib_root)? else {
+        return Ok(None);
+    };
+    if cache.schema_version != STDLIB_INDEX_SCHEMA_VERSION {
+        return Ok(None);
+    }
+    if cache.engine_version != env!("CARGO_PKG_VERSION") {
+        return Ok(None);
+    }
+    if cache.signature != signature {
+        return Ok(None);
+    }
+    if canonical_stdlib_root(stdlib_root) != canonical_stdlib_root(Path::new(&cache.stdlib_root)) {
+        return Ok(None);
+    }
+    Ok(Some(cache))
+}
+
+fn stdlib_cache_root_registry_path() -> Result<PathBuf, String> {
+    Ok(resolve_mercurio_user_dir().join(STDLIB_INDEX_ROOT_REGISTRY_FILE_NAME))
+}
+
+fn load_stdlib_cache_root_registry() -> Result<Vec<String>, String> {
+    let path = stdlib_cache_root_registry_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let parsed = serde_json::from_str::<Vec<String>>(&raw).map_err(|e| e.to_string())?;
+    let mut unique = BTreeSet::<String>::new();
+    for root in parsed {
+        let canonical = normalize_workspace_path(&root);
+        if !canonical.trim().is_empty() {
+            unique.insert(canonical);
+        }
+    }
+    Ok(unique.into_iter().collect())
+}
+
+fn write_stdlib_cache_root_registry(roots: &[String]) -> Result<(), String> {
+    let path = stdlib_cache_root_registry_path()?;
+    let bytes = serde_json::to_vec(roots).map_err(|e| e.to_string())?;
+    write_atomic(&path, &bytes)
+}
+
+fn register_stdlib_cache_root(stdlib_root: &Path) -> Result<(), String> {
+    let canonical = canonical_stdlib_root(stdlib_root);
+    if canonical.trim().is_empty() {
+        return Ok(());
+    }
+    let mut roots = load_stdlib_cache_root_registry()?;
+    if roots.iter().any(|existing| existing == &canonical) {
+        return Ok(());
+    }
+    roots.push(canonical);
+    roots.sort();
+    write_stdlib_cache_root_registry(&roots)
+}
+
+pub(crate) fn clear_all_persisted_stdlib_indexes() -> Result<usize, String> {
+    let roots = load_stdlib_cache_root_registry()?;
+    let mut retained = Vec::<String>::new();
+    let mut failures = Vec::<String>::new();
+    let mut deleted = 0usize;
+
+    for root in roots {
+        let path = stdlib_index_cache_file_path(Path::new(&root));
+        if !path.exists() {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => deleted += 1,
+            Err(error) => {
+                retained.push(root.clone());
+                failures.push(format!("{}: {}", path.to_string_lossy(), error));
+            }
+        }
+    }
+
+    write_stdlib_cache_root_registry(&retained)?;
+    if failures.is_empty() {
+        Ok(deleted)
+    } else {
+        Err(format!(
+            "Failed to delete stdlib index cache files: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+fn clear_library_symbols_for_project(state: &CoreState, project_root: &str) -> Result<(), String> {
+    let mut store = state
+        .symbol_index
+        .lock()
+        .map_err(|_| "Symbol index lock poisoned".to_string())?;
+    let files = store
+        .library_symbols(project_root, None)
+        .into_iter()
+        .map(|symbol| symbol.file_path)
+        .collect::<BTreeSet<_>>();
+    for file_path in files {
+        store.delete_symbols_for_file(project_root, &file_path);
+    }
+    Ok(())
+}
+
+pub(crate) fn persist_stdlib_index_cache(
+    state: &CoreState,
+    project_root: &str,
+    stdlib_root: Option<&Path>,
+    stdlib_signature: &str,
+) -> Result<(), String> {
+    let Some(stdlib_root) = stdlib_root else {
+        return Ok(());
+    };
+    if stdlib_signature.trim().is_empty() {
+        return Ok(());
+    }
+    let project_root = canonical_project_root(project_root);
+    let library_key = normalized_compare_key(stdlib_root);
+    let mut symbols = {
+        let store = state
+            .symbol_index
+            .lock()
+            .map_err(|_| "Symbol index lock poisoned".to_string())?;
+        store
+            .library_symbols(&project_root, None)
+            .into_iter()
+            .filter(|symbol| symbol.library_key.as_deref() == Some(library_key.as_str()))
+            .collect::<Vec<_>>()
+    };
+    symbols.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then(a.start_line.cmp(&b.start_line))
+            .then(a.start_col.cmp(&b.start_col))
+            .then(a.qualified_name.cmp(&b.qualified_name))
+            .then(a.kind.cmp(&b.kind))
+    });
+    symbols.dedup_by(|left, right| left.id == right.id);
+    let semantic_projections = {
+        let cache_key = format!("stdlib-semantic-projection|{library_key}");
+        let cache = state
+            .workspace_snapshot_cache
+            .lock()
+            .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
+        match cache.get(&cache_key) {
+            Some(WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(projections)) => {
+                projections.as_ref().clone()
+            }
+            _ => Vec::new(),
+        }
+    };
+    if symbols.is_empty() && semantic_projections.is_empty() {
+        return Ok(());
+    }
+    let snapshot = PersistedStdlibIndex {
+        schema_version: STDLIB_INDEX_SCHEMA_VERSION,
+        engine_version: env!("CARGO_PKG_VERSION").to_string(),
+        stdlib_root: canonical_stdlib_root(stdlib_root),
+        signature: stdlib_signature.to_string(),
+        library_tree: collect_tree_manifest(stdlib_root)?,
+        symbols,
+        semantic_projections,
+    };
+    let bytes = serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?;
+    write_atomic(&stdlib_index_cache_file_path(stdlib_root), &bytes)?;
+    register_stdlib_cache_root(stdlib_root)?;
+    Ok(())
+}
+
+pub(crate) fn seed_stdlib_index_from_cache_for_project(
+    state: &CoreState,
+    project_root: &str,
+    stdlib_root: Option<&Path>,
+    stdlib_signature: &str,
+) -> Result<bool, String> {
+    let Some(stdlib_root) = stdlib_root else {
+        return Ok(false);
+    };
+    if stdlib_signature.trim().is_empty() {
+        return Ok(false);
+    }
+    let Some(cache) =
+        read_validated_persisted_stdlib_index_symbols_only(stdlib_root, stdlib_signature)?
+    else {
+        return Ok(false);
+    };
+    if cache.symbols.is_empty() {
+        return Ok(false);
+    }
+
+    let project_root = canonical_project_root(project_root);
+    let library_key = normalized_compare_key(stdlib_root);
+    clear_library_symbols_for_project(state, &project_root)?;
+
+    let mut grouped = BTreeMap::<String, Vec<SymbolRecord>>::new();
+    for mut symbol in cache.symbols {
+        symbol.project_root = project_root.clone();
+        symbol.scope = Scope::Stdlib;
+        symbol.library_key = Some(library_key.clone());
+        grouped.entry(symbol.file_path.clone()).or_default().push(symbol);
+    }
+    let mut store = state
+        .symbol_index
+        .lock()
+        .map_err(|_| "Symbol index lock poisoned".to_string())?;
+    for (file_path, rows) in grouped {
+        store.upsert_symbols_for_file(&project_root, &file_path, rows);
+    }
+    store.mark_stdlib_indexed(&project_root, &library_key, stdlib_signature);
+    store.rebuild_symbol_mappings(&project_root);
+    drop(store);
+    Ok(true)
+}
+
+pub(crate) fn seed_stdlib_semantic_projection_cache_for_project(
+    state: &CoreState,
+    project_root: &str,
+) -> Result<bool, String> {
+    let project_root = canonical_project_root(project_root);
+    if project_root.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let root_path = PathBuf::from(&project_root);
+    if !root_path.exists() {
+        return Ok(false);
+    }
+
+    let default_stdlib = state
+        .settings
+        .lock()
+        .ok()
+        .and_then(|settings| settings.default_stdlib.clone());
+    let project_config = load_project_config(&root_path).ok().flatten();
+    let library_config = project_config
+        .as_ref()
+        .and_then(|config| config.library.as_ref());
+    let stdlib_override = project_config
+        .as_ref()
+        .and_then(|config| config.stdlib.as_ref());
+    let (_loader, stdlib_path) = resolve_stdlib_path(
+        &state.stdlib_root,
+        default_stdlib.as_deref(),
+        library_config,
+        stdlib_override,
+        &root_path,
+    );
+    let Some(stdlib_path) = stdlib_path else {
+        return Ok(false);
+    };
+    let stdlib_files = collect_stdlib_files(Some(&stdlib_path))?;
+    if stdlib_files.is_empty() {
+        return Ok(false);
+    }
+    let signature = stdlib_signature_key(&stdlib_files)?;
+    let Some(cache) = read_validated_persisted_stdlib_index(&stdlib_path, &signature)? else {
+        return Ok(false);
+    };
+    if cache.semantic_projections.is_empty() {
+        return Ok(false);
+    }
+
+    let library_key = normalized_compare_key(&stdlib_path);
+    let mut workspace_cache = state
+        .workspace_snapshot_cache
+        .lock()
+        .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
+    workspace_cache.insert(
+        format!("stdlib-semantic-projection|{library_key}"),
+        WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(Arc::new(
+            cache.semantic_projections,
+        )),
+    );
+    Ok(true)
+}
+
+pub(crate) fn seed_stdlib_index_if_missing(
+    state: &CoreState,
+    project_root: &str,
+) -> Result<bool, String> {
+    let project_root = canonical_project_root(project_root);
+    if project_root.trim().is_empty() {
+        return Ok(false);
+    }
+    let need_seed = {
+        let store = state
+            .symbol_index
+            .lock()
+            .map_err(|_| "Symbol index lock poisoned".to_string())?;
+        store.library_symbols(&project_root, None).is_empty()
+    };
+    if !need_seed {
+        return Ok(false);
+    }
+
+    let root_path = PathBuf::from(&project_root);
+    if !root_path.exists() {
+        return Ok(false);
+    }
+    let default_stdlib = state
+        .settings
+        .lock()
+        .ok()
+        .and_then(|settings| settings.default_stdlib.clone());
+    let project_config = load_project_config(&root_path).ok().flatten();
+    let library_config = project_config
+        .as_ref()
+        .and_then(|config| config.library.as_ref());
+    let stdlib_override = project_config
+        .as_ref()
+        .and_then(|config| config.stdlib.as_ref());
+    let (_loader, stdlib_path) = resolve_stdlib_path(
+        &state.stdlib_root,
+        default_stdlib.as_deref(),
+        library_config,
+        stdlib_override,
+        &root_path,
+    );
+    let Some(stdlib_path) = stdlib_path else {
+        return Ok(false);
+    };
+    let stdlib_files = collect_stdlib_files(Some(&stdlib_path))?;
+    if stdlib_files.is_empty() {
+        return Ok(false);
+    }
+    let signature = stdlib_signature_key(&stdlib_files)?;
+    seed_stdlib_index_from_cache_for_project(
+        state,
+        &project_root,
+        Some(&stdlib_path),
+        &signature,
     )
 }
 

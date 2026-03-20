@@ -29,7 +29,9 @@ use std::time::{Instant, SystemTime};
 use crate::project::load_project_config;
 use crate::project_root_key::{canonical_project_root, normalize_display_path};
 use crate::state::{StdlibCache, StdlibSymbol, WorkspaceSnapshotCacheEntry};
-use crate::stdlib::resolve_stdlib_path;
+use crate::stdlib::{
+    persist_stdlib_index_cache, resolve_stdlib_path, seed_stdlib_index_from_cache_for_project,
+};
 use crate::symbol_index::{query_project_symbols, refresh_project_semantic_lookup};
 use crate::workspace::{collect_model_files, collect_project_files};
 use crate::workspace_ir_cache::schedule_workspace_ir_cache_persist;
@@ -1494,8 +1496,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
                 );
             }
             let projected = map_semantic_element_to_projected_symbol(element, &empty_library_spans);
-            library_projection_views
-                .push(stdlib_projection_view_from_projected_symbol(&projected));
+            library_projection_views.push(stdlib_projection_view_from_projected_symbol(&projected));
             let key = format!(
                 "{}|{}|{}",
                 projected.file_path, projected.qualified_name, projected.name
@@ -1676,6 +1677,14 @@ pub fn load_library_symbols_sync(
     let library_key = stdlib_path_for_log
         .as_ref()
         .map(|path| normalized_compare_key(path));
+    if !stdlib_signature.is_empty() {
+        let _ = seed_stdlib_index_from_cache_for_project(
+            state,
+            &root,
+            stdlib_path_for_log.as_deref(),
+            &stdlib_signature,
+        )?;
+    }
     let index_fresh =
         if let (Some(key), false) = (library_key.as_ref(), stdlib_signature.is_empty()) {
             let store = state
@@ -1827,6 +1836,12 @@ pub fn load_library_symbols_sync(
                 }
             }
         }
+        let _ = persist_stdlib_index_cache(
+            state,
+            &root,
+            stdlib_path_for_log.as_deref(),
+            &stdlib_signature,
+        );
         resolved
     };
     let stdlib_duration_ms = stdlib_start.elapsed().as_millis();
@@ -1851,6 +1866,9 @@ pub fn load_library_symbols_sync(
         root.clone(),
         persist_signature.map(|value| value.to_string()),
     );
+    if !stdlib_signature.is_empty() {
+        let _ = persist_stdlib_index_cache(state, &root, stdlib_path_for_log.as_deref(), &stdlib_signature);
+    }
     Ok(response)
 }
 
@@ -3971,6 +3989,10 @@ package ConnectionTest {
             load_library_symbols_sync(&state, project_b.to_string_lossy().to_string(), None, true)
                 .expect("load b1");
         assert!(!b1.workspace_snapshot_hit);
+
+        state
+            .clear_in_memory_caches_for_tests()
+            .expect("clear runtime caches");
 
         let a2 =
             load_library_symbols_sync(&state, project_a.to_string_lossy().to_string(), None, true)

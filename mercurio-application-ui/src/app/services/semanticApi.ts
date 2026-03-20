@@ -3,7 +3,9 @@ import type {
   ExpressionsToolView,
   ProjectElementPropertySectionsView,
   ProjectModelView,
+  WorkspaceStartupSnapshotResult,
   WorkspaceSymbolSnapshotResult,
+  WorkspaceTreeSnapshotResult,
 } from "../contracts";
 
 const PROJECT_ELEMENT_PROPERTIES_TIMEOUT_MS = 20000;
@@ -68,5 +70,25 @@ export async function getWorkspaceSymbolSnapshot(
   return callTool<WorkspaceSymbolSnapshotResult>("core.get_workspace_symbol_snapshot@v1", {
     root,
     hydrate_library: hydrateLibrary,
+  });
+}
+
+export async function getWorkspaceStartupSnapshot(
+  root: string,
+  hydrateLibrary = true,
+  preferCache = true,
+): Promise<WorkspaceStartupSnapshotResult> {
+  return callTool<WorkspaceStartupSnapshotResult>("core.get_workspace_startup_snapshot@v1", {
+    root,
+    hydrate_library: hydrateLibrary,
+    prefer_cache: preferCache,
+  });
+}
+
+export async function getWorkspaceTreeSnapshot(
+  root: string,
+): Promise<WorkspaceTreeSnapshotResult> {
+  return callTool<WorkspaceTreeSnapshotResult>("core.get_workspace_tree_snapshot@v1", {
+    root,
   });
 }

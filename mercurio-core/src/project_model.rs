@@ -23,7 +23,7 @@ use crate::project::load_project_config;
 use crate::project_model_seed::seed_symbol_index_if_empty;
 use crate::project_root_key::canonical_project_root;
 use crate::state::{CoreState, WorkspaceSnapshotCacheEntry};
-use crate::stdlib::resolve_stdlib_path;
+use crate::stdlib::{resolve_stdlib_path, seed_stdlib_semantic_projection_cache_for_project};
 use crate::symbol_index::{
     query_project_semantic_projection_by_qualified_name, IndexedSemanticProjectionElementView,
 };
@@ -153,8 +153,7 @@ fn get_element_attributes_internal(
                 symbol_kind.as_deref(),
             ),
         };
-        let Some(symbol) = symbol
-        else {
+        let Some(symbol) = symbol else {
             return Ok(ProjectElementAttributesView {
                 element_qualified_name,
                 metatype_qname: None,
@@ -368,14 +367,26 @@ fn query_stdlib_semantic_projection_by_qualified_name(
         return Ok(None);
     };
     let cache_key = format!("stdlib-semantic-projection|{library_key}");
-    let cache = state
-        .workspace_snapshot_cache
-        .lock()
-        .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
-    let Some(WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(projections)) =
-        cache.get(&cache_key)
-    else {
-        return Ok(None);
+    let mut seeded_from_cache = false;
+    let projections = loop {
+        let cache = state
+            .workspace_snapshot_cache
+            .lock()
+            .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
+        if let Some(WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(projections)) =
+            cache.get(&cache_key)
+        {
+            break projections.clone();
+        }
+        drop(cache);
+        if seeded_from_cache {
+            return Ok(None);
+        }
+        let seeded = seed_stdlib_semantic_projection_cache_for_project(state, &root)?;
+        if !seeded {
+            return Ok(None);
+        }
+        seeded_from_cache = true;
     };
 
     let requested_file_key = file_path
@@ -384,7 +395,8 @@ fn query_stdlib_semantic_projection_by_qualified_name(
     if let Some(requested_key) = requested_file_key {
         if let Some(projection) = projections.iter().find(|projection| {
             projection.qualified_name == target
-                && normalize_compare_key(std::path::Path::new(&projection.file_path)) == requested_key
+                && normalize_compare_key(std::path::Path::new(&projection.file_path))
+                    == requested_key
         }) {
             return Ok(Some(indexed_projection_view(projection)));
         }
