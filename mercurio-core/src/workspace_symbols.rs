@@ -5,7 +5,7 @@ use std::time::Instant;
 use crate::compile::load_library_symbols_sync;
 use crate::project_model_seed::seed_symbol_index_if_empty;
 use crate::project_root_key::canonical_project_root;
-use crate::stdlib::seed_stdlib_index_from_cache_for_project;
+use crate::stdlib::{is_stdlib_index_seeded_for_project, seed_stdlib_index_from_cache_for_project};
 use crate::symbol_index::{
     query_library_symbols_impl, query_project_symbols_impl, IndexedSymbolView,
 };
@@ -224,12 +224,21 @@ pub fn get_workspace_startup_snapshot(
                 (library_path.as_deref(), stdlib_signature.as_deref())
             {
                 let library_root = PathBuf::from(path);
-                let _ = seed_stdlib_index_from_cache_for_project(
+                let stdlib_seeded = is_stdlib_index_seeded_for_project(
                     state,
                     &root,
-                    Some(&library_root),
+                    &library_root,
                     signature,
-                );
+                )
+                .unwrap_or(false);
+                if !stdlib_seeded {
+                    let _ = seed_stdlib_index_from_cache_for_project(
+                        state,
+                        &root,
+                        Some(&library_root),
+                        signature,
+                    );
+                }
             }
             cache_seed_symbol_index_ms = elapsed_ms(cache_seed_symbol_index_started_at);
             let cache_seed_projection_started_at = Instant::now();

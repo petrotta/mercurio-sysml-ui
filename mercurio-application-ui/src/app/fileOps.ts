@@ -23,6 +23,30 @@ export async function createProjectFile(root: string, parent: string, name: stri
   return createdPath || "";
 }
 
+export async function createProject(
+  parent: string,
+  name: string,
+  author?: string,
+  description?: string,
+  organization?: string,
+  useDefaultLibrary = true,
+): Promise<string> {
+  const createdRoot = await invoke<string>("create_project", {
+    parent,
+    name,
+    author,
+    description,
+    organization,
+    useDefaultLibrary,
+  });
+  return createdRoot || "";
+}
+
+export async function getUserProjectsRoot(): Promise<string> {
+  const root = await invoke<string>("get_user_projects_root");
+  return root || "";
+}
+
 export async function getAstForPath(path: string): Promise<string> {
   const ast = await invoke<string>("get_ast_for_path", { path });
   return ast || "";

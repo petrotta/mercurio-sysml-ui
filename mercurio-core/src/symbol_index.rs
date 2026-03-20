@@ -1474,6 +1474,104 @@ mod tests {
     }
 
     #[test]
+    fn file_scoped_recompile_preserves_other_files_and_refreshes_changed_projection() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_projection_file_scope_{stamp}"));
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        let left_file = project_dir.join("left.sysml");
+        let right_file = project_dir.join("right.sysml");
+        fs::write(&left_file, "package LeftPkg { action def OldAction; }\n")
+            .expect("write left file");
+        fs::write(&right_file, "package RightPkg { action def StableAction; }\n")
+            .expect("write right file");
+        fs::write(
+            project_dir.join(".project"),
+            "{\"name\":\"projection-file-scope\",\"src\":[\"*.sysml\"]}",
+        )
+        .expect("write project descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let project_root = project_dir.to_string_lossy().to_string();
+
+        let first_compile = compile_workspace_sync(
+            &state,
+            project_root.clone(),
+            1,
+            true,
+            None,
+            Vec::new(),
+            |_| {},
+        )
+        .expect("first compile");
+        assert!(first_compile.ok);
+
+        let stable_before = query_project_semantic_projection_by_qualified_name(
+            &state,
+            project_root.clone(),
+            "RightPkg::StableAction".to_string(),
+            Some(right_file.to_string_lossy().to_string()),
+        )
+        .expect("query stable projection before recompile")
+        .expect("stable projection row before recompile");
+        assert!(!stable_before.features.is_empty());
+
+        fs::write(&left_file, "package LeftPkg { action def NewAction; }\n")
+            .expect("update left file");
+        let second_compile = compile_project_delta_sync(
+            &state,
+            project_root.clone(),
+            2,
+            true,
+            Some(left_file.clone()),
+            Vec::new(),
+            |_| {},
+        )
+        .expect("second compile");
+        assert!(second_compile.ok);
+
+        let old_after_recompile = query_project_semantic_projection_by_qualified_name(
+            &state,
+            project_root.clone(),
+            "LeftPkg::OldAction".to_string(),
+            Some(left_file.to_string_lossy().to_string()),
+        )
+        .expect("query stale left projection");
+        assert!(old_after_recompile.is_none());
+
+        let new_after_recompile = query_project_semantic_projection_by_qualified_name(
+            &state,
+            project_root.clone(),
+            "LeftPkg::NewAction".to_string(),
+            Some(left_file.to_string_lossy().to_string()),
+        )
+        .expect("query fresh left projection")
+        .expect("fresh left projection row");
+        assert!(new_after_recompile
+            .features
+            .iter()
+            .any(|feature| feature.name == "name"));
+
+        let stable_after = query_project_semantic_projection_by_qualified_name(
+            &state,
+            project_root,
+            "RightPkg::StableAction".to_string(),
+            Some(right_file.to_string_lossy().to_string()),
+        )
+        .expect("query stable projection after recompile")
+        .expect("stable projection row after recompile");
+        assert!(stable_after
+            .features
+            .iter()
+            .any(|feature| feature.name == "name"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn query_project_semantic_projection_seeds_from_workspace_ir_cache() {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)

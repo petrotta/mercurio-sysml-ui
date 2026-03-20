@@ -19,8 +19,9 @@ use crate::state::{CoreState, StdlibCache, WorkspaceSnapshotCacheEntry};
 use crate::workspace_tree::{collect_tree_manifest, WorkspaceTreeEntryView};
 use mercurio_sysml_pkg::mercurio_sysml_semantic_adapter::{ingest_text, Language};
 
-const STDLIB_INDEX_SCHEMA_VERSION: u32 = 1;
-const STDLIB_INDEX_CACHE_FILE_NAME: &str = "stdlib-index-v1.json";
+const STDLIB_INDEX_SCHEMA_VERSION: u32 = 2;
+const STDLIB_INDEX_CACHE_FILE_NAME: &str = "stdlib-index-v1.bin";
+const STDLIB_INDEX_LEGACY_JSON_CACHE_FILE_NAME: &str = "stdlib-index-v1.json";
 const STDLIB_INDEX_ROOT_REGISTRY_FILE_NAME: &str = "cache-stdlib-roots.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,16 +36,6 @@ struct PersistedStdlibIndex {
     symbols: Vec<SymbolRecord>,
     #[serde(default)]
     semantic_projections: Vec<SemanticElementProjectionView>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedStdlibIndexSymbolsOnly {
-    schema_version: u32,
-    engine_version: String,
-    stdlib_root: String,
-    signature: String,
-    #[serde(default)]
-    symbols: Vec<SymbolRecord>,
 }
 
 pub fn list_stdlib_versions_from_root(stdlib_root: &Path) -> Result<Vec<String>, String> {
@@ -81,6 +72,13 @@ fn stdlib_index_cache_file_path(stdlib_root: &Path) -> PathBuf {
         .join(STDLIB_INDEX_CACHE_FILE_NAME)
 }
 
+fn stdlib_index_legacy_json_cache_file_path(stdlib_root: &Path) -> PathBuf {
+    PathBuf::from(canonical_stdlib_root(stdlib_root))
+        .join(".mercurio")
+        .join("cache")
+        .join(STDLIB_INDEX_LEGACY_JSON_CACHE_FILE_NAME)
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -104,20 +102,14 @@ fn read_persisted_stdlib_index(stdlib_root: &Path) -> Result<Option<PersistedStd
     if !path.exists() {
         return Ok(None);
     }
-    let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let parsed = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-    Ok(Some(parsed))
-}
-
-fn read_persisted_stdlib_index_symbols_only(
-    stdlib_root: &Path,
-) -> Result<Option<PersistedStdlibIndexSymbolsOnly>, String> {
-    let path = stdlib_index_cache_file_path(stdlib_root);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let parsed = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let raw = fs::read(&path).map_err(|e| e.to_string())?;
+    let parsed = match bincode::deserialize(&raw) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            let _ = fs::remove_file(&path);
+            return Ok(None);
+        }
+    };
     Ok(Some(parsed))
 }
 
@@ -126,28 +118,6 @@ fn read_validated_persisted_stdlib_index(
     signature: &str,
 ) -> Result<Option<PersistedStdlibIndex>, String> {
     let Some(cache) = read_persisted_stdlib_index(stdlib_root)? else {
-        return Ok(None);
-    };
-    if cache.schema_version != STDLIB_INDEX_SCHEMA_VERSION {
-        return Ok(None);
-    }
-    if cache.engine_version != env!("CARGO_PKG_VERSION") {
-        return Ok(None);
-    }
-    if cache.signature != signature {
-        return Ok(None);
-    }
-    if canonical_stdlib_root(stdlib_root) != canonical_stdlib_root(Path::new(&cache.stdlib_root)) {
-        return Ok(None);
-    }
-    Ok(Some(cache))
-}
-
-fn read_validated_persisted_stdlib_index_symbols_only(
-    stdlib_root: &Path,
-    signature: &str,
-) -> Result<Option<PersistedStdlibIndexSymbolsOnly>, String> {
-    let Some(cache) = read_persisted_stdlib_index_symbols_only(stdlib_root)? else {
         return Ok(None);
     };
     if cache.schema_version != STDLIB_INDEX_SCHEMA_VERSION {
@@ -175,7 +145,10 @@ fn load_stdlib_cache_root_registry() -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
     let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let parsed = serde_json::from_str::<Vec<String>>(&raw).map_err(|e| e.to_string())?;
+    let parsed = match serde_json::from_str::<Vec<String>>(&raw) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(Vec::new()),
+    };
     let mut unique = BTreeSet::<String>::new();
     for root in parsed {
         let canonical = normalize_workspace_path(&root);
@@ -213,16 +186,24 @@ pub(crate) fn clear_all_persisted_stdlib_indexes() -> Result<usize, String> {
     let mut deleted = 0usize;
 
     for root in roots {
-        let path = stdlib_index_cache_file_path(Path::new(&root));
-        if !path.exists() {
-            continue;
-        }
-        match fs::remove_file(&path) {
-            Ok(()) => deleted += 1,
-            Err(error) => {
-                retained.push(root.clone());
-                failures.push(format!("{}: {}", path.to_string_lossy(), error));
+        let mut root_failed = false;
+        for path in [
+            stdlib_index_cache_file_path(Path::new(&root)),
+            stdlib_index_legacy_json_cache_file_path(Path::new(&root)),
+        ] {
+            if !path.exists() {
+                continue;
             }
+            match fs::remove_file(&path) {
+                Ok(()) => deleted += 1,
+                Err(error) => {
+                    root_failed = true;
+                    failures.push(format!("{}: {}", path.to_string_lossy(), error));
+                }
+            }
+        }
+        if root_failed {
+            retained.push(root.clone());
         }
     }
 
@@ -312,7 +293,7 @@ pub(crate) fn persist_stdlib_index_cache(
         symbols,
         semantic_projections,
     };
-    let bytes = serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?;
+    let bytes = bincode::serialize(&snapshot).map_err(|e| e.to_string())?;
     write_atomic(&stdlib_index_cache_file_path(stdlib_root), &bytes)?;
     register_stdlib_cache_root(stdlib_root)?;
     Ok(())
@@ -330,9 +311,7 @@ pub(crate) fn seed_stdlib_index_from_cache_for_project(
     if stdlib_signature.trim().is_empty() {
         return Ok(false);
     }
-    let Some(cache) =
-        read_validated_persisted_stdlib_index_symbols_only(stdlib_root, stdlib_signature)?
-    else {
+    let Some(cache) = read_validated_persisted_stdlib_index(stdlib_root, stdlib_signature)? else {
         return Ok(false);
     };
     if cache.symbols.is_empty() {
@@ -361,6 +340,21 @@ pub(crate) fn seed_stdlib_index_from_cache_for_project(
     store.rebuild_symbol_mappings(&project_root);
     drop(store);
     Ok(true)
+}
+
+pub(crate) fn is_stdlib_index_seeded_for_project(
+    state: &CoreState,
+    project_root: &str,
+    stdlib_root: &Path,
+    stdlib_signature: &str,
+) -> Result<bool, String> {
+    let project_root = canonical_project_root(project_root);
+    let library_key = normalized_compare_key(stdlib_root);
+    let store = state
+        .symbol_index
+        .lock()
+        .map_err(|_| "Symbol index lock poisoned".to_string())?;
+    Ok(store.is_stdlib_index_fresh(&project_root, &library_key, stdlib_signature))
 }
 
 pub(crate) fn seed_stdlib_semantic_projection_cache_for_project(
@@ -885,5 +879,35 @@ fn default_modifiers() -> MetamodelModifiersView {
         is_readonly: false,
         is_derived: false,
         is_parallel: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn corrupt_persisted_stdlib_index_is_treated_as_cache_miss() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let stdlib_root =
+            std::env::temp_dir().join(format!("mercurio_stdlib_corrupt_cache_{stamp}"));
+        let cache_file = stdlib_index_cache_file_path(&stdlib_root);
+        fs::create_dir_all(
+            cache_file
+                .parent()
+                .expect("stdlib cache directory parent must exist"),
+        )
+        .expect("create stdlib cache dir");
+        fs::write(&cache_file, b"not-bincode").expect("write corrupt cache");
+
+        let restored = read_persisted_stdlib_index(&stdlib_root).expect("read cache");
+        assert!(restored.is_none());
+        assert!(!cache_file.exists());
+
+        let _ = fs::remove_dir_all(&stdlib_root);
     }
 }

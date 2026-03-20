@@ -19,8 +19,8 @@ mod commands;
 mod logging;
 
 use commands::{
-    app_exit, call_tool, create_file, list_dir, read_file, show_in_explorer, window_close,
-    window_minimize, window_toggle_maximize, write_file,
+    app_exit, call_tool, create_file, create_project, get_user_projects_root, list_dir, read_file,
+    show_in_explorer, window_close, window_minimize, window_toggle_maximize, write_file,
 };
 use logging::{get_logs, log_event, log_frontend, set_app_handle};
 
@@ -547,6 +547,9 @@ pub fn run() {
             }
         })
         .menu(|app| {
+            let new_project = MenuItemBuilder::with_id("file.new_project", "New Project...")
+                .accelerator("Ctrl+N")
+                .build(app)?;
             let open_folder = MenuItemBuilder::with_id("file.open_folder", "Open Folder...")
                 .accelerator("Ctrl+Shift+O")
                 .build(app)?;
@@ -590,6 +593,8 @@ pub fn run() {
                 .build(app)?;
 
             let file_menu = SubmenuBuilder::new(app, "File")
+                .item(&new_project)
+                .separator()
                 .item(&open_folder)
                 .item(&open_file)
                 .item(&save)
@@ -626,6 +631,7 @@ pub fn run() {
         })
         .on_menu_event(|app, event| {
             let action = match event.id().as_ref() {
+                "file.new_project" => Some("new-project"),
                 "file.open_folder" => Some("open-folder"),
                 "file.open_file" => Some("open-file"),
                 "file.save" => Some("save-active"),
@@ -647,10 +653,12 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            get_user_projects_root,
             list_dir,
             read_file,
             write_file,
             create_file,
+            create_project,
             window_minimize,
             window_toggle_maximize,
             app_exit,

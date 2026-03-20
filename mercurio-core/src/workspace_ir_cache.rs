@@ -1,5 +1,7 @@
-use mercurio_symbol_index::{SymbolIndexStore, SymbolRecord};
-use mercurio_sysml_semantics::semantic_contract::SemanticElementProjectionView;
+use mercurio_symbol_index::{InMemorySymbolIndexSnapshot, SymbolIndexStore, SymbolRecord};
+use mercurio_sysml_semantics::semantic_contract::{
+    SemanticElementProjectionView, SemanticElementView,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -16,13 +18,15 @@ use crate::workspace_tree::{
 };
 use crate::{state::WorkspaceSnapshotCacheEntry, CoreState};
 
-const WORKSPACE_IR_SCHEMA_VERSION: u32 = 4;
-const WORKSPACE_IR_CACHE_FILE_NAME: &str = "workspace-ir-v1.json";
+const WORKSPACE_IR_BINARY_SCHEMA_VERSION: u32 = 2;
+const WORKSPACE_IR_BINARY_CACHE_FILE_NAME: &str = "workspace-ir-v1.bin";
+const WORKSPACE_IR_LEGACY_JSON_CACHE_FILE_NAME: &str = "workspace-ir-v1.json";
+const WORKSPACE_IR_LEGACY_SYMBOL_INDEX_BINARY_CACHE_FILE_NAME: &str = "workspace-symbol-index-v1.bin";
 const WORKSPACE_IR_PERSIST_DEBOUNCE_MS: u64 = 200;
 const WORKSPACE_IR_ROOT_REGISTRY_FILE_NAME: &str = "cache-roots.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkspaceIrCache {
+struct WorkspaceIrBinaryCache {
     schema_version: u32,
     engine_version: String,
     project_root: String,
@@ -34,9 +38,11 @@ struct WorkspaceIrCache {
     project_tree: Vec<WorkspaceTreeEntryView>,
     #[serde(default)]
     library_tree: Vec<WorkspaceTreeEntryView>,
-    symbols: Vec<SymbolRecord>,
+    #[serde(default)]
+    semantic_elements: Vec<SemanticElementView>,
     #[serde(default)]
     semantic_projections: Vec<SemanticElementProjectionView>,
+    symbol_index: InMemorySymbolIndexSnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -61,7 +67,21 @@ fn cache_file_path(project_root: &str) -> PathBuf {
     PathBuf::from(canonical_project_root(project_root))
         .join(".mercurio")
         .join("cache")
-        .join(WORKSPACE_IR_CACHE_FILE_NAME)
+        .join(WORKSPACE_IR_BINARY_CACHE_FILE_NAME)
+}
+
+fn legacy_json_cache_file_path(project_root: &str) -> PathBuf {
+    PathBuf::from(canonical_project_root(project_root))
+        .join(".mercurio")
+        .join("cache")
+        .join(WORKSPACE_IR_LEGACY_JSON_CACHE_FILE_NAME)
+}
+
+fn legacy_symbol_index_binary_cache_file_path(project_root: &str) -> PathBuf {
+    PathBuf::from(canonical_project_root(project_root))
+        .join(".mercurio")
+        .join("cache")
+        .join(WORKSPACE_IR_LEGACY_SYMBOL_INDEX_BINARY_CACHE_FILE_NAME)
 }
 
 fn synthesize_project_semantic_projection(
@@ -104,22 +124,28 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
 }
 
-fn read_cache_file(project_root: &str) -> Result<Option<WorkspaceIrCache>, String> {
+fn read_binary_cache_file(project_root: &str) -> Result<Option<WorkspaceIrBinaryCache>, String> {
     let path = cache_file_path(project_root);
     if !path.exists() {
         return Ok(None);
     }
-    let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let parsed: WorkspaceIrCache = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let raw = fs::read(&path).map_err(|e| e.to_string())?;
+    let parsed = match bincode::deserialize::<WorkspaceIrBinaryCache>(&raw) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            let _ = fs::remove_file(&path);
+            return Ok(None);
+        }
+    };
     Ok(Some(parsed))
 }
 
-fn read_validated_cache_file(project_root: &str) -> Result<Option<WorkspaceIrCache>, String> {
+fn read_validated_binary_cache_file(project_root: &str) -> Result<Option<WorkspaceIrBinaryCache>, String> {
     let project_root = canonical_project_root(project_root);
-    let Some(cache) = read_cache_file(&project_root)? else {
+    let Some(cache) = read_binary_cache_file(&project_root)? else {
         return Ok(None);
     };
-    if cache.schema_version != WORKSPACE_IR_SCHEMA_VERSION {
+    if cache.schema_version != WORKSPACE_IR_BINARY_SCHEMA_VERSION {
         return Ok(None);
     }
     if cache.engine_version != env!("CARGO_PKG_VERSION") {
@@ -141,7 +167,10 @@ fn load_cache_root_registry() -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
     let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let parsed = serde_json::from_str::<Vec<String>>(&raw).map_err(|e| e.to_string())?;
+    let parsed = match serde_json::from_str::<Vec<String>>(&raw) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(Vec::new()),
+    };
     let mut unique = BTreeSet::<String>::new();
     for root in parsed {
         let canonical = canonical_project_root(&root);
@@ -179,18 +208,27 @@ pub(crate) fn clear_all_workspace_ir_caches() -> Result<usize, String> {
     let mut deleted = 0usize;
 
     for root in roots {
-        let path = cache_file_path(&root);
-        if !path.exists() {
-            continue;
+        let mut root_failed = false;
+        for path in [
+            cache_file_path(&root),
+            legacy_json_cache_file_path(&root),
+            legacy_symbol_index_binary_cache_file_path(&root),
+        ] {
+            if !path.exists() {
+                continue;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    deleted += 1;
+                }
+                Err(error) => {
+                    root_failed = true;
+                    delete_failures.push(format!("{}: {}", path.to_string_lossy(), error));
+                }
+            }
         }
-        match fs::remove_file(&path) {
-            Ok(()) => {
-                deleted += 1;
-            }
-            Err(error) => {
-                retained.push(root.clone());
-                delete_failures.push(format!("{}: {}", path.to_string_lossy(), error));
-            }
+        if root_failed {
+            retained.push(root);
         }
     }
 
@@ -208,7 +246,7 @@ pub(crate) fn clear_all_workspace_ir_caches() -> Result<usize, String> {
 pub(crate) fn load_workspace_ir_cache_snapshot(
     project_root: &str,
 ) -> Result<Option<WorkspaceIrCacheSnapshot>, String> {
-    let Some(cache) = read_validated_cache_file(project_root)? else {
+    let Some(cache) = read_validated_binary_cache_file(project_root)? else {
         return Ok(None);
     };
     Ok(Some(WorkspaceIrCacheSnapshot {
@@ -250,6 +288,40 @@ pub(crate) fn persist_workspace_ir_cache(
             .then(a.kind.cmp(&b.kind))
     });
     symbols.dedup_by(|left, right| left.id == right.id);
+    let semantic_elements = {
+        let mut root_prefixes = vec![format!("project-semantic|{}|", project_root)];
+        if !raw_project_root.is_empty() && raw_project_root != project_root {
+            root_prefixes.push(format!("project-semantic|{}|", raw_project_root));
+        }
+        let mut by_file_and_qname = BTreeMap::<(String, String), SemanticElementView>::new();
+        let cache = state
+            .workspace_snapshot_cache
+            .lock()
+            .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
+        for (key, entry) in cache.iter() {
+            if !root_prefixes.iter().any(|prefix| key.starts_with(prefix)) {
+                continue;
+            }
+            let WorkspaceSnapshotCacheEntry::ProjectSemantic(elements) = entry else {
+                continue;
+            };
+            for element in elements.iter() {
+                let dedupe_key = (element.file_path.clone(), element.qualified_name.clone());
+                let should_replace = by_file_and_qname
+                    .get(&dedupe_key)
+                    .map(|existing| {
+                        existing.attributes.len() < element.attributes.len()
+                            || (existing.metatype_qname.is_none()
+                                && element.metatype_qname.is_some())
+                    })
+                    .unwrap_or(true);
+                if should_replace {
+                    by_file_and_qname.insert(dedupe_key, element.clone());
+                }
+            }
+        }
+        by_file_and_qname.into_values().collect::<Vec<_>>()
+    };
     let semantic_projections = {
         let mut root_prefixes = vec![format!("project-semantic|{}|", project_root)];
         if !raw_project_root.is_empty() && raw_project_root != project_root {
@@ -300,8 +372,15 @@ pub(crate) fn persist_workspace_ir_cache(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let snapshot = WorkspaceIrCache {
-        schema_version: WORKSPACE_IR_SCHEMA_VERSION,
+    let symbol_index_snapshot = {
+        let store = state
+            .symbol_index
+            .lock()
+            .map_err(|_| "Symbol index lock poisoned".to_string())?;
+        store.snapshot_for_root(&project_root)
+    };
+    let snapshot = WorkspaceIrBinaryCache {
+        schema_version: WORKSPACE_IR_BINARY_SCHEMA_VERSION,
         engine_version: env!("CARGO_PKG_VERSION").to_string(),
         project_root: project_root.to_string(),
         written_at_unix_ms,
@@ -309,12 +388,12 @@ pub(crate) fn persist_workspace_ir_cache(
         library_path,
         project_tree,
         library_tree,
-        symbols,
+        semantic_elements,
         semantic_projections,
+        symbol_index: symbol_index_snapshot,
     };
-    let bytes = serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?;
-    let path = cache_file_path(&project_root);
-    write_atomic(&path, &bytes)?;
+    let bytes = bincode::serialize(&snapshot).map_err(|e| e.to_string())?;
+    write_atomic(&cache_file_path(&project_root), &bytes)?;
     register_cache_root(&project_root)?;
     Ok(())
 }
@@ -414,67 +493,68 @@ pub(crate) fn seed_symbol_index_from_workspace_ir_cache(
 ) -> Result<bool, String> {
     let raw_project_root = project_root.trim().to_string();
     let project_root = canonical_project_root(project_root);
-    let Some(cache) = read_validated_cache_file(&project_root)? else {
+    let Some(cache) = read_validated_binary_cache_file(&project_root)? else {
         return Ok(false);
     };
-    let WorkspaceIrCache {
-        written_at_unix_ms: _,
-        library_path: _,
-        project_tree: _,
-        library_tree: _,
-        symbols,
+    let WorkspaceIrBinaryCache {
+        semantic_elements,
         semantic_projections,
-        schema_version: _,
-        engine_version: _,
-        project_root: _,
-        stdlib_signature: _,
+        symbol_index,
+        ..
     } = cache;
-    if symbols.is_empty() {
-        return Ok(false);
-    }
-
-    let mut grouped = BTreeMap::<String, Vec<SymbolRecord>>::new();
-    for mut symbol in symbols {
-        symbol.project_root = project_root.to_string();
-        grouped
-            .entry(symbol.file_path.clone())
-            .or_default()
-            .push(symbol);
-    }
-
     let mut store = state
         .symbol_index
         .lock()
         .map_err(|_| "Symbol index lock poisoned".to_string())?;
-    for (file_path, rows) in grouped {
-        store.upsert_symbols_for_file(&project_root, &file_path, rows);
-    }
-    store.rebuild_symbol_mappings(&project_root);
+    store.restore_root_from_snapshot(symbol_index);
+    let semantic_projections = if semantic_projections.is_empty() {
+        let mut by_file_and_qname =
+            BTreeMap::<(String, String), SemanticElementProjectionView>::new();
+        for symbol in store.project_symbols(&project_root, None) {
+            let projection = synthesize_project_semantic_projection(&project_root, &symbol);
+            let dedupe_key = (projection.file_path.clone(), projection.qualified_name.clone());
+            by_file_and_qname.entry(dedupe_key).or_insert(projection);
+        }
+        by_file_and_qname.into_values().collect::<Vec<_>>()
+    } else {
+        semantic_projections
+    };
     drop(store);
 
-    if !semantic_projections.is_empty() {
+    if !semantic_elements.is_empty() || !semantic_projections.is_empty() {
         let mut workspace_cache = state
             .workspace_snapshot_cache
             .lock()
             .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
-        let mut keys = vec![format!("project-semantic|{}|workspace-ir", project_root)];
+        let mut key_suffixes = vec![project_root.clone()];
         if !raw_project_root.is_empty() && raw_project_root != project_root {
-            keys.push(format!(
-                "project-semantic|{}|workspace-ir",
-                raw_project_root
-            ));
+            key_suffixes.push(raw_project_root.clone());
         }
-        for key in keys {
-            workspace_cache.insert(
-                key,
-                WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(std::sync::Arc::new(
-                    semantic_projections.clone(),
-                )),
-            );
+        for root_key in key_suffixes {
+            if !semantic_elements.is_empty() {
+                workspace_cache.insert(
+                    format!("project-semantic|{}|workspace-ir-elements", root_key),
+                    WorkspaceSnapshotCacheEntry::ProjectSemantic(std::sync::Arc::new(
+                        semantic_elements.clone(),
+                    )),
+                );
+            }
+            if !semantic_projections.is_empty() {
+                workspace_cache.insert(
+                    format!("project-semantic|{}|workspace-ir-projection", root_key),
+                    WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(std::sync::Arc::new(
+                        semantic_projections.clone(),
+                    )),
+                );
+            }
         }
     }
-    let _ =
-        refresh_project_semantic_lookup(state, &project_root, &[], semantic_projections.as_slice());
+    let _ = refresh_project_semantic_lookup(
+        state,
+        &project_root,
+        semantic_elements.as_slice(),
+        semantic_projections.as_slice(),
+    );
     Ok(true)
 }
 
@@ -484,20 +564,15 @@ pub(crate) fn seed_semantic_projection_cache_from_workspace_ir_cache(
 ) -> Result<bool, String> {
     let raw_project_root = project_root.trim().to_string();
     let project_root = canonical_project_root(project_root);
-    let Some(cache) = read_validated_cache_file(&project_root)? else {
+    let Some(cache) = read_validated_binary_cache_file(&project_root)? else {
         return Ok(false);
     };
-    let WorkspaceIrCache {
-        library_path: _,
-        project_tree: _,
-        library_tree: _,
+    let WorkspaceIrBinaryCache {
+        semantic_elements,
         semantic_projections,
-        schema_version: _,
-        engine_version: _,
-        project_root: _,
         ..
     } = cache;
-    if semantic_projections.is_empty() {
+    if semantic_elements.is_empty() && semantic_projections.is_empty() {
         return Ok(false);
     }
 
@@ -506,25 +581,36 @@ pub(crate) fn seed_semantic_projection_cache_from_workspace_ir_cache(
             .workspace_snapshot_cache
             .lock()
             .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
-        let mut keys = vec![format!("project-semantic|{}|workspace-ir", project_root)];
+        let mut key_suffixes = vec![project_root.clone()];
         if !raw_project_root.is_empty() && raw_project_root != project_root {
-            keys.push(format!(
-                "project-semantic|{}|workspace-ir",
-                raw_project_root
-            ));
+            key_suffixes.push(raw_project_root.clone());
         }
-        for key in keys {
-            workspace_cache.insert(
-                key,
-                WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(std::sync::Arc::new(
-                    semantic_projections.clone(),
-                )),
-            );
+        for root_key in key_suffixes {
+            if !semantic_elements.is_empty() {
+                workspace_cache.insert(
+                    format!("project-semantic|{}|workspace-ir-elements", root_key),
+                    WorkspaceSnapshotCacheEntry::ProjectSemantic(std::sync::Arc::new(
+                        semantic_elements.clone(),
+                    )),
+                );
+            }
+            if !semantic_projections.is_empty() {
+                workspace_cache.insert(
+                    format!("project-semantic|{}|workspace-ir-projection", root_key),
+                    WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(std::sync::Arc::new(
+                        semantic_projections.clone(),
+                    )),
+                );
+            }
         }
     }
 
-    let _ =
-        refresh_project_semantic_lookup(state, &project_root, &[], semantic_projections.as_slice());
+    let _ = refresh_project_semantic_lookup(
+        state,
+        &project_root,
+        semantic_elements.as_slice(),
+        semantic_projections.as_slice(),
+    );
     Ok(true)
 }
 
@@ -587,6 +673,23 @@ mod tests {
         }
     }
 
+    fn semantic_element(file_path: &str, qualified_name: &str) -> SemanticElementView {
+        let mut attributes = std::collections::HashMap::new();
+        attributes.insert("declaredName".to_string(), "Main".to_string());
+        attributes.insert("semantic_kind".to_string(), "Package".to_string());
+        SemanticElementView {
+            name: qualified_name
+                .rsplit("::")
+                .next()
+                .unwrap_or(qualified_name)
+                .to_string(),
+            qualified_name: qualified_name.to_string(),
+            metatype_qname: Some("sysml::Package".to_string()),
+            file_path: file_path.to_string(),
+            attributes,
+        }
+    }
+
     #[test]
     fn workspace_ir_cache_round_trips_into_symbol_index() {
         let stamp = SystemTime::now()
@@ -630,6 +733,12 @@ mod tests {
                 .lock()
                 .expect("workspace cache lock");
             workspace_cache.insert(
+                format!("project-semantic|{}|typed-full", project_root),
+                WorkspaceSnapshotCacheEntry::ProjectSemantic(std::sync::Arc::new(vec![
+                    semantic_element("main.sysml", "Demo::Main"),
+                ])),
+            );
+            workspace_cache.insert(
                 format!("project-semantic|{}|typed", project_root),
                 WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(std::sync::Arc::new(vec![
                     projection("main.sysml", "Demo::Main"),
@@ -653,7 +762,7 @@ mod tests {
         {
             let store = state.symbol_index.lock().expect("index lock");
             assert_eq!(store.project_symbols(&project_root, None).len(), 1);
-            assert_eq!(store.library_symbols(&project_root, None).len(), 0);
+            assert_eq!(store.library_symbols(&project_root, None).len(), 1);
         }
         {
             let workspace_cache = state
@@ -672,7 +781,79 @@ mod tests {
             assert!(restored_projection
                 .iter()
                 .any(|element| element.qualified_name == "Demo::Main"));
+            let restored_semantic = workspace_cache.iter().find_map(|(key, entry)| match entry {
+                WorkspaceSnapshotCacheEntry::ProjectSemantic(elements)
+                    if key.starts_with(&format!("project-semantic|{}|", project_root)) =>
+                {
+                    Some(elements.clone())
+                }
+                _ => None,
+            });
+            let restored_semantic = restored_semantic.expect("restored semantic cache");
+            assert!(restored_semantic
+                .iter()
+                .any(|element| element.qualified_name == "Demo::Main"
+                    && element.attributes.contains_key("declaredName")));
         }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn workspace_ir_binary_snapshot_restores_library_symbols_and_freshness() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("mercurio_workspace_ir_binary_restore_{stamp}"));
+        fs::create_dir_all(&root).expect("create root");
+        let project_root = root.to_string_lossy().to_string();
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+
+        {
+            let mut store = state.symbol_index.lock().expect("index lock");
+            store.upsert_symbols_for_file(
+                &project_root,
+                "main.sysml",
+                vec![symbol(
+                    "p1",
+                    &project_root,
+                    mercurio_symbol_index::Scope::Project,
+                    "main.sysml",
+                    "Demo::Main",
+                )],
+            );
+            store.upsert_symbols_for_file(
+                &project_root,
+                "Kernel.kerml",
+                vec![symbol(
+                    "l1",
+                    &project_root,
+                    mercurio_symbol_index::Scope::Stdlib,
+                    "Kernel.kerml",
+                    "KerML::Kernel::Package",
+                )],
+            );
+            store.mark_stdlib_indexed(&project_root, "stdlib-key", "sig-lib");
+            store.rebuild_symbol_mappings(&project_root);
+        }
+
+        persist_workspace_ir_cache(&state, &project_root, Some("sig-lib"))
+            .expect("persist workspace cache");
+
+        state
+            .clear_in_memory_caches_for_tests()
+            .expect("clear runtime caches");
+
+        let seeded = seed_symbol_index_from_workspace_ir_cache(&state, &project_root)
+            .expect("seed from cache");
+        assert!(seeded);
+
+        let store = state.symbol_index.lock().expect("index lock");
+        assert_eq!(store.project_symbols(&project_root, None).len(), 1);
+        assert_eq!(store.library_symbols(&project_root, None).len(), 1);
+        assert!(store.is_stdlib_index_fresh(&project_root, "stdlib-key", "sig-lib"));
 
         let _ = fs::remove_dir_all(&root);
     }

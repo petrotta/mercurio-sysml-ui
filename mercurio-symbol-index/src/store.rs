@@ -66,8 +66,30 @@ pub trait SymbolIndexStore {
     ) -> Option<SymbolMetatypeMappingRecord>;
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InMemorySymbolIndexSnapshot {
+    pub project_root: String,
+    pub files: Vec<(String, Vec<SymbolRecord>)>,
+    pub stdlib_freshness: Vec<(String, String)>,
+    pub mappings: Vec<SymbolMetatypeMappingRecord>,
+}
+
 pub enum SymbolIndex {
     InMemory(InMemorySymbolIndex),
+}
+
+impl SymbolIndex {
+    pub fn snapshot_for_root(&self, project_root: &str) -> InMemorySymbolIndexSnapshot {
+        match self {
+            SymbolIndex::InMemory(store) => store.snapshot_for_root(project_root),
+        }
+    }
+
+    pub fn restore_root_from_snapshot(&mut self, snapshot: InMemorySymbolIndexSnapshot) {
+        match self {
+            SymbolIndex::InMemory(store) => store.restore_root_from_snapshot(snapshot),
+        }
+    }
 }
 
 impl SymbolIndexStore for SymbolIndex {
@@ -221,6 +243,84 @@ pub struct InMemorySymbolIndex {
     library_symbols_cache: RefCell<HashMap<String, Vec<SymbolRecord>>>,
     stdlib_freshness: HashMap<(String, String), String>,
     mappings_by_symbol: HashMap<(String, String), SymbolMetatypeMappingRecord>,
+}
+
+impl InMemorySymbolIndex {
+    fn remove_root_data(&mut self, project_root: &str) {
+        let normalized_root = normalized_root_key(project_root);
+        self.by_project_file
+            .retain(|(root, _), _| root != &normalized_root);
+        self.stdlib_freshness
+            .retain(|(root, _), _| root != &normalized_root);
+        self.mappings_by_symbol
+            .retain(|(root, _), _| root != &normalized_root);
+        self.project_symbols_cache
+            .borrow_mut()
+            .remove(&normalized_root);
+        self.library_symbols_cache
+            .borrow_mut()
+            .remove(&normalized_root);
+    }
+
+    pub fn snapshot_for_root(&self, project_root: &str) -> InMemorySymbolIndexSnapshot {
+        let normalized_root = normalized_root_key(project_root);
+        let mut files = self
+            .by_project_file
+            .iter()
+            .filter(|((root, _), _)| root == &normalized_root)
+            .map(|((_, file_path), symbols)| (file_path.clone(), symbols.clone()))
+            .collect::<Vec<_>>();
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut stdlib_freshness = self
+            .stdlib_freshness
+            .iter()
+            .filter(|((root, _), _)| root == &normalized_root)
+            .map(|((_, library_key), signature)| (library_key.clone(), signature.clone()))
+            .collect::<Vec<_>>();
+        stdlib_freshness.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut mappings = self
+            .mappings_by_symbol
+            .iter()
+            .filter(|((root, _), _)| root == &normalized_root)
+            .map(|(_, mapping)| mapping.clone())
+            .collect::<Vec<_>>();
+        mappings.sort_by(|left, right| {
+            left.symbol_file_path
+                .cmp(&right.symbol_file_path)
+                .then(left.symbol_qualified_name.cmp(&right.symbol_qualified_name))
+                .then(left.symbol_id.cmp(&right.symbol_id))
+        });
+
+        InMemorySymbolIndexSnapshot {
+            project_root: normalized_root,
+            files,
+            stdlib_freshness,
+            mappings,
+        }
+    }
+
+    pub fn restore_root_from_snapshot(&mut self, snapshot: InMemorySymbolIndexSnapshot) {
+        let normalized_root = normalized_root_key(&snapshot.project_root);
+        self.remove_root_data(&normalized_root);
+
+        for (file_path, symbols) in snapshot.files {
+            self.by_project_file
+                .insert((normalized_root.clone(), file_path), symbols);
+        }
+        for (library_key, signature) in snapshot.stdlib_freshness {
+            self.stdlib_freshness
+                .insert((normalized_root.clone(), library_key), signature);
+        }
+        for mut mapping in snapshot.mappings {
+            mapping.project_root = normalized_root.clone();
+            self.mappings_by_symbol.insert(
+                (normalized_root.clone(), mapping.symbol_id.clone()),
+                mapping,
+            );
+        }
+    }
 }
 
 impl SymbolIndexStore for InMemorySymbolIndex {

@@ -3,10 +3,12 @@
 //! Intent: keep `lib.rs` focused on application bootstrap and analysis logic,
 //! while grouping UI-invoked commands by concern.
 
+pub mod core;
 pub mod fs_ops;
 pub mod tools;
 pub mod window;
 
+pub use core::{create_project, get_user_projects_root};
 pub use fs_ops::{create_file, list_dir, read_file, write_file};
 pub use tools::call_tool;
 pub use window::{

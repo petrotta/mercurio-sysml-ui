@@ -12,7 +12,9 @@ import { useFileTree, useProjectTree } from "./app/useProjectTree";
 import { logFrontendEvent } from "./app/services/logger";
 import {
   type ProjectFilesChangedEvent,
+  createProject,
   createProjectFile,
+  getUserProjectsRoot,
   readFileText,
   startProjectFileWatcher,
   stopProjectFileWatcher,
@@ -30,7 +32,6 @@ import { ParseErrorsPanel } from "./app/components/ParseErrorsPanel";
 import type {
   CacheClearSummary,
   FileDiagnosticView,
-  ProjectExpressionRecordView,
   SymbolView,
   ExpressionEvaluationResult,
 } from "./app/contracts";
@@ -57,7 +58,7 @@ type HarnessRun = {
   at: string;
 };
 
-type ToolTabId = "runs" | "logs" | "expressions";
+type ToolTabId = "tooling" | "logs" | "expressions";
 
 type SymbolTreeNode = {
   symbol: SymbolView;
@@ -90,6 +91,20 @@ type NewFileDialogState = {
   parentPath: string;
   name: string;
   extension: NewFileExtension;
+  error: string;
+  submitting: boolean;
+};
+
+type NewProjectDialogState = {
+  parentPath: string;
+  name: string;
+  author: string;
+  description: string;
+  organization: string;
+  createStarterFile: boolean;
+  starterFileName: string;
+  starterFileExtension: NewFileExtension;
+  useDefaultLibrary: boolean;
   error: string;
   submitting: boolean;
 };
@@ -146,14 +161,13 @@ const CENTER_PANE_MIN_WIDTH = 480;
 const MAIN_LAYOUT_NON_CONTENT_WIDTH = 32;
 const MAX_RECENT_PROJECTS = 12;
 const RECENT_PROJECT_BROWSE_VALUE = "__browse__";
-const BUILD_PROGRESS_VISIBLE_KEY = "mercurio.simpleUi.buildProgressVisible";
-const EXPRESSIONS_TAB_VISIBLE_KEY = "mercurio.simpleUi.expressionsTabVisible";
 const STDLIB_PATH_OPTIONS_KEY = "mercurio.simpleUi.stdlibPathOptions";
 const PROJECT_FILES_SHOW_BY_FILE_KEY = "mercurio.simpleUi.projectFilesShowByFile";
 const AUTO_BUILD_ACTIVE_FILE_KEY = "mercurio.simpleUi.autoBuildActiveFile";
 const AUTO_BUILD_DEBOUNCE_MS = 900;
 const AUTO_BUILD_MIN_INTERVAL_MS = 2500;
 const FILE_DIAGNOSTIC_MARKER_OWNER = "mercurio.diagnostics";
+const INVALID_NEW_PROJECT_NAME_CHARS = /[<>:"/\\|?*]/;
 const INVALID_NEW_FILE_NAME_CHARS = /[<>:"/\\|?*]/;
 const UI_ICON = {
   folder: String.fromCodePoint(0x1F4C1),
@@ -174,6 +188,8 @@ const UI_ICON = {
   maximize: "\u25FB",
   close: "\u00D7",
 } as const;
+
+type TreeNodeIconKind = "dir" | "file" | "sysml" | "kerml";
 let sysmlLanguageRegistered = false;
 
 function createStdlibOptionId(): string {
@@ -422,6 +438,23 @@ function displayNameForPath(path: string): string {
   return path.split(/[\\/]/).pop() || path;
 }
 
+function parentPathForPath(path: string): string {
+  const trimmed = path.trim().replace(/[\\/]+$/, "");
+  if (!trimmed) return "";
+  const parts = trimmed.split(/[\\/]+/);
+  if (parts.length <= 1) return "";
+  if (/^[A-Za-z]:$/.test(parts[0] || "")) {
+    return `${parts[0]}\\${parts.slice(1, -1).join("\\")}`;
+  }
+  if (trimmed.startsWith("\\\\")) {
+    return `\\\\${parts.slice(0, -1).join("\\")}`;
+  }
+  if (trimmed.startsWith("/")) {
+    return `/${parts.slice(0, -1).join("/")}`;
+  }
+  return parts.slice(0, -1).join("\\");
+}
+
 function toFileEntry(path: string, name: string, isDir: boolean): FileEntry {
   return {
     path,
@@ -430,8 +463,17 @@ function toFileEntry(path: string, name: string, isDir: boolean): FileEntry {
   };
 }
 
-function treeNodeIcon(isDir: boolean): string {
-  return isDir ? UI_ICON.folder : UI_ICON.file;
+function treeNodeIconKind(path: string, isDir: boolean): TreeNodeIconKind {
+  if (isDir) return "dir";
+  const normalized = path.toLowerCase();
+  if (normalized.endsWith(".sysml")) return "sysml";
+  if (normalized.endsWith(".kerml")) return "kerml";
+  return "file";
+}
+
+function treeNodeIcon(kind: TreeNodeIconKind): string {
+  if (kind === "dir") return UI_ICON.folder;
+  return UI_ICON.file;
 }
 
 function symbolKindIcon(kind: string | null | undefined): string {
@@ -597,6 +639,26 @@ function buildNewSemanticFileName(name: string, extension: NewFileExtension): st
   return `${baseName}${extension}`;
 }
 
+function buildProjectPackageName(name: string): string {
+  const compact = name
+    .trim()
+    .replace(/[^A-Za-z0-9_]+/g, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part, index) => {
+      const lower = part.toLowerCase();
+      return index === 0 ? lower : `${lower.slice(0, 1).toUpperCase()}${lower.slice(1)}`;
+    })
+    .join("")
+    .replace(/^[^A-Za-z_]+/, "");
+  return compact || "newProject";
+}
+
+function buildStarterProjectContent(projectName: string): string {
+  const packageName = buildProjectPackageName(projectName);
+  return `package ${packageName} {\n}\n`;
+}
+
 function symbolSelection(symbol: SymbolView): TextSelection {
   const startLine = Math.max(1, symbol.start_line || 1);
   const startCol = Math.max(1, symbol.start_col || 1);
@@ -688,31 +750,18 @@ export function App() {
   const [dialogStdlibMetaLoading, setDialogStdlibMetaLoading] = useState(false);
   const [tabContextMenu, setTabContextMenu] = useState<TabContextMenuState | null>(null);
   const [fileContextMenu, setFileContextMenu] = useState<FileContextMenuState | null>(null);
+  const [newProjectDialog, setNewProjectDialog] = useState<NewProjectDialogState | null>(null);
   const [newFileDialog, setNewFileDialog] = useState<NewFileDialogState | null>(null);
+  const [pendingProjectFileToOpen, setPendingProjectFileToOpen] = useState<string | null>(null);
   const [tabsOverflow, setTabsOverflow] = useState(false);
   const [tabsOverflowMenuOpen, setTabsOverflowMenuOpen] = useState(false);
   const [dragTabPath, setDragTabPath] = useState<string | null>(null);
   const [dragOverTabPath, setDragOverTabPath] = useState<string | null>(null);
-  const [buildProgressVisible, setBuildProgressVisible] = useState<boolean>(() =>
-    window.localStorage?.getItem(BUILD_PROGRESS_VISIBLE_KEY) !== "0",
-  );
-  const [expressionsTabVisible, setExpressionsTabVisible] = useState<boolean>(() =>
-    window.localStorage?.getItem(EXPRESSIONS_TAB_VISIBLE_KEY) !== "0",
-  );
-  const [activeToolTab, setActiveToolTab] = useState<ToolTabId>(() => {
-    const logsVisible = window.localStorage?.getItem(BUILD_PROGRESS_VISIBLE_KEY) !== "0";
-    if (logsVisible) return "logs";
-    const expressionsVisible = window.localStorage?.getItem(EXPRESSIONS_TAB_VISIBLE_KEY) !== "0";
-    return expressionsVisible ? "expressions" : "runs";
-  });
+  const [activeToolTab, setActiveToolTab] = useState<ToolTabId>("logs");
   const [expressionInput, setExpressionInput] = useState("1 + 2 * 3");
   const [expressionResult, setExpressionResult] = useState<ExpressionEvaluationResult | null>(null);
   const [expressionPending, setExpressionPending] = useState(false);
   const [expressionRequestError, setExpressionRequestError] = useState("");
-  const [projectExpressions, setProjectExpressions] = useState<ProjectExpressionRecordView[]>([]);
-  const [projectExpressionsDiagnostics, setProjectExpressionsDiagnostics] = useState<string[]>([]);
-  const [projectExpressionsLoading, setProjectExpressionsLoading] = useState(false);
-  const [projectExpressionsError, setProjectExpressionsError] = useState("");
   const [autoBuildActiveFile, setAutoBuildActiveFile] = useState<boolean>(() =>
     window.localStorage?.getItem(AUTO_BUILD_ACTIVE_FILE_KEY) === "1",
   );
@@ -806,6 +855,7 @@ export function App() {
   const leftPaneWidthRef = useRef(leftPaneWidth);
   const rightPaneWidthRef = useRef(rightPaneWidth);
   const tabsStripRef = useRef<HTMLDivElement | null>(null);
+  const newProjectNameInputRef = useRef<HTMLInputElement | null>(null);
   const newFileNameInputRef = useRef<HTMLInputElement | null>(null);
   const rightPanelRef = useRef<HTMLElement | null>(null);
 const centerPanelRef = useRef<HTMLElement | null>(null);
@@ -824,6 +874,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   const libraryWatcherRootRef = useRef("");
   const projectFilesSettingsButtonRef = useRef<HTMLDivElement | null>(null);
   const autoBuildTimerRef = useRef<number | undefined>(undefined);
+  const autoBuildQueuedRef = useRef(false);
   const lastAutoBuildAtRef = useRef<number>(0);
   const compileRunIdRef = useRef<number | null>(compileRunId ?? null);
   const workspaceStartupRequestRef = useRef(0);
@@ -1114,14 +1165,6 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   }, [rightPaneWidth]);
 
   useEffect(() => {
-    window.localStorage?.setItem(BUILD_PROGRESS_VISIBLE_KEY, buildProgressVisible ? "1" : "0");
-  }, [buildProgressVisible]);
-
-  useEffect(() => {
-    window.localStorage?.setItem(EXPRESSIONS_TAB_VISIBLE_KEY, expressionsTabVisible ? "1" : "0");
-  }, [expressionsTabVisible]);
-
-  useEffect(() => {
     window.localStorage?.setItem(AUTO_BUILD_ACTIVE_FILE_KEY, autoBuildActiveFile ? "1" : "0");
   }, [autoBuildActiveFile]);
 
@@ -1130,49 +1173,9 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   }, [compileRunId]);
 
   useEffect(() => {
-    if (activeToolTab === "logs" && !buildProgressVisible) {
-      setActiveToolTab(expressionsTabVisible ? "expressions" : "runs");
-      return;
-    }
-    if (activeToolTab === "expressions" && !expressionsTabVisible) {
-      setActiveToolTab(buildProgressVisible ? "logs" : "runs");
-    }
-  }, [activeToolTab, buildProgressVisible, expressionsTabVisible]);
-
-  useEffect(() => {
-    if (!rootPath || !expressionsTabVisible) {
-      setProjectExpressions([]);
-      setProjectExpressionsDiagnostics([]);
-      setProjectExpressionsError("");
-      setProjectExpressionsLoading(false);
-      return;
-    }
-    let active = true;
-    setProjectExpressionsLoading(true);
-    setProjectExpressionsError("");
-    void getExpressionsView(rootPath).then(
-      (view) => {
-        if (!active) return;
-        setProjectExpressions(view.records || []);
-        setProjectExpressionsDiagnostics(view.diagnostics || []);
-        setExpressionResult(view.evaluation || null);
-      },
-      (error) => {
-        if (!active) return;
-        setProjectExpressions([]);
-        setProjectExpressionsDiagnostics([]);
-        setProjectExpressionsError(String(error));
-        setExpressionResult(null);
-      },
-    ).finally(() => {
-      if (active) {
-        setProjectExpressionsLoading(false);
-      }
-    });
-    return () => {
-      active = false;
-    };
-  }, [expressionsTabVisible, rootPath]);
+    setExpressionResult(null);
+    setExpressionRequestError("");
+  }, [rootPath]);
 
   useEffect(() => {
     let active = true;
@@ -1398,6 +1401,24 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   }, [aboutWindowOpen]);
 
   useEffect(() => {
+    if (!newProjectDialog) return;
+    const focusTimer = window.setTimeout(() => {
+      newProjectNameInputRef.current?.focus();
+      newProjectNameInputRef.current?.select();
+    }, 0);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !newProjectDialog.submitting) {
+        setNewProjectDialog(null);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.clearTimeout(focusTimer);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [newProjectDialog]);
+
+  useEffect(() => {
     if (!newFileDialog) return;
     const focusTimer = window.setTimeout(() => {
       newFileNameInputRef.current?.focus();
@@ -1553,6 +1574,116 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       setCompileStatus(`Open failed: ${String(error)}`);
     }
   }, [activeFilePath, persistActiveEditorBuffer, openTabs, applySelection, activateEditorTab, setCompileStatus]);
+
+  const createNewProjectFromDialog = useCallback(async () => {
+    if (!newProjectDialog || newProjectDialog.submitting) return;
+    const parentPath = newProjectDialog.parentPath.trim();
+    if (!parentPath) {
+      setNewProjectDialog((prev) => (prev ? { ...prev, error: "Parent folder is required." } : prev));
+      return;
+    }
+    const projectName = newProjectDialog.name.trim();
+    if (!projectName) {
+      setNewProjectDialog((prev) => (prev ? { ...prev, error: "Project name is required." } : prev));
+      return;
+    }
+    if (projectName === "." || projectName === ".." || INVALID_NEW_PROJECT_NAME_CHARS.test(projectName)) {
+      setNewProjectDialog((prev) => (
+        prev
+          ? { ...prev, error: "Project name contains invalid characters: <>:\"/\\|?*" }
+          : prev
+      ));
+      return;
+    }
+    const createStarterFile = !!newProjectDialog.createStarterFile;
+    const starterFileBaseName = createStarterFile
+      ? newProjectDialog.starterFileName.trim().replace(/\.(sysml|kerml)$/i, "").trim()
+      : "";
+    if (createStarterFile && !starterFileBaseName) {
+      setNewProjectDialog((prev) => (prev ? { ...prev, error: "Starter file name is required." } : prev));
+      return;
+    }
+    if (createStarterFile && INVALID_NEW_FILE_NAME_CHARS.test(starterFileBaseName)) {
+      setNewProjectDialog((prev) => (
+        prev
+          ? { ...prev, error: "Starter file name contains invalid characters: <>:\"/\\|?*" }
+          : prev
+      ));
+      return;
+    }
+    setNewProjectDialog((prev) => (prev ? { ...prev, error: "", submitting: true } : prev));
+    try {
+      const createdRoot = await createProject(
+        parentPath,
+        projectName,
+        newProjectDialog.author.trim(),
+        newProjectDialog.description.trim(),
+        newProjectDialog.organization.trim(),
+        newProjectDialog.useDefaultLibrary,
+      );
+      let starterPath: string | null = null;
+      if (createStarterFile) {
+        const starterFileName = buildNewSemanticFileName(
+          starterFileBaseName,
+          newProjectDialog.starterFileExtension,
+        );
+        starterPath = await createProjectFile(createdRoot, createdRoot, starterFileName);
+        await invoke("write_file", {
+          path: starterPath,
+          content: buildStarterProjectContent(projectName),
+        });
+      }
+      setNewProjectDialog(null);
+      if (starterPath) {
+        setPendingProjectFileToOpen(starterPath);
+      }
+      const nextRoot = createdRoot.trim();
+      if (autoBuildTimerRef.current !== undefined) {
+        window.clearTimeout(autoBuildTimerRef.current);
+        autoBuildTimerRef.current = undefined;
+      }
+      if (compileRunIdRef.current) {
+        void cancelCompile();
+      }
+      setRootPath(nextRoot);
+      if (nextRoot) {
+        window.localStorage?.setItem(ROOT_STORAGE_KEY, nextRoot);
+        setRecentProjects((prev) => pushRecentProject(nextRoot, prev));
+      }
+      setCompileStatus(
+        starterPath
+          ? `Created project: ${createdRoot} (${displayNameForPath(starterPath)})`
+          : `Created project: ${createdRoot}`,
+      );
+    } catch (error) {
+      const message = String(error);
+      setCompileStatus(`Create project failed: ${message}`);
+      setNewProjectDialog((prev) => (
+        prev
+          ? { ...prev, error: `Create project failed: ${message}`, submitting: false }
+          : prev
+      ));
+    }
+  }, [cancelCompile, newProjectDialog, setCompileStatus]);
+
+  useEffect(() => {
+    const pendingPath = (pendingProjectFileToOpen || "").trim();
+    const activeRoot = (projectTreeRootPath || rootPath).trim();
+    if (!pendingPath || !activeRoot || !isPathWithin(activeRoot, pendingPath)) return;
+    let active = true;
+    void (async () => {
+      try {
+        await openFilePath(pendingPath);
+      } finally {
+        if (active) {
+          setPendingProjectFileToOpen(null);
+        }
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [openFilePath, pendingProjectFileToOpen, projectTreeRootPath, rootPath]);
 
   const openEntry = useCallback(async (entry: FileEntry) => {
     if (entry.is_dir) {
@@ -1775,23 +1906,34 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   }, [rootPath, activeFilePath, runCompile, compileProject, setCompileStatus, collectUnsavedCompileInputs, addHarnessRun]);
 
   const scheduleAutoBuild = useCallback(() => {
-    if (!autoBuildActiveFile) return;
-    if (!rootPath) return;
-    if (!activeFilePath || !isSemanticSource(activeFilePath)) return;
-    if (compileRunIdRef.current) return;
+    if (!autoBuildActiveFile || !rootPath || !activeFilePath || !isSemanticSource(activeFilePath)) {
+      autoBuildQueuedRef.current = false;
+      return;
+    }
+    if (compileRunIdRef.current) {
+      autoBuildQueuedRef.current = true;
+      return;
+    }
+    autoBuildQueuedRef.current = false;
     if (autoBuildTimerRef.current !== undefined) {
       window.clearTimeout(autoBuildTimerRef.current);
     }
     autoBuildTimerRef.current = window.setTimeout(() => {
       autoBuildTimerRef.current = undefined;
       if (!autoBuildActiveFile) return;
-      if (compileRunIdRef.current) return;
+      if (compileRunIdRef.current) {
+        autoBuildQueuedRef.current = true;
+        return;
+      }
       const now = Date.now();
       if (now - lastAutoBuildAtRef.current < AUTO_BUILD_MIN_INTERVAL_MS) {
         autoBuildTimerRef.current = window.setTimeout(() => {
           autoBuildTimerRef.current = undefined;
           if (!autoBuildActiveFile) return;
-          if (compileRunIdRef.current) return;
+          if (compileRunIdRef.current) {
+            autoBuildQueuedRef.current = true;
+            return;
+          }
           lastAutoBuildAtRef.current = Date.now();
           void compileActiveFile();
         }, AUTO_BUILD_MIN_INTERVAL_MS);
@@ -1801,6 +1943,13 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       void compileActiveFile();
     }, AUTO_BUILD_DEBOUNCE_MS);
   }, [autoBuildActiveFile, rootPath, activeFilePath, compileActiveFile]);
+
+  useEffect(() => {
+    if (compileRunId !== null) return;
+    if (!autoBuildQueuedRef.current) return;
+    autoBuildQueuedRef.current = false;
+    scheduleAutoBuild();
+  }, [compileRunId, scheduleAutoBuild]);
 
   const clearAllCaches = useCallback(async () => {
     if (compileRunId) {
@@ -1890,9 +2039,43 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     }
   }, [rootPath, setCompileStatus, compileProject]);
 
+  const openNewProjectDialog = useCallback(async () => {
+    setMenuOpen(null);
+    setTabContextMenu(null);
+    setFileContextMenu(null);
+    setTabsOverflowMenuOpen(false);
+    const activeParent = parentPathForPath(rootPath);
+    let suggestedParent = activeParent;
+    if (!suggestedParent) {
+      try {
+        suggestedParent = await getUserProjectsRoot();
+      } catch {
+        suggestedParent = "";
+      }
+    }
+    setNewProjectDialog({
+      parentPath: suggestedParent,
+      name: "",
+      author: "",
+      description: "",
+      organization: "",
+      createStarterFile: true,
+      starterFileName: "model",
+      starterFileExtension: ".sysml",
+      useDefaultLibrary: true,
+      error: "",
+      submitting: false,
+    });
+  }, [rootPath]);
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const lowered = event.key.toLowerCase();
+      if ((event.ctrlKey || event.metaKey) && lowered === "n") {
+        event.preventDefault();
+        void openNewProjectDialog();
+        return;
+      }
       if ((event.ctrlKey || event.metaKey) && lowered === "s") {
         event.preventDefault();
         void saveActiveFile();
@@ -1912,10 +2095,13 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [saveActiveFile, compileProject, compileRunId]);
+  }, [openNewProjectDialog, saveActiveFile, compileProject, compileRunId]);
 
   const runMenuAction = useCallback(async (action: string) => {
     switch (action) {
+      case "new-project":
+        await openNewProjectDialog();
+        return;
       case "open-folder": {
         const selected = await open({ directory: true, multiple: false });
         if (typeof selected === "string") {
@@ -1945,12 +2131,13 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       case "clear-caches":
         await clearAllCaches();
         return;
+      case "show-tooling":
+        setActiveToolTab("tooling");
+        return;
       case "show-logs":
-        setBuildProgressVisible(true);
         setActiveToolTab("logs");
         return;
       case "show-expressions":
-        setExpressionsTabVisible(true);
         setActiveToolTab("expressions");
         return;
       case "select-stdlib-path": {
@@ -1978,14 +2165,13 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
         return;
     }
   }, [
+    openNewProjectDialog,
     applyRootPath,
     openFilePath,
     saveActiveFile,
     compileProject,
     compileActiveFile,
     clearAllCaches,
-    setBuildProgressVisible,
-    setExpressionsTabVisible,
     setActiveToolTab,
     setStdlibManagerOpen,
     setAboutWindowOpen,
@@ -2004,7 +2190,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     const timer = window.setTimeout(() => {
       projectFilesChangedTimerRef.current = undefined;
       const watchRoot = projectWatcherRootRef.current;
-      const activeRoot = rootPath;
+      const activeRoot = projectTreeRootPath || rootPath || watchRoot;
       if (!watchRoot || !activeRoot) {
         return;
       }
@@ -2016,7 +2202,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       });
     }, 250);
     projectFilesChangedTimerRef.current = timer;
-  }, [refreshRoot, rootPath, normalizeWatchedPath]);
+  }, [projectTreeRootPath, refreshRoot, rootPath, normalizeWatchedPath]);
 
   const scheduleLibraryTreeRefresh = useCallback(() => {
     if (libraryFilesChangedTimerRef.current !== undefined) {
@@ -2606,7 +2792,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
     const panelHeight = panel?.clientHeight || 0;
     if (!panelHeight) return;
     const delta = event.clientY - drag.startY;
-    const next = drag.startRatio + delta / panelHeight;
+    const next = drag.startRatio - delta / panelHeight;
     const clamped = clampCenterHarnessSplitRatio(next);
     if (Math.abs(clamped - centerHarnessSplitRatio) > 0.0001) {
       setCenterHarnessSplitRatio(clamped);
@@ -2748,6 +2934,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
       const isDir = entry.is_dir;
       const isOpen = !!expanded[entry.path];
       const fileKey = normalizePath(entry.path);
+      const iconKind = treeNodeIconKind(entry.path, isDir);
       const active = !isDir && normalizePath(activeFilePath) === fileKey;
       const hasParseError = fileDiagnosticPaths.has(fileKey);
       const fileSymbols = isDir ? [] : (symbolsByFile.get(fileKey) || []);
@@ -2818,8 +3005,8 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
               }}
               title={entry.path}
             >
-              <span className={`simple-tree-icon ${isDir ? "dir" : "file"}`}>
-                {isDir ? treeNodeIcon(true) : treeNodeIcon(false)}
+              <span className={`simple-tree-icon ${iconKind}`}>
+                {treeNodeIcon(iconKind)}
               </span>
               <span className="simple-tree-label">{entry.name}</span>
               {!isDir && symbolCount > 0 ? <span className="simple-tree-count">{symbolCount}</span> : null}
@@ -2870,6 +3057,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
       const key = entry.path;
       const isDir = entry.is_dir;
       const fileKey = normalizePath(entry.path);
+      const iconKind = treeNodeIconKind(entry.path, isDir);
       const isOpen = isDir ? !!expandedLibraryDirs[entry.path] : !!expandedLibraryFiles[fileKey];
       const active = !isDir && normalizePath(activeFilePath) === fileKey;
       const fileSymbols = isDir ? [] : (librarySymbolsByFile.get(fileKey) || []);
@@ -2942,8 +3130,8 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
               }}
               title={entry.path}
             >
-              <span className={`simple-tree-icon ${isDir ? "dir" : "file"}`}>
-                {treeNodeIcon(isDir)}
+              <span className={`simple-tree-icon ${iconKind}`}>
+                {treeNodeIcon(iconKind)}
               </span>
               <span className="simple-tree-label">{entry.name}</span>
               {!isDir ? <span className="simple-tree-count">{fileSymbols.length}</span> : null}
@@ -3120,40 +3308,8 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
     }
   }, [buildProgressText, setCompileStatus]);
   const openToolTab = useCallback((tab: ToolTabId) => {
-    if (tab === "logs") {
-      setBuildProgressVisible(true);
-    }
-    if (tab === "expressions") {
-      setExpressionsTabVisible(true);
-    }
     setActiveToolTab(tab);
   }, []);
-  const refreshProjectExpressions = useCallback(async () => {
-    if (!rootPath) {
-      setProjectExpressions([]);
-      setProjectExpressionsDiagnostics([]);
-      setProjectExpressionsError("");
-      return;
-    }
-    setProjectExpressionsLoading(true);
-    setProjectExpressionsError("");
-    try {
-      const view = await getExpressionsView(rootPath);
-      setProjectExpressions(view.records || []);
-      setProjectExpressionsDiagnostics(view.diagnostics || []);
-      setExpressionResult(view.evaluation || null);
-      setCompileStatus(`Loaded ${view.records?.length || 0} project expressions`);
-    } catch (error) {
-      const message = String(error);
-      setProjectExpressions([]);
-      setProjectExpressionsDiagnostics([]);
-      setProjectExpressionsError(message);
-      setExpressionResult(null);
-      setCompileStatus(`Project expressions failed: ${message}`);
-    } finally {
-      setProjectExpressionsLoading(false);
-    }
-  }, [rootPath, setCompileStatus]);
   const evaluateExpressionInput = useCallback(async () => {
     if (!rootPath) {
       setExpressionResult(null);
@@ -3172,9 +3328,6 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
     setExpressionRequestError("");
     try {
       const view = await getExpressionsView(rootPath, source);
-      setProjectExpressions(view.records || []);
-      setProjectExpressionsDiagnostics(view.diagnostics || []);
-      setProjectExpressionsError("");
       setExpressionResult(view.evaluation || null);
       setCompileStatus(`Expression result: ${view.evaluation?.result || "-"}`);
     } catch (error) {
@@ -3235,18 +3388,6 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
     });
   }, [setCompileStatus]);
 
-  const closeToolTab = useCallback((tab: ToolTabId) => {
-    if (tab === "logs") {
-      setBuildProgressVisible(false);
-      setActiveToolTab((prev) => (prev === "logs" ? (expressionsTabVisible ? "expressions" : "runs") : prev));
-      return;
-    }
-    if (tab === "expressions") {
-      setExpressionsTabVisible(false);
-      setActiveToolTab((prev) => (prev === "expressions" ? (buildProgressVisible ? "logs" : "runs") : prev));
-    }
-  }, [buildProgressVisible, expressionsTabVisible]);
-
   return (
     <div className="app-shell simple-ui-shell">
       <header
@@ -3276,6 +3417,8 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
               </button>
               {menuOpen === "file" ? (
                 <div className="menu-bar-dropdown">
+                  <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); void runMenuAction("new-project"); }}>New Project...</button>
+                  <div className="menu-bar-sep" />
                   <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); void runMenuAction("open-folder"); }}>Open Folder...</button>
                   <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); void runMenuAction("open-file"); }}>Open File...</button>
                   <div className="menu-bar-sep" />
@@ -3319,11 +3462,14 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
               </button>
               {menuOpen === "view" ? (
                 <div className="menu-bar-dropdown">
+                  <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); openToolTab("tooling"); }}>
+                    {activeToolTab === "tooling" ? `${UI_ICON.check} ` : ""}Show Tooling
+                  </button>
                   <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); openToolTab("logs"); }}>
-                    {buildProgressVisible ? `${UI_ICON.check} ` : ""}Show Logs
+                    {activeToolTab === "logs" ? `${UI_ICON.check} ` : ""}Show Logs
                   </button>
                   <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); openToolTab("expressions"); }}>
-                    {expressionsTabVisible ? `${UI_ICON.check} ` : ""}Show Expressions
+                    {activeToolTab === "expressions" ? `${UI_ICON.check} ` : ""}Show Expressions
                   </button>
                 </div>
               ) : null}
@@ -3371,6 +3517,9 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
       </header>
       <header className="titlebar simple-ui-titlebar">
         <div className="simple-ui-root-picker">
+          <button type="button" className="ghost" onClick={() => void openNewProjectDialog()}>
+            New Project...
+          </button>
           <select
             value={recentPickerValue}
             onChange={(event) => {
@@ -3745,9 +3894,10 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                   <div className="simple-editor-welcome-card">
                     <div className="simple-editor-welcome-title">Welcome to Mercurio SysML</div>
                     <div className="simple-editor-welcome-text">
-                      Choose a recent project or open a root folder, then select a file from the project tree.
+                      Create a new project, choose a recent project, or open a root folder, then select a file from the project tree.
                     </div>
                     <div className="simple-editor-welcome-hints muted">
+                      <div>Ctrl+N: New Project</div>
                       <div>Ctrl+Shift+O: Open Folder</div>
                       <div>Ctrl+O: Open File</div>
                       <div>Ctrl+S: Save</div>
@@ -3809,241 +3959,182 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                 </>
               )}
             </div>
-            {!showCenterWelcome ? (
-              <>
-                <div
-                  className={`simple-harness-resizer ${centerHarnessSplitDragging ? "active" : ""}`}
-                  role="separator"
-                  aria-orientation="horizontal"
-                  aria-label="Resize tooling area"
-                  onPointerDown={handleCenterHarnessResizerPointerDown}
-                  onPointerMove={handleCenterHarnessResizerPointerMove}
-                  onPointerUp={stopCenterHarnessResizerDrag}
-                  onPointerCancel={stopCenterHarnessResizerDrag}
-                />
-                <div className="simple-tooling">
-                  <div className="panel-header simple-tooling-header">
-                    <div className="simple-tooling-tabs" role="tablist" aria-label="Tooling tabs">
+            <div
+              className={`simple-harness-resizer ${centerHarnessSplitDragging ? "active" : ""}`}
+              role="separator"
+              aria-orientation="horizontal"
+              aria-label="Resize tooling area"
+              onPointerDown={handleCenterHarnessResizerPointerDown}
+              onPointerMove={handleCenterHarnessResizerPointerMove}
+              onPointerUp={stopCenterHarnessResizerDrag}
+              onPointerCancel={stopCenterHarnessResizerDrag}
+            />
+            <div className="simple-tooling">
+              <div className="panel-header simple-tooling-header">
+                <div className="simple-tooling-tabs" role="tablist" aria-label="Tooling tabs">
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={activeToolTab === "tooling"}
+                    className={`ghost simple-tool-tab ${activeToolTab === "tooling" ? "active" : ""}`}
+                    onClick={() => setActiveToolTab("tooling")}
+                  >
+                    Tooling
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={activeToolTab === "logs"}
+                    className={`ghost simple-tool-tab ${activeToolTab === "logs" ? "active" : ""}`}
+                    onClick={() => openToolTab("logs")}
+                  >
+                    Logs
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={activeToolTab === "expressions"}
+                    className={`ghost simple-tool-tab ${activeToolTab === "expressions" ? "active" : ""}`}
+                    onClick={() => openToolTab("expressions")}
+                  >
+                    Expressions
+                  </button>
+                </div>
+                <div className="simple-tooling-actions">
+                  {activeToolTab === "logs" ? (
+                    <>
+                      <button type="button" className="ghost" onClick={() => void copyBuildProgress()}>
+                        Copy Logs
+                      </button>
+                      <button type="button" className="ghost" onClick={clearBuildLogs}>
+                        Clear
+                      </button>
+                    </>
+                  ) : null}
+                  {activeToolTab === "expressions" ? (
+                    <>
                       <button
                         type="button"
-                        role="tab"
-                        aria-selected={activeToolTab === "runs"}
-                        className={`ghost simple-tool-tab ${activeToolTab === "runs" ? "active" : ""}`}
-                        onClick={() => setActiveToolTab("runs")}
+                        className="ghost"
+                        onClick={() => void evaluateExpressionInput()}
+                        disabled={expressionPending}
                       >
-                        Runs
+                        {expressionPending ? "Evaluating..." : "Evaluate"}
                       </button>
-                      {buildProgressVisible ? (
-                        <div className={`simple-tool-tab-group ${activeToolTab === "logs" ? "active" : ""}`}>
-                          <button
-                            type="button"
-                            role="tab"
-                            aria-selected={activeToolTab === "logs"}
-                            className={`ghost simple-tool-tab ${activeToolTab === "logs" ? "active" : ""}`}
-                            onClick={() => openToolTab("logs")}
-                          >
-                            Logs
-                          </button>
-                          <button
-                            type="button"
-                            className="ghost simple-tool-tab-close"
-                            onClick={() => closeToolTab("logs")}
-                            title="Close Logs tab"
-                            aria-label="Close Logs tab"
-                          >
-                            x
-                          </button>
-                        </div>
-                      ) : null}
-                      {expressionsTabVisible ? (
-                        <div className={`simple-tool-tab-group ${activeToolTab === "expressions" ? "active" : ""}`}>
-                          <button
-                            type="button"
-                            role="tab"
-                            aria-selected={activeToolTab === "expressions"}
-                            className={`ghost simple-tool-tab ${activeToolTab === "expressions" ? "active" : ""}`}
-                            onClick={() => openToolTab("expressions")}
-                          >
-                            Expressions
-                          </button>
-                          <button
-                            type="button"
-                            className="ghost simple-tool-tab-close"
-                            onClick={() => closeToolTab("expressions")}
-                            title="Close Expressions tab"
-                            aria-label="Close Expressions tab"
-                          >
-                            x
-                          </button>
-                        </div>
-                      ) : null}
+                      <button type="button" className="ghost" onClick={clearExpressionTool} disabled={expressionPending}>
+                        Clear
+                      </button>
+                    </>
+                  ) : null}
+                </div>
+              </div>
+              <div className="simple-tooling-body">
+                {activeToolTab === "logs" ? (
+                  <div className="simple-log-tool" role="tabpanel" aria-label="Logs tool">
+                    <div className="simple-build-progress-status muted">{compileStatus}</div>
+                    <div className="simple-build-progress-meta muted">
+                      <span>run {buildProgress.runId ?? "-"}</span>
+                      <span>stage {buildProgress.stage}</span>
+                      <span>events {buildProgress.eventCount}</span>
+                      <span>elapsed {formatDurationMs(buildElapsedMs)}</span>
+                      <span>last event {formatDurationMs(buildIdleMs)} ago</span>
                     </div>
-                    <div className="simple-tooling-actions">
-                      {activeToolTab === "logs" ? (
-                        <>
-                          <button type="button" className="ghost" onClick={() => void copyBuildProgress()}>
-                            Copy Logs
-                          </button>
-                          <button type="button" className="ghost" onClick={clearBuildLogs}>
-                            Clear
-                          </button>
-                        </>
-                      ) : null}
-                      {activeToolTab === "expressions" ? (
-                        <>
-                          <button
-                            type="button"
-                            className="ghost"
-                            onClick={() => void evaluateExpressionInput()}
-                            disabled={expressionPending}
-                          >
-                            {expressionPending ? "Evaluating..." : "Evaluate"}
-                          </button>
-                          <button type="button" className="ghost" onClick={clearExpressionTool} disabled={expressionPending}>
-                            Clear
-                          </button>
-                          <button
-                            type="button"
-                            className="ghost"
-                            onClick={() => void refreshProjectExpressions()}
-                            disabled={projectExpressionsLoading || !rootPath}
-                          >
-                            {projectExpressionsLoading ? "Refreshing..." : "Refresh"}
-                          </button>
-                        </>
-                      ) : null}
+                    {buildStalledHint ? (
+                      <div className="simple-build-progress-stalled">{buildStalledHint}</div>
+                    ) : null}
+                    {buildProgress.file ? (
+                      <div className="simple-build-progress-file">{buildProgress.file}</div>
+                    ) : null}
+                    <div className="simple-build-progress-list">
+                      <BuildLogList entries={buildLogEntries} />
+                    </div>
+                    <div className="simple-harness-runs" aria-label="Recent runs">
+                      {harnessRuns.length ? (
+                        harnessRuns.map((run) => {
+                          const width = `${Math.max(6, Math.round((run.durationMs / harnessMaxDuration) * 100))}%`;
+                          const runOk = run.ok && run.budgetOk;
+                          return (
+                            <div key={run.id} className="simple-harness-row">
+                              <span>{run.at}</span>
+                              <span>{run.kind}</span>
+                              <span className={runOk ? "ok" : "error"}>{runOk ? "ok" : "fail"}</span>
+                              <span>{Math.round(run.durationMs)} ms</span>
+                              <span>{run.progressUpdates} ui</span>
+                              <div className="simple-harness-bar">
+                                <div className={`simple-harness-bar-fill ${runOk ? "ok" : "error"}`} style={{ width }} />
+                              </div>
+                            </div>
+                          );
+                        })
+                      ) : (
+                        <div className="muted">No runs yet.</div>
+                      )}
                     </div>
                   </div>
-                  <div className="simple-tooling-body">
-                    {activeToolTab === "logs" ? (
-                      <div className="simple-log-tool" role="tabpanel" aria-label="Logs tool">
-                        <div className="simple-build-progress-status muted">{compileStatus}</div>
-                        <div className="simple-build-progress-meta muted">
-                          <span>run {buildProgress.runId ?? "-"}</span>
-                          <span>stage {buildProgress.stage}</span>
-                          <span>events {buildProgress.eventCount}</span>
-                          <span>elapsed {formatDurationMs(buildElapsedMs)}</span>
-                          <span>last event {formatDurationMs(buildIdleMs)} ago</span>
-                        </div>
-                        {buildStalledHint ? (
-                          <div className="simple-build-progress-stalled">{buildStalledHint}</div>
-                        ) : null}
-                        {buildProgress.file ? (
-                          <div className="simple-build-progress-file">{buildProgress.file}</div>
-                        ) : null}
-                        <div className="simple-build-progress-list">
-                          <BuildLogList entries={buildLogEntries} />
-                        </div>
-                      </div>
-                    ) : activeToolTab === "expressions" ? (
-                      <div className="simple-expression-tool" role="tabpanel" aria-label="Expressions tool">
-                        <label className="simple-expression-editor">
+                ) : activeToolTab === "expressions" ? (
+                  <div className="simple-expression-tool" role="tabpanel" aria-label="Expressions tool">
+                    <label className="simple-expression-editor">
+                      <span className="muted">Expression</span>
+                      <textarea
+                        className="simple-expression-input"
+                        value={expressionInput}
+                        onChange={(event) => setExpressionInput(event.target.value)}
+                        onKeyDown={(event) => {
+                          if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+                            event.preventDefault();
+                            void evaluateExpressionInput();
+                          }
+                        }}
+                        spellCheck={false}
+                        placeholder="Type an expression like 1 + 2 * 3"
+                      />
+                    </label>
+                    <div className="simple-expression-hint muted">Press Ctrl+Enter to evaluate.</div>
+                    <div className="simple-expression-results">
+                      {expressionRequestError ? (
+                        <div className="error">{expressionRequestError}</div>
+                      ) : null}
+                      {expressionResult ? (
+                        <div className="simple-expression-grid">
                           <span className="muted">Expression</span>
-                          <textarea
-                            className="simple-expression-input"
-                            value={expressionInput}
-                            onChange={(event) => setExpressionInput(event.target.value)}
-                            onKeyDown={(event) => {
-                              if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
-                                event.preventDefault();
-                                void evaluateExpressionInput();
-                              }
-                            }}
-                            spellCheck={false}
-                            placeholder="Type an expression like 1 + 2 * 3"
-                          />
-                        </label>
-                        <div className="simple-expression-hint muted">Press Ctrl+Enter to evaluate.</div>
-                        <div className="simple-expression-results">
-                          {expressionRequestError ? (
-                            <div className="error">{expressionRequestError}</div>
-                          ) : null}
-                          {expressionResult ? (
-                            <div className="simple-expression-grid">
-                              <span className="muted">Expression</span>
-                              <span>{expressionResult.expression}</span>
-                              <span className="muted">Result</span>
-                              <span>{expressionResult.result}</span>
+                          <span>{expressionResult.expression}</span>
+                          <span className="muted">Result</span>
+                          <span>{expressionResult.result}</span>
+                        </div>
+                      ) : (
+                        <div className="muted">Enter an expression and evaluate it against the current project.</div>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="simple-harness-runs simple-tooling-panel" role="tabpanel" aria-label="Tooling tab">
+                    <div className="muted">
+                      avg {Math.round(harnessAvgDuration)} ms | max {Math.round(harnessMaxDuration)} ms | ui updates {progressUiUpdates} | dropped requests {droppedCompileRequests} | budget failures {harnessBudgetFailures}
+                    </div>
+                    {harnessRuns.length ? (
+                      harnessRuns.map((run) => {
+                        const width = `${Math.max(6, Math.round((run.durationMs / harnessMaxDuration) * 100))}%`;
+                        const runOk = run.ok && run.budgetOk;
+                        return (
+                          <div key={run.id} className="simple-harness-row">
+                            <span>{run.at}</span>
+                            <span>{run.kind}</span>
+                            <span className={runOk ? "ok" : "error"}>{runOk ? "ok" : "fail"}</span>
+                            <span>{Math.round(run.durationMs)} ms</span>
+                            <span>{run.progressUpdates} ui</span>
+                            <div className="simple-harness-bar">
+                              <div className={`simple-harness-bar-fill ${runOk ? "ok" : "error"}`} style={{ width }} />
                             </div>
-                          ) : (
-                            <div className="muted">Enter an expression and evaluate it against the current project.</div>
-                          )}
-                          <div className="simple-expression-library">
-                            <div className="simple-expression-library-header">
-                              <strong>Project Expressions</strong>
-                              <span className="muted">{projectExpressions.length} rows</span>
-                            </div>
-                            {projectExpressionsError ? (
-                              <div className="simple-expression-problem error">{projectExpressionsError}</div>
-                            ) : null}
-                            {projectExpressionsDiagnostics.length ? (
-                              <div className="simple-expression-problems">
-                                {projectExpressionsDiagnostics.map((message) => (
-                                  <div key={message} className="muted">{message}</div>
-                                ))}
-                              </div>
-                            ) : null}
-                            {projectExpressions.length ? (
-                              <div className="simple-expression-records">
-                                {projectExpressions.map((record) => (
-                                  <div
-                                    key={`${record.file_path}|${record.owner_qualified_name}|${record.qualified_name}|${record.slot}|${record.expression}`}
-                                    className="simple-expression-record"
-                                  >
-                                    <div className="simple-expression-record-meta">
-                                      <span>{displayNameForPath(record.file_path)}</span>
-                                      <span>{record.owner_qualified_name}</span>
-                                      <span>{record.slot}</span>
-                                      <span>{record.expression_kind}</span>
-                                    </div>
-                                    <button
-                                      type="button"
-                                      className="ghost simple-expression-record-text"
-                                      onClick={() => setExpressionInput(record.expression)}
-                                      title="Use this expression"
-                                    >
-                                      {record.expression}
-                                    </button>
-                                  </div>
-                                ))}
-                              </div>
-                            ) : !projectExpressionsLoading && !projectExpressionsError ? (
-                              <div className="muted">No project expressions available.</div>
-                            ) : null}
                           </div>
-                        </div>
-                      </div>
+                        );
+                      })
                     ) : (
-                      <div className="simple-harness-runs" role="tabpanel" aria-label="Runs tool">
-                        <div className="muted">
-                          avg {Math.round(harnessAvgDuration)} ms | max {Math.round(harnessMaxDuration)} ms | ui updates {progressUiUpdates} | dropped requests {droppedCompileRequests} | budget failures {harnessBudgetFailures}
-                        </div>
-                        {harnessRuns.length ? (
-                          harnessRuns.map((run) => {
-                            const width = `${Math.max(6, Math.round((run.durationMs / harnessMaxDuration) * 100))}%`;
-                            const runOk = run.ok && run.budgetOk;
-                            return (
-                              <div key={run.id} className="simple-harness-row">
-                                <span>{run.at}</span>
-                                <span>{run.kind}</span>
-                                <span className={runOk ? "ok" : "error"}>{runOk ? "ok" : "fail"}</span>
-                                <span>{Math.round(run.durationMs)} ms</span>
-                                <span>{run.progressUpdates} ui</span>
-                                <div className="simple-harness-bar">
-                                  <div className={`simple-harness-bar-fill ${runOk ? "ok" : "error"}`} style={{ width }} />
-                                </div>
-                              </div>
-                            );
-                          })
-                        ) : (
-                          <div className="muted">No runs yet.</div>
-                        )}
-                      </div>
+                      <div className="muted">No runs yet.</div>
                     )}
                   </div>
-                </div>
-              </>
-            ) : null}
+                )}
+              </div>
+            </div>
           </div>
         </section>
 
@@ -4178,6 +4269,201 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                 ? `Apply writes library.path for ${rootPath}`
                 : "Select a project root before applying a stdlib option."}
             </div>
+          </section>
+        </div>
+      ) : null}
+
+      {newProjectDialog ? (
+        <div
+          className="simple-modal-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !newProjectDialog.submitting) {
+              setNewProjectDialog(null);
+            }
+          }}
+        >
+          <section
+            className="simple-modal simple-new-project-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Create new project"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                void createNewProjectFromDialog();
+              }}
+            >
+              <div className="simple-modal-header">
+                <strong>New Project</strong>
+                <div className="simple-modal-header-actions">
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={newProjectDialog.submitting}
+                    onClick={() => setNewProjectDialog(null)}
+                  >
+                    Cancel
+                  </button>
+                  <button type="submit" disabled={newProjectDialog.submitting}>
+                    {newProjectDialog.submitting ? "Creating..." : "Create"}
+                  </button>
+                </div>
+              </div>
+              <div className="simple-modal-body simple-new-project-body">
+                <label className="simple-new-file-field">
+                  <span className="muted">Parent Folder</span>
+                  <div className="simple-new-project-path-row">
+                    <input
+                      value={newProjectDialog.parentPath}
+                      onChange={(event) => setNewProjectDialog((prev) => (
+                        prev ? { ...prev, parentPath: event.target.value, error: "" } : prev
+                      ))}
+                      placeholder="C:\\Users\\...\\Documents"
+                      aria-label="Project parent folder"
+                      disabled={newProjectDialog.submitting}
+                    />
+                    <button
+                      type="button"
+                      className="ghost"
+                      disabled={newProjectDialog.submitting}
+                      onClick={() => {
+                        void (async () => {
+                          const selected = await open({ directory: true, multiple: false });
+                          if (typeof selected !== "string") return;
+                          setNewProjectDialog((prev) => (
+                            prev ? { ...prev, parentPath: selected, error: "" } : prev
+                          ));
+                        })();
+                      }}
+                    >
+                      Browse...
+                    </button>
+                  </div>
+                </label>
+                <div className="simple-new-project-grid">
+                  <label className="simple-new-file-field">
+                    <span className="muted">Project Name</span>
+                    <input
+                      ref={newProjectNameInputRef}
+                      value={newProjectDialog.name}
+                      onChange={(event) => setNewProjectDialog((prev) => (
+                        prev ? { ...prev, name: event.target.value, error: "" } : prev
+                      ))}
+                      placeholder="vehicle-architecture"
+                      aria-label="Project name"
+                      disabled={newProjectDialog.submitting}
+                    />
+                  </label>
+                  <label className="simple-new-file-field">
+                    <span className="muted">Author</span>
+                    <input
+                      value={newProjectDialog.author}
+                      onChange={(event) => setNewProjectDialog((prev) => (
+                        prev ? { ...prev, author: event.target.value, error: "" } : prev
+                      ))}
+                      placeholder="Optional"
+                      aria-label="Project author"
+                      disabled={newProjectDialog.submitting}
+                    />
+                  </label>
+                  <label className="simple-new-file-field">
+                    <span className="muted">Organization</span>
+                    <input
+                      value={newProjectDialog.organization}
+                      onChange={(event) => setNewProjectDialog((prev) => (
+                        prev ? { ...prev, organization: event.target.value, error: "" } : prev
+                      ))}
+                      placeholder="Optional"
+                      aria-label="Project organization"
+                      disabled={newProjectDialog.submitting}
+                    />
+                  </label>
+                </div>
+                <label className="simple-new-file-field">
+                  <span className="muted">Description</span>
+                  <textarea
+                    value={newProjectDialog.description}
+                    onChange={(event) => setNewProjectDialog((prev) => (
+                      prev ? { ...prev, description: event.target.value, error: "" } : prev
+                    ))}
+                    placeholder="Optional"
+                    aria-label="Project description"
+                    disabled={newProjectDialog.submitting}
+                  />
+                </label>
+                <div className="simple-new-project-options">
+                  <label className="simple-new-project-check">
+                    <input
+                      type="checkbox"
+                      checked={newProjectDialog.useDefaultLibrary}
+                      onChange={(event) => setNewProjectDialog((prev) => (
+                        prev ? { ...prev, useDefaultLibrary: event.target.checked, error: "" } : prev
+                      ))}
+                      disabled={newProjectDialog.submitting}
+                    />
+                    <span>Use default stdlib</span>
+                  </label>
+                  <label className="simple-new-project-check">
+                    <input
+                      type="checkbox"
+                      checked={newProjectDialog.createStarterFile}
+                      onChange={(event) => setNewProjectDialog((prev) => (
+                        prev ? { ...prev, createStarterFile: event.target.checked, error: "" } : prev
+                      ))}
+                      disabled={newProjectDialog.submitting}
+                    />
+                    <span>Create starter model file</span>
+                  </label>
+                </div>
+                {newProjectDialog.createStarterFile ? (
+                  <label className="simple-new-file-field">
+                    <span className="muted">Starter File</span>
+                    <div className="simple-new-file-input-row">
+                      <input
+                        value={newProjectDialog.starterFileName}
+                        onChange={(event) => setNewProjectDialog((prev) => (
+                          prev ? { ...prev, starterFileName: event.target.value, error: "" } : prev
+                        ))}
+                        placeholder="model"
+                        aria-label="Starter file name"
+                        disabled={newProjectDialog.submitting}
+                      />
+                      <div className="simple-new-file-type-group" role="radiogroup" aria-label="Starter file type">
+                        {([".sysml", ".kerml"] as const).map((extension) => (
+                          <button
+                            key={extension}
+                            type="button"
+                            className={`simple-new-file-type-btn ${newProjectDialog.starterFileExtension === extension ? "active" : ""}`}
+                            onClick={() => setNewProjectDialog((prev) => (
+                              prev ? { ...prev, starterFileExtension: extension, error: "" } : prev
+                            ))}
+                            disabled={newProjectDialog.submitting}
+                            aria-pressed={newProjectDialog.starterFileExtension === extension}
+                          >
+                            {extension}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </label>
+                ) : null}
+                {newProjectDialog.error ? (
+                  <div className="error">{newProjectDialog.error}</div>
+                ) : (
+                  <div className="muted">
+                    Creates a project folder with a `.project` descriptor
+                    {newProjectDialog.createStarterFile ? " and a starter source file." : "."}
+                  </div>
+                )}
+              </div>
+              <div className="simple-modal-footer muted">
+                Root: {newProjectDialog.parentPath.trim() && newProjectDialog.name.trim()
+                  ? `${newProjectDialog.parentPath.replace(/[\\/]+$/, "")}\\${newProjectDialog.name.trim()}`
+                  : "<choose parent and name>"}
+              </div>
+            </form>
           </section>
         </div>
       ) : null}

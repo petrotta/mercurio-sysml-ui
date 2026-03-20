@@ -1350,9 +1350,21 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
             .map(|element| normalize_semantic_projection_file_path(&display_root_path, element))
             .collect::<Vec<_>>(),
     );
+    let selected_project_semantic_file_keys = project_symbol_files
+        .iter()
+        .map(|path| normalized_compare_key(path))
+        .collect::<HashSet<_>>();
     if semantic_cache_needs_store || semantic_projection_needs_store {
         if let Ok(mut cache) = state.workspace_snapshot_cache.lock() {
-            clear_project_semantic_cache_for_root(&mut cache, &root);
+            if target_path.is_none() {
+                clear_project_semantic_cache_for_root(&mut cache, &root);
+            } else {
+                retain_project_semantic_cache_for_files(
+                    &mut cache,
+                    &root,
+                    &selected_project_semantic_file_keys,
+                );
+            }
             let mut semantic_cache_keys = vec![semantic_cache_key.clone()];
             let mut semantic_projection_cache_keys = vec![semantic_projection_cache_key.clone()];
             if !raw_root.is_empty() && raw_root != root {
@@ -1385,12 +1397,15 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
             }
         }
     }
-    let _ = refresh_project_semantic_lookup(
-        state,
-        &root,
-        semantic_elements.as_ref(),
-        semantic_projection.as_ref(),
-    );
+    let _ = refresh_project_semantic_lookup_from_cache(state, &root)
+        .or_else(|_| {
+            refresh_project_semantic_lookup(
+                state,
+                &root,
+                semantic_elements.as_ref(),
+                semantic_projection.as_ref(),
+            )
+        });
     let semantic_total = semantic_elements.len();
     emit_progress(
         "analysis",
@@ -1971,6 +1986,117 @@ fn clear_project_semantic_cache_for_root(
     for key in to_remove {
         cache.remove(&key);
     }
+}
+
+fn collect_project_semantic_cache_for_root(
+    cache: &HashMap<String, WorkspaceSnapshotCacheEntry>,
+    project_root: &str,
+) -> (
+    Vec<mercurio_sysml_semantics::semantic_contract::SemanticElementView>,
+    Vec<mercurio_sysml_semantics::semantic_contract::SemanticElementProjectionView>,
+) {
+    let canonical_root = canonical_project_root(project_root);
+    let mut semantic_elements = Vec::new();
+    let mut semantic_projections = Vec::new();
+    for (key, entry) in cache.iter() {
+        if !project_semantic_cache_key_matches_root(key, &canonical_root) {
+            continue;
+        }
+        match entry {
+            WorkspaceSnapshotCacheEntry::ProjectSemantic(elements) => {
+                semantic_elements.extend(elements.iter().cloned());
+            }
+            WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(elements) => {
+                semantic_projections.extend(elements.iter().cloned());
+            }
+            WorkspaceSnapshotCacheEntry::Stdlib(_) => {}
+        }
+    }
+    (semantic_elements, semantic_projections)
+}
+
+fn retain_project_semantic_cache_for_files(
+    cache: &mut HashMap<String, WorkspaceSnapshotCacheEntry>,
+    project_root: &str,
+    selected_file_keys: &HashSet<String>,
+) {
+    if selected_file_keys.is_empty() {
+        return;
+    }
+    let canonical_root = canonical_project_root(project_root);
+    let target_keys = cache
+        .iter()
+        .filter_map(|(key, entry)| match entry {
+            WorkspaceSnapshotCacheEntry::ProjectSemantic(_)
+            | WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(_)
+                if project_semantic_cache_key_matches_root(key, &canonical_root) =>
+            {
+                Some(key.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for key in target_keys {
+        let replacement = cache.get(&key).and_then(|entry| match entry {
+            WorkspaceSnapshotCacheEntry::ProjectSemantic(elements) => {
+                let filtered = elements
+                    .iter()
+                    .filter(|element| {
+                        !selected_file_keys
+                            .contains(&normalized_compare_key(Path::new(&element.file_path)))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if filtered.is_empty() {
+                    None
+                } else {
+                    Some(WorkspaceSnapshotCacheEntry::ProjectSemantic(Arc::new(filtered)))
+                }
+            }
+            WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(elements) => {
+                let filtered = elements
+                    .iter()
+                    .filter(|element| {
+                        !selected_file_keys
+                            .contains(&normalized_compare_key(Path::new(&element.file_path)))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if filtered.is_empty() {
+                    None
+                } else {
+                    Some(WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(Arc::new(
+                        filtered,
+                    )))
+                }
+            }
+            WorkspaceSnapshotCacheEntry::Stdlib(_) => None,
+        });
+        if let Some(entry) = replacement {
+            cache.insert(key, entry);
+        } else {
+            cache.remove(&key);
+        }
+    }
+}
+
+fn refresh_project_semantic_lookup_from_cache(
+    state: &CoreState,
+    project_root: &str,
+) -> Result<(), String> {
+    let (semantic_elements, semantic_projections) = {
+        let cache = state
+            .workspace_snapshot_cache
+            .lock()
+            .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
+        collect_project_semantic_cache_for_root(&cache, project_root)
+    };
+    refresh_project_semantic_lookup(
+        state,
+        project_root,
+        semantic_elements.as_slice(),
+        semantic_projections.as_slice(),
+    )
 }
 
 fn stdlib_semantic_projection_cache_key(stdlib_path: &Path) -> String {

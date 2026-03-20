@@ -717,7 +717,7 @@ fn build_metatype_reconciled_sections(
             .unwrap_or_else(|| "-".to_string());
         let qualified_name =
             matched_feature.and_then(|feature| semantic_value_to_qualified_name(&feature.value));
-        let row_key = canonical_metatype_row_key(attribute, matched_feature, &row_value);
+        let row_key = canonical_metatype_row_key(attribute, matched_feature);
         if !seen_row_keys.insert(row_key) {
             continue;
         }
@@ -873,27 +873,42 @@ fn project_element_property_row(
 fn canonical_metatype_row_key(
     attribute: &ProjectElementInheritedAttributeView,
     matched_feature: Option<&mercurio_sysml_semantics::semantic_contract::SemanticFeatureView>,
-    row_value: &str,
 ) -> String {
     let feature_key = matched_feature.map_or_else(
-        || String::new(),
+        || {
+            let fallback = if !attribute.qualified_name.trim().is_empty() {
+                attribute.qualified_name.as_str()
+            } else {
+                attribute.name.as_str()
+            };
+            let tail_key = tail_lookup_key(fallback);
+            if tail_key.is_empty() {
+                normalize_lookup_key(fallback)
+            } else {
+                tail_key
+            }
+        },
         |feature| {
             let metamodel_feature_qname = feature
                 .metamodel_feature_qname
                 .as_deref()
                 .unwrap_or("")
                 .trim();
-            if metamodel_feature_qname.is_empty() {
-                normalize_lookup_key(&feature.name)
+            let feature_key_source = if metamodel_feature_qname.is_empty() {
+                feature.name.as_str()
             } else {
-                normalize_lookup_key(metamodel_feature_qname)
+                metamodel_feature_qname
+            };
+            let tail_key = tail_lookup_key(feature_key_source);
+            if tail_key.is_empty() {
+                normalize_lookup_key(feature_key_source)
+            } else {
+                tail_key
             }
         },
     );
-    let declared_on_key = tail_lookup_key(&attribute.declared_on);
     let signature_key = normalize_lookup_key(&format_attribute_signature(attribute));
-    let value_key = normalize_lookup_key(row_value);
-    format!("{feature_key}|{declared_on_key}|{signature_key}|{value_key}")
+    format!("{feature_key}|{signature_key}")
 }
 
 fn semantic_value_to_text(
@@ -1799,5 +1814,72 @@ standard library package KerML {
         assert_eq!(sections[0].rows.len(), 1);
         assert_eq!(sections[0].rows[0].label, "name : String[0..1]");
         assert_eq!(sections[0].rows[0].value, "R");
+    }
+
+    #[test]
+    fn metatype_reconciled_sections_dedupe_same_feature_from_different_declaring_types() {
+        let projection = IndexedSemanticProjectionElementView {
+            name: "eng".to_string(),
+            qualified_name: "CalculationExample::vehicle::eng".to_string(),
+            file_path: "main.sysml".to_string(),
+            metatype_qname: Some("CalculationExample::VehiclePart".to_string()),
+            features: vec![SemanticFeatureView {
+                name: "type".to_string(),
+                feature_kind: "attribute".to_string(),
+                many: true,
+                containment: false,
+                declared_type_qname: Some("CalculationExample::Type".to_string()),
+                metamodel_feature_qname: Some("CalculationExample::VehiclePart::type".to_string()),
+                value: SemanticValueView::Ref {
+                    qualified_name: Some("CalculationExample::VehiclePart".to_string()),
+                    proxy_text: None,
+                    metatype_qname: Some("CalculationExample::Type".to_string()),
+                    containment: false,
+                },
+                diagnostics: Vec::new(),
+            }],
+        };
+        let attrs = ProjectElementAttributesView {
+            element_qualified_name: "CalculationExample::vehicle::eng".to_string(),
+            metatype_qname: Some("CalculationExample::VehiclePart".to_string()),
+            explicit_attributes: Vec::new(),
+            inherited_attributes: Vec::new(),
+            direct_metatype_attributes: vec![ProjectElementInheritedAttributeView {
+                name: "type".to_string(),
+                qualified_name: "CalculationExample::VehiclePart::type".to_string(),
+                declared_on: "CalculationExample::VehiclePart".to_string(),
+                declared_type: Some("Type".to_string()),
+                multiplicity: Some("0..*".to_string()),
+                direction: None,
+                documentation: None,
+                cst_value: None,
+            }],
+            inherited_metatype_attributes: vec![ProjectElementInheritedAttributeView {
+                name: "type".to_string(),
+                qualified_name: "KerML::Kernel::TypeFeaturing::type".to_string(),
+                declared_on: "KerML::Kernel::TypeFeaturing".to_string(),
+                declared_type: Some("Type".to_string()),
+                multiplicity: Some("0..*".to_string()),
+                direction: None,
+                documentation: None,
+                cst_value: None,
+            }],
+            expressions: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        let sections = build_metatype_reconciled_sections(
+            &projection,
+            &attrs,
+            "CalculationExample::vehicle::eng",
+            &attrs.direct_metatype_attributes,
+            &attrs.inherited_metatype_attributes,
+            &attrs.expressions,
+        );
+
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].rows.len(), 1);
+        assert_eq!(sections[0].rows[0].label, "type : Type[0..*]");
+        assert_eq!(sections[0].rows[0].value, "CalculationExample::VehiclePart");
     }
 }

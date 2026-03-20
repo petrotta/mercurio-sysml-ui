@@ -7,4 +7,4 @@ pub use query::{
     query_documentation_symbols_for_stdlib, query_symbols_by_metatype,
     query_symbols_by_metatype_with_subtypes,
 };
-pub use store::{InMemorySymbolIndex, SymbolIndex, SymbolIndexStore};
+pub use store::{InMemorySymbolIndex, InMemorySymbolIndexSnapshot, SymbolIndex, SymbolIndexStore};

@@ -515,14 +515,24 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
                 .filter(|value| !value.is_empty());
             let file_path = arg_optional_string(&args, "file_path");
             let qualified_name = arg_optional_string(&args, "qualified_name");
-            let xtext_export_path = arg_optional_string(&args, "xtext_export_path");
+            let _xtext_export_path = arg_optional_string(&args, "xtext_export_path");
             tauri::async_runtime::spawn_blocking(move || {
-                let view = core_get_project_expressions_view(
-                    root.clone(),
-                    file_path,
-                    qualified_name,
-                    xtext_export_path,
-                )?;
+                let mut view = core_get_project_expression_records(&core, root.clone())?;
+                if let Some(file_path) = file_path.as_deref() {
+                    let needle = file_path.trim();
+                    if !needle.is_empty() {
+                        view.records.retain(|record| record.file_path.trim() == needle);
+                    }
+                }
+                if let Some(qualified_name) = qualified_name.as_deref() {
+                    let needle = qualified_name.trim();
+                    if !needle.is_empty() {
+                        view.records.retain(|record| {
+                            record.qualified_name.trim() == needle
+                                || record.owner_qualified_name.trim() == needle
+                        });
+                    }
+                }
                 let evaluation = if let Some(expression) = expression {
                     Some(ExpressionEvaluationResult {
                         result: core_evaluate_project_expression(root, expression.clone())?,

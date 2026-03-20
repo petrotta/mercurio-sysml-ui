@@ -15,6 +15,8 @@ type CombinedPropertiesPaneProps = {
   onSelectQualifiedName?: (qualifiedName: string) => void;
 };
 
+const HIDE_EMPTY_ATTRIBUTES_KEY = "mercurio.simpleUi.hideEmptyAttributes";
+
 function formatAttributeSignature(attribute: ProjectElementInheritedAttributeView): string {
   const name = attribute.name?.trim() || "(unnamed)";
   const declaredType = attribute.declared_type?.trim() || "";
@@ -104,11 +106,25 @@ export function CombinedPropertiesPane({
   const [propertySectionsLoading, setPropertySectionsLoading] = useState(false);
   const [propertySectionsError, setPropertySectionsError] = useState("");
   const [metatypePopupOpen, setMetatypePopupOpen] = useState(false);
-  const [hideEmptyAttributes, setHideEmptyAttributes] = useState(false);
+  const [hideEmptyAttributes, setHideEmptyAttributes] = useState(() => {
+    try {
+      return window.localStorage?.getItem(HIDE_EMPTY_ATTRIBUTES_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
   const requestSeqRef = useRef(0);
   const propColDragActiveRef = useRef(false);
   const propTableRef = useRef<HTMLDivElement | null>(null);
   const symbol = selectedSymbols?.[0] || null;
+
+  useEffect(() => {
+    try {
+      window.localStorage?.setItem(HIDE_EMPTY_ATTRIBUTES_KEY, hideEmptyAttributes ? "1" : "0");
+    } catch {
+      // best-effort persistence
+    }
+  }, [hideEmptyAttributes]);
 
   useEffect(() => {
     const onPointerMove = (event: PointerEvent) => {
