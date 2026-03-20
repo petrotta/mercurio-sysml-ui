@@ -31,6 +31,7 @@ export async function getProjectElementPropertySections(
   elementQualifiedName: string,
   filePath?: string | null,
   symbolKind?: string | null,
+  sourceScope?: "project" | "library" | null,
 ): Promise<ProjectElementPropertySectionsView> {
   return withTimeout(
     callTool<ProjectElementPropertySectionsView>("core.get_project_element_property_sections@v1", {
@@ -38,6 +39,7 @@ export async function getProjectElementPropertySections(
       element_qualified_name: elementQualifiedName,
       file_path: filePath || null,
       symbol_kind: symbolKind || null,
+      source_scope: sourceScope || null,
     }),
     PROJECT_ELEMENT_PROPERTIES_TIMEOUT_MS,
     "Loading property sections",

@@ -534,6 +534,7 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
             let element_qualified_name = arg_string(&args, "element_qualified_name")?;
             let file_path = arg_optional_string(&args, "file_path");
             let symbol_kind = arg_optional_string(&args, "symbol_kind");
+            let source_scope = arg_optional_string(&args, "source_scope");
             tauri::async_runtime::spawn_blocking(move || {
                 core_get_project_element_property_sections(
                     &core,
@@ -541,6 +542,7 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
                     element_qualified_name,
                     file_path,
                     symbol_kind,
+                    source_scope,
                 )
             })
             .await

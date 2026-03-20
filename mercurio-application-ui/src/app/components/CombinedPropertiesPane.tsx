@@ -133,6 +133,7 @@ export function CombinedPropertiesPane({
     const elementQname = (symbol?.qualified_name || "").trim();
     const filePath = symbol?.file_path || null;
     const symbolKind = (symbol?.kind || "").trim();
+    const sourceScope = symbol?.source_scope || null;
     if (!rootPath || !elementQname) {
       requestSeqRef.current += 1;
       setPropertySectionsView(null);
@@ -145,7 +146,13 @@ export function CombinedPropertiesPane({
     const seq = ++requestSeqRef.current;
     setPropertySectionsLoading(true);
     setPropertySectionsError("");
-    void getProjectElementPropertySections(rootPath, elementQname, filePath, symbolKind || null)
+    void getProjectElementPropertySections(
+      rootPath,
+      elementQname,
+      filePath,
+      symbolKind || null,
+      sourceScope,
+    )
       .then((payload) => {
         if (requestSeqRef.current !== seq) return;
         setPropertySectionsView(payload || null);
@@ -165,6 +172,7 @@ export function CombinedPropertiesPane({
     symbol?.qualified_name,
     symbol?.file_path,
     symbol?.kind,
+    symbol?.source_scope,
     semanticRefreshVersion,
   ]);
 

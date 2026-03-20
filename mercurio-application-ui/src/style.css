@@ -1383,27 +1383,38 @@ body.theme-light .simple-harness {
 
 .simple-tooling {
   border-top: 1px solid #2d3034;
-  padding: 6px;
+  padding: 8px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
   min-height: 0;
   overflow: hidden;
+  background:
+    linear-gradient(180deg, rgba(57, 93, 132, 0.12) 0%, rgba(18, 21, 26, 0) 56%),
+    #171b20;
+  box-shadow: inset 0 0 0 1px rgba(96, 118, 144, 0.14);
 }
 
 body.theme-light .simple-tooling {
   border-top-color: #d3dae6;
+  background:
+    linear-gradient(180deg, rgba(87, 132, 184, 0.1) 0%, rgba(247, 250, 255, 0) 56%),
+    #f5f8fc;
+  box-shadow: inset 0 0 0 1px rgba(108, 135, 170, 0.14);
 }
 
 .simple-tooling-header {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 10px;
+  flex-wrap: wrap;
 }
 
 .simple-tooling-tabs {
   display: inline-flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
   min-width: 0;
 }
@@ -1456,6 +1467,7 @@ body.theme-light .simple-tool-tab-group.active .simple-tool-tab {
   margin-left: auto;
   display: inline-flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
 }
 
@@ -1465,6 +1477,20 @@ body.theme-light .simple-tool-tab-group.active .simple-tool-tab {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  border: 1px solid #2f353d;
+  border-radius: 12px;
+  background: rgba(14, 17, 21, 0.72);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.03),
+    0 8px 18px rgba(0, 0, 0, 0.16);
+}
+
+body.theme-light .simple-tooling-body {
+  border-color: #d3dae6;
+  background: rgba(255, 255, 255, 0.88);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.85),
+    0 8px 18px rgba(50, 74, 107, 0.08);
 }
 
 .simple-log-tool {
@@ -1472,8 +1498,9 @@ body.theme-light .simple-tool-tab-group.active .simple-tool-tab {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 10px;
   overflow: hidden;
+  padding: 12px;
 }
 
 .simple-expression-tool {
@@ -1481,8 +1508,9 @@ body.theme-light .simple-tool-tab-group.active .simple-tool-tab {
   min-height: 0;
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
-  gap: 8px;
+  gap: 10px;
   overflow: hidden;
+  padding: 12px;
 }
 
 .simple-expression-editor {
@@ -1502,6 +1530,7 @@ body.theme-light .simple-tool-tab-group.active .simple-tool-tab {
   padding: 10px 12px;
   font: inherit;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.24);
 }
 
 body.theme-light .simple-expression-input {
@@ -1522,15 +1551,17 @@ body.theme-light .simple-expression-input {
   min-height: 0;
   overflow: auto;
   border: 1px solid #2d3034;
-  border-radius: 8px;
+  border-radius: 10px;
   padding: 10px 12px;
   display: grid;
   align-content: start;
   gap: 10px;
+  background: rgba(19, 24, 30, 0.78);
 }
 
 body.theme-light .simple-expression-results {
   border-color: #d3dae6;
+  background: rgba(248, 251, 255, 0.92);
 }
 
 .simple-expression-grid {
@@ -1562,6 +1593,12 @@ body.theme-light .simple-expression-results {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #2d3034;
+}
+
+body.theme-light .simple-expression-library-header {
+  border-bottom-color: #d3dae6;
 }
 
 .simple-expression-records {
@@ -1575,10 +1612,12 @@ body.theme-light .simple-expression-results {
   padding: 8px 10px;
   border: 1px solid #2d3034;
   border-radius: 8px;
+  background: rgba(14, 18, 22, 0.42);
 }
 
 body.theme-light .simple-expression-record {
   border-color: #d3dae6;
+  background: rgba(255, 255, 255, 0.82);
 }
 
 .simple-expression-record-meta {
@@ -2096,8 +2135,17 @@ body.theme-light .simple-build-progress-panel {
   font-size: 12px;
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 38px;
+  max-height: 52px;
   overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid #2f353d;
+  border-radius: 10px;
+  background: rgba(19, 24, 30, 0.76);
+}
+
+body.theme-light .simple-build-progress-status {
+  border-color: #d3dae6;
+  background: rgba(248, 251, 255, 0.92);
 }
 
 .simple-build-progress-stalled {
@@ -2123,6 +2171,18 @@ body.theme-light .simple-build-progress-stalled {
   font-size: 11px;
 }
 
+.simple-build-progress-meta > span {
+  padding: 5px 8px;
+  border-radius: 999px;
+  border: 1px solid #34383f;
+  background: rgba(24, 29, 35, 0.8);
+}
+
+body.theme-light .simple-build-progress-meta > span {
+  border-color: #d3dae6;
+  background: rgba(255, 255, 255, 0.82);
+}
+
 .simple-build-progress-file {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   font-size: 11px;
@@ -2143,10 +2203,11 @@ body.theme-light .simple-build-progress-file {
   min-height: 0;
   overflow: auto;
   display: grid;
-  gap: 3px;
+  gap: 6px;
   font-size: 12px;
   user-select: text;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  padding: 2px;
 }
 
 .simple-build-progress-row {
@@ -2154,6 +2215,15 @@ body.theme-light .simple-build-progress-file {
   grid-template-columns: 92px 46px 72px minmax(0, 1fr);
   gap: 6px;
   align-items: start;
+  padding: 8px 10px;
+  border: 1px solid #2f353d;
+  border-radius: 10px;
+  background: rgba(19, 24, 30, 0.72);
+}
+
+body.theme-light .simple-build-progress-row {
+  border-color: #d3dae6;
+  background: rgba(250, 252, 255, 0.94);
 }
 
 .simple-build-progress-row.info .simple-build-progress-level {

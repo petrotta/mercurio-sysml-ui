@@ -27,7 +27,7 @@ export const COMPILE_REQUEST_DEBOUNCE_MS = 250;
 export function indexedToSymbol(
   symbol: IndexedSymbolView,
 ): SymbolView {
-  const sourceScope = symbol.scope === "library"
+  const sourceScope = symbol.scope === "library" || symbol.scope === "stdlib"
     ? "library"
     : symbol.scope === "project"
       ? "project"

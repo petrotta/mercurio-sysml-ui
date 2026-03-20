@@ -37,6 +37,9 @@ use crate::CoreState;
 
 #[cfg(test)]
 use mercurio_sysml_semantics::semantic_contract::SemanticElementView;
+use mercurio_sysml_semantics::semantic_contract::{
+    SemanticElementProjectionView, SemanticFeatureView, SemanticValueView,
+};
 
 pub use crate::state::{CompileDiagnosticView, CompileFileResult};
 
@@ -1465,6 +1468,7 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
             stdlib_files.len(),
             WorkspaceSemanticSelection::LibraryOnly,
         );
+        let mut library_projection_views = Vec::<SemanticElementProjectionView>::new();
         let library_total = library_semantic_elements.len();
         emit_progress(
             "analysis",
@@ -1490,6 +1494,8 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
                 );
             }
             let projected = map_semantic_element_to_projected_symbol(element, &empty_library_spans);
+            library_projection_views
+                .push(stdlib_projection_view_from_projected_symbol(&projected));
             let key = format!(
                 "{}|{}|{}",
                 projected.file_path, projected.qualified_name, projected.name
@@ -1502,6 +1508,11 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
                 library_symbol_count += 1;
             }
         }
+        store_stdlib_semantic_projection_cache(
+            state,
+            stdlib_path_for_log.as_deref(),
+            library_projection_views,
+        );
     }
     if include_symbols {
         augment_owned_relationships(&mut symbols);
@@ -1786,6 +1797,14 @@ pub fn load_library_symbols_sync(
         .into_iter()
         .map(|element| map_semantic_element_to_projected_symbol(element, &empty_library_spans))
         .collect::<Vec<_>>();
+        store_stdlib_semantic_projection_cache(
+            state,
+            stdlib_path_for_log.as_deref(),
+            projected_library_symbols
+                .iter()
+                .map(stdlib_projection_view_from_projected_symbol)
+                .collect::<Vec<_>>(),
+        );
         let mut resolved = Vec::<SymbolView>::new();
         let mut raw_for_index = Vec::<RawIndexSymbol>::new();
         for projected in projected_library_symbols {
@@ -1933,6 +1952,77 @@ fn clear_project_semantic_cache_for_root(
         .collect::<Vec<_>>();
     for key in to_remove {
         cache.remove(&key);
+    }
+}
+
+fn stdlib_semantic_projection_cache_key(stdlib_path: &Path) -> String {
+    format!(
+        "stdlib-semantic-projection|{}",
+        normalized_compare_key(stdlib_path)
+    )
+}
+
+fn store_stdlib_semantic_projection_cache(
+    state: &CoreState,
+    stdlib_path: Option<&Path>,
+    projection: Vec<SemanticElementProjectionView>,
+) {
+    let Some(stdlib_path) = stdlib_path else {
+        return;
+    };
+    if projection.is_empty() {
+        return;
+    }
+    if let Ok(mut cache) = state.workspace_snapshot_cache.lock() {
+        cache.insert(
+            stdlib_semantic_projection_cache_key(stdlib_path),
+            WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(Arc::new(projection)),
+        );
+    }
+}
+
+fn stdlib_projection_view_from_projected_symbol(
+    symbol: &ProjectedSemanticSymbol,
+) -> SemanticElementProjectionView {
+    SemanticElementProjectionView {
+        name: symbol.name.clone(),
+        qualified_name: symbol.qualified_name.clone(),
+        file_path: symbol.file_path.clone(),
+        metatype_qname: projected_symbol_metatype_qname(symbol),
+        features: symbol
+            .properties
+            .iter()
+            .map(|property| SemanticFeatureView {
+                name: property.name.clone(),
+                feature_kind: "attribute".to_string(),
+                many: matches!(property.value, ProjectedPropertyValue::List { .. }),
+                containment: false,
+                declared_type_qname: None,
+                metamodel_feature_qname: None,
+                value: semantic_value_from_projected_property_value(&property.value),
+                diagnostics: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+fn semantic_value_from_projected_property_value(
+    value: &ProjectedPropertyValue,
+) -> SemanticValueView {
+    match value {
+        ProjectedPropertyValue::Text { value } => SemanticValueView::Text {
+            value: value.clone(),
+        },
+        ProjectedPropertyValue::List { items } => SemanticValueView::List {
+            items: items
+                .iter()
+                .map(|item| SemanticValueView::Text {
+                    value: item.clone(),
+                })
+                .collect(),
+        },
+        ProjectedPropertyValue::Bool { value } => SemanticValueView::Bool { value: *value },
+        ProjectedPropertyValue::Number { value } => SemanticValueView::U64 { value: *value },
     }
 }
 

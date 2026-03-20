@@ -29,6 +29,36 @@ use crate::symbol_index::{
 };
 use crate::workspace::collect_project_files;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ElementSourceScope {
+    Project,
+    Library,
+}
+
+impl ElementSourceScope {
+    fn from_option(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some(value) if value.eq_ignore_ascii_case("library") => Self::Library,
+            Some(value) if value.eq_ignore_ascii_case("stdlib") => Self::Library,
+            _ => Self::Project,
+        }
+    }
+
+    fn missing_symbol_message(self) -> &'static str {
+        match self {
+            Self::Project => "Element not found in current project symbol index.",
+            Self::Library => "Element not found in current stdlib symbol index.",
+        }
+    }
+
+    fn missing_semantic_message(self) -> &'static str {
+        match self {
+            Self::Project => "No semantic row in EMF cache. Run Compile to refresh.",
+            Self::Library => "No semantic row in stdlib semantic cache. Run Compile to refresh.",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectElementPropertyRowView {
     pub key: String,
@@ -84,6 +114,22 @@ pub fn get_project_element_attributes(
     element_qualified_name: String,
     symbol_kind: Option<String>,
 ) -> Result<ProjectElementAttributesView, String> {
+    get_element_attributes_internal(
+        state,
+        root,
+        element_qualified_name,
+        symbol_kind,
+        ElementSourceScope::Project,
+    )
+}
+
+fn get_element_attributes_internal(
+    state: &CoreState,
+    root: String,
+    element_qualified_name: String,
+    symbol_kind: Option<String>,
+    source_scope: ElementSourceScope,
+) -> Result<ProjectElementAttributesView, String> {
     let root = canonical_project_root(&root);
     let root_path = PathBuf::from(&root);
     if !root_path.exists() {
@@ -96,8 +142,18 @@ pub fn get_project_element_attributes(
             .symbol_index
             .lock()
             .map_err(|_| "Symbol index lock poisoned".to_string())?;
-        let Some(symbol) =
-            store.project_symbol(&root, &element_qualified_name, symbol_kind.as_deref())
+        let symbol = match source_scope {
+            ElementSourceScope::Project => {
+                store.project_symbol(&root, &element_qualified_name, symbol_kind.as_deref())
+            }
+            ElementSourceScope::Library => find_library_symbol(
+                &*store,
+                &root,
+                &element_qualified_name,
+                symbol_kind.as_deref(),
+            ),
+        };
+        let Some(symbol) = symbol
         else {
             return Ok(ProjectElementAttributesView {
                 element_qualified_name,
@@ -107,7 +163,7 @@ pub fn get_project_element_attributes(
                 direct_metatype_attributes: Vec::new(),
                 inherited_metatype_attributes: Vec::new(),
                 expressions: Vec::new(),
-                diagnostics: vec!["Element not found in current project symbol index.".to_string()],
+                diagnostics: vec![source_scope.missing_symbol_message().to_string()],
             });
         };
         let (metatype_qname, diagnostics) = resolve_symbol_metatype(&*store, &root, &symbol);
@@ -141,16 +197,21 @@ pub fn get_project_element_attributes(
         metatype_qname.as_deref(),
     );
     let symbol_qualified_name = symbol.qualified_name.clone();
-    let expression_view = get_project_expression_records(state, root.clone())?;
-    let expressions = expression_view
-        .records
-        .into_iter()
-        .filter(|record| {
-            record.owner_qualified_name == symbol_qualified_name
-                || record.qualified_name == symbol_qualified_name
-        })
-        .collect::<Vec<_>>();
-    diagnostics.extend(expression_view.diagnostics);
+    let expressions = match source_scope {
+        ElementSourceScope::Project => {
+            let expression_view = get_project_expression_records(state, root.clone())?;
+            diagnostics.extend(expression_view.diagnostics);
+            expression_view
+                .records
+                .into_iter()
+                .filter(|record| {
+                    record.owner_qualified_name == symbol_qualified_name
+                        || record.qualified_name == symbol_qualified_name
+                })
+                .collect::<Vec<_>>()
+        }
+        ElementSourceScope::Library => Vec::new(),
+    };
     let (direct_metatype_attributes, inherited_metatype_attributes, inherited_attributes) =
         match load_stdlib_metatype_index(state, &root) {
             Ok(Some(index)) => {
@@ -203,19 +264,30 @@ pub fn get_project_element_property_sections(
     element_qualified_name: String,
     file_path: Option<String>,
     symbol_kind: Option<String>,
+    source_scope: Option<String>,
 ) -> Result<ProjectElementPropertySectionsView, String> {
-    let attrs = get_project_element_attributes(
+    let source_scope = ElementSourceScope::from_option(source_scope.as_deref());
+    let attrs = get_element_attributes_internal(
         state,
         root.clone(),
         element_qualified_name.clone(),
         symbol_kind,
+        source_scope,
     )?;
-    let semantic_projection = query_project_semantic_projection_by_qualified_name(
-        state,
-        root,
-        element_qualified_name.clone(),
-        file_path,
-    )?;
+    let semantic_projection = match source_scope {
+        ElementSourceScope::Project => query_project_semantic_projection_by_qualified_name(
+            state,
+            root,
+            element_qualified_name.clone(),
+            file_path,
+        )?,
+        ElementSourceScope::Library => query_stdlib_semantic_projection_by_qualified_name(
+            state,
+            root,
+            element_qualified_name.clone(),
+            file_path,
+        )?,
+    };
 
     let mut diagnostics = attrs.diagnostics.clone();
     let resolved_metatype_qname = semantic_projection
@@ -233,6 +305,7 @@ pub fn get_project_element_property_sections(
         &attrs,
         &element_qualified_name,
         &mut diagnostics,
+        source_scope.missing_semantic_message(),
     );
 
     Ok(ProjectElementPropertySectionsView {
@@ -243,6 +316,97 @@ pub fn get_project_element_property_sections(
         sections,
         diagnostics,
     })
+}
+
+fn find_library_symbol(
+    store: &dyn SymbolIndexStore,
+    root: &str,
+    element_qualified_name: &str,
+    symbol_kind: Option<&str>,
+) -> Option<SymbolRecord> {
+    let mut out = store
+        .library_symbols(root, None)
+        .into_iter()
+        .filter(|symbol| symbol.qualified_name == element_qualified_name)
+        .collect::<Vec<_>>();
+    if let Some(kind) = symbol_kind {
+        if let Some(exact) = out
+            .iter()
+            .find(|symbol| symbol.kind.eq_ignore_ascii_case(kind))
+        {
+            return Some(exact.clone());
+        }
+    }
+    out.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then(a.start_line.cmp(&b.start_line))
+            .then(a.start_col.cmp(&b.start_col))
+    });
+    out.into_iter().next()
+}
+
+fn query_stdlib_semantic_projection_by_qualified_name(
+    state: &CoreState,
+    root: String,
+    qualified_name: String,
+    file_path: Option<String>,
+) -> Result<Option<IndexedSemanticProjectionElementView>, String> {
+    let root = canonical_project_root(&root);
+    let root_path = PathBuf::from(&root);
+    if !root_path.exists() {
+        return Err("Root path does not exist".to_string());
+    }
+
+    let target = qualified_name.trim();
+    if target.is_empty() {
+        return Ok(None);
+    }
+
+    let library_key = resolve_current_stdlib_library_key(state, &root_path)?;
+    let Some(library_key) = library_key else {
+        return Ok(None);
+    };
+    let cache_key = format!("stdlib-semantic-projection|{library_key}");
+    let cache = state
+        .workspace_snapshot_cache
+        .lock()
+        .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
+    let Some(WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(projections)) =
+        cache.get(&cache_key)
+    else {
+        return Ok(None);
+    };
+
+    let requested_file_key = file_path
+        .as_deref()
+        .map(|value| normalize_compare_key(std::path::Path::new(value)));
+    if let Some(requested_key) = requested_file_key {
+        if let Some(projection) = projections.iter().find(|projection| {
+            projection.qualified_name == target
+                && normalize_compare_key(std::path::Path::new(&projection.file_path)) == requested_key
+        }) {
+            return Ok(Some(indexed_projection_view(projection)));
+        }
+    }
+
+    Ok(projections
+        .iter()
+        .filter(|projection| projection.qualified_name == target)
+        .max_by_key(|projection| projection.features.len())
+        .map(indexed_projection_view))
+}
+
+fn indexed_projection_view(
+    projection: &mercurio_sysml_semantics::semantic_contract::SemanticElementProjectionView,
+) -> IndexedSemanticProjectionElementView {
+    IndexedSemanticProjectionElementView {
+        name: projection.name.clone(),
+        qualified_name: projection.qualified_name.clone(),
+        file_path: projection.file_path.clone(),
+        metatype_qname: projection.metatype_qname.clone(),
+        features: projection.features.clone(),
+    }
 }
 
 pub fn get_project_expressions_view(
@@ -294,6 +458,28 @@ fn load_stdlib_metatype_index(
         return Err("Root path does not exist".to_string());
     }
 
+    let library_key = resolve_current_stdlib_library_key(state, &root_path)?;
+    let Some(target_key) = library_key else {
+        return Ok(None);
+    };
+    let cache = state
+        .workspace_snapshot_cache
+        .lock()
+        .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
+    for entry in cache.values() {
+        if let WorkspaceSnapshotCacheEntry::Stdlib(snapshot) = entry {
+            if normalize_compare_key(&snapshot.path) == target_key {
+                return Ok(Some(snapshot.metatype_index.clone()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn resolve_current_stdlib_library_key(
+    state: &CoreState,
+    root_path: &std::path::Path,
+) -> Result<Option<String>, String> {
     let default_stdlib = state
         .settings
         .lock()
@@ -311,24 +497,9 @@ fn load_stdlib_metatype_index(
         default_stdlib.as_deref(),
         library_config,
         stdlib_override,
-        &root_path,
+        root_path,
     );
-    let Some(target_stdlib_path) = stdlib_path.as_ref() else {
-        return Ok(None);
-    };
-    let target_key = normalize_compare_key(target_stdlib_path);
-    let cache = state
-        .workspace_snapshot_cache
-        .lock()
-        .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
-    for entry in cache.values() {
-        if let WorkspaceSnapshotCacheEntry::Stdlib(snapshot) = entry {
-            if normalize_compare_key(&snapshot.path) == target_key {
-                return Ok(Some(snapshot.metatype_index.clone()));
-            }
-        }
-    }
-    Ok(None)
+    Ok(stdlib_path.as_ref().map(|path| normalize_compare_key(path)))
 }
 
 fn normalize_compare_key(path: &std::path::Path) -> String {
@@ -427,6 +598,7 @@ fn build_project_element_property_sections(
     attrs: &ProjectElementAttributesView,
     selected_element_qname: &str,
     diagnostics: &mut Vec<String>,
+    missing_semantic_message: &str,
 ) -> Vec<ProjectElementPropertySectionView> {
     let direct_metatype_attributes = attrs.direct_metatype_attributes.as_slice();
     let inherited_metatype_attributes = if !attrs.inherited_metatype_attributes.is_empty() {
@@ -460,10 +632,10 @@ fn build_project_element_property_sections(
         .iter()
         .any(|line| line.contains("Element not found"))
     {
-        "No semantic row in EMF cache. Run Compile to refresh.".to_string()
+        missing_semantic_message.to_string()
     } else {
-        diagnostics.push("No semantic row in EMF cache. Run Compile to refresh.".to_string());
-        "No semantic row in EMF cache. Run Compile to refresh.".to_string()
+        diagnostics.push(missing_semantic_message.to_string());
+        missing_semantic_message.to_string()
     };
     build_semantic_fallback_sections(None, expressions, selected_element_qname, Some(message))
 }
@@ -478,6 +650,7 @@ fn build_metatype_reconciled_sections(
 ) -> Vec<ProjectElementPropertySectionView> {
     let mut used_semantic_feature_indexes = HashSet::<usize>::new();
     let mut seen_attribute_keys = HashSet::<String>::new();
+    let mut seen_row_keys = HashSet::<String>::new();
     let mut metatype_rows = Vec::<ProjectElementPropertyRowView>::new();
     let mut all_metatype_attributes = Vec::<ProjectElementInheritedAttributeView>::new();
     all_metatype_attributes.extend_from_slice(direct_metatype_attributes);
@@ -532,6 +705,10 @@ fn build_metatype_reconciled_sections(
             .unwrap_or_else(|| "-".to_string());
         let qualified_name =
             matched_feature.and_then(|feature| semantic_value_to_qualified_name(&feature.value));
+        let row_key = canonical_metatype_row_key(attribute, matched_feature, &row_value);
+        if !seen_row_keys.insert(row_key) {
+            continue;
+        }
         metatype_rows.push(project_element_property_row(
             format!("metatype-attribute-{attribute_key}"),
             format_attribute_signature(attribute),
@@ -679,6 +856,32 @@ fn project_element_property_row(
         qualified_name,
         is_empty,
     }
+}
+
+fn canonical_metatype_row_key(
+    attribute: &ProjectElementInheritedAttributeView,
+    matched_feature: Option<&mercurio_sysml_semantics::semantic_contract::SemanticFeatureView>,
+    row_value: &str,
+) -> String {
+    let feature_key = matched_feature.map_or_else(
+        || String::new(),
+        |feature| {
+            let metamodel_feature_qname = feature
+                .metamodel_feature_qname
+                .as_deref()
+                .unwrap_or("")
+                .trim();
+            if metamodel_feature_qname.is_empty() {
+                normalize_lookup_key(&feature.name)
+            } else {
+                normalize_lookup_key(metamodel_feature_qname)
+            }
+        },
+    );
+    let declared_on_key = tail_lookup_key(&attribute.declared_on);
+    let signature_key = normalize_lookup_key(&format_attribute_signature(attribute));
+    let value_key = normalize_lookup_key(row_value);
+    format!("{feature_key}|{declared_on_key}|{signature_key}|{value_key}")
 }
 
 fn semantic_value_to_text(
@@ -1004,6 +1207,7 @@ mod tests {
     use crate::state::CoreState;
     use crate::stdlib::get_stdlib_metamodel;
     use mercurio_symbol_index::SymbolIndexStore;
+    use mercurio_sysml_semantics::semantic_contract::{SemanticFeatureView, SemanticValueView};
     use std::fs;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1448,5 +1652,140 @@ standard library package KerML {
         }
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stdlib_property_sections_use_library_scope_projection_cache() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_stdlib_property_sections_{stamp}"));
+        let library_dir = root.join("stdlib");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&library_dir).expect("create library dir");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+
+        let library_source = r#"
+standard library package KerML {
+  package Kernel {
+    metaclass Element {}
+    metaclass Expression specializes Element {}
+    metaclass Package specializes Element {
+      derived var feature filterCondition : Expression[0..*];
+    }
+  }
+}
+"#;
+        let library_file = library_dir.join("KerML.kerml");
+        fs::write(&library_file, library_source).expect("write library file");
+        fs::write(project_dir.join("main.sysml"), "package Demo {}\n").expect("write model file");
+        fs::write(
+            project_dir.join(".project"),
+            format!(
+                "{{\"name\":\"pm-db\",\"library\":{{\"path\":\"{}\"}},\"src\":[\"*.sysml\"]}}",
+                library_dir.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        compile_for_index(&state, &project_dir);
+
+        let sections = get_project_element_property_sections(
+            &state,
+            project_dir.to_string_lossy().to_string(),
+            "KerML::Kernel::Package".to_string(),
+            Some(library_file.to_string_lossy().to_string()),
+            Some("MetaclassDef".to_string()),
+            Some("library".to_string()),
+        )
+        .expect("stdlib property sections");
+
+        assert!(sections.metatype_qname.is_some());
+        assert!(
+            sections
+                .diagnostics
+                .iter()
+                .all(|line| !line.contains("No semantic row")),
+            "unexpected diagnostics: {:?}",
+            sections.diagnostics
+        );
+        assert!(
+            sections
+                .sections
+                .iter()
+                .flat_map(|section| section.rows.iter())
+                .all(|row| row.label != "semantic.status"),
+            "expected cached stdlib projection rows, got {:?}",
+            sections.sections
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn metatype_reconciled_sections_dedupe_duplicate_direct_and_inherited_rows() {
+        let projection = IndexedSemanticProjectionElementView {
+            name: "R".to_string(),
+            qualified_name: "ViewTest::R".to_string(),
+            file_path: "main.sysml".to_string(),
+            metatype_qname: Some("sysml::PartUsage".to_string()),
+            features: vec![SemanticFeatureView {
+                name: "name".to_string(),
+                feature_kind: "attribute".to_string(),
+                many: false,
+                containment: false,
+                declared_type_qname: Some("sysml::String".to_string()),
+                metamodel_feature_qname: Some("sysml::Element::name".to_string()),
+                value: SemanticValueView::Text {
+                    value: "R".to_string(),
+                },
+                diagnostics: Vec::new(),
+            }],
+        };
+        let attrs = ProjectElementAttributesView {
+            element_qualified_name: "ViewTest::R".to_string(),
+            metatype_qname: Some("sysml::PartUsage".to_string()),
+            explicit_attributes: Vec::new(),
+            inherited_attributes: Vec::new(),
+            direct_metatype_attributes: vec![ProjectElementInheritedAttributeView {
+                name: "name".to_string(),
+                qualified_name: "sysml::Element::name".to_string(),
+                declared_on: "sysml::Element".to_string(),
+                declared_type: Some("String".to_string()),
+                multiplicity: Some("0..1".to_string()),
+                direction: None,
+                documentation: None,
+                cst_value: None,
+            }],
+            inherited_metatype_attributes: vec![ProjectElementInheritedAttributeView {
+                name: "name".to_string(),
+                qualified_name: "KerML::Kernel::Element::name".to_string(),
+                declared_on: "KerML::Kernel::Element".to_string(),
+                declared_type: Some("String".to_string()),
+                multiplicity: Some("0..1".to_string()),
+                direction: None,
+                documentation: None,
+                cst_value: None,
+            }],
+            expressions: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+
+        let sections = build_metatype_reconciled_sections(
+            &projection,
+            &attrs,
+            "ViewTest::R",
+            &attrs.direct_metatype_attributes,
+            &attrs.inherited_metatype_attributes,
+            &attrs.expressions,
+        );
+
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].label, "Metatype Attributes");
+        assert_eq!(sections[0].rows.len(), 1);
+        assert_eq!(sections[0].rows[0].label, "name : String[0..1]");
+        assert_eq!(sections[0].rows[0].value, "R");
     }
 }

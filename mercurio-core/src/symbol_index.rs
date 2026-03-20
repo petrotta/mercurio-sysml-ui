@@ -9,6 +9,7 @@ use std::path::Path;
 use crate::project_model_seed::seed_symbol_index_if_empty;
 use crate::project_root_key::canonical_project_root;
 use crate::state::{ProjectSemanticLookup, WorkspaceSnapshotCacheEntry};
+use crate::workspace_ir_cache::seed_semantic_projection_cache_from_workspace_ir_cache;
 use crate::CoreState;
 
 #[derive(Debug, Clone, Serialize)]
@@ -149,6 +150,28 @@ fn ensure_project_semantic_lookup_loaded(
                     semantic_projections.extend(elements.iter().cloned());
                 }
                 WorkspaceSnapshotCacheEntry::Stdlib(_) => {}
+            }
+        }
+    }
+    if semantic_projections.is_empty()
+        && seed_semantic_projection_cache_from_workspace_ir_cache(state, &project_root)?
+    {
+        semantic_elements.clear();
+        semantic_projections.clear();
+        if let Ok(cache) = state.workspace_snapshot_cache.lock() {
+            for (key, entry) in cache.iter() {
+                if !key.starts_with(&root_prefix) {
+                    continue;
+                }
+                match entry {
+                    WorkspaceSnapshotCacheEntry::ProjectSemantic(elements) => {
+                        semantic_elements.extend(elements.iter().cloned());
+                    }
+                    WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(elements) => {
+                        semantic_projections.extend(elements.iter().cloned());
+                    }
+                    WorkspaceSnapshotCacheEntry::Stdlib(_) => {}
+                }
             }
         }
     }
@@ -1174,6 +1197,82 @@ mod tests {
         assert_eq!(found.qualified_name, "Example::w");
         assert_eq!(found.features.len(), 1);
         assert_eq!(found.features[0].name, "name");
+    }
+
+    #[test]
+    fn query_project_semantic_projection_rehydrates_from_workspace_ir_cache() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mercurio_projection_rehydrate_{stamp}"));
+        let project_dir = root.join("project");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        let main_file = project_dir.join("main.sysml");
+        fs::write(&main_file, "package P { action def DoThing; }\n")
+            .expect("write project file");
+        fs::write(
+            project_dir.join(".project"),
+            "{\"name\":\"projection-rehydrate\",\"src\":[\"*.sysml\"]}",
+        )
+        .expect("write project descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let project_root = project_dir.to_string_lossy().to_string();
+
+        let compile = compile_workspace_sync(
+            &state,
+            project_root.clone(),
+            1,
+            true,
+            None,
+            Vec::new(),
+            |_| {},
+        )
+        .expect("compile");
+        assert!(compile.ok);
+
+        let initial = query_project_semantic_projection_by_qualified_name(
+            &state,
+            project_root.clone(),
+            "P".to_string(),
+            Some(main_file.to_string_lossy().to_string()),
+        )
+        .expect("query initial projection")
+        .expect("initial projection row");
+        assert!(!initial.features.is_empty());
+
+        crate::workspace_ir_cache::persist_workspace_ir_cache(&state, &project_root, None)
+            .expect("persist workspace ir cache");
+
+        state
+            .workspace_snapshot_cache
+            .lock()
+            .expect("workspace cache lock")
+            .clear();
+        state
+            .project_semantic_lookup_cache
+            .lock()
+            .expect("semantic lookup cache lock")
+            .clear();
+
+        {
+            let store = state.symbol_index.lock().expect("symbol index lock");
+            assert!(!store.project_symbols(&project_root, None).is_empty());
+        }
+
+        let rehydrated = query_project_semantic_projection_by_qualified_name(
+            &state,
+            project_root.clone(),
+            "P".to_string(),
+            Some(main_file.to_string_lossy().to_string()),
+        )
+        .expect("query rehydrated projection")
+        .expect("rehydrated projection row");
+        assert_eq!(rehydrated.qualified_name, "P");
+        assert!(!rehydrated.features.is_empty());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -335,6 +335,62 @@ pub(crate) fn seed_symbol_index_from_workspace_ir_cache(
     Ok(true)
 }
 
+pub(crate) fn seed_semantic_projection_cache_from_workspace_ir_cache(
+    state: &CoreState,
+    project_root: &str,
+) -> Result<bool, String> {
+    let raw_project_root = project_root.trim().to_string();
+    let project_root = canonical_project_root(project_root);
+    let Some(cache) = read_cache_file(&project_root)? else {
+        return Ok(false);
+    };
+    let WorkspaceIrCache {
+        schema_version,
+        engine_version,
+        project_root: cached_project_root,
+        semantic_projections,
+        ..
+    } = cache;
+    if schema_version != WORKSPACE_IR_SCHEMA_VERSION {
+        return Ok(false);
+    }
+    if engine_version != env!("CARGO_PKG_VERSION") {
+        return Ok(false);
+    }
+    if normalized_path_key(&cached_project_root) != normalized_path_key(&project_root) {
+        return Ok(false);
+    }
+    if semantic_projections.is_empty() {
+        return Ok(false);
+    }
+
+    {
+        let mut workspace_cache = state
+            .workspace_snapshot_cache
+            .lock()
+            .map_err(|_| "Workspace snapshot cache lock poisoned".to_string())?;
+        let mut keys = vec![format!("project-semantic|{}|workspace-ir", project_root)];
+        if !raw_project_root.is_empty() && raw_project_root != project_root {
+            keys.push(format!(
+                "project-semantic|{}|workspace-ir",
+                raw_project_root
+            ));
+        }
+        for key in keys {
+            workspace_cache.insert(
+                key,
+                WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(std::sync::Arc::new(
+                    semantic_projections.clone(),
+                )),
+            );
+        }
+    }
+
+    let _ =
+        refresh_project_semantic_lookup(state, &project_root, &[], semantic_projections.as_slice());
+    Ok(true)
+}
+
 pub(crate) fn clear_workspace_ir_cache(project_root: &str) -> Result<bool, String> {
     let project_root = canonical_project_root(project_root);
     if project_root.trim().is_empty() {
