@@ -38,6 +38,7 @@ export type SymbolView = {
   qualified_name: string;
   parent_qualified_name?: string | null;
   file: number;
+  short_name?: string | null;
   start_line: number;
   start_col: number;
   end_line: number;
@@ -46,6 +47,10 @@ export type SymbolView = {
   expr_start_col?: number;
   expr_end_line?: number;
   expr_end_col?: number;
+  short_name_start_line?: number;
+  short_name_start_col?: number;
+  short_name_end_line?: number;
+  short_name_end_col?: number;
   doc?: string | null;
   properties: SymbolProperty[];
   relationships?: SymbolRelationship[];

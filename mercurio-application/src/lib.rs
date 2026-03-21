@@ -19,8 +19,10 @@ mod commands;
 mod logging;
 
 use commands::{
-    app_exit, call_tool, create_file, create_project, get_user_projects_root, list_dir, read_file,
-    show_in_explorer, window_close, window_minimize, window_toggle_maximize, write_file,
+    app_exit, apply_semantic_edit, call_tool, create_file, create_project,
+    get_user_projects_root, list_dir, list_semantic_edit_actions, preview_semantic_edit,
+    read_file, show_in_explorer, window_close, window_minimize, window_toggle_maximize,
+    write_file,
 };
 use logging::{get_logs, log_event, log_frontend, set_app_handle};
 
@@ -39,6 +41,10 @@ pub(crate) struct AppState {
     pub(crate) settings_path: PathBuf,
     pub(crate) project_file_watchers: Mutex<HashMap<String, ActiveProjectFileWatcher>>,
 }
+
+const MIN_MAIN_WINDOW_WIDTH: u32 = 960;
+const MIN_MAIN_WINDOW_HEIGHT: u32 = 640;
+const WINDOWS_MINIMIZED_COORDINATE: i32 = -32000;
 
 #[derive(Serialize)]
 pub(crate) struct DirEntry {
@@ -67,6 +73,16 @@ struct ProjectFilesChangedPayload {
 
 struct ActiveProjectFileWatcher {
     _watcher: RecommendedWatcher,
+}
+
+fn normalize_watcher_display_path(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("\\\\?\\UNC\\") {
+        return format!("\\\\{}", rest);
+    }
+    if let Some(rest) = path.strip_prefix("\\\\?\\") {
+        return rest.to_string();
+    }
+    path.to_string()
 }
 
 fn sanitize_zip_path(path: &Path) -> Result<PathBuf, String> {
@@ -291,12 +307,17 @@ fn start_project_file_watcher(
     let canonical_root = root_path
         .canonicalize()
         .map_err(|error| format!("Failed to canonicalize project root: {}", error))?;
-    let root_key = canonical_root.to_string_lossy().to_string();
+    let root_key = normalize_watcher_display_path(&canonical_root.to_string_lossy());
     let mut watchers = state
         .project_file_watchers
         .lock()
         .map_err(|error| format!("Failed to access watcher registry: {}", error))?;
     if watchers.contains_key(&root_key) {
+        log_event(
+            "INFO",
+            "watcher",
+            format!("already watching root={}", root_key),
+        );
         return Ok(false);
     }
 
@@ -305,16 +326,30 @@ fn start_project_file_watcher(
     let app_for_emit = app.clone();
     let watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
         let Ok(event) = result else {
+            log_event(
+                "WARN",
+                "watcher",
+                format!("watch event error root={}", root_key_for_event),
+            );
             return;
         };
         let kind = format!("{:?}", event.kind);
         for path in event.paths {
+            let normalized_path = normalize_watcher_display_path(&path.to_string_lossy());
+            log_event(
+                "INFO",
+                "watcher",
+                format!(
+                    "event root={} kind={} path={}",
+                    root_key_for_event, kind, normalized_path
+                ),
+            );
             let _ = app_for_emit.emit_to(
                 EventTarget::webview_window("main"),
                 "project-files-changed",
                 ProjectFilesChangedPayload {
                     root: root_key_for_event.clone(),
-                    path: path.to_string_lossy().to_string(),
+                    path: normalized_path,
                     kind: kind.to_string(),
                 },
             );
@@ -329,6 +364,16 @@ fn start_project_file_watcher(
     watchers.insert(
         root_key.clone(),
         ActiveProjectFileWatcher { _watcher: watcher },
+    );
+    log_event(
+        "INFO",
+        "watcher",
+        format!(
+            "started root_input={} canonical_root={} watch_path={}",
+            root.trim(),
+            root_key,
+            root_path_for_watch.display()
+        ),
     );
     Ok(true)
 }
@@ -345,12 +390,18 @@ fn stop_project_file_watcher(
     let canonical_root = root_path
         .canonicalize()
         .map_err(|error| format!("Failed to canonicalize project root: {}", error))?;
-    let root_key = canonical_root.to_string_lossy().to_string();
+    let root_key = normalize_watcher_display_path(&canonical_root.to_string_lossy());
     let mut watchers = state
         .project_file_watchers
         .lock()
         .map_err(|error| format!("Failed to access watcher registry: {}", error))?;
-    Ok(watchers.remove(&root_key).is_some())
+    let removed = watchers.remove(&root_key).is_some();
+    log_event(
+        "INFO",
+        "watcher",
+        format!("stopped root={} removed={}", root_key, removed),
+    );
+    Ok(removed)
 }
 
 #[tauri::command]
@@ -400,21 +451,28 @@ fn set_project_stdlib_path(
 }
 
 fn remember_main_window_state(state: &AppState, window: &Window) -> Result<(), String> {
+    if window.is_minimized().map_err(|e| e.to_string())? {
+        return Ok(());
+    }
     let position = window.outer_position().map_err(|e| e.to_string())?;
     let size = window.outer_size().map_err(|e| e.to_string())?;
     let maximized = window.is_maximized().map_err(|e| e.to_string())?;
+    let bounds = WindowBoundsSettings {
+        x: position.x,
+        y: position.y,
+        width: size.width,
+        height: size.height,
+    };
+    if !is_valid_main_window_bounds(&bounds) {
+        return Ok(());
+    }
     let mut settings = state
         .core
         .settings
         .lock()
         .map_err(|_| "Settings lock poisoned".to_string())?;
     settings.main_window = Some(WindowStateSettings {
-        bounds: Some(WindowBoundsSettings {
-            x: position.x,
-            y: position.y,
-            width: size.width,
-            height: size.height,
-        }),
+        bounds: Some(bounds),
         maximized,
     });
     Ok(())
@@ -431,6 +489,26 @@ fn persist_main_window_state(state: &AppState, window: &Window) -> Result<(), St
     save_app_settings(&state.settings_path, &settings)
 }
 
+fn is_valid_main_window_bounds(bounds: &WindowBoundsSettings) -> bool {
+    bounds.width >= MIN_MAIN_WINDOW_WIDTH
+        && bounds.height >= MIN_MAIN_WINDOW_HEIGHT
+        && bounds.x > WINDOWS_MINIMIZED_COORDINATE
+        && bounds.y > WINDOWS_MINIMIZED_COORDINATE
+}
+
+fn clear_main_window_state(state: &AppState) -> Result<(), String> {
+    let settings = {
+        let mut settings = state
+            .core
+            .settings
+            .lock()
+            .map_err(|_| "Settings lock poisoned".to_string())?;
+        settings.main_window = None;
+        settings.clone()
+    };
+    save_app_settings(&state.settings_path, &settings)
+}
+
 fn restore_main_window_state(state: &AppState, window: &WebviewWindow) -> Result<(), String> {
     let window_state = state
         .core
@@ -443,19 +521,29 @@ fn restore_main_window_state(state: &AppState, window: &WebviewWindow) -> Result
         return Ok(());
     };
     if let Some(bounds) = window_state.bounds {
-        if bounds.width > 0 && bounds.height > 0 {
+        if is_valid_main_window_bounds(&bounds) {
             window
                 .set_size(Size::Physical(PhysicalSize::new(
                     bounds.width,
                     bounds.height,
                 )))
                 .map_err(|e| e.to_string())?;
+            window
+                .set_position(Position::Physical(PhysicalPosition::new(
+                    bounds.x, bounds.y,
+                )))
+                .map_err(|e| e.to_string())?;
+        } else {
+            clear_main_window_state(state)?;
+            log_event(
+                "WARN",
+                "window",
+                format!(
+                    "discarded invalid saved bounds x={} y={} width={} height={}",
+                    bounds.x, bounds.y, bounds.width, bounds.height
+                ),
+            );
         }
-        window
-            .set_position(Position::Physical(PhysicalPosition::new(
-                bounds.x, bounds.y,
-            )))
-            .map_err(|e| e.to_string())?;
     }
     if window_state.maximized {
         window.maximize().map_err(|e| e.to_string())?;
@@ -672,6 +760,9 @@ pub fn run() {
             start_project_file_watcher,
             stop_project_file_watcher,
             set_project_stdlib_path,
+            list_semantic_edit_actions,
+            preview_semantic_edit,
+            apply_semantic_edit,
             call_tool,
             get_logs,
             log_frontend,

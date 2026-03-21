@@ -1,6 +1,18 @@
+function stripWindowsDevicePrefix(path: string): string {
+  const trimmed = `${path || ""}`.trim();
+  if (!trimmed) return "";
+
+  const uncMatch = trimmed.match(/^[/\\]{2}\?[/\\]UNC[/\\](.+)$/i);
+  if (uncMatch) {
+    return `\\\\${uncMatch[1]}`;
+  }
+
+  return trimmed.replace(/^[/\\]{2}\?[/\\]/, "");
+}
+
 export function normalizeFsPath(path: string | null | undefined): string {
   if (!path) return "";
-  return path
+  return stripWindowsDevicePrefix(path)
     .replace(/\\/g, "/")
     .replace(/\/+/g, "/")
     .replace(/\/+$/, "")

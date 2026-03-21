@@ -932,6 +932,16 @@ body.theme-light .simple-tree-icon.kerml::after {
   font-size: 11px;
 }
 
+.simple-tree-symbol-row.drop-target .simple-tree-symbol-entry {
+  border-color: #6ea8ff;
+  background: rgba(71, 122, 212, 0.28);
+}
+
+body.theme-light .simple-tree-symbol-row.drop-target .simple-tree-symbol-entry {
+  border-color: #6b98d8;
+  background: #dce9fb;
+}
+
 .simple-tree-symbol-toggle {
   min-width: 16px;
   width: 16px;
@@ -982,6 +992,20 @@ body.theme-light .simple-tree-symbol-entry.active {
   background: #d4e4f8;
 }
 
+.simple-tree-symbol-entry.drag-source {
+  opacity: 0.55;
+}
+
+.simple-tree-symbol-entry-renaming {
+  border: 1px solid #6ea8ff;
+  background: rgba(71, 122, 212, 0.22);
+}
+
+body.theme-light .simple-tree-symbol-entry-renaming {
+  border-color: #6b98d8;
+  background: #dce9fb;
+}
+
 .simple-tree-symbol-kind {
   font-size: 10px;
   color: #9aa0a6;
@@ -1008,6 +1032,24 @@ body.theme-light .simple-tree-symbol-entry.active {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.simple-tree-symbol-rename-input {
+  min-width: 0;
+  width: 100%;
+  height: 20px;
+  padding: 0 6px;
+}
+
+.simple-tree-symbol-rename-status {
+  white-space: nowrap;
+  font-size: 10px;
+}
+
+.simple-tree-symbol-rename-error {
+  font-size: 10px;
+  margin-top: -2px;
+  margin-bottom: 2px;
 }
 
 .simple-tree-symbol-more {
@@ -1199,6 +1241,115 @@ body.theme-light .simple-tab-context-menu {
   width: 100%;
   height: 24px;
   padding: 0 8px;
+}
+
+.simple-semantic-edit-menu {
+  min-width: 220px;
+}
+
+.simple-semantic-edit-menu-title {
+  font-size: 12px;
+  font-weight: 700;
+  padding: 4px 8px 6px;
+  border-bottom: 1px solid rgba(127, 127, 127, 0.25);
+  margin-bottom: 2px;
+  word-break: break-word;
+}
+
+.simple-semantic-edit-menu-message {
+  padding: 6px 8px;
+}
+
+.simple-semantic-edit-modal {
+  width: min(760px, calc(100vw - 40px));
+}
+
+.simple-semantic-edit-body {
+  display: grid;
+  gap: 14px;
+}
+
+.simple-semantic-edit-meta {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.simple-semantic-edit-fields {
+  display: grid;
+  gap: 12px;
+}
+
+.simple-semantic-edit-field,
+.simple-semantic-edit-checkbox {
+  display: grid;
+  gap: 6px;
+}
+
+.simple-semantic-edit-field input,
+.simple-semantic-edit-field select,
+.simple-semantic-edit-field textarea {
+  width: 100%;
+  border: 1px solid #4a4d51;
+  border-radius: 6px;
+  background: #181b1f;
+  color: inherit;
+  padding: 8px 10px;
+  font: inherit;
+}
+
+body.theme-light .simple-semantic-edit-field input,
+body.theme-light .simple-semantic-edit-field select,
+body.theme-light .simple-semantic-edit-field textarea {
+  border-color: #cfd5df;
+  background: #ffffff;
+}
+
+.simple-semantic-edit-field textarea {
+  min-height: 88px;
+  resize: vertical;
+}
+
+.simple-semantic-edit-checkbox {
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: center;
+}
+
+.simple-semantic-edit-preview {
+  display: grid;
+  gap: 8px;
+}
+
+.simple-semantic-edit-preview-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+}
+
+.simple-semantic-edit-diagnostics {
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.simple-semantic-edit-diff {
+  margin: 0;
+  border: 1px solid #3a3d41;
+  border-radius: 6px;
+  background: #171a1e;
+  padding: 10px;
+  overflow: auto;
+  max-height: 260px;
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+body.theme-light .simple-semantic-edit-diff {
+  border-color: #cfd5df;
+  background: #f8fbff;
 }
 
 .simple-editor-tab-menu {

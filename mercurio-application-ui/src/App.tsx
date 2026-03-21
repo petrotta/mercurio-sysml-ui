@@ -11,6 +11,11 @@ import { isPathWithin, normalizePathKey as normalizePath } from "./app/pathUtils
 import { useFileTree, useProjectTree } from "./app/useProjectTree";
 import { logFrontendEvent } from "./app/services/logger";
 import {
+  applySemanticEdit,
+  listSemanticEditActions,
+  previewSemanticEdit,
+} from "./app/services/semanticEditApi";
+import {
   type ProjectFilesChangedEvent,
   createProject,
   createProjectFile,
@@ -35,6 +40,14 @@ import type {
   SymbolView,
   ExpressionEvaluationResult,
 } from "./app/contracts";
+import type {
+  SemanticEditAction,
+  SemanticEditApplyResult,
+  SemanticEditField,
+  SemanticEditInputValues,
+  SemanticEditPreviewResult,
+  SemanticEditTargetWithLineage,
+} from "./app/semanticEditTypes";
 import type {
   FileEntry,
 } from "./app/types";
@@ -83,6 +96,37 @@ type FileContextMenuState = {
   x: number;
   y: number;
   allowNewFile: boolean;
+};
+
+type SemanticEditMenuState = {
+  symbol: SymbolView;
+  x: number;
+  y: number;
+  loading: boolean;
+  actions: SemanticEditAction[];
+  error: string;
+};
+
+type SemanticEditDialogState = {
+  symbol: SymbolView;
+  action: SemanticEditAction;
+  values: SemanticEditInputValues;
+  preview: SemanticEditPreviewResult | null;
+  previewing: boolean;
+  applying: boolean;
+  previewError: string;
+  dirtySincePreview: boolean;
+};
+
+type SymbolTreeDragState = {
+  symbol: SymbolView;
+};
+
+type TreeRenameState = {
+  symbol: SymbolView;
+  value: string;
+  submitting: boolean;
+  error: string;
 };
 
 type NewFileExtension = ".sysml" | ".kerml";
@@ -670,6 +714,164 @@ function symbolSelection(symbol: SymbolView): TextSelection {
   return { startLine, startCol, endLine, endCol };
 }
 
+function isEditableTarget(target: EventTarget | null): boolean {
+  const element = target instanceof HTMLElement ? target : null;
+  if (!element) return false;
+  const tagName = element.tagName;
+  return element.isContentEditable
+    || tagName === "INPUT"
+    || tagName === "TEXTAREA"
+    || tagName === "SELECT";
+}
+
+function canRenameSymbol(symbol: SymbolView): boolean {
+  return (symbol.source_scope || "project") === "project"
+    && !!symbol.file_path.trim()
+    && !!`${symbol.name || ""}`.trim();
+}
+
+function renamedQualifiedName(symbol: SymbolView, newName: string): string {
+  const oldName = `${symbol.name || ""}`.trim();
+  const qualifiedName = `${symbol.qualified_name || ""}`.trim();
+  if (!qualifiedName || !oldName) return qualifiedName;
+  if (qualifiedName === oldName) return newName;
+  const suffix = `::${oldName}`;
+  return qualifiedName.endsWith(suffix)
+    ? `${qualifiedName.slice(0, -suffix.length)}::${newName}`
+    : qualifiedName;
+}
+
+function renamedSymbolSnapshot(symbol: SymbolView, newName: string): SymbolView {
+  return {
+    ...symbol,
+    name: newName,
+    short_name: newName,
+    qualified_name: renamedQualifiedName(symbol, newName),
+  };
+}
+
+function semanticEditTarget(symbol: SymbolView): SemanticEditTargetWithLineage {
+  const metatypeLineage = symbol.properties
+    .find((property) => property.name === "metatype_lineage" || property.name === "mercurio::metatypeLineage");
+  const metatypeSupertypes = symbol.properties
+    .find((property) => property.name === "metatype_supertypes" || property.name === "mercurio::metatypeSupertypes");
+  const lineageItems = metatypeLineage?.value.type === "list"
+    ? metatypeLineage.value.items
+    : [];
+  const supertypeItems = metatypeSupertypes?.value.type === "list"
+    ? metatypeSupertypes.value.items
+    : (symbol.relationships || [])
+      .filter((relationship) => relationship.kind === "metatypeSupertype")
+      .map((relationship) => relationship.resolved_target || relationship.target)
+      .filter((value): value is string => !!value);
+  return {
+    symbol_id: symbol.symbol_id || null,
+    qualified_name: symbol.qualified_name,
+    name: symbol.name,
+    kind: symbol.kind,
+    metatype_qname: symbol.metatype_qname || null,
+    metatype_lineage: lineageItems,
+    metatype_supertypes: supertypeItems,
+    file_path: symbol.file_path,
+    parent_qualified_name: symbol.parent_qualified_name || null,
+    start_line: symbol.start_line,
+    start_col: symbol.start_col,
+    end_line: symbol.end_line,
+    end_col: symbol.end_col,
+    short_name_start_line: symbol.short_name_start_line,
+    short_name_start_col: symbol.short_name_start_col,
+    short_name_end_line: symbol.short_name_end_line,
+    short_name_end_col: symbol.short_name_end_col,
+    source_scope: symbol.source_scope || "project",
+  } satisfies SemanticEditTargetWithLineage;
+}
+
+function buildSemanticEditInputValues(action: SemanticEditAction): SemanticEditInputValues {
+  const values: SemanticEditInputValues = {};
+  for (const field of action.fields) {
+    if (field.field_type === "checkbox") {
+      values[field.key] = !!field.default_bool;
+    } else if (field.field_type === "select") {
+      values[field.key] = field.default_text || field.options[0]?.value || "";
+    } else {
+      values[field.key] = field.default_text || "";
+    }
+  }
+  return values;
+}
+
+function semanticEditFieldValue(field: SemanticEditField, value: string | boolean | undefined): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (field.field_type === "select" && field.options.length) {
+    return field.options[0].value;
+  }
+  return "";
+}
+
+const DRAG_MOVE_TO_PACKAGE_ACTION: SemanticEditAction = {
+  id: "package.move_symbol_here",
+  label: "Move Here",
+  description: "Move the dragged semantic element into this package.",
+  applies_to: [{ type_name: "Package", include_subtypes: true }],
+  fields: [
+    {
+      key: "source_qualified_name",
+      label: "Source Element",
+      field_type: "readonly",
+      required: true,
+      description: "The semantic element being moved.",
+      options: [],
+    },
+    {
+      key: "source_kind",
+      label: "Source Kind",
+      field_type: "readonly",
+      required: true,
+      description: "The kind/metatype of the dragged element.",
+      options: [],
+    },
+    {
+      key: "source_file_path",
+      label: "Source File",
+      field_type: "readonly",
+      required: true,
+      description: "Same-file tree moves are supported in this pass.",
+      options: [],
+    },
+  ],
+};
+
+const TREE_RENAME_ACTION_ID = "element.rename";
+
+function canDragSymbol(symbol: SymbolView): boolean {
+  return (symbol.source_scope || "project") === "project";
+}
+
+function isPackageLike(symbol: SymbolView): boolean {
+  const kind = `${symbol.kind || ""}`.toLowerCase();
+  const metatype = `${symbol.metatype_qname || ""}`.toLowerCase();
+  return kind.includes("package") || metatype.endsWith("::package") || metatype === "package";
+}
+
+function canDropSymbolOnPackage(source: SymbolView, target: SymbolView): boolean {
+  if (!canDragSymbol(source)) return false;
+  if (!isPackageLike(target)) return false;
+  if (normalizePath(source.file_path) !== normalizePath(target.file_path)) return false;
+  const sourceId = symbolIdentity(source);
+  const targetId = symbolIdentity(target);
+  if (sourceId === targetId) return false;
+  const sourceParent = (source.parent_qualified_name || "").trim();
+  const targetQname = (target.qualified_name || "").trim();
+  const sourceQname = (source.qualified_name || "").trim();
+  if (!targetQname || !sourceQname) return false;
+  if (sourceParent === targetQname) return false;
+  if (targetQname === sourceQname) return false;
+  if (targetQname.startsWith(`${sourceQname}::`)) return false;
+  return true;
+}
+
 const BuildLogList = memo(function BuildLogList({
   entries,
 }: {
@@ -731,6 +933,7 @@ export function App() {
   const [expandedLibraryFiles, setExpandedLibraryFiles] = useState<Record<string, boolean>>({});
   const [collapsedSymbolNodes, setCollapsedSymbolNodes] = useState<Record<string, boolean>>({});
   const [expandedProjectElementsOverflow, setExpandedProjectElementsOverflow] = useState(false);
+  const [expandedLibraryElementsOverflow, setExpandedLibraryElementsOverflow] = useState(false);
   const [expandedProjectFileSymbolOverflow, setExpandedProjectFileSymbolOverflow] = useState<Record<string, boolean>>({});
   const [expandedLibraryFileSymbolOverflow, setExpandedLibraryFileSymbolOverflow] = useState<Record<string, boolean>>({});
   const [collapsedParseErrorFiles, setCollapsedParseErrorFiles] = useState<Record<string, boolean>>({});
@@ -750,6 +953,11 @@ export function App() {
   const [dialogStdlibMetaLoading, setDialogStdlibMetaLoading] = useState(false);
   const [tabContextMenu, setTabContextMenu] = useState<TabContextMenuState | null>(null);
   const [fileContextMenu, setFileContextMenu] = useState<FileContextMenuState | null>(null);
+  const [semanticEditMenu, setSemanticEditMenu] = useState<SemanticEditMenuState | null>(null);
+  const [semanticEditDialog, setSemanticEditDialog] = useState<SemanticEditDialogState | null>(null);
+  const [symbolTreeDragState, setSymbolTreeDragState] = useState<SymbolTreeDragState | null>(null);
+  const [symbolTreeDropTargetId, setSymbolTreeDropTargetId] = useState<string | null>(null);
+  const [treeRenameState, setTreeRenameState] = useState<TreeRenameState | null>(null);
   const [newProjectDialog, setNewProjectDialog] = useState<NewProjectDialogState | null>(null);
   const [newFileDialog, setNewFileDialog] = useState<NewFileDialogState | null>(null);
   const [pendingProjectFileToOpen, setPendingProjectFileToOpen] = useState<string | null>(null);
@@ -844,6 +1052,7 @@ export function App() {
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
   const cursorListenerRef = useRef<{ dispose: () => void } | null>(null);
+  const treeRenameInputRef = useRef<HTMLInputElement | null>(null);
   const suppressDirtyRef = useRef(false);
   const dirtyRef = useRef(false);
   const fileOpenReqRef = useRef(0);
@@ -1060,6 +1269,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   useEffect(() => {
     if (!rootPath) {
       setTreeError("");
+      setTreeRenameState(null);
       workspaceStartupRequestRef.current += 1;
       hydrateProjectTree("", []);
       hydrateLibraryTree("", []);
@@ -1119,6 +1329,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     collapseLibraryTree();
     setCollapsedSymbolNodes({});
     setExpandedProjectElementsOverflow(false);
+    setExpandedLibraryElementsOverflow(false);
     setExpandedProjectFileSymbolOverflow({});
     setExpandedLibraryFileSymbolOverflow({});
     contentRef.current = "";
@@ -1322,13 +1533,14 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   }, [measureTabsOverflow]);
 
   useEffect(() => {
-    if (!tabContextMenu && !fileContextMenu && !tabsOverflowMenuOpen) return;
+    if (!tabContextMenu && !fileContextMenu && !semanticEditMenu && !tabsOverflowMenuOpen) return;
     const onMouseDown = (event: MouseEvent) => {
       const target = event.target as HTMLElement | null;
       if (!target) return;
       if (
         target.closest(".simple-tab-context-menu")
         || target.closest(".simple-file-context-menu")
+        || target.closest(".simple-semantic-edit-menu")
         || target.closest(".simple-project-files-settings-menu")
         || target.closest(".simple-editor-tabs-overflow")
       ) {
@@ -1336,6 +1548,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       }
       setTabContextMenu(null);
       setFileContextMenu(null);
+      setSemanticEditMenu(null);
       setTabsOverflowMenuOpen(false);
       setProjectFilesSettingsMenuOpen(false);
     };
@@ -1343,6 +1556,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       if (event.key !== "Escape") return;
       setTabContextMenu(null);
       setFileContextMenu(null);
+      setSemanticEditMenu(null);
       setTabsOverflowMenuOpen(false);
       setProjectFilesSettingsMenuOpen(false);
     };
@@ -1352,7 +1566,18 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       window.removeEventListener("mousedown", onMouseDown);
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [tabContextMenu, fileContextMenu, tabsOverflowMenuOpen, projectFilesSettingsMenuOpen]);
+  }, [tabContextMenu, fileContextMenu, semanticEditMenu, tabsOverflowMenuOpen, projectFilesSettingsMenuOpen]);
+
+  useEffect(() => {
+    if (!treeRenameState) return;
+    const focusTimer = window.setTimeout(() => {
+      treeRenameInputRef.current?.focus();
+      treeRenameInputRef.current?.select();
+    }, 0);
+    return () => {
+      window.clearTimeout(focusTimer);
+    };
+  }, [treeRenameState]);
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -1406,6 +1631,13 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       newProjectNameInputRef.current?.focus();
       newProjectNameInputRef.current?.select();
     }, 0);
+    return () => {
+      window.clearTimeout(focusTimer);
+    };
+  }, [!!newProjectDialog]);
+
+  useEffect(() => {
+    if (!newProjectDialog) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !newProjectDialog.submitting) {
         setNewProjectDialog(null);
@@ -1413,7 +1645,6 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     };
     window.addEventListener("keydown", onKeyDown);
     return () => {
-      window.clearTimeout(focusTimer);
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [newProjectDialog]);
@@ -1424,6 +1655,13 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       newFileNameInputRef.current?.focus();
       newFileNameInputRef.current?.select();
     }, 0);
+    return () => {
+      window.clearTimeout(focusTimer);
+    };
+  }, [!!newFileDialog]);
+
+  useEffect(() => {
+    if (!newFileDialog) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !newFileDialog.submitting) {
         setNewFileDialog(null);
@@ -1431,7 +1669,6 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     };
     window.addEventListener("keydown", onKeyDown);
     return () => {
-      window.clearTimeout(focusTimer);
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [newFileDialog]);
@@ -1526,6 +1763,29 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       return changed ? next : prev;
     });
   }, [activeFilePath]);
+
+  const openEditedFileWithContent = useCallback((
+    path: string,
+    updatedText: string,
+    selection?: TextSelection,
+  ) => {
+    const pathKey = normalizePath(path);
+    const tab: EditorTab = {
+      path,
+      name: displayNameForPath(path),
+      content: updatedText,
+      dirty: false,
+    };
+    persistActiveEditorBuffer();
+    setOpenTabs((prev) => {
+      const existingIndex = prev.findIndex((entry) => normalizePath(entry.path) === pathKey);
+      if (existingIndex < 0) {
+        return [...prev, tab];
+      }
+      return prev.map((entry, index) => (index === existingIndex ? tab : entry));
+    });
+    activateEditorTab(tab, selection);
+  }, [persistActiveEditorBuffer, activateEditorTab]);
 
   const openFilePath = useCallback(async (
     path: string,
@@ -1905,6 +2165,248 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     return ok;
   }, [rootPath, activeFilePath, runCompile, compileProject, setCompileStatus, collectUnsavedCompileInputs, addHarnessRun]);
 
+  const getCurrentTextForPath = useCallback(async (path: string): Promise<string> => {
+    const pathKey = normalizePath(path);
+    if (activeFilePath && normalizePath(activeFilePath) === pathKey) {
+      return contentRef.current;
+    }
+    const existing = openTabs.find((tab) => normalizePath(tab.path) === pathKey);
+    if (existing) {
+      return existing.content;
+    }
+    return readFileText(path);
+  }, [activeFilePath, openTabs]);
+
+  const openSemanticEditMenu = useCallback((symbol: SymbolView, x: number, y: number) => {
+    setTreeRenameState(null);
+    setTabContextMenu(null);
+    setFileContextMenu(null);
+    setTabsOverflowMenuOpen(false);
+    setSemanticEditMenu({
+      symbol,
+      x,
+      y,
+      loading: true,
+      actions: [],
+      error: "",
+    });
+    void listSemanticEditActions(semanticEditTarget(symbol))
+      .then((actions) => {
+        setSemanticEditMenu((prev) => {
+          if (!prev || symbolIdentity(prev.symbol) !== symbolIdentity(symbol)) return prev;
+          const visibleActions = actions.filter(
+            (action) => action.id !== DRAG_MOVE_TO_PACKAGE_ACTION.id && action.id !== TREE_RENAME_ACTION_ID,
+          );
+          return {
+            ...prev,
+            loading: false,
+            actions: visibleActions,
+            error: visibleActions.length || canRenameSymbol(symbol)
+              ? ""
+              : "No semantic actions available for this element.",
+          };
+        });
+      })
+      .catch((error) => {
+        setSemanticEditMenu((prev) => {
+          if (!prev || symbolIdentity(prev.symbol) !== symbolIdentity(symbol)) return prev;
+          return {
+            ...prev,
+            loading: false,
+            error: `Failed to load actions: ${String(error)}`,
+          };
+        });
+      });
+  }, []);
+
+  const startSemanticEditAction = useCallback((
+    symbol: SymbolView,
+    action: SemanticEditAction,
+    initialValues?: SemanticEditInputValues,
+  ) => {
+    setTreeRenameState(null);
+    setSemanticEditMenu(null);
+    setSemanticEditDialog({
+      symbol,
+      action,
+      values: { ...buildSemanticEditInputValues(action), ...(initialValues || {}) },
+      preview: null,
+      previewing: false,
+      applying: false,
+      previewError: "",
+      dirtySincePreview: true,
+    });
+  }, []);
+
+  const startTreeRename = useCallback((symbol: SymbolView) => {
+    if (!canRenameSymbol(symbol)) {
+      setCompileStatus("Rename is unavailable for the selected symbol.");
+      return;
+    }
+    setSemanticEditMenu(null);
+    setSelectedSymbol(symbol);
+    setTreeRenameState({
+      symbol,
+      value: symbol.name || "",
+      submitting: false,
+      error: "",
+    });
+  }, [setCompileStatus]);
+
+  const openMoveSymbolToPackageDialog = useCallback((source: SymbolView, targetPackage: SymbolView) => {
+    if (!canDropSymbolOnPackage(source, targetPackage)) {
+      setCompileStatus("That package drop target is not valid for the selected symbol.");
+      return;
+    }
+    setSymbolTreeDropTargetId(null);
+    setSelectedSymbol(targetPackage);
+    startSemanticEditAction(targetPackage, DRAG_MOVE_TO_PACKAGE_ACTION, {
+      source_symbol_id: source.symbol_id || "",
+      source_qualified_name: source.qualified_name || source.name || "",
+      source_name: source.name || "",
+      source_kind: source.kind || symbolKindLabel(source),
+      source_file_path: source.file_path,
+      source_parent_qualified_name: source.parent_qualified_name || "",
+      source_start_line: `${source.start_line || 0}`,
+      source_start_col: `${source.start_col || 0}`,
+      source_end_line: `${source.end_line || 0}`,
+      source_end_col: `${source.end_col || 0}`,
+    });
+  }, [setCompileStatus, startSemanticEditAction]);
+
+  const updateSemanticEditValue = useCallback((key: string, value: string | boolean) => {
+    setSemanticEditDialog((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        values: { ...prev.values, [key]: value },
+        preview: null,
+        previewError: "",
+        dirtySincePreview: true,
+      };
+    });
+  }, []);
+
+  const requestSemanticEditPreview = useCallback(async () => {
+    if (!semanticEditDialog || !rootPath) return;
+    const dialog = semanticEditDialog;
+    setSemanticEditDialog((prev) => (prev ? { ...prev, previewing: true, previewError: "" } : prev));
+    try {
+      const currentText = await getCurrentTextForPath(dialog.symbol.file_path);
+      const preview = await previewSemanticEdit({
+        root: rootPath,
+        target: semanticEditTarget(dialog.symbol),
+        action_id: dialog.action.id,
+        input: dialog.values,
+        current_text: currentText,
+        conflict_policy: "abort",
+      });
+      setSemanticEditDialog((prev) => {
+        if (!prev || prev.action.id !== dialog.action.id || symbolIdentity(prev.symbol) !== symbolIdentity(dialog.symbol)) {
+          return prev;
+        }
+        return {
+          ...prev,
+          preview,
+          previewing: false,
+          previewError: "",
+          dirtySincePreview: false,
+        };
+      });
+    } catch (error) {
+      setSemanticEditDialog((prev) => (prev ? {
+        ...prev,
+        previewing: false,
+        previewError: String(error),
+      } : prev));
+    }
+  }, [semanticEditDialog, rootPath, getCurrentTextForPath]);
+
+  const requestSemanticEditApply = useCallback(async () => {
+    if (!semanticEditDialog || !rootPath || !semanticEditDialog.preview || semanticEditDialog.dirtySincePreview) {
+      return;
+    }
+    const dialog = semanticEditDialog;
+    setSemanticEditDialog((prev) => (prev ? { ...prev, applying: true, previewError: "" } : prev));
+    try {
+      const currentText = await getCurrentTextForPath(dialog.symbol.file_path);
+      const result: SemanticEditApplyResult = await applySemanticEdit({
+        root: rootPath,
+        target: semanticEditTarget(dialog.symbol),
+        action_id: dialog.action.id,
+        input: dialog.values,
+        current_text: currentText,
+        conflict_policy: "abort",
+      });
+      openEditedFileWithContent(dialog.symbol.file_path, result.updated_text, symbolSelection(dialog.symbol));
+      setSelectedSymbol(dialog.symbol);
+      setSemanticEditDialog(null);
+      setCompileStatus(`${dialog.action.label} applied to ${dialog.symbol.name || dialog.symbol.qualified_name}`);
+      await compileProject();
+    } catch (error) {
+      setSemanticEditDialog((prev) => (prev ? {
+        ...prev,
+        applying: false,
+        previewError: String(error),
+      } : prev));
+    }
+  }, [
+    semanticEditDialog,
+    rootPath,
+    getCurrentTextForPath,
+    openEditedFileWithContent,
+    compileProject,
+    setCompileStatus,
+  ]);
+
+  const submitTreeRename = useCallback(async () => {
+    if (!treeRenameState || !rootPath) return;
+    if (compileRunId) {
+      setCompileStatus("Wait for the current build to finish before renaming.");
+      return;
+    }
+    const symbol = treeRenameState.symbol;
+    const newName = treeRenameState.value.trim();
+    if (!newName) {
+      setTreeRenameState((prev) => (prev ? { ...prev, error: "A new name is required." } : prev));
+      return;
+    }
+    if (newName === (symbol.name || "").trim()) {
+      setTreeRenameState(null);
+      return;
+    }
+    setTreeRenameState((prev) => (prev ? { ...prev, submitting: true, error: "" } : prev));
+    try {
+      const currentText = await getCurrentTextForPath(symbol.file_path);
+      const result = await applySemanticEdit({
+        root: rootPath,
+        target: semanticEditTarget(symbol),
+        action_id: TREE_RENAME_ACTION_ID,
+        input: { new_name: newName },
+        current_text: currentText,
+        conflict_policy: "abort",
+      });
+      const renamed = renamedSymbolSnapshot(symbol, newName);
+      openEditedFileWithContent(symbol.file_path, result.updated_text, symbolSelection(renamed));
+      setSelectedSymbol(renamed);
+      setTreeRenameState(null);
+      setCompileStatus(`Renamed ${symbol.name || symbol.qualified_name} to ${newName}`);
+      await compileProject();
+    } catch (error) {
+      const message = String(error);
+      setTreeRenameState((prev) => (prev ? { ...prev, submitting: false, error: message } : prev));
+      setCompileStatus(`Rename failed: ${message}`);
+    }
+  }, [
+    treeRenameState,
+    rootPath,
+    compileRunId,
+    getCurrentTextForPath,
+    openEditedFileWithContent,
+    compileProject,
+    setCompileStatus,
+  ]);
+
   const scheduleAutoBuild = useCallback(() => {
     if (!autoBuildActiveFile || !rootPath || !activeFilePath || !isSemanticSource(activeFilePath)) {
       autoBuildQueuedRef.current = false;
@@ -2070,6 +2572,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (isEditableTarget(event.target)) return;
       const lowered = event.key.toLowerCase();
       if ((event.ctrlKey || event.metaKey) && lowered === "n") {
         event.preventDefault();
@@ -2091,11 +2594,28 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
         event.preventDefault();
         if (compileRunId) return;
         void compileProject();
+        return;
+      }
+      if (!event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && event.key === "F2") {
+        if (!selectedSymbol || treeRenameState || semanticEditDialog || newProjectDialog || newFileDialog) return;
+        event.preventDefault();
+        startTreeRename(selectedSymbol);
       }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [openNewProjectDialog, saveActiveFile, compileProject, compileRunId]);
+  }, [
+    openNewProjectDialog,
+    saveActiveFile,
+    compileProject,
+    compileRunId,
+    selectedSymbol,
+    treeRenameState,
+    semanticEditDialog,
+    newProjectDialog,
+    newFileDialog,
+    startTreeRename,
+  ]);
 
   const runMenuAction = useCallback(async (action: string) => {
     switch (action) {
@@ -2197,8 +2717,18 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       if (normalizeWatchedPath(watchRoot) !== normalizeWatchedPath(activeRoot)) {
         return;
       }
-      void refreshRoot(activeRoot).catch(() => {
+      void logFrontendEvent({
+        level: "info",
+        kind: "watcher",
+        message: `project refresh root=${activeRoot}`,
+      }).catch(() => {});
+      void refreshRoot(activeRoot).catch((error) => {
         if (!activeRoot) return;
+        void logFrontendEvent({
+          level: "error",
+          kind: "watcher",
+          message: `project refresh failed root=${activeRoot} error=${String(error)}`,
+        }).catch(() => {});
       });
     }, 250);
     projectFilesChangedTimerRef.current = timer;
@@ -2218,8 +2748,18 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       if (normalizeWatchedPath(watchRoot) !== normalizeWatchedPath(activeRoot)) {
         return;
       }
-      void refreshLibraryTree(activeRoot).catch(() => {
+      void logFrontendEvent({
+        level: "info",
+        kind: "watcher",
+        message: `library refresh root=${activeRoot}`,
+      }).catch(() => {});
+      void refreshLibraryTree(activeRoot).catch((error) => {
         if (!activeRoot) return;
+        void logFrontendEvent({
+          level: "error",
+          kind: "watcher",
+          message: `library refresh failed root=${activeRoot} error=${String(error)}`,
+        }).catch(() => {});
       });
     }, 250);
     libraryFilesChangedTimerRef.current = timer;
@@ -2310,6 +2850,12 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
         (!!libraryKey && changedRoot === libraryKey)
         || (!!libraryRoot && !!changedPath && isPathWithin(changedPath, libraryRoot));
 
+      void logFrontendEvent({
+        level: "info",
+        kind: "watcher",
+        message: `event kind=${payload?.kind || ""} root=${changedRoot} path=${changedPath} projectAffected=${projectAffected} libraryAffected=${libraryAffected}`,
+      }).catch(() => {});
+
       if (projectAffected) {
         scheduleProjectTreeRefresh();
         if (libraryCoveredByProject && libraryKey) {
@@ -2332,14 +2878,6 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
         window.clearTimeout(libraryFilesChangedTimerRef.current);
         libraryFilesChangedTimerRef.current = undefined;
       }
-      if (projectWatcherRootRef.current) {
-        void stopProjectFileWatcher(projectWatcherRootRef.current);
-        projectWatcherRootRef.current = "";
-      }
-      if (libraryWatcherRootRef.current) {
-        void stopProjectFileWatcher(libraryWatcherRootRef.current);
-        libraryWatcherRootRef.current = "";
-      }
     };
   }, [
     libraryTreeRootPath,
@@ -2351,6 +2889,19 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     setCompileStatus,
     showErrorNotification,
   ]);
+
+  useEffect(() => {
+    return () => {
+      if (projectWatcherRootRef.current) {
+        void stopProjectFileWatcher(projectWatcherRootRef.current);
+        projectWatcherRootRef.current = "";
+      }
+      if (libraryWatcherRootRef.current) {
+        void stopProjectFileWatcher(libraryWatcherRootRef.current);
+        libraryWatcherRootRef.current = "";
+      }
+    };
+  }, []);
 
   const projectSymbols = useMemo(
     () => symbols.filter((symbol) => symbol.source_scope !== "library"),
@@ -2365,6 +2916,11 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   const projectSymbolRoots = useMemo(
     () => buildSymbolOwnershipTree(projectSymbols),
     [projectSymbols],
+  );
+
+  const librarySymbolRoots = useMemo(
+    () => buildSymbolOwnershipTree(librarySymbols),
+    [librarySymbols],
   );
 
   const symbolsByFile = useMemo(() => {
@@ -2542,6 +3098,10 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     setExpandedProjectElementsOverflow(true);
   }, []);
 
+  const showAllLibraryElements = useCallback(() => {
+    setExpandedLibraryElementsOverflow(true);
+  }, []);
+
   const showAllProjectFileSymbols = useCallback((filePath: string) => {
     const key = normalizePath(filePath);
     setExpandedProjectFileSymbolOverflow((prev) => ({ ...prev, [key]: true }));
@@ -2575,6 +3135,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
         return next;
       });
       setExpandedProjectElementsOverflow(true);
+      setExpandedLibraryElementsOverflow(true);
       setExpandedProjectFileSymbolOverflow(() => {
         const next: Record<string, boolean> = {};
         for (const key of symbolsByFile.keys()) {
@@ -2602,6 +3163,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     setExpandedLibraryFiles({});
     setCollapsedSymbolNodes({});
     setExpandedProjectElementsOverflow(false);
+    setExpandedLibraryElementsOverflow(false);
     setExpandedProjectFileSymbolOverflow({});
     setExpandedLibraryFileSymbolOverflow({});
   }, [collapseAll, collapseLibraryTree]);
@@ -2870,11 +3432,45 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
         const selected = selectedSymbolId === symbolId;
         const hasChildren = node.children.length > 0;
         const isCollapsed = hasChildren ? !!collapsedSymbolNodes[symbolId] : false;
+        const dragSource = symbolTreeDragState && symbolIdentity(symbolTreeDragState.symbol) === symbolId;
+        const dropTarget = symbolTreeDropTargetId === symbolId;
+        const renaming = treeRenameState && symbolIdentity(treeRenameState.symbol) === symbolId;
         rows.push(
           <div
             key={symbolId}
-            className="simple-tree-symbol-row"
+            className={`simple-tree-symbol-row ${dropTarget ? "drop-target" : ""}`}
             style={{ paddingLeft: `${basePaddingLeft + depth * 14}px` }}
+            onDragOver={(event) => {
+              if (!symbolTreeDragState || !canDropSymbolOnPackage(symbolTreeDragState.symbol, symbol)) return;
+              event.preventDefault();
+              event.dataTransfer.dropEffect = "move";
+              if (symbolTreeDropTargetId !== symbolId) {
+                setSymbolTreeDropTargetId(symbolId);
+              }
+            }}
+            onDragEnter={(event) => {
+              if (!symbolTreeDragState || !canDropSymbolOnPackage(symbolTreeDragState.symbol, symbol)) return;
+              event.preventDefault();
+              if (symbolTreeDropTargetId !== symbolId) {
+                setSymbolTreeDropTargetId(symbolId);
+              }
+            }}
+            onDragLeave={(event) => {
+              const related = event.relatedTarget as HTMLElement | null;
+              if (related?.closest(`[data-symbol-row-id="${symbolId}"]`)) return;
+              if (symbolTreeDropTargetId === symbolId) {
+                setSymbolTreeDropTargetId(null);
+              }
+            }}
+            onDrop={(event) => {
+              if (!symbolTreeDragState || !canDropSymbolOnPackage(symbolTreeDragState.symbol, symbol)) return;
+              event.preventDefault();
+              event.stopPropagation();
+              setSymbolTreeDropTargetId(null);
+              setSymbolTreeDragState(null);
+              openMoveSymbolToPackageDialog(symbolTreeDragState.symbol, symbol);
+            }}
+            data-symbol-row-id={symbolId}
           >
             {hasChildren ? (
               <button
@@ -2892,22 +3488,90 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
             ) : (
               <span className="simple-tree-symbol-toggle-placeholder" />
             )}
-            <button
-              type="button"
-              className={`ghost simple-tree-symbol-entry ${selected ? "active" : ""}`}
-              onClick={() => {
-                void selectSymbol(symbol);
-              }}
-              title={`${symbol.qualified_name}\n${symbol.file_path}`}
-            >
-              <span className="simple-tree-symbol-kind">
-                <span className="simple-tree-symbol-kind-icon">{symbolKindIcon(kindLabel)}</span>
-                <span className="simple-tree-symbol-kind-label">{kindLabel}</span>
-              </span>
-              <span className="simple-tree-symbol-name">{symbol.name || "<anonymous>"}</span>
-            </button>
+            {renaming ? (
+              <div
+                className={`simple-tree-symbol-entry simple-tree-symbol-entry-renaming ${selected ? "active" : ""}`}
+                onClick={(event) => event.stopPropagation()}
+                title={`${symbol.qualified_name}\n${symbol.file_path}`}
+              >
+                <span className="simple-tree-symbol-kind">
+                  <span className="simple-tree-symbol-kind-icon">{symbolKindIcon(kindLabel)}</span>
+                  <span className="simple-tree-symbol-kind-label">{kindLabel}</span>
+                </span>
+                <input
+                  ref={treeRenameInputRef}
+                  className="simple-tree-symbol-rename-input"
+                  value={treeRenameState.value}
+                  disabled={treeRenameState.submitting}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    setTreeRenameState((prev) => (prev ? { ...prev, value, error: "" } : prev));
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      void submitTreeRename();
+                      return;
+                    }
+                    if (event.key === "Escape") {
+                      event.preventDefault();
+                      setTreeRenameState(null);
+                    }
+                  }}
+                  onMouseDown={(event) => event.stopPropagation()}
+                  onClick={(event) => event.stopPropagation()}
+                  spellCheck={false}
+                />
+                <span className="simple-tree-symbol-rename-status muted">
+                  {treeRenameState.submitting ? "Renaming..." : "Enter to apply"}
+                </span>
+              </div>
+            ) : (
+              <button
+                type="button"
+                className={`ghost simple-tree-symbol-entry ${selected ? "active" : ""} ${dragSource ? "drag-source" : ""}`}
+                draggable={canDragSymbol(symbol)}
+                onDragStart={(event) => {
+                  if (!canDragSymbol(symbol)) return;
+                  event.dataTransfer.effectAllowed = "move";
+                  event.dataTransfer.setData("text/plain", symbol.qualified_name || symbol.name || symbolId);
+                  setSymbolTreeDragState({ symbol });
+                }}
+                onDragEnd={() => {
+                  setSymbolTreeDragState(null);
+                  setSymbolTreeDropTargetId(null);
+                }}
+                onClick={() => {
+                  void selectSymbol(symbol);
+                }}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  setSelectedSymbol(symbol);
+                  openSemanticEditMenu(symbol, event.clientX, event.clientY);
+                }}
+                title={`${symbol.qualified_name}\n${symbol.file_path}`}
+              >
+                <span className="simple-tree-symbol-kind">
+                  <span className="simple-tree-symbol-kind-icon">{symbolKindIcon(kindLabel)}</span>
+                  <span className="simple-tree-symbol-kind-label">{kindLabel}</span>
+                </span>
+                <span className="simple-tree-symbol-name">{symbol.name || "<anonymous>"}</span>
+              </button>
+            )}
           </div>,
         );
+        if (renaming && treeRenameState.error) {
+          rows.push(
+            <div
+              key={`${symbolId}-rename-error`}
+              className="simple-tree-symbol-rename-error error"
+              style={{ paddingLeft: `${basePaddingLeft + depth * 14 + 20}px` }}
+            >
+              {treeRenameState.error}
+            </div>,
+          );
+        }
         if (hasChildren && !isCollapsed && budget.remaining > 0) {
           rows.push(...renderNodes(node.children, depth + 1));
         }
@@ -2915,7 +3579,18 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
       return rows;
     };
     return renderNodes(symbolRoots, 0);
-  }, [selectedSymbolId, selectSymbol, collapsedSymbolNodes, toggleSymbolNodeCollapse]);
+  }, [
+    selectedSymbolId,
+    selectSymbol,
+    collapsedSymbolNodes,
+    toggleSymbolNodeCollapse,
+    openSemanticEditMenu,
+    symbolTreeDragState,
+    symbolTreeDropTargetId,
+    openMoveSymbolToPackageDialog,
+    treeRenameState,
+    submitTreeRename,
+  ]);
 
   const projectElementsTree = useMemo(() => {
     const renderLimit = expandedProjectElementsOverflow
@@ -2927,6 +3602,17 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
       shownCount: renderLimit - budget.remaining,
     };
   }, [expandedProjectElementsOverflow, projectSymbolRoots, projectSymbols.length, renderContainedSymbols]);
+
+  const libraryElementsTree = useMemo(() => {
+    const renderLimit = expandedLibraryElementsOverflow
+      ? Math.max(FILE_SYMBOL_RENDER_LIMIT, librarySymbols.length + 1)
+      : FILE_SYMBOL_RENDER_LIMIT;
+    const budget = { remaining: renderLimit };
+    return {
+      shown: renderContainedSymbols(librarySymbolRoots, 14, budget),
+      shownCount: renderLimit - budget.remaining,
+    };
+  }, [expandedLibraryElementsOverflow, librarySymbolRoots, librarySymbols.length, renderContainedSymbols]);
 
   const renderTree = useCallback((entries: FileEntry[], depth = 0): ReactNode => {
     return entries.map((entry) => {
@@ -3221,6 +3907,16 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
     const top = Math.max(8, Math.min(fileContextMenu.y, viewportHeight - menuHeight - 8));
     return { left, top };
   }, [fileContextMenu]);
+  const semanticEditMenuStyle = useMemo((): CSSProperties | null => {
+    if (!semanticEditMenu) return null;
+    const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 1280;
+    const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 800;
+    const menuWidth = 220;
+    const menuHeight = Math.max(80, 36 + semanticEditMenu.actions.length * 28);
+    const left = Math.max(8, Math.min(semanticEditMenu.x, viewportWidth - menuWidth - 8));
+    const top = Math.max(8, Math.min(semanticEditMenu.y, viewportHeight - menuHeight - 8));
+    return { left, top };
+  }, [semanticEditMenu]);
   const contextMenuHasOtherTabs = useMemo(() => {
     if (!contextTab) return false;
     const keepKey = normalizePath(contextTab.path);
@@ -3560,6 +4256,20 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
               type="button"
               className="ghost simple-tree-section-toggle"
               onClick={() => setProjectFilesExpanded((prev) => !prev)}
+              onContextMenu={(event) => {
+                const trimmedRoot = rootPath.trim();
+                if (!trimmedRoot) return;
+                event.preventDefault();
+                event.stopPropagation();
+                setTabContextMenu(null);
+                setTabsOverflowMenuOpen(false);
+                setFileContextMenu({
+                  path: trimmedRoot,
+                  x: event.clientX,
+                  y: event.clientY,
+                  allowNewFile: true,
+                });
+              }}
               title={projectFilesExpanded ? "Collapse project files" : "Expand project files"}
               aria-label={projectFilesExpanded ? "Collapse project files" : "Expand project files"}
             >
@@ -3676,13 +4386,41 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                       <span className="simple-tree-section-caret">{libraryFilesExpanded ? "v" : ">"}</span>
                       <span className="simple-tree-section-title">Library Files</span>
                     </button>
-                    <span className="simple-tree-count">{libraryFilePaths.length}</span>
+                    <span className="simple-tree-count">
+                      {projectFilesShowByFile ? libraryFilePaths.length : librarySymbols.length}
+                    </span>
                   </div>
                   {libraryFilesExpanded ? (
-                    libraryFilePaths.length ? (
-                      renderLibraryTree(libraryTreeEntries)
+                    projectFilesShowByFile ? (
+                      libraryFilePaths.length ? (
+                        renderLibraryTree(libraryTreeEntries)
+                      ) : (
+                        <div className="muted">No library files indexed.</div>
+                      )
                     ) : (
-                      <div className="muted">No library files indexed.</div>
+                      librarySymbolRoots.length ? (
+                        <div className="simple-tree-symbols">
+                          {libraryElementsTree.shown}
+                          {librarySymbols.length > libraryElementsTree.shownCount ? (
+                            <button
+                              type="button"
+                              className="ghost simple-tree-symbol-more simple-tree-symbol-more-btn muted"
+                              style={{ paddingLeft: "14px" }}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                showAllLibraryElements();
+                              }}
+                              title={`Show ${librarySymbols.length - libraryElementsTree.shownCount} more symbols`}
+                            >
+                              +{librarySymbols.length - libraryElementsTree.shownCount} more symbols
+                            </button>
+                          ) : null}
+                        </div>
+                      ) : (
+                        <div className="muted">
+                          {symbolsStatus === "loading" ? "Loading library symbols..." : "No library symbols indexed."}
+                        </div>
+                      )
                     )
                   ) : null}
                 </div>
@@ -3887,6 +4625,42 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                   >
                     Show in Explorer
                   </button>
+                </div>
+              ) : null}
+              {semanticEditMenu && semanticEditMenuStyle ? (
+                <div className="simple-tab-context-menu simple-semantic-edit-menu" style={semanticEditMenuStyle}>
+                  <div className="simple-semantic-edit-menu-title">
+                    {semanticEditMenu.symbol.name || semanticEditMenu.symbol.qualified_name}
+                  </div>
+                  {canRenameSymbol(semanticEditMenu.symbol) ? (
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => startTreeRename(semanticEditMenu.symbol)}
+                      title="Rename this element in the containment tree"
+                    >
+                      Rename
+                    </button>
+                  ) : null}
+                  {semanticEditMenu.loading ? (
+                    <div className="muted simple-semantic-edit-menu-message">Loading actions...</div>
+                  ) : null}
+                  {!semanticEditMenu.loading && semanticEditMenu.error ? (
+                    <div className="error simple-semantic-edit-menu-message">{semanticEditMenu.error}</div>
+                  ) : null}
+                  {!semanticEditMenu.loading && !semanticEditMenu.error
+                    ? semanticEditMenu.actions.map((action) => (
+                      <button
+                        key={action.id}
+                        type="button"
+                        className="ghost"
+                        onClick={() => startSemanticEditAction(semanticEditMenu.symbol, action)}
+                        title={action.description}
+                      >
+                        {action.label}
+                      </button>
+                    ))
+                    : null}
                 </div>
               ) : null}
               {showCenterWelcome ? (
@@ -4177,6 +4951,156 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
           />
         </aside>
       </main>
+
+      {semanticEditDialog ? (
+        <div
+          className="simple-modal-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !semanticEditDialog.previewing && !semanticEditDialog.applying) {
+              setSemanticEditDialog(null);
+            }
+          }}
+        >
+          <section
+            className="simple-modal simple-semantic-edit-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={`Semantic edit: ${semanticEditDialog.action.label}`}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="simple-modal-header">
+              <strong>{semanticEditDialog.action.label}</strong>
+              <div className="simple-modal-header-actions">
+                <button
+                  type="button"
+                  className="ghost"
+                  disabled={semanticEditDialog.previewing || semanticEditDialog.applying}
+                  onClick={() => setSemanticEditDialog(null)}
+                >
+                  Close
+                </button>
+                <button
+                  type="button"
+                  className="ghost"
+                  disabled={semanticEditDialog.previewing || semanticEditDialog.applying}
+                  onClick={() => void requestSemanticEditPreview()}
+                >
+                  {semanticEditDialog.previewing ? "Previewing..." : "Preview"}
+                </button>
+                <button
+                  type="button"
+                  disabled={
+                    semanticEditDialog.previewing
+                    || semanticEditDialog.applying
+                    || !semanticEditDialog.preview
+                    || semanticEditDialog.dirtySincePreview
+                  }
+                  onClick={() => void requestSemanticEditApply()}
+                >
+                  {semanticEditDialog.applying ? "Applying..." : "Apply"}
+                </button>
+              </div>
+            </div>
+            <div className="simple-modal-body simple-semantic-edit-body">
+              <div className="simple-semantic-edit-meta">
+                <div><strong>Target:</strong> {semanticEditDialog.symbol.qualified_name}</div>
+                <div><strong>Kind:</strong> {semanticEditDialog.symbol.kind}</div>
+                <div><strong>File:</strong> {displayNameForPath(semanticEditDialog.symbol.file_path)}</div>
+              </div>
+              <div className="simple-semantic-edit-fields">
+                {semanticEditDialog.action.fields.map((field) => {
+                  const value = semanticEditDialog.values[field.key];
+                  if (field.field_type === "checkbox") {
+                    return (
+                      <label key={field.key} className="simple-semantic-edit-checkbox">
+                        <input
+                          type="checkbox"
+                          checked={!!value}
+                          disabled={semanticEditDialog.previewing || semanticEditDialog.applying}
+                          onChange={(event) => updateSemanticEditValue(field.key, event.target.checked)}
+                        />
+                        <span>{field.label}</span>
+                      </label>
+                    );
+                  }
+                  return (
+                    <label key={field.key} className="simple-semantic-edit-field">
+                      <span className="muted">
+                        {field.label}
+                        {field.required ? " *" : ""}
+                      </span>
+                      {field.field_type === "readonly" ? (
+                        <input
+                          value={semanticEditFieldValue(field, value)}
+                          readOnly
+                          disabled
+                        />
+                      ) : field.field_type === "textarea" ? (
+                        <textarea
+                          value={semanticEditFieldValue(field, value)}
+                          placeholder={field.placeholder || ""}
+                          disabled={semanticEditDialog.previewing || semanticEditDialog.applying}
+                          onChange={(event) => updateSemanticEditValue(field.key, event.target.value)}
+                        />
+                      ) : field.field_type === "select" ? (
+                        <select
+                          value={semanticEditFieldValue(field, value)}
+                          disabled={semanticEditDialog.previewing || semanticEditDialog.applying}
+                          onChange={(event) => updateSemanticEditValue(field.key, event.target.value)}
+                        >
+                          {field.options.map((option) => (
+                            <option key={`${field.key}-${option.value}`} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input
+                          value={semanticEditFieldValue(field, value)}
+                          placeholder={field.placeholder || ""}
+                          disabled={semanticEditDialog.previewing || semanticEditDialog.applying}
+                          onChange={(event) => updateSemanticEditValue(field.key, event.target.value)}
+                        />
+                      )}
+                      {field.description ? <div className="muted">{field.description}</div> : null}
+                    </label>
+                  );
+                })}
+              </div>
+              {semanticEditDialog.previewError ? (
+                <div className="error">{semanticEditDialog.previewError}</div>
+              ) : null}
+              {semanticEditDialog.preview ? (
+                <div className="simple-semantic-edit-preview">
+                  <div className="simple-semantic-edit-preview-header">
+                    <strong>Preview Diff</strong>
+                    <span className="muted">
+                      {semanticEditDialog.preview.changed ? "Changes detected" : "No textual changes"}
+                    </span>
+                  </div>
+                  {semanticEditDialog.preview.diagnostics.length ? (
+                    <div className="simple-semantic-edit-diagnostics">
+                      {semanticEditDialog.preview.diagnostics.map((diagnostic, index) => (
+                        <div key={`${diagnostic}-${index}`} className="muted">{diagnostic}</div>
+                      ))}
+                    </div>
+                  ) : null}
+                  <pre className="simple-semantic-edit-diff">
+                    {semanticEditDialog.preview.diff || "No changes."}
+                  </pre>
+                </div>
+              ) : (
+                <div className="muted">Fill in the fields, then preview the generated text diff before applying.</div>
+              )}
+            </div>
+            <div className="simple-modal-footer muted">
+              {semanticEditDialog.dirtySincePreview
+                ? "Preview is stale. Run Preview again before Apply."
+                : "Apply writes the updated text to disk and refreshes the model."}
+            </div>
+          </section>
+        </div>
+      ) : null}
 
       {stdlibManagerOpen ? (
         <div
