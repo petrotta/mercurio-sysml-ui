@@ -56,6 +56,26 @@ export type CompileResponse = {
   total_duration_ms?: number;
 };
 
+export type IndexedStructuralTypeView = {
+  feature_name: string;
+  label: string;
+  target: string;
+  target_metatype_qname: string | null;
+  declared_type_qname: string | null;
+  metamodel_feature_qname: string | null;
+};
+
+export type IndexedDirectedRelationshipView = {
+  canonical_kind: string;
+  display_label: string;
+  source: string;
+  target: string;
+  target_metatype_qname: string | null;
+  source_feature: string | null;
+  target_feature: string | null;
+  resolved: boolean;
+};
+
 export type IndexedSymbolView = {
   id: string;
   project_root: string;
@@ -72,6 +92,9 @@ export type IndexedSymbolView = {
   end_line: number;
   end_col: number;
   doc_text: string | null;
+  structural_type: IndexedStructuralTypeView | null;
+  directed_relationships: IndexedDirectedRelationshipView[];
+  explorer_diagnostics: string[];
 };
 
 export type WorkspaceSymbolSnapshotTimingsView = {

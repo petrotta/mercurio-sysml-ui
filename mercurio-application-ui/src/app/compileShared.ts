@@ -49,6 +49,27 @@ export function indexedToSymbol(
     doc: symbol.doc_text || null,
     properties: [],
     relationships: [],
+    structural_type: symbol.structural_type
+      ? {
+          feature_name: symbol.structural_type.feature_name,
+          label: symbol.structural_type.label,
+          target: symbol.structural_type.target,
+          target_metatype_qname: symbol.structural_type.target_metatype_qname || null,
+          declared_type_qname: symbol.structural_type.declared_type_qname || null,
+          metamodel_feature_qname: symbol.structural_type.metamodel_feature_qname || null,
+        }
+      : null,
+    directed_relationships: (symbol.directed_relationships || []).map((relationship) => ({
+      canonical_kind: relationship.canonical_kind,
+      display_label: relationship.display_label,
+      source: relationship.source,
+      target: relationship.target,
+      target_metatype_qname: relationship.target_metatype_qname || null,
+      source_feature: relationship.source_feature || null,
+      target_feature: relationship.target_feature || null,
+      resolved: !!relationship.resolved,
+    })),
+    explorer_diagnostics: symbol.explorer_diagnostics || [],
   };
 }
 

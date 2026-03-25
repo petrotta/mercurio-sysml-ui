@@ -9,6 +9,8 @@
     "preview": "vite preview",
     "generate:core-contracts": "node scripts/generate-core-contracts.mjs",
     "check:semantic-authority": "node scripts/check-semantic-authority.cjs",
+    "test:diagram": "tsc --pretty false --module esnext --target ES2022 --moduleResolution bundler --outDir .tmp-diagram-tests src/app/diagrams/model.ts src/app/diagrams/file.ts src/app/diagrams/graph.ts src/app/diagrams/file.spec.ts src/app/diagrams/graph.spec.ts src/app/contracts.ts src/app/generated/core-contracts.ts && node --experimental-specifier-resolution=node .tmp-diagram-tests/diagrams/file.spec.js && node --experimental-specifier-resolution=node .tmp-diagram-tests/diagrams/graph.spec.js && node -e \"require('fs').rmSync('.tmp-diagram-tests',{recursive:true,force:true})\"",
+    "test:explorer": "tsc --pretty false --module esnext --target ES2022 --moduleResolution bundler --outDir .tmp-explorer-tests src/app/explorer/graph.ts src/app/explorer/graph.spec.ts src/app/diagrams/file.ts src/app/contracts.ts src/app/generated/core-contracts.ts && node --experimental-specifier-resolution=node .tmp-explorer-tests/explorer/graph.spec.js && node -e \"require('fs').rmSync('.tmp-explorer-tests',{recursive:true,force:true})\"",
     "test:path-utils": "tsc --pretty false --module esnext --target ES2022 --moduleResolution bundler --outDir .tmp-path-tests src/app/pathUtils.ts src/app/pathUtils.spec.ts && node .tmp-path-tests/pathUtils.spec.js && node -e \"require('fs').rmSync('.tmp-path-tests',{recursive:true,force:true})\"",
     "postinstall": "node scripts/copy-monaco.cjs"
   },
@@ -20,6 +22,7 @@
     "vite": "^7.2.4"
   },
   "dependencies": {
+    "@xyflow/react": "^12.10.1",
     "@monaco-editor/react": "^4.7.0",
     "@tauri-apps/api": "^2.9.1",
     "@tauri-apps/plugin-dialog": "^2.6.0",

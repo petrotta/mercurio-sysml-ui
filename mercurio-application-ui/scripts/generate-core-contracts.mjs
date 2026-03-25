@@ -59,6 +59,16 @@ const STRUCT_SPECS = [
   },
   {
     rustPath: resolve(workspaceRoot, "mercurio-core", "src", "symbol_index.rs"),
+    rustName: "IndexedStructuralTypeView",
+    tsName: "IndexedStructuralTypeView",
+  },
+  {
+    rustPath: resolve(workspaceRoot, "mercurio-core", "src", "symbol_index.rs"),
+    rustName: "IndexedDirectedRelationshipView",
+    tsName: "IndexedDirectedRelationshipView",
+  },
+  {
+    rustPath: resolve(workspaceRoot, "mercurio-core", "src", "symbol_index.rs"),
     rustName: "IndexedSymbolView",
     tsName: "IndexedSymbolView",
   },

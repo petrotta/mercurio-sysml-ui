@@ -13,6 +13,10 @@ export async function readFileText(path: string): Promise<string> {
   return content || "";
 }
 
+export async function writeFileText(path: string, content: string): Promise<void> {
+  await invoke("write_file", { path, content });
+}
+
 export async function listDirEntries(path: string): Promise<FileEntry[]> {
   const entries = await invoke<FileEntry[]>("list_dir", { path });
   return entries || [];

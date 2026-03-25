@@ -889,6 +889,20 @@ body.theme-light .simple-tree-row.active {
   color: #f6b94f;
 }
 
+.simple-tree-icon.diagram {
+  color: #b7bdc6;
+}
+
+.simple-tree-icon.diagram::after {
+  content: "\25A3";
+  position: absolute;
+  left: 50%;
+  top: 54%;
+  transform: translate(-50%, -50%);
+  font-size: 8px;
+  color: #86d6c5;
+}
+
 body.theme-light .simple-tree-icon.sysml::after {
   color: #2f7fb1;
   text-shadow: 0 0 0.5px rgba(255, 255, 255, 0.85);
@@ -896,6 +910,11 @@ body.theme-light .simple-tree-icon.sysml::after {
 
 body.theme-light .simple-tree-icon.kerml::after {
   color: #b26a00;
+  text-shadow: 0 0 0.5px rgba(255, 255, 255, 0.85);
+}
+
+body.theme-light .simple-tree-icon.diagram::after {
+  color: #2a8474;
   text-shadow: 0 0 0.5px rgba(255, 255, 255, 0.85);
 }
 
@@ -1474,6 +1493,277 @@ body.theme-light .simple-editor-tabs-dropdown-footer {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+}
+
+.simple-diagram-host {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-top: 1px solid #2b2f33;
+}
+
+.simple-diagram-host.drag-hover .diagram-flow-shell {
+  outline: 2px dashed #5aa0d6;
+  outline-offset: -8px;
+}
+
+.simple-diagram-toolbar {
+  gap: 12px;
+}
+
+.simple-diagram-toolbar-actions {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 6px;
+}
+
+.diagram-flow-shell {
+  flex: 1;
+  min-height: 0;
+  background:
+    radial-gradient(circle at top left, rgba(124, 131, 141, 0.12), transparent 34%),
+    linear-gradient(180deg, #2a2d31, #22252a);
+}
+
+body.theme-light .diagram-flow-shell {
+  background:
+    radial-gradient(circle at top left, rgba(180, 186, 194, 0.2), transparent 34%),
+    linear-gradient(180deg, #eef1f4, #e4e8ed);
+}
+
+.diagram-node-card {
+  min-width: 220px;
+  max-width: 300px;
+  border: 1px solid #3a4149;
+  border-radius: 12px;
+  padding: 10px 12px;
+  background: linear-gradient(180deg, #25303a, #1d252d);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.24);
+}
+
+.diagram-node-card.selected {
+  border-color: #69abd8;
+  box-shadow: 0 0 0 1px rgba(105, 171, 216, 0.45), 0 12px 26px rgba(0, 0, 0, 0.28);
+}
+
+.react-flow__node.diagram-flow-node {
+  transition: box-shadow 120ms ease, transform 120ms ease;
+}
+
+.react-flow__node.diagram-flow-node.selected {
+  z-index: 12 !important;
+}
+
+.react-flow__node.diagram-flow-node.dragging {
+  z-index: 24 !important;
+}
+
+.react-flow__node.diagram-flow-node.dragging .diagram-node-card {
+  opacity: 0.9;
+}
+
+body.theme-light .diagram-node-card {
+  border-color: #c9d5e3;
+  background: linear-gradient(180deg, #ffffff, #eef4fb);
+  box-shadow: 0 10px 18px rgba(55, 84, 119, 0.12);
+}
+
+.diagram-node-kind {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #8ebedc;
+}
+
+body.theme-light .diagram-node-kind {
+  color: #3a6d96;
+}
+
+.diagram-node-name {
+  margin-top: 4px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #edf4fb;
+}
+
+body.theme-light .diagram-node-name {
+  color: #203041;
+}
+
+.diagram-node-attributes {
+  display: grid;
+  gap: 4px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(132, 145, 160, 0.32);
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 11px;
+}
+
+.diagram-node-doc {
+  margin-top: 8px;
+  color: #9faebd;
+  font-size: 11px;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+body.theme-light .diagram-node-doc {
+  color: #566b82;
+}
+
+.diagram-edge path {
+  stroke-width: 1.4px;
+}
+
+.diagram-edge.generalization path {
+  stroke: #d7af63;
+}
+
+.diagram-edge.relationship path {
+  stroke: #78bddb;
+}
+
+.diagram-edge.containment path {
+  stroke: #6fc09d;
+}
+
+.explorer-edge path {
+  stroke-width: 1.7px;
+}
+
+.explorer-edge.ownsDefinition path {
+  stroke: #6fc09d;
+}
+
+.explorer-edge.specializes path {
+  stroke: #d7af63;
+  stroke-dasharray: 7 4;
+}
+
+.explorer-edge.directedRelationship path {
+  stroke: #88a8f0;
+  stroke-dasharray: 5 5;
+}
+
+.explorer-edge.directedRelationship.canonical-satisfy path {
+  stroke: #68c47d;
+}
+
+.explorer-edge.directedRelationship.canonical-refine path {
+  stroke: #f0b562;
+}
+
+.explorer-edge.directedRelationship.canonical-verify path {
+  stroke: #73c9d6;
+}
+
+.explorer-edge.directedRelationship.canonical-allocate path {
+  stroke: #d188ee;
+}
+
+.explorer-edge.directedRelationship.canonical-trace path,
+.explorer-edge.directedRelationship.canonical-dependency path {
+  stroke: #9da8b8;
+}
+
+body.theme-light .diagram-edge.generalization path {
+  stroke: #a36f16;
+}
+
+body.theme-light .diagram-edge.relationship path {
+  stroke: #2d83a8;
+}
+
+body.theme-light .diagram-edge.containment path {
+  stroke: #2a8e6f;
+}
+
+body.theme-light .explorer-edge.ownsDefinition path {
+  stroke: #2a8e6f;
+}
+
+body.theme-light .explorer-edge.specializes path {
+  stroke: #a36f16;
+}
+
+body.theme-light .explorer-edge.directedRelationship path {
+  stroke: #587bcb;
+}
+
+body.theme-light .explorer-edge.directedRelationship.canonical-satisfy path {
+  stroke: #2d8f48;
+}
+
+body.theme-light .explorer-edge.directedRelationship.canonical-refine path {
+  stroke: #c17817;
+}
+
+body.theme-light .explorer-edge.directedRelationship.canonical-verify path {
+  stroke: #1e8b9c;
+}
+
+body.theme-light .explorer-edge.directedRelationship.canonical-allocate path {
+  stroke: #9c55b8;
+}
+
+body.theme-light .explorer-edge.directedRelationship.canonical-trace path,
+body.theme-light .explorer-edge.directedRelationship.canonical-dependency path {
+  stroke: #6e7b8e;
+}
+
+.react-flow__node.diagram-flow-node.relation-only .diagram-node-card,
+.diagram-node-card.relation-only {
+  border-style: dashed;
+  background: linear-gradient(180deg, #20262d, #191e24);
+}
+
+body.theme-light .react-flow__node.diagram-flow-node.relation-only .diagram-node-card,
+body.theme-light .diagram-node-card.relation-only {
+  background: linear-gradient(180deg, #f8fbff, #edf2f8);
+}
+
+.simple-properties-panel-header {
+  justify-content: space-between;
+}
+
+.explorer-edge-card {
+  min-width: 240px;
+}
+
+.explorer-edge-card .diagram-overlay-text {
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-size: 11px;
+  word-break: break-word;
+}
+
+.diagram-overlay-card {
+  max-width: 300px;
+  border: 1px solid #39414a;
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: rgba(23, 28, 34, 0.92);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.22);
+}
+
+body.theme-light .diagram-overlay-card {
+  border-color: #ccd7e4;
+  background: rgba(255, 255, 255, 0.96);
+}
+
+.diagram-overlay-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.diagram-overlay-text {
+  margin-bottom: 8px;
+  font-size: 12px;
 }
 
 .simple-editor-title {
@@ -2112,6 +2402,22 @@ body.theme-light .simple-about-title {
   width: 100%;
   height: 30px;
   padding: 0 8px;
+}
+
+.simple-new-diagram-root-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
+.simple-new-diagram-root-row input {
+  width: 100%;
+  height: 30px;
+  padding: 0 8px;
+}
+
+.simple-new-diagram-modal {
+  width: min(620px, calc(100vw - 36px));
 }
 
 .simple-new-file-type-group {

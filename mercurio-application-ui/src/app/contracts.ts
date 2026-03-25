@@ -28,6 +28,26 @@ export type SymbolRelationship = {
   end_col: number;
 };
 
+export type SymbolStructuralType = {
+  feature_name: string;
+  label: string;
+  target: string;
+  target_metatype_qname?: string | null;
+  declared_type_qname?: string | null;
+  metamodel_feature_qname?: string | null;
+};
+
+export type DirectedRelationshipView = {
+  canonical_kind: string;
+  display_label: string;
+  source: string;
+  target: string;
+  target_metatype_qname?: string | null;
+  source_feature?: string | null;
+  target_feature?: string | null;
+  resolved: boolean;
+};
+
 export type SymbolView = {
   symbol_id?: string | null;
   name: string;
@@ -54,6 +74,9 @@ export type SymbolView = {
   doc?: string | null;
   properties: SymbolProperty[];
   relationships?: SymbolRelationship[];
+  structural_type?: SymbolStructuralType | null;
+  directed_relationships?: DirectedRelationshipView[];
+  explorer_diagnostics?: string[];
 };
 
 export type ParseTreeNodeView = {

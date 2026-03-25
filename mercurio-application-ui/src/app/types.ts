@@ -1,4 +1,4 @@
-import type { DiagramType } from "./diagrams/model";
+import type { DiagramDocument, DiagramPoint, DiagramViewport } from "./diagrams/file";
 import type {
   SymbolView,
 } from "./contracts";
@@ -65,23 +65,10 @@ export type DiagramLayout = {
   children: Array<{ layout: DiagramLayout; x: number; y: number }>;
 };
 
-export type DiagramViewport = { x: number; y: number; width: number; height: number };
-
-export type DiagramNode = {
-  qualified: string;
-  name: string;
-  kind: string;
-};
-
-export type DiagramNodeOffset = { x: number; y: number };
+export type DiagramNodeOffset = DiagramPoint;
 
 export type DiagramNodeSize = { width: number; height: number };
 
-export type DiagramFile = {
-  version: number;
-  diagram_type: DiagramType;
-  nodes: DiagramNode[];
-  offsets?: Record<string, DiagramNodeOffset>;
-  sizes?: Record<string, DiagramNodeSize>;
-};
+export type DiagramFile = DiagramDocument;
+export type { DiagramViewport };
 

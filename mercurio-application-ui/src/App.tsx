@@ -1,15 +1,43 @@
 import "./style.css";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, PointerEvent as ReactPointerEvent, ReactNode } from "react";
+import type { CSSProperties, DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import MonacoEditor, { loader, type OnMount } from "@monaco-editor/react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { RECENTS_KEY, ROOT_STORAGE_KEY, THEME_KEY } from "./app/constants";
 import { formatFileDiagnostic } from "./app/compileShared";
+import { DiagramCanvas } from "./app/components/DiagramCanvas";
+import { ModelExplorerCanvas } from "./app/components/ModelExplorerCanvas";
 import { isPathWithin, normalizePathKey as normalizePath } from "./app/pathUtils";
 import { useFileTree, useProjectTree } from "./app/useProjectTree";
 import { logFrontendEvent } from "./app/services/logger";
+import {
+  buildDiagramFileName,
+  createDiagramDocument,
+  isDiagramFilePath,
+  parseDiagramDocument,
+  prepareDiagramDocumentForSave,
+  serializeDiagramDocument,
+  type DiagramDocument,
+  type DiagramPoint,
+  type DiagramViewport,
+} from "./app/diagrams/file";
+import {
+  buildDiagramGraph,
+  mergeDiagramNodePositions,
+  resolvePreferredDiagramRoot,
+} from "./app/diagrams/graph";
+import {
+  DIAGRAM_TYPE_OPTIONS,
+  type DiagramType,
+} from "./app/diagrams/model";
+import {
+  buildExplorerGraph,
+  canExpandExplorerNode,
+  mergeExplorerNodePositions,
+  resolvePreferredExplorerRoot,
+} from "./app/explorer/graph";
 import {
   applySemanticEdit,
   listSemanticEditActions,
@@ -23,6 +51,7 @@ import {
   readFileText,
   startProjectFileWatcher,
   stopProjectFileWatcher,
+  writeFileText,
 } from "./app/fileOps";
 import { useCompileRunner } from "./app/useCompileRunner";
 import {
@@ -39,6 +68,7 @@ import type {
   FileDiagnosticView,
   SymbolView,
   ExpressionEvaluationResult,
+  ProjectModelView,
 } from "./app/contracts";
 import type {
   SemanticEditAction,
@@ -78,12 +108,41 @@ type SymbolTreeNode = {
   children: SymbolTreeNode[];
 };
 
-type EditorTab = {
+type TextEditorTab = {
   path: string;
   name: string;
+  kind: "text";
   content: string;
   dirty: boolean;
 };
+
+type DiagramEditorTab = {
+  path: string;
+  name: string;
+  kind: "diagram";
+  content: string;
+  document: DiagramDocument;
+  dirty: boolean;
+};
+
+type ExplorerEditorTab = {
+  path: string;
+  name: string;
+  kind: "explorer";
+  content: string;
+  rootQualifiedName: string;
+  expandedQualifiedNames: string[];
+  viewport: DiagramViewport | null;
+  nodePositions: Record<string, DiagramPoint>;
+  showDirectedRelationships: boolean;
+  historyBack: string[];
+  historyForward: string[];
+  selectedQualifiedName: string | null;
+  selectedEdgeId: string | null;
+  dirty: false;
+};
+
+type EditorTab = TextEditorTab | DiagramEditorTab | ExplorerEditorTab;
 
 type TabContextMenuState = {
   path: string;
@@ -96,6 +155,7 @@ type FileContextMenuState = {
   x: number;
   y: number;
   allowNewFile: boolean;
+  allowNewDiagram: boolean;
 };
 
 type SemanticEditMenuState = {
@@ -135,6 +195,17 @@ type NewFileDialogState = {
   parentPath: string;
   name: string;
   extension: NewFileExtension;
+  error: string;
+  submitting: boolean;
+};
+
+type NewDiagramDialogState = {
+  parentPath: string;
+  fileName: string;
+  name: string;
+  diagramType: DiagramType;
+  rootQualifiedName: string;
+  rootFilePath: string;
   error: string;
   submitting: boolean;
 };
@@ -213,6 +284,8 @@ const AUTO_BUILD_MIN_INTERVAL_MS = 2500;
 const FILE_DIAGNOSTIC_MARKER_OWNER = "mercurio.diagnostics";
 const INVALID_NEW_PROJECT_NAME_CHARS = /[<>:"/\\|?*]/;
 const INVALID_NEW_FILE_NAME_CHARS = /[<>:"/\\|?*]/;
+const SYMBOL_TREE_DRAG_MIME = "application/x-mercurio-symbol";
+const MODEL_EXPLORER_TAB_PATH = "__model_explorer__";
 const UI_ICON = {
   folder: String.fromCodePoint(0x1F4C1),
   file: String.fromCodePoint(0x1F4C4),
@@ -233,7 +306,7 @@ const UI_ICON = {
   close: "\u00D7",
 } as const;
 
-type TreeNodeIconKind = "dir" | "file" | "sysml" | "kerml";
+type TreeNodeIconKind = "dir" | "file" | "sysml" | "kerml" | "diagram";
 let sysmlLanguageRegistered = false;
 
 function createStdlibOptionId(): string {
@@ -251,6 +324,42 @@ function symbolIdentity(symbol: SymbolView): string {
   const backendId = `${symbol.symbol_id || ""}`.trim();
   if (backendId) return backendId;
   return `${normalizePath(symbol.file_path)}|${symbol.qualified_name || symbol.name}|${symbol.start_line}|${symbol.start_col}`;
+}
+
+function normalizeQualifiedName(value: string | null | undefined): string {
+  return `${value || ""}`.trim();
+}
+
+function diagramPointsEqual(a: DiagramPoint | null | undefined, b: DiagramPoint | null | undefined): boolean {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  return a.x === b.x && a.y === b.y;
+}
+
+function diagramViewportsEqual(
+  a: DiagramViewport | null | undefined,
+  b: DiagramViewport | null | undefined,
+): boolean {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  return a.x === b.x && a.y === b.y && a.zoom === b.zoom;
+}
+
+function diagramNodePositionsEqual(
+  a: Record<string, DiagramPoint> | null | undefined,
+  b: Record<string, DiagramPoint> | null | undefined,
+): boolean {
+  const left = a || {};
+  const right = b || {};
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  if (leftKeys.length !== rightKeys.length) return false;
+  for (const key of leftKeys) {
+    if (!diagramPointsEqual(left[key], right[key])) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function clampLeftPaneWidth(next: number, viewportWidth: number, rightPaneWidth: number): number {
@@ -512,6 +621,7 @@ function treeNodeIconKind(path: string, isDir: boolean): TreeNodeIconKind {
   const normalized = path.toLowerCase();
   if (normalized.endsWith(".sysml")) return "sysml";
   if (normalized.endsWith(".kerml")) return "kerml";
+  if (normalized.endsWith(".diagram")) return "diagram";
   return "file";
 }
 
@@ -596,6 +706,7 @@ function editorLanguageForPath(path: string | null | undefined): string {
   const ext = fileExtension(path);
   if (ext === ".sysml" || ext === ".kerml") return SYSML_LANGUAGE_ID;
   if (ext === ".json") return "json";
+  if (ext === ".diagram") return "json";
   if (ext === ".yaml" || ext === ".yml") return "yaml";
   if (ext === ".xml") return "xml";
   if (ext === ".md" || ext === ".markdown") return "markdown";
@@ -676,6 +787,18 @@ function ensureSysmlLanguage(monaco: Parameters<OnMount>[1]): void {
 function isSemanticSource(path: string | null | undefined): boolean {
   const value = (path || "").toLowerCase();
   return value.endsWith(".sysml") || value.endsWith(".kerml");
+}
+
+function isTextEditorTab(tab: EditorTab | null | undefined): tab is TextEditorTab {
+  return !!tab && tab.kind === "text";
+}
+
+function isDiagramEditorTab(tab: EditorTab | null | undefined): tab is DiagramEditorTab {
+  return !!tab && tab.kind === "diagram";
+}
+
+function isExplorerEditorTab(tab: EditorTab | null | undefined): tab is ExplorerEditorTab {
+  return !!tab && tab.kind === "explorer";
 }
 
 function buildNewSemanticFileName(name: string, extension: NewFileExtension): string {
@@ -946,6 +1069,7 @@ export function App() {
   const [stdlibManagerOpen, setStdlibManagerOpen] = useState(false);
   const [aboutWindowOpen, setAboutWindowOpen] = useState(false);
   const [metamodelSchemaVersion, setMetamodelSchemaVersion] = useState<string | null>(null);
+  const [projectModel, setProjectModel] = useState<ProjectModelView | null>(null);
   const [projectFilesSettingsMenuOpen, setProjectFilesSettingsMenuOpen] = useState(false);
   const [stdlibPathOptions, setStdlibPathOptions] = useState<StdlibPathOption[]>(() => readStdlibPathOptions());
   const [dialogActiveStdlibPath, setDialogActiveStdlibPath] = useState("");
@@ -960,11 +1084,13 @@ export function App() {
   const [treeRenameState, setTreeRenameState] = useState<TreeRenameState | null>(null);
   const [newProjectDialog, setNewProjectDialog] = useState<NewProjectDialogState | null>(null);
   const [newFileDialog, setNewFileDialog] = useState<NewFileDialogState | null>(null);
+  const [newDiagramDialog, setNewDiagramDialog] = useState<NewDiagramDialogState | null>(null);
   const [pendingProjectFileToOpen, setPendingProjectFileToOpen] = useState<string | null>(null);
   const [tabsOverflow, setTabsOverflow] = useState(false);
   const [tabsOverflowMenuOpen, setTabsOverflowMenuOpen] = useState(false);
   const [dragTabPath, setDragTabPath] = useState<string | null>(null);
   const [dragOverTabPath, setDragOverTabPath] = useState<string | null>(null);
+  const [diagramDragHover, setDiagramDragHover] = useState(false);
   const [activeToolTab, setActiveToolTab] = useState<ToolTabId>("logs");
   const [expressionInput, setExpressionInput] = useState("1 + 2 * 3");
   const [expressionResult, setExpressionResult] = useState<ExpressionEvaluationResult | null>(null);
@@ -1047,6 +1173,30 @@ export function App() {
     ),
     [compileToast.fileDiagnostics],
   );
+  const projectSymbols = useMemo(
+    () => symbols.filter((symbol) => symbol.source_scope !== "library"),
+    [symbols],
+  );
+  const workspaceSymbolsByQualified = useMemo(
+    () => new Map(symbols.map((symbol) => [symbol.qualified_name, symbol] as const)),
+    [symbols],
+  );
+  const projectSymbolsByQualified = useMemo(
+    () => new Map(projectSymbols.map((symbol) => [symbol.qualified_name, symbol] as const)),
+    [projectSymbols],
+  );
+  const librarySymbols = useMemo(
+    () => symbols.filter((symbol) => symbol.source_scope === "library"),
+    [symbols],
+  );
+  const projectSymbolRoots = useMemo(
+    () => buildSymbolOwnershipTree(projectSymbols),
+    [projectSymbols],
+  );
+  const librarySymbolRoots = useMemo(
+    () => buildSymbolOwnershipTree(librarySymbols),
+    [librarySymbols],
+  );
   const [buildClockTick, setBuildClockTick] = useState(0);
 
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
@@ -1066,6 +1216,7 @@ export function App() {
   const tabsStripRef = useRef<HTMLDivElement | null>(null);
   const newProjectNameInputRef = useRef<HTMLInputElement | null>(null);
   const newFileNameInputRef = useRef<HTMLInputElement | null>(null);
+  const newDiagramNameInputRef = useRef<HTMLInputElement | null>(null);
   const rightPanelRef = useRef<HTMLElement | null>(null);
 const centerPanelRef = useRef<HTMLElement | null>(null);
 const leftPaneDragRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
@@ -1410,27 +1561,34 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   }, []);
 
   useEffect(() => {
+    if (!rootPath) {
+      setProjectModel(null);
+      setMetamodelSchemaVersion(null);
+      return;
+    }
     let active = true;
     void Promise.allSettled([
-      rootPath ? getProjectModel(rootPath) : Promise.resolve(null),
+      getProjectModel(rootPath),
       getDefaultStdlib(),
     ])
       .then((results) => {
         if (!active) return;
         const projectModel = results[0].status === "fulfilled" ? results[0].value : null;
         const defaultStdlib = results[1].status === "fulfilled" ? results[1].value : null;
+        setProjectModel(projectModel);
         const resolvedStdlibPath = (projectModel?.stdlib_path || activeLibraryPath || "").trim();
         const version = stdlibVersionFromPath(resolvedStdlibPath) || (defaultStdlib || "").trim();
         setMetamodelSchemaVersion(version || null);
       })
       .catch(() => {
         if (!active) return;
+        setProjectModel(null);
         setMetamodelSchemaVersion(null);
       });
     return () => {
       active = false;
     };
-  }, [rootPath, activeLibraryPath]);
+  }, [rootPath, activeLibraryPath, semanticRefreshVersion]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -1674,6 +1832,30 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   }, [newFileDialog]);
 
   useEffect(() => {
+    if (!newDiagramDialog) return;
+    const focusTimer = window.setTimeout(() => {
+      newDiagramNameInputRef.current?.focus();
+      newDiagramNameInputRef.current?.select();
+    }, 0);
+    return () => {
+      window.clearTimeout(focusTimer);
+    };
+  }, [!!newDiagramDialog]);
+
+  useEffect(() => {
+    if (!newDiagramDialog) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !newDiagramDialog.submitting) {
+        setNewDiagramDialog(null);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [newDiagramDialog]);
+
+  useEffect(() => {
     if (!stdlibManagerOpen) return;
     let active = true;
     setDialogStdlibMetaLoading(true);
@@ -1732,9 +1914,14 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
 
   const activateEditorTab = useCallback((tab: EditorTab, selection?: TextSelection) => {
     setActiveFilePath(tab.path);
-    contentRef.current = tab.content;
     dirtyRef.current = tab.dirty;
     setDirty(tab.dirty);
+    if (!isTextEditorTab(tab)) {
+      contentRef.current = tab.content;
+      setCursorPos(null);
+      return;
+    }
+    contentRef.current = tab.content;
     if (editorRef.current) {
       suppressDirtyRef.current = true;
       editorRef.current.setValue(tab.content);
@@ -1756,6 +1943,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       let changed = false;
       const next = prev.map((tab) => {
         if (normalizePath(tab.path) !== activeKey) return tab;
+        if (!isTextEditorTab(tab)) return tab;
         if (tab.content === nextContent && tab.dirty === nextDirty) return tab;
         changed = true;
         return { ...tab, content: nextContent, dirty: nextDirty };
@@ -1770,9 +1958,10 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     selection?: TextSelection,
   ) => {
     const pathKey = normalizePath(path);
-    const tab: EditorTab = {
+    const tab: TextEditorTab = {
       path,
       name: displayNameForPath(path),
+      kind: "text",
       content: updatedText,
       dirty: false,
     };
@@ -1816,12 +2005,37 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     try {
       const text = await readFileText(path);
       if (reqId !== fileOpenReqRef.current) return;
-      const tab: EditorTab = {
-        path,
-        name: displayNameForPath(path),
-        content: text,
-        dirty: false,
-      };
+      let tab: EditorTab;
+      if (isDiagramFilePath(path)) {
+        try {
+          const document = parseDiagramDocument(text);
+          tab = {
+            path,
+            name: document.name || displayNameForPath(path),
+            kind: "diagram",
+            content: text,
+            document,
+            dirty: false,
+          };
+        } catch (error) {
+          setCompileStatus(`Diagram parse failed for ${displayNameForPath(path)}: ${String(error)}. Opened as text.`);
+          tab = {
+            path,
+            name: displayNameForPath(path),
+            kind: "text",
+            content: text,
+            dirty: false,
+          };
+        }
+      } else {
+        tab = {
+          path,
+          name: displayNameForPath(path),
+          kind: "text",
+          content: text,
+          dirty: false,
+        };
+      }
       setOpenTabs((prev) => {
         if (prev.some((entry) => normalizePath(entry.path) === pathKey)) return prev;
         return [...prev, tab];
@@ -1834,6 +2048,63 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       setCompileStatus(`Open failed: ${String(error)}`);
     }
   }, [activeFilePath, persistActiveEditorBuffer, openTabs, applySelection, activateEditorTab, setCompileStatus]);
+
+  const updateExplorerTab = useCallback((
+    path: string,
+    updater: (tab: ExplorerEditorTab) => ExplorerEditorTab,
+  ) => {
+    const pathKey = normalizePath(path);
+    setOpenTabs((prev) => prev.map((tab) => {
+      if (normalizePath(tab.path) !== pathKey || !isExplorerEditorTab(tab)) return tab;
+      return updater(tab);
+    }));
+  }, []);
+
+  const openModelExplorerForSymbol = useCallback((symbol: SymbolView | null) => {
+    const preferredRoot = resolvePreferredExplorerRoot(symbol, symbols);
+    if (!preferredRoot) {
+      setCompileStatus("Select an element to open Model Explorer.");
+      return;
+    }
+    const existing = openTabs.find((tab) => normalizePath(tab.path) === normalizePath(MODEL_EXPLORER_TAB_PATH));
+    const nextTab: ExplorerEditorTab = isExplorerEditorTab(existing)
+      ? {
+          ...existing,
+          rootQualifiedName: preferredRoot.qualified_name,
+          expandedQualifiedNames: [],
+          viewport: null,
+          nodePositions: {},
+          historyBack: existing.rootQualifiedName && existing.rootQualifiedName !== preferredRoot.qualified_name
+            ? [...existing.historyBack, existing.rootQualifiedName]
+            : existing.historyBack,
+          historyForward: [],
+          selectedQualifiedName: preferredRoot.qualified_name,
+          selectedEdgeId: null,
+        }
+      : {
+          path: MODEL_EXPLORER_TAB_PATH,
+          name: "Model Explorer",
+          kind: "explorer",
+          content: "",
+          rootQualifiedName: preferredRoot.qualified_name,
+          expandedQualifiedNames: [],
+          viewport: null,
+          nodePositions: {},
+          showDirectedRelationships: false,
+          historyBack: [],
+          historyForward: [],
+          selectedQualifiedName: preferredRoot.qualified_name,
+          selectedEdgeId: null,
+          dirty: false,
+        };
+    persistActiveEditorBuffer();
+    setOpenTabs((prev) => {
+      const next = prev.filter((tab) => normalizePath(tab.path) !== normalizePath(MODEL_EXPLORER_TAB_PATH));
+      return [...next, nextTab];
+    });
+    setSelectedSymbol(preferredRoot);
+    activateEditorTab(nextTab);
+  }, [activateEditorTab, openTabs, persistActiveEditorBuffer, setCompileStatus, symbols]);
 
   const createNewProjectFromDialog = useCallback(async () => {
     if (!newProjectDialog || newProjectDialog.submitting) return;
@@ -2065,6 +2336,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   const collectUnsavedCompileInputs = useCallback(() => {
     const byPath = new Map<string, { path: string; content: string }>();
     for (const tab of openTabs) {
+      if (!isTextEditorTab(tab)) continue;
       if (!tab.dirty || !isSemanticSource(tab.path)) continue;
       byPath.set(normalizePath(tab.path), { path: tab.path, content: tab.content });
     }
@@ -2092,11 +2364,35 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
 
   const saveActiveFile = useCallback(async (): Promise<boolean> => {
     if (!activeFilePath) return false;
+    const activeKey = normalizePath(activeFilePath);
+    const currentTab = openTabs.find((tab) => normalizePath(tab.path) === activeKey) || null;
+    if (!currentTab) return false;
     try {
-      await invoke("write_file", { path: activeFilePath, content: contentRef.current });
+      if (isExplorerEditorTab(currentTab)) {
+        setCompileStatus("Model Explorer tabs are live views and do not need saving.");
+        return true;
+      }
+      if (isDiagramEditorTab(currentTab)) {
+        const graph = buildDiagramGraph(currentTab.document, projectModel, projectSymbols);
+        const prepared = prepareDiagramDocumentForSave(
+          currentTab.document,
+          graph.nodes.map((node) => node.id),
+        );
+        const content = serializeDiagramDocument(prepared);
+        await writeFileText(activeFilePath, content);
+        dirtyRef.current = false;
+        setDirty(false);
+        setOpenTabs((prev) => prev.map((tab) => (
+          normalizePath(tab.path) === activeKey && isDiagramEditorTab(tab)
+            ? { ...tab, name: prepared.name, document: prepared, content, dirty: false }
+            : tab
+        )));
+        setCompileStatus(`Saved ${displayNameForPath(activeFilePath)}`);
+        return true;
+      }
+      await writeFileText(activeFilePath, contentRef.current);
       dirtyRef.current = false;
       setDirty(false);
-      const activeKey = normalizePath(activeFilePath);
       setOpenTabs((prev) => prev.map((tab) => (
         normalizePath(tab.path) === activeKey
           ? { ...tab, content: contentRef.current, dirty: false }
@@ -2108,7 +2404,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       setCompileStatus(`Save failed: ${String(error)}`);
       return false;
     }
-  }, [activeFilePath, setCompileStatus]);
+  }, [activeFilePath, openTabs, projectModel, projectSymbols, setCompileStatus]);
 
   const addHarnessRun = useCallback((
     kind: "project" | "file",
@@ -2168,11 +2464,12 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   const getCurrentTextForPath = useCallback(async (path: string): Promise<string> => {
     const pathKey = normalizePath(path);
     if (activeFilePath && normalizePath(activeFilePath) === pathKey) {
-      return contentRef.current;
+      const currentTab = openTabs.find((tab) => normalizePath(tab.path) === pathKey) || null;
+      return isTextEditorTab(currentTab) ? contentRef.current : readFileText(path);
     }
     const existing = openTabs.find((tab) => normalizePath(tab.path) === pathKey);
     if (existing) {
-      return existing.content;
+      return isTextEditorTab(existing) ? existing.content : readFileText(path);
     }
     return readFileText(path);
   }, [activeFilePath, openTabs]);
@@ -2597,7 +2894,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
         return;
       }
       if (!event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && event.key === "F2") {
-        if (!selectedSymbol || treeRenameState || semanticEditDialog || newProjectDialog || newFileDialog) return;
+        if (!selectedSymbol || treeRenameState || semanticEditDialog || newProjectDialog || newFileDialog || newDiagramDialog) return;
         event.preventDefault();
         startTreeRename(selectedSymbol);
       }
@@ -2614,6 +2911,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     semanticEditDialog,
     newProjectDialog,
     newFileDialog,
+    newDiagramDialog,
     startTreeRename,
   ]);
 
@@ -2621,6 +2919,9 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     switch (action) {
       case "new-project":
         await openNewProjectDialog();
+        return;
+      case "open-explorer":
+        openModelExplorerForSymbol(selectedSymbol);
         return;
       case "open-folder": {
         const selected = await open({ directory: true, multiple: false });
@@ -2686,6 +2987,8 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     }
   }, [
     openNewProjectDialog,
+    openModelExplorerForSymbol,
+    selectedSymbol,
     applyRootPath,
     openFilePath,
     saveActiveFile,
@@ -2903,26 +3206,6 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     };
   }, []);
 
-  const projectSymbols = useMemo(
-    () => symbols.filter((symbol) => symbol.source_scope !== "library"),
-    [symbols],
-  );
-
-  const librarySymbols = useMemo(
-    () => symbols.filter((symbol) => symbol.source_scope === "library"),
-    [symbols],
-  );
-
-  const projectSymbolRoots = useMemo(
-    () => buildSymbolOwnershipTree(projectSymbols),
-    [projectSymbols],
-  );
-
-  const librarySymbolRoots = useMemo(
-    () => buildSymbolOwnershipTree(librarySymbols),
-    [librarySymbols],
-  );
-
   const symbolsByFile = useMemo(() => {
     const map = new Map<string, SymbolView[]>();
     for (const symbol of projectSymbols) {
@@ -2992,6 +3275,332 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     if (!target) return;
     void selectSymbol(target);
   }, [projectSymbols, selectSymbol, symbols]);
+
+  const updateDiagramTab = useCallback((
+    path: string,
+    updater: (tab: DiagramEditorTab) => DiagramEditorTab,
+  ) => {
+    const pathKey = normalizePath(path);
+    setOpenTabs((prev) => prev.map((tab) => {
+      if (normalizePath(tab.path) !== pathKey || !isDiagramEditorTab(tab)) return tab;
+      return updater(tab);
+    }));
+  }, []);
+
+  const activeDiagramTab = useMemo(() => {
+    if (!activeFilePath) return null;
+    const key = normalizePath(activeFilePath);
+    const tab = openTabs.find((entry) => normalizePath(entry.path) === key) || null;
+    return isDiagramEditorTab(tab) ? tab : null;
+  }, [activeFilePath, openTabs]);
+  const activeExplorerTab = useMemo(() => {
+    if (!activeFilePath) return null;
+    const key = normalizePath(activeFilePath);
+    const tab = openTabs.find((entry) => normalizePath(entry.path) === key) || null;
+    return isExplorerEditorTab(tab) ? tab : null;
+  }, [activeFilePath, openTabs]);
+  const activeDiagramDocument = activeDiagramTab?.document || null;
+  const activeDiagramGraph = useMemo(
+    () => (activeDiagramDocument ? buildDiagramGraph(activeDiagramDocument, projectModel, projectSymbols) : null),
+    [
+      activeDiagramDocument?.diagram_type,
+      activeDiagramDocument?.root_element_qualified_name,
+      activeDiagramDocument?.root_file_path,
+      projectModel,
+      projectSymbols,
+    ],
+  );
+  const activeDiagramPositions = useMemo(
+    () => (
+      activeDiagramDocument && activeDiagramGraph
+        ? mergeDiagramNodePositions(activeDiagramGraph, activeDiagramDocument.node_positions)
+        : {}
+    ),
+    [activeDiagramDocument?.node_positions, activeDiagramGraph],
+  );
+  const activeDiagramViewport = activeDiagramDocument?.viewport || null;
+  const activeExplorerGraph = useMemo(
+    () => (
+      activeExplorerTab
+        ? buildExplorerGraph({
+            rootQualifiedName: activeExplorerTab.rootQualifiedName,
+            expandedQualifiedNames: activeExplorerTab.expandedQualifiedNames,
+            showDirectedRelationships: activeExplorerTab.showDirectedRelationships,
+            workspaceSymbols: symbols,
+            projectModel,
+          })
+        : null
+    ),
+    [
+      activeExplorerTab?.rootQualifiedName,
+      activeExplorerTab?.expandedQualifiedNames,
+      activeExplorerTab?.showDirectedRelationships,
+      symbols,
+      projectModel,
+    ],
+  );
+  const activeExplorerPositions = useMemo(
+    () => (
+      activeExplorerTab && activeExplorerGraph
+        ? mergeExplorerNodePositions(activeExplorerGraph, activeExplorerTab.nodePositions)
+        : {}
+    ),
+    [activeExplorerGraph, activeExplorerTab?.nodePositions],
+  );
+  const activeExplorerViewport = activeExplorerTab?.viewport || null;
+  const activeExplorerSelectedEdge = useMemo(
+    () => activeExplorerGraph?.edges.find((edge) => edge.id === activeExplorerTab?.selectedEdgeId) || null,
+    [activeExplorerGraph, activeExplorerTab?.selectedEdgeId],
+  );
+
+  const updateActiveDiagramRoot = useCallback((symbol: SymbolView) => {
+    if (!activeDiagramTab) return;
+    const nextRoot = resolvePreferredDiagramRoot(activeDiagramTab.document.diagram_type, symbol, projectSymbols) || symbol;
+    updateDiagramTab(activeDiagramTab.path, (tab) => {
+      const document = createDiagramDocument({
+        name: tab.document.name,
+        diagramType: tab.document.diagram_type,
+        rootQualifiedName: nextRoot.qualified_name || symbol.qualified_name || symbol.name,
+        rootFilePath: nextRoot.file_path || symbol.file_path,
+        viewport: null,
+        nodePositions: {},
+      });
+      return {
+        ...tab,
+        document,
+        dirty: true,
+      };
+    });
+  }, [activeDiagramTab, projectSymbols, updateDiagramTab]);
+
+  const handleDiagramPositionsChange = useCallback((positions: Record<string, DiagramPoint>) => {
+    if (!activeDiagramTab) return;
+    updateDiagramTab(activeDiagramTab.path, (tab) => {
+      if (diagramNodePositionsEqual(tab.document.node_positions, positions)) {
+        return tab;
+      }
+      return {
+        ...tab,
+        dirty: true,
+        document: {
+          ...tab.document,
+          node_positions: positions,
+        },
+      };
+    });
+  }, [activeDiagramTab, updateDiagramTab]);
+
+  const handleDiagramViewportChange = useCallback((viewport: DiagramViewport) => {
+    if (!activeDiagramTab) return;
+    updateDiagramTab(activeDiagramTab.path, (tab) => {
+      if (diagramViewportsEqual(tab.document.viewport, viewport)) {
+        return tab;
+      }
+      return {
+        ...tab,
+        dirty: true,
+        document: {
+          ...tab.document,
+          viewport,
+        },
+      };
+    });
+  }, [activeDiagramTab, updateDiagramTab]);
+
+  const handleDiagramSelectNode = useCallback((qualifiedName: string) => {
+    const target = projectSymbolsByQualified.get(qualifiedName);
+    if (!target) return;
+    setSelectedSymbol(target);
+  }, [projectSymbolsByQualified]);
+
+  const handleDiagramOpenNode = useCallback((qualifiedName: string) => {
+    const target = projectSymbolsByQualified.get(qualifiedName);
+    if (!target) return;
+    void selectSymbol(target);
+  }, [projectSymbolsByQualified, selectSymbol]);
+
+  const getDraggedSymbolQualifiedName = useCallback((dataTransfer: DataTransfer): string => {
+    const typedValue = dataTransfer.getData(SYMBOL_TREE_DRAG_MIME);
+    if (typedValue) {
+      return typedValue;
+    }
+    return symbolTreeDragState?.symbol.qualified_name || "";
+  }, [symbolTreeDragState]);
+
+  const handleDiagramCanvasDragEnter = useCallback((event: ReactDragEvent<HTMLDivElement>) => {
+    const types = Array.from(event.dataTransfer.types || []);
+    if (!types.includes(SYMBOL_TREE_DRAG_MIME) && !symbolTreeDragState) return;
+    event.preventDefault();
+    setDiagramDragHover(true);
+  }, [symbolTreeDragState]);
+
+  const handleDiagramCanvasDragOver = useCallback((event: ReactDragEvent<HTMLDivElement>) => {
+    const qualifiedName = getDraggedSymbolQualifiedName(event.dataTransfer);
+    if (!qualifiedName) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    setDiagramDragHover(true);
+  }, [getDraggedSymbolQualifiedName]);
+
+  const handleDiagramCanvasDragLeave = useCallback((event: ReactDragEvent<HTMLDivElement>) => {
+    if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+    setDiagramDragHover(false);
+  }, []);
+
+  const handleDiagramCanvasDrop = useCallback((event: ReactDragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setDiagramDragHover(false);
+    const qualifiedName = getDraggedSymbolQualifiedName(event.dataTransfer);
+    if (!qualifiedName) return;
+    const target = projectSymbolsByQualified.get(qualifiedName) || symbolTreeDragState?.symbol || null;
+    if (!target) return;
+    updateActiveDiagramRoot(target);
+    setSelectedSymbol(target);
+  }, [getDraggedSymbolQualifiedName, projectSymbolsByQualified, symbolTreeDragState, updateActiveDiagramRoot]);
+
+  const setActiveExplorerRoot = useCallback((qualifiedName: string) => {
+    if (!activeExplorerTab) return;
+    const target = workspaceSymbolsByQualified.get(qualifiedName) || null;
+    const preferredRoot = resolvePreferredExplorerRoot(target, symbols) || target;
+    const rootQualifiedName = preferredRoot?.qualified_name || qualifiedName;
+    updateExplorerTab(activeExplorerTab.path, (tab) => ({
+      ...tab,
+      rootQualifiedName,
+      expandedQualifiedNames: [],
+      viewport: null,
+      nodePositions: {},
+      historyBack: tab.rootQualifiedName && tab.rootQualifiedName !== rootQualifiedName
+        ? [...tab.historyBack, tab.rootQualifiedName]
+        : tab.historyBack,
+      historyForward: [],
+      selectedQualifiedName: rootQualifiedName,
+      selectedEdgeId: null,
+    }));
+    if (preferredRoot) {
+      setSelectedSymbol(preferredRoot);
+    }
+  }, [activeExplorerTab, symbols, updateExplorerTab, workspaceSymbolsByQualified]);
+
+  const handleExplorerPositionsChange = useCallback((positions: Record<string, DiagramPoint>) => {
+    if (!activeExplorerTab) return;
+    updateExplorerTab(activeExplorerTab.path, (tab) => (
+      diagramNodePositionsEqual(tab.nodePositions, positions)
+        ? tab
+        : { ...tab, nodePositions: positions }
+    ));
+  }, [activeExplorerTab, updateExplorerTab]);
+
+  const handleExplorerViewportChange = useCallback((viewport: DiagramViewport) => {
+    if (!activeExplorerTab) return;
+    updateExplorerTab(activeExplorerTab.path, (tab) => (
+      diagramViewportsEqual(tab.viewport, viewport)
+        ? tab
+        : { ...tab, viewport }
+    ));
+  }, [activeExplorerTab, updateExplorerTab]);
+
+  const handleExplorerSelectNode = useCallback((qualifiedName: string) => {
+    if (!activeExplorerTab) return;
+    updateExplorerTab(activeExplorerTab.path, (tab) => ({ ...tab, selectedQualifiedName: qualifiedName, selectedEdgeId: null }));
+    const target = workspaceSymbolsByQualified.get(qualifiedName);
+    if (target) {
+      setSelectedSymbol(target);
+    }
+  }, [activeExplorerTab, updateExplorerTab, workspaceSymbolsByQualified]);
+
+  const handleExplorerOpenNode = useCallback((qualifiedName: string) => {
+    const target = workspaceSymbolsByQualified.get(qualifiedName);
+    if (!target) return;
+    void selectSymbol(target);
+  }, [selectSymbol, workspaceSymbolsByQualified]);
+
+  const handleExplorerExpandNode = useCallback((qualifiedName: string) => {
+    if (!activeExplorerTab) return;
+    updateExplorerTab(activeExplorerTab.path, (tab) => {
+      const normalized = normalizeQualifiedName(qualifiedName);
+      if (!normalized) return tab;
+      if (tab.expandedQualifiedNames.includes(normalized)) return tab;
+      return {
+        ...tab,
+        expandedQualifiedNames: [...tab.expandedQualifiedNames, normalized],
+      };
+    });
+  }, [activeExplorerTab, updateExplorerTab]);
+
+  const handleExplorerSelectEdge = useCallback((edgeId: string | null) => {
+    if (!activeExplorerTab) return;
+    updateExplorerTab(activeExplorerTab.path, (tab) => ({ ...tab, selectedEdgeId: edgeId }));
+  }, [activeExplorerTab, updateExplorerTab]);
+
+  const handleExplorerBack = useCallback(() => {
+    if (!activeExplorerTab || !activeExplorerTab.historyBack.length) return;
+    updateExplorerTab(activeExplorerTab.path, (tab) => {
+      const nextBack = [...tab.historyBack];
+      const nextRoot = nextBack.pop() || tab.rootQualifiedName;
+      return {
+        ...tab,
+        rootQualifiedName: nextRoot,
+        expandedQualifiedNames: [],
+        viewport: null,
+        nodePositions: {},
+        historyBack: nextBack,
+        historyForward: tab.rootQualifiedName ? [tab.rootQualifiedName, ...tab.historyForward] : tab.historyForward,
+        selectedQualifiedName: nextRoot,
+        selectedEdgeId: null,
+      };
+    });
+  }, [activeExplorerTab, updateExplorerTab]);
+
+  const handleExplorerForward = useCallback(() => {
+    if (!activeExplorerTab || !activeExplorerTab.historyForward.length) return;
+    updateExplorerTab(activeExplorerTab.path, (tab) => {
+      const [nextRoot, ...rest] = tab.historyForward;
+      return {
+        ...tab,
+        rootQualifiedName: nextRoot || tab.rootQualifiedName,
+        expandedQualifiedNames: [],
+        viewport: null,
+        nodePositions: {},
+        historyBack: tab.rootQualifiedName ? [...tab.historyBack, tab.rootQualifiedName] : tab.historyBack,
+        historyForward: rest,
+        selectedQualifiedName: nextRoot || tab.selectedQualifiedName,
+        selectedEdgeId: null,
+      };
+    });
+  }, [activeExplorerTab, updateExplorerTab]);
+
+  const handleExplorerToggleDirectedRelationships = useCallback(() => {
+    if (!activeExplorerTab) return;
+    updateExplorerTab(activeExplorerTab.path, (tab) => ({
+      ...tab,
+      showDirectedRelationships: !tab.showDirectedRelationships,
+      selectedEdgeId: null,
+    }));
+  }, [activeExplorerTab, updateExplorerTab]);
+
+  const handleExplorerFollowRelationshipTarget = useCallback((nodeId: string) => {
+    const targetNode = activeExplorerGraph?.nodes.find((node) => node.id === nodeId || node.qualifiedName === nodeId) || null;
+    if (!targetNode) return;
+    setActiveExplorerRoot(targetNode.qualifiedName);
+  }, [activeExplorerGraph, setActiveExplorerRoot]);
+
+  const handleExplorerCanvasDrop = useCallback((event: ReactDragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setDiagramDragHover(false);
+    const qualifiedName = getDraggedSymbolQualifiedName(event.dataTransfer);
+    if (!qualifiedName) return;
+    setActiveExplorerRoot(qualifiedName);
+  }, [getDraggedSymbolQualifiedName, setActiveExplorerRoot]);
+
+  const canExpandExplorerSelection = useMemo(
+    () => canExpandExplorerNode(activeExplorerTab?.selectedQualifiedName, symbols),
+    [activeExplorerTab?.selectedQualifiedName, symbols],
+  );
+  const canReRootExplorerSelection = useMemo(
+    () => !!normalizeQualifiedName(activeExplorerTab?.selectedQualifiedName)
+      && normalizeQualifiedName(activeExplorerTab?.selectedQualifiedName) !== normalizeQualifiedName(activeExplorerTab?.rootQualifiedName),
+    [activeExplorerTab?.rootQualifiedName, activeExplorerTab?.selectedQualifiedName],
+  );
 
   const openDiagnostic = useCallback((path: string, diagnostic: FileDiagnosticView) => {
     const line = Math.max(1, diagnostic.line || 1);
@@ -3073,6 +3682,64 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       ));
     }
   }, [newFileDialog, rootPath, refreshRoot, ensureExpanded, openFilePath, setCompileStatus]);
+
+  const createNewDiagramFromDialog = useCallback(async () => {
+    if (!newDiagramDialog || newDiagramDialog.submitting) return;
+    const activeRoot = rootPath.trim();
+    if (!activeRoot) {
+      setNewDiagramDialog((prev) => (prev ? { ...prev, error: "Select a project root first." } : prev));
+      return;
+    }
+    const diagramName = newDiagramDialog.name.trim();
+    if (!diagramName) {
+      setNewDiagramDialog((prev) => (prev ? { ...prev, error: "Diagram name is required." } : prev));
+      return;
+    }
+    const rootQualifiedName = newDiagramDialog.rootQualifiedName.trim();
+    if (!rootQualifiedName) {
+      setNewDiagramDialog((prev) => (prev ? { ...prev, error: "Root element is required." } : prev));
+      return;
+    }
+    const baseName = newDiagramDialog.fileName.trim().replace(/\.diagram$/i, "").trim();
+    if (!baseName) {
+      setNewDiagramDialog((prev) => (prev ? { ...prev, error: "File name is required." } : prev));
+      return;
+    }
+    if (INVALID_NEW_FILE_NAME_CHARS.test(baseName)) {
+      setNewDiagramDialog((prev) => (
+        prev
+          ? { ...prev, error: "File name contains invalid characters: <>:\"/\\|?*" }
+          : prev
+      ));
+      return;
+    }
+    setNewDiagramDialog((prev) => (prev ? { ...prev, error: "", submitting: true } : prev));
+    try {
+      const fileName = buildDiagramFileName(baseName);
+      const createdPath = await createProjectFile(activeRoot, newDiagramDialog.parentPath, fileName);
+      const document = createDiagramDocument({
+        name: diagramName,
+        diagramType: newDiagramDialog.diagramType,
+        rootQualifiedName,
+        rootFilePath: newDiagramDialog.rootFilePath.trim() || null,
+      });
+      await writeFileText(createdPath, serializeDiagramDocument(document));
+      await refreshRoot(activeRoot);
+      await ensureExpanded(newDiagramDialog.parentPath);
+      setProjectFilesExpanded(true);
+      setNewDiagramDialog(null);
+      setCompileStatus(`Created diagram: ${createdPath}`);
+      await openFilePath(createdPath);
+    } catch (error) {
+      const message = String(error);
+      setCompileStatus(`Create diagram failed: ${message}`);
+      setNewDiagramDialog((prev) => (
+        prev
+          ? { ...prev, error: `Create diagram failed: ${message}`, submitting: false }
+          : prev
+      ));
+    }
+  }, [newDiagramDialog, rootPath, refreshRoot, ensureExpanded, openFilePath, setCompileStatus]);
 
   const toggleProjectFileSymbols = useCallback((filePath: string) => {
     const key = normalizePath(filePath);
@@ -3534,6 +4201,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                 onDragStart={(event) => {
                   if (!canDragSymbol(symbol)) return;
                   event.dataTransfer.effectAllowed = "move";
+                  event.dataTransfer.setData(SYMBOL_TREE_DRAG_MIME, symbol.qualified_name || symbol.name || symbolId);
                   event.dataTransfer.setData("text/plain", symbol.qualified_name || symbol.name || symbolId);
                   setSymbolTreeDragState({ symbol });
                 }}
@@ -3687,6 +4355,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                   x: event.clientX,
                   y: event.clientY,
                   allowNewFile: isDir,
+                  allowNewDiagram: false,
                 });
               }}
               title={entry.path}
@@ -3812,6 +4481,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                   x: event.clientX,
                   y: event.clientY,
                   allowNewFile: false,
+                  allowNewDiagram: false,
                 });
               }}
               title={entry.path}
@@ -3882,6 +4552,24 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
     const key = normalizePath(activeFilePath);
     return openTabs.find((tab) => normalizePath(tab.path) === key) || null;
   }, [openTabs, activeFilePath]);
+  useEffect(() => {
+    if (!activeTab) return;
+    dirtyRef.current = activeTab.dirty;
+    setDirty(activeTab.dirty);
+    if (isDiagramEditorTab(activeTab)) {
+      contentRef.current = activeTab.content;
+    }
+  }, [activeTab]);
+  useEffect(() => {
+    if (isTextEditorTab(activeTab)) return;
+    if (cursorListenerRef.current) {
+      cursorListenerRef.current.dispose();
+      cursorListenerRef.current = null;
+    }
+    editorRef.current = null;
+    monacoRef.current = null;
+    setCursorPos(null);
+  }, [activeTab]);
   const contextTab = useMemo(() => {
     if (!tabContextMenu) return null;
     const key = normalizePath(tabContextMenu.path);
@@ -3902,7 +4590,8 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
     const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 1280;
     const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 800;
     const menuWidth = 172;
-    const menuHeight = 38;
+    const actionCount = (fileContextMenu.allowNewFile ? 1 : 0) + (fileContextMenu.allowNewDiagram ? 1 : 0) + 1;
+    const menuHeight = 8 + actionCount * 28;
     const left = Math.max(8, Math.min(fileContextMenu.x, viewportWidth - menuWidth - 8));
     const top = Math.max(8, Math.min(fileContextMenu.y, viewportHeight - menuHeight - 8));
     return { left, top };
@@ -4114,6 +4803,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
               {menuOpen === "file" ? (
                 <div className="menu-bar-dropdown">
                   <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); void runMenuAction("new-project"); }}>New Project...</button>
+                  <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); void runMenuAction("open-explorer"); }} disabled={!selectedSymbol}>Open Model Explorer</button>
                   <div className="menu-bar-sep" />
                   <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); void runMenuAction("open-folder"); }}>Open Folder...</button>
                   <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); void runMenuAction("open-file"); }}>Open File...</button>
@@ -4268,6 +4958,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                   x: event.clientX,
                   y: event.clientY,
                   allowNewFile: true,
+                  allowNewDiagram: false,
                 });
               }}
               title={projectFilesExpanded ? "Collapse project files" : "Expand project files"}
@@ -4632,6 +5323,14 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                   <div className="simple-semantic-edit-menu-title">
                     {semanticEditMenu.symbol.name || semanticEditMenu.symbol.qualified_name}
                   </div>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => openModelExplorerForSymbol(semanticEditMenu.symbol)}
+                    title="Open the selected element in Model Explorer"
+                  >
+                    Open Model Explorer
+                  </button>
                   {canRenameSymbol(semanticEditMenu.symbol) ? (
                     <button
                       type="button"
@@ -4681,55 +5380,107 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                 </div>
               ) : (
                 <>
-                  <div className="panel-header simple-editor-header">
-                    <div className="simple-editor-title">{activeFileName}{dirty ? " *" : ""}</div>
-                    <div className="simple-editor-meta">
-                      <span>Symbols in file: {activeFileSymbols.length}</span>
-                      <span>Parsed files: {parsedFiles.length}</span>
-                      <span>Unresolved: {unresolvedCount}</span>
-                    </div>
-                  </div>
-                  <div className="editor-host" id="monaco-root">
-                    <MonacoEditor
-                      defaultValue=""
-                      onChange={(value) => {
-                        if (suppressDirtyRef.current) {
-                          suppressDirtyRef.current = false;
-                          return;
-                        }
-                        contentRef.current = value ?? "";
-                        if (!dirtyRef.current) {
-                          dirtyRef.current = true;
-                          setDirty(true);
-                          if (activeFilePath) {
-                            const activeKey = normalizePath(activeFilePath);
-                            setOpenTabs((prev) => prev.map((tab) => (
-                              normalizePath(tab.path) === activeKey
-                                ? { ...tab, dirty: true }
-                                : tab
-                            )));
-                          }
-                        }
-                        scheduleAutoBuild();
-                      }}
-                      language={editorLanguage}
-                      theme={appTheme === "light" ? "vs" : "vs-dark"}
-                      onMount={handleEditorMount}
-                      options={{
-                        minimap: { enabled: false },
-                        wordWrap: "off",
-                        scrollBeyondLastLine: false,
-                        renderLineHighlight: "line",
-                        fontSize: 13,
-                        automaticLayout: true,
-                        scrollbar: {
-                          vertical: "hidden",
-                          horizontal: "hidden",
-                          alwaysConsumeMouseWheel: false,
-                        },
-                      }}
+                  {activeExplorerTab && activeExplorerGraph ? (
+                    <ModelExplorerCanvas
+                      graph={activeExplorerGraph}
+                      positions={activeExplorerPositions}
+                      viewport={activeExplorerViewport}
+                      dragHover={diagramDragHover}
+                      selectedNodeQualifiedName={activeExplorerTab.selectedQualifiedName}
+                      selectedEdgeId={activeExplorerTab.selectedEdgeId}
+                      selectedEdge={activeExplorerSelectedEdge}
+                      canGoBack={activeExplorerTab.historyBack.length > 0}
+                      canGoForward={activeExplorerTab.historyForward.length > 0}
+                      canExpandSelected={canExpandExplorerSelection}
+                      canReRootSelected={canReRootExplorerSelection}
+                      onPositionsChange={handleExplorerPositionsChange}
+                      onViewportChange={handleExplorerViewportChange}
+                      onSelectNode={handleExplorerSelectNode}
+                      onOpenNode={handleExplorerOpenNode}
+                      onReRootNode={setActiveExplorerRoot}
+                      onExpandNode={handleExplorerExpandNode}
+                      onSelectEdge={handleExplorerSelectEdge}
+                      onFollowRelationshipTarget={handleExplorerFollowRelationshipTarget}
+                      onBack={handleExplorerBack}
+                      onForward={handleExplorerForward}
+                      onToggleDirectedRelationships={handleExplorerToggleDirectedRelationships}
+                      onCanvasDragEnter={handleDiagramCanvasDragEnter}
+                      onCanvasDragOver={handleDiagramCanvasDragOver}
+                      onCanvasDragLeave={handleDiagramCanvasDragLeave}
+                      onCanvasDrop={handleExplorerCanvasDrop}
                     />
-                  </div>
+                  ) : activeDiagramTab && activeDiagramGraph ? (
+                    <DiagramCanvas
+                      graph={activeDiagramGraph}
+                      positions={activeDiagramPositions}
+                      viewport={activeDiagramViewport}
+                      dirty={dirty}
+                      dragHover={diagramDragHover}
+                      onPositionsChange={handleDiagramPositionsChange}
+                      onViewportChange={handleDiagramViewportChange}
+                      onSelectNode={handleDiagramSelectNode}
+                      onOpenNode={handleDiagramOpenNode}
+                      onSave={() => { void saveActiveFile(); }}
+                      onCanvasDragEnter={handleDiagramCanvasDragEnter}
+                      onCanvasDragOver={handleDiagramCanvasDragOver}
+                      onCanvasDragLeave={handleDiagramCanvasDragLeave}
+                      onCanvasDrop={handleDiagramCanvasDrop}
+                      onRebind={selectedSymbol ? () => updateActiveDiagramRoot(selectedSymbol) : undefined}
+                      canRebind={!!selectedSymbol}
+                    />
+                  ) : (
+                    <>
+                      <div className="panel-header simple-editor-header">
+                        <div className="simple-editor-title">{activeFileName}{dirty ? " *" : ""}</div>
+                        <div className="simple-editor-meta">
+                          <span>Symbols in file: {activeFileSymbols.length}</span>
+                          <span>Parsed files: {parsedFiles.length}</span>
+                          <span>Unresolved: {unresolvedCount}</span>
+                        </div>
+                      </div>
+                      <div className="editor-host" id="monaco-root">
+                        <MonacoEditor
+                          defaultValue=""
+                          onChange={(value) => {
+                            if (suppressDirtyRef.current) {
+                              suppressDirtyRef.current = false;
+                              return;
+                            }
+                            contentRef.current = value ?? "";
+                            if (!dirtyRef.current) {
+                              dirtyRef.current = true;
+                              setDirty(true);
+                              if (activeFilePath) {
+                                const activeKey = normalizePath(activeFilePath);
+                                setOpenTabs((prev) => prev.map((tab) => {
+                                  if (normalizePath(tab.path) !== activeKey) return tab;
+                                  if (isExplorerEditorTab(tab) || tab.dirty) return tab;
+                                  return { ...tab, dirty: true };
+                                }));
+                              }
+                            }
+                            scheduleAutoBuild();
+                          }}
+                          language={editorLanguage}
+                          theme={appTheme === "light" ? "vs" : "vs-dark"}
+                          onMount={handleEditorMount}
+                          options={{
+                            minimap: { enabled: false },
+                            wordWrap: "off",
+                            scrollBeyondLastLine: false,
+                            renderLineHighlight: "line",
+                            fontSize: 13,
+                            automaticLayout: true,
+                            scrollbar: {
+                              vertical: "hidden",
+                              horizontal: "hidden",
+                              alwaysConsumeMouseWheel: false,
+                            },
+                          }}
+                        />
+                      </div>
+                    </>
+                  )}
                 </>
               )}
             </div>
@@ -4928,6 +5679,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
             selectedSymbol={selectedSymbol}
             semanticRefreshVersion={semanticRefreshVersion}
             onSelectQualifiedName={selectQualifiedName}
+            onOpenExplorer={() => openModelExplorerForSymbol(selectedSymbol)}
           />
           <div
             className={`simple-right-splitter ${rightPanelSplitDragging ? "active" : ""}`}
@@ -5386,6 +6138,154 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                 Root: {newProjectDialog.parentPath.trim() && newProjectDialog.name.trim()
                   ? `${newProjectDialog.parentPath.replace(/[\\/]+$/, "")}\\${newProjectDialog.name.trim()}`
                   : "<choose parent and name>"}
+              </div>
+            </form>
+          </section>
+        </div>
+      ) : null}
+
+      {newDiagramDialog ? (
+        <div
+          className="simple-modal-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !newDiagramDialog.submitting) {
+              setNewDiagramDialog(null);
+            }
+          }}
+        >
+          <section
+            className="simple-modal simple-new-file-modal simple-new-diagram-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Create new diagram"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                void createNewDiagramFromDialog();
+              }}
+            >
+              <div className="simple-modal-header">
+                <strong>New Diagram</strong>
+                <div className="simple-modal-header-actions">
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={newDiagramDialog.submitting}
+                    onClick={() => setNewDiagramDialog(null)}
+                  >
+                    Cancel
+                  </button>
+                  <button type="submit" disabled={newDiagramDialog.submitting}>
+                    {newDiagramDialog.submitting ? "Creating..." : "Create"}
+                  </button>
+                </div>
+              </div>
+              <div className="simple-modal-body simple-new-file-body">
+                <div className="simple-new-file-meta muted">
+                  <span>Folder: {displayNameForPath(newDiagramDialog.parentPath)}</span>
+                  <span title={newDiagramDialog.parentPath}>{newDiagramDialog.parentPath}</span>
+                </div>
+                <label className="simple-new-file-field">
+                  <span className="muted">Diagram Name</span>
+                  <input
+                    ref={newDiagramNameInputRef}
+                    value={newDiagramDialog.name}
+                    onChange={(event) => setNewDiagramDialog((prev) => (
+                      prev ? { ...prev, name: event.target.value, error: "" } : prev
+                    ))}
+                    placeholder="Vehicle Diagram"
+                    aria-label="Diagram name"
+                    disabled={newDiagramDialog.submitting}
+                  />
+                </label>
+                <label className="simple-new-file-field">
+                  <span className="muted">File Name</span>
+                  <input
+                    value={newDiagramDialog.fileName}
+                    onChange={(event) => setNewDiagramDialog((prev) => (
+                      prev ? { ...prev, fileName: event.target.value, error: "" } : prev
+                    ))}
+                    placeholder="vehicle-diagram.diagram"
+                    aria-label="Diagram file name"
+                    disabled={newDiagramDialog.submitting}
+                  />
+                </label>
+                <label className="simple-new-file-field">
+                  <span className="muted">Diagram Type</span>
+                  <div className="simple-new-file-type-group" role="radiogroup" aria-label="Diagram type">
+                    {DIAGRAM_TYPE_OPTIONS.map((option) => (
+                      <button
+                        key={option.value}
+                        type="button"
+                        className={`simple-new-file-type-btn ${newDiagramDialog.diagramType === option.value ? "active" : ""}`}
+                        onClick={() => setNewDiagramDialog((prev) => {
+                          if (!prev) return prev;
+                          const preferredRoot = resolvePreferredDiagramRoot(option.value, selectedSymbol, projectSymbols);
+                          return {
+                            ...prev,
+                            diagramType: option.value,
+                            rootQualifiedName: preferredRoot?.qualified_name || prev.rootQualifiedName,
+                            rootFilePath: preferredRoot?.file_path || prev.rootFilePath,
+                            error: "",
+                          };
+                        })}
+                        disabled={newDiagramDialog.submitting}
+                        aria-pressed={newDiagramDialog.diagramType === option.value}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                </label>
+                <label className="simple-new-file-field">
+                  <span className="muted">Root Element</span>
+                  <div className="simple-new-diagram-root-row">
+                    <input
+                      value={newDiagramDialog.rootQualifiedName}
+                      onChange={(event) => setNewDiagramDialog((prev) => (
+                        prev ? { ...prev, rootQualifiedName: event.target.value, error: "" } : prev
+                      ))}
+                      placeholder="Qualified name"
+                      aria-label="Root element qualified name"
+                      disabled={newDiagramDialog.submitting}
+                    />
+                    <button
+                      type="button"
+                      className="ghost"
+                      disabled={newDiagramDialog.submitting || !selectedSymbol}
+                      onClick={() => {
+                        const preferredRoot = resolvePreferredDiagramRoot(newDiagramDialog.diagramType, selectedSymbol, projectSymbols);
+                        if (!preferredRoot) return;
+                        setNewDiagramDialog((prev) => (
+                          prev ? {
+                            ...prev,
+                            rootQualifiedName: preferredRoot.qualified_name,
+                            rootFilePath: preferredRoot.file_path || "",
+                            error: "",
+                          } : prev
+                        ));
+                      }}
+                    >
+                      Use Selected
+                    </button>
+                  </div>
+                </label>
+                <div className="muted simple-new-file-meta">
+                  <span>Root file</span>
+                  <span title={newDiagramDialog.rootFilePath || "-"}>{newDiagramDialog.rootFilePath || "-"}</span>
+                </div>
+                {newDiagramDialog.error ? (
+                  <div className="error">{newDiagramDialog.error}</div>
+                ) : (
+                  <div className="muted">
+                    Creates a `.diagram` document that stores the diagram root, viewport, and saved node positions.
+                  </div>
+                )}
+              </div>
+              <div className="simple-modal-footer muted">
+                File path: {`${newDiagramDialog.parentPath.replace(/[\\/]+$/, "")}\\${buildDiagramFileName(newDiagramDialog.fileName)}`}
               </div>
             </form>
           </section>

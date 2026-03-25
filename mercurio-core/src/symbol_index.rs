@@ -13,6 +13,28 @@ use crate::workspace_ir_cache::seed_semantic_projection_cache_from_workspace_ir_
 use crate::CoreState;
 
 #[derive(Debug, Clone, Serialize)]
+pub struct IndexedStructuralTypeView {
+    pub feature_name: String,
+    pub label: String,
+    pub target: String,
+    pub target_metatype_qname: Option<String>,
+    pub declared_type_qname: Option<String>,
+    pub metamodel_feature_qname: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexedDirectedRelationshipView {
+    pub canonical_kind: String,
+    pub display_label: String,
+    pub source: String,
+    pub target: String,
+    pub target_metatype_qname: Option<String>,
+    pub source_feature: Option<String>,
+    pub target_feature: Option<String>,
+    pub resolved: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct IndexedSymbolView {
     pub id: String,
     pub project_root: String,
@@ -29,6 +51,9 @@ pub struct IndexedSymbolView {
     pub end_line: u32,
     pub end_col: u32,
     pub doc_text: Option<String>,
+    pub structural_type: Option<IndexedStructuralTypeView>,
+    pub directed_relationships: Vec<IndexedDirectedRelationshipView>,
+    pub explorer_diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,8 +94,23 @@ pub struct IndexedSemanticProjectionElementView {
     pub features: Vec<mercurio_sysml_semantics::semantic_contract::SemanticFeatureView>,
 }
 
-fn to_view(record: SymbolRecord) -> IndexedSymbolView {
+#[derive(Debug, Clone)]
+struct ProjectionRefTarget {
+    qualified_name: String,
+    metatype_qname: Option<String>,
+}
+
+fn to_view(
+    record: SymbolRecord,
+    lookup: Option<&ProjectSemanticLookup>,
+) -> IndexedSymbolView {
     let file_path = normalize_symbol_display_path(&record);
+    let projection = projection_for_record(&record, &file_path, lookup);
+    let mut explorer_diagnostics = Vec::<String>::new();
+    let structural_type = projection.and_then(|value| derive_structural_type_view(&record, value));
+    let directed_relationships = projection
+        .map(|value| derive_directed_relationship_views(&record, value, &mut explorer_diagnostics))
+        .unwrap_or_default();
     IndexedSymbolView {
         id: record.id,
         project_root: record.project_root,
@@ -90,7 +130,295 @@ fn to_view(record: SymbolRecord) -> IndexedSymbolView {
         end_line: record.end_line,
         end_col: record.end_col,
         doc_text: record.doc_text,
+        structural_type,
+        directed_relationships,
+        explorer_diagnostics,
     }
+}
+
+fn projection_for_record<'a>(
+    record: &SymbolRecord,
+    display_file_path: &str,
+    lookup: Option<&'a ProjectSemanticLookup>,
+) -> Option<&'a SemanticElementProjectionView> {
+    let lookup = lookup?;
+    let file_key = normalized_compare_key(Path::new(display_file_path));
+    lookup
+        .projections_by_file_qname
+        .get(&(file_key, record.qualified_name.clone()))
+        .or_else(|| lookup.best_projections_by_qname.get(&record.qualified_name))
+}
+
+fn normalized_leaf_name(value: Option<&str>, fallback: &str) -> String {
+    value
+        .unwrap_or(fallback)
+        .rsplit("::")
+        .next()
+        .unwrap_or(fallback)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn collect_projection_ref_targets(value: &SemanticValueView) -> Vec<ProjectionRefTarget> {
+    match value {
+        SemanticValueView::Ref {
+            qualified_name,
+            metatype_qname,
+            ..
+        } => qualified_name
+            .as_ref()
+            .map(|target| target.trim())
+            .filter(|target| !target.is_empty())
+            .map(|target| ProjectionRefTarget {
+                qualified_name: target.to_string(),
+                metatype_qname: metatype_qname.clone(),
+            })
+            .into_iter()
+            .collect(),
+        SemanticValueView::List { items } => items
+            .iter()
+            .flat_map(collect_projection_ref_targets)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn symbol_kind_lower(record: &SymbolRecord) -> String {
+    record.kind.trim().to_ascii_lowercase()
+}
+
+fn symbol_metatype_lower(record: &SymbolRecord) -> String {
+    record
+        .metatype_qname
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn looks_like_definition(record: &SymbolRecord) -> bool {
+    let kind = symbol_kind_lower(record);
+    let metatype = symbol_metatype_lower(record);
+    kind.contains("definition")
+        || metatype.contains("definition")
+        || kind == "package"
+        || metatype.ends_with("::package")
+}
+
+fn looks_like_usage(record: &SymbolRecord) -> bool {
+    let kind = symbol_kind_lower(record);
+    let metatype = symbol_metatype_lower(record);
+    kind.contains("usage") || metatype.contains("usage")
+}
+
+fn type_feature_targets(feature: &SemanticFeatureView) -> Vec<ProjectionRefTarget> {
+    if !feature.feature_kind.eq_ignore_ascii_case("reference") {
+        return Vec::new();
+    }
+    let leaf = normalized_leaf_name(
+        feature.metamodel_feature_qname.as_deref(),
+        feature.name.as_str(),
+    );
+    if leaf != "type" {
+        return Vec::new();
+    }
+    collect_projection_ref_targets(&feature.value)
+}
+
+fn derive_structural_type_view(
+    record: &SymbolRecord,
+    projection: &SemanticElementProjectionView,
+) -> Option<IndexedStructuralTypeView> {
+    if looks_like_definition(record) || !looks_like_usage(record) {
+        return None;
+    }
+    let feature = projection
+        .features
+        .iter()
+        .find(|candidate| !type_feature_targets(candidate).is_empty())?;
+    let target = type_feature_targets(feature).into_iter().next()?;
+    Some(IndexedStructuralTypeView {
+        feature_name: feature.name.clone(),
+        label: record.name.clone(),
+        target: target.qualified_name,
+        target_metatype_qname: target.metatype_qname,
+        declared_type_qname: feature.declared_type_qname.clone(),
+        metamodel_feature_qname: feature.metamodel_feature_qname.clone(),
+    })
+}
+
+fn canonical_directed_relationship_kind(record: &SymbolRecord) -> Option<&'static str> {
+    let combined = format!(
+        "{} {}",
+        symbol_kind_lower(record),
+        symbol_metatype_lower(record)
+    );
+    if combined.contains("satisfy") {
+        return Some("satisfy");
+    }
+    if combined.contains("refine") {
+        return Some("refine");
+    }
+    if combined.contains("verif") {
+        return Some("verify");
+    }
+    if combined.contains("allocat") {
+        return Some("allocate");
+    }
+    if combined.contains("trace") {
+        return Some("trace");
+    }
+    if combined.contains("depend") {
+        return Some("dependency");
+    }
+    None
+}
+
+fn source_feature_for_kind(canonical_kind: &str, feature: &SemanticFeatureView) -> bool {
+    if !feature.feature_kind.eq_ignore_ascii_case("reference") {
+        return false;
+    }
+    let leaf = normalized_leaf_name(
+        feature.metamodel_feature_qname.as_deref(),
+        feature.name.as_str(),
+    );
+    if matches!(
+        leaf.as_str(),
+        "source" | "from" | "client" | "subject" | "sender" | "supplier"
+    ) {
+        return true;
+    }
+    match canonical_kind {
+        "satisfy" => leaf.contains("satisf") || leaf.contains("subject"),
+        "refine" => leaf.contains("refin") || leaf.contains("subject"),
+        "verify" => leaf.contains("verif") || leaf.contains("subject"),
+        "allocate" => leaf.contains("allocat") && !leaf.contains("target"),
+        _ => false,
+    }
+}
+
+fn target_feature_for_kind(canonical_kind: &str, feature: &SemanticFeatureView) -> bool {
+    if !feature.feature_kind.eq_ignore_ascii_case("reference") {
+        return false;
+    }
+    let leaf = normalized_leaf_name(
+        feature.metamodel_feature_qname.as_deref(),
+        feature.name.as_str(),
+    );
+    if matches!(leaf.as_str(), "target" | "to" | "receiver" | "accepter") {
+        return true;
+    }
+    match canonical_kind {
+        "satisfy" => leaf.contains("requirement") || leaf.contains("target"),
+        "refine" => leaf.contains("refin") || leaf.contains("target"),
+        "verify" => leaf.contains("requirement") || leaf.contains("target"),
+        "allocate" => leaf.contains("target") || leaf.contains("to"),
+        "dependency" => leaf.contains("supplier") || leaf.contains("target"),
+        "trace" => leaf.contains("target"),
+        _ => false,
+    }
+}
+
+fn derive_directed_relationship_views(
+    record: &SymbolRecord,
+    projection: &SemanticElementProjectionView,
+    diagnostics: &mut Vec<String>,
+) -> Vec<IndexedDirectedRelationshipView> {
+    let Some(canonical_kind) = canonical_directed_relationship_kind(record) else {
+        return Vec::new();
+    };
+    let mut source_targets = Vec::<(Option<String>, ProjectionRefTarget)>::new();
+    let mut relation_targets = Vec::<(Option<String>, ProjectionRefTarget)>::new();
+    let mut fallback_targets = Vec::<ProjectionRefTarget>::new();
+
+    for feature in &projection.features {
+        let refs = collect_projection_ref_targets(&feature.value);
+        if refs.is_empty() {
+            continue;
+        }
+        if source_feature_for_kind(canonical_kind, feature) {
+            source_targets.extend(refs.into_iter().map(|value| {
+                (
+                    feature.metamodel_feature_qname.clone().or_else(|| Some(feature.name.clone())),
+                    value,
+                )
+            }));
+            continue;
+        }
+        if target_feature_for_kind(canonical_kind, feature) {
+            relation_targets.extend(refs.into_iter().map(|value| {
+                (
+                    feature.metamodel_feature_qname.clone().or_else(|| Some(feature.name.clone())),
+                    value,
+                )
+            }));
+            continue;
+        }
+        fallback_targets.extend(refs);
+    }
+
+    if relation_targets.is_empty() && fallback_targets.len() == 1 {
+        if let Some(value) = fallback_targets.into_iter().next() {
+            relation_targets.push((None, value));
+        }
+    }
+
+    let source_values = if source_targets.is_empty() {
+        record
+            .parent_qualified_name
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                vec![(
+                    None,
+                    ProjectionRefTarget {
+                        qualified_name: value.to_string(),
+                        metatype_qname: None,
+                    },
+                )]
+            })
+            .unwrap_or_default()
+    } else {
+        source_targets
+    };
+
+    if source_values.is_empty() || relation_targets.is_empty() {
+        diagnostics.push(format!(
+            "Could not normalize {} relationship for {}",
+            canonical_kind, record.qualified_name
+        ));
+        return Vec::new();
+    }
+
+    let mut out = Vec::<IndexedDirectedRelationshipView>::new();
+    for (source_feature, source) in &source_values {
+        for (target_feature, target) in &relation_targets {
+            if source.qualified_name.trim().is_empty()
+                || target.qualified_name.trim().is_empty()
+                || source.qualified_name == target.qualified_name
+            {
+                continue;
+            }
+            out.push(IndexedDirectedRelationshipView {
+                canonical_kind: canonical_kind.to_string(),
+                display_label: canonical_kind.to_string(),
+                source: source.qualified_name.clone(),
+                target: target.qualified_name.clone(),
+                target_metatype_qname: target.metatype_qname.clone(),
+                source_feature: source_feature.clone(),
+                target_feature: target_feature.clone(),
+                resolved: true,
+            });
+        }
+    }
+    if out.is_empty() {
+        diagnostics.push(format!(
+            "Normalized {} relationship had no usable endpoints for {}",
+            canonical_kind, record.qualified_name
+        ));
+    }
+    out
 }
 
 fn normalize_symbol_display_path(record: &SymbolRecord) -> String {
@@ -272,6 +600,7 @@ pub fn query_symbols_by_metatype(
     metatype_qname: String,
 ) -> Result<Vec<IndexedSymbolView>, String> {
     let project_root = canonical_project_root(&project_root);
+    let lookup = ensure_project_semantic_lookup_loaded(state, &project_root).ok();
     let store = state
         .symbol_index
         .lock()
@@ -279,7 +608,7 @@ pub fn query_symbols_by_metatype(
     Ok(store
         .symbols_by_metatype(&project_root, &metatype_qname)
         .into_iter()
-        .map(to_view)
+        .map(|record| to_view(record, lookup.as_ref()))
         .collect())
 }
 
@@ -294,7 +623,7 @@ pub fn query_stdlib_documentation_symbols(
     Ok(store
         .stdlib_documentation_symbols(&library_key)
         .into_iter()
-        .map(to_view)
+        .map(|record| to_view(record, None))
         .collect())
 }
 
@@ -310,6 +639,7 @@ pub(crate) fn query_library_symbols_impl(
     if ensure_seeded {
         seed_symbol_index_if_empty(state, &project_root)?;
     }
+    let lookup = ensure_project_semantic_lookup_loaded(state, &project_root).ok();
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(usize::MAX);
     let store = state
@@ -319,7 +649,7 @@ pub(crate) fn query_library_symbols_impl(
     Ok(store
         .library_symbols_paged(&project_root, file_path.as_deref(), offset, limit)
         .into_iter()
-        .map(to_view)
+        .map(|record| to_view(record, lookup.as_ref()))
         .collect())
 }
 
@@ -345,6 +675,7 @@ pub(crate) fn query_project_symbols_impl(
     if ensure_seeded {
         seed_symbol_index_if_empty(state, &project_root)?;
     }
+    let lookup = ensure_project_semantic_lookup_loaded(state, &project_root).ok();
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(usize::MAX);
     let store = state
@@ -354,7 +685,7 @@ pub(crate) fn query_project_symbols_impl(
     Ok(store
         .project_symbols_paged(&project_root, file_path.as_deref(), offset, limit)
         .into_iter()
-        .map(to_view)
+        .map(|record| to_view(record, lookup.as_ref()))
         .collect())
 }
 
@@ -377,6 +708,7 @@ pub fn query_project_symbols_for_files(
 ) -> Result<Vec<IndexedSymbolView>, String> {
     let project_root = canonical_project_root(&project_root);
     seed_symbol_index_if_empty(state, &project_root)?;
+    let lookup = ensure_project_semantic_lookup_loaded(state, &project_root).ok();
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(usize::MAX);
     let unique_file_paths = file_paths
@@ -407,7 +739,7 @@ pub fn query_project_symbols_for_files(
         .into_iter()
         .skip(offset)
         .take(limit)
-        .map(to_view)
+        .map(|record| to_view(record, lookup.as_ref()))
         .collect())
 }
 
@@ -703,12 +1035,150 @@ mod tests {
     use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn symbol_record(
+        qualified_name: &str,
+        parent_qualified_name: Option<&str>,
+        kind: &str,
+        metatype_qname: Option<&str>,
+    ) -> SymbolRecord {
+        SymbolRecord {
+            id: qualified_name.to_string(),
+            project_root: "C:\\demo".to_string(),
+            library_key: None,
+            scope: mercurio_symbol_index::Scope::Project,
+            name: qualified_name
+                .rsplit("::")
+                .next()
+                .unwrap_or(qualified_name)
+                .to_string(),
+            qualified_name: qualified_name.to_string(),
+            parent_qualified_name: parent_qualified_name.map(ToString::to_string),
+            kind: kind.to_string(),
+            metatype_qname: metatype_qname.map(ToString::to_string),
+            file_path: "model.sysml".to_string(),
+            start_line: 1,
+            start_col: 1,
+            end_line: 1,
+            end_col: 1,
+            doc_text: None,
+            properties_json: None,
+        }
+    }
+
+    fn ref_feature(
+        name: &str,
+        metamodel_feature_qname: Option<&str>,
+        target: &str,
+        target_metatype_qname: Option<&str>,
+    ) -> SemanticFeatureView {
+        SemanticFeatureView {
+            name: name.to_string(),
+            feature_kind: "reference".to_string(),
+            many: false,
+            containment: false,
+            declared_type_qname: None,
+            metamodel_feature_qname: metamodel_feature_qname.map(ToString::to_string),
+            value: SemanticValueView::Ref {
+                qualified_name: Some(target.to_string()),
+                proxy_text: None,
+                metatype_qname: target_metatype_qname.map(ToString::to_string),
+                containment: false,
+            },
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn projection(
+        qualified_name: &str,
+        metatype_qname: Option<&str>,
+        features: Vec<SemanticFeatureView>,
+    ) -> SemanticElementProjectionView {
+        SemanticElementProjectionView {
+            name: qualified_name
+                .rsplit("::")
+                .next()
+                .unwrap_or(qualified_name)
+                .to_string(),
+            qualified_name: qualified_name.to_string(),
+            file_path: "model.sysml".to_string(),
+            metatype_qname: metatype_qname.map(ToString::to_string),
+            features,
+        }
+    }
+
     fn normalized_compare_key(path: &Path) -> String {
         let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         normalized
             .to_string_lossy()
             .replace('/', "\\")
             .to_ascii_lowercase()
+    }
+
+    #[test]
+    fn derive_structural_type_view_extracts_usage_type_target() {
+        let record = symbol_record(
+            "Vehicle::engine",
+            Some("Vehicle"),
+            "PartUsage",
+            Some("sysml::PartUsage"),
+        );
+        let projection = projection(
+            "Vehicle::engine",
+            Some("sysml::PartUsage"),
+            vec![SemanticFeatureView {
+                name: "type".to_string(),
+                feature_kind: "reference".to_string(),
+                many: false,
+                containment: false,
+                declared_type_qname: Some("Engine".to_string()),
+                metamodel_feature_qname: Some("sysml::PartUsage::type".to_string()),
+                value: SemanticValueView::Ref {
+                    qualified_name: Some("Engine".to_string()),
+                    proxy_text: None,
+                    metatype_qname: Some("sysml::PartDefinition".to_string()),
+                    containment: false,
+                },
+                diagnostics: Vec::new(),
+            }],
+        );
+
+        let structural = derive_structural_type_view(&record, &projection).expect("structural type");
+        assert_eq!(structural.label, "engine");
+        assert_eq!(structural.target, "Engine");
+        assert_eq!(
+            structural.metamodel_feature_qname.as_deref(),
+            Some("sysml::PartUsage::type")
+        );
+    }
+
+    #[test]
+    fn derive_directed_relationship_views_uses_parent_as_source_fallback() {
+        let record = symbol_record(
+            "Vehicle::satisfyReq",
+            Some("Vehicle"),
+            "Satisfy",
+            Some("sysml::Satisfy"),
+        );
+        let projection = projection(
+            "Vehicle::satisfyReq",
+            Some("sysml::Satisfy"),
+            vec![ref_feature(
+                "requirement",
+                Some("sysml::Satisfy::requirement"),
+                "Requirement",
+                Some("sysml::RequirementDefinition"),
+            )],
+        );
+        let mut diagnostics = Vec::new();
+
+        let relationships =
+            derive_directed_relationship_views(&record, &projection, &mut diagnostics);
+        assert_eq!(diagnostics.len(), 0);
+        assert_eq!(relationships.len(), 1);
+        assert_eq!(relationships[0].canonical_kind, "satisfy");
+        assert_eq!(relationships[0].source, "Vehicle");
+        assert_eq!(relationships[0].target, "Requirement");
+        assert!(relationships[0].resolved);
     }
 
     #[test]
