@@ -224,3 +224,53 @@ const unresolvedGraph = buildDiagramGraph({
   root_file_path: null,
 }, projectModel, projectSymbols);
 assertEqual(unresolvedGraph.unresolvedRoot, true, "missing root yields unresolved graph");
+
+const metadataPreferredSymbols: SymbolView[] = [
+  {
+    symbol_id: "meta-package",
+    name: "MetaPkg",
+    kind: "Namespace",
+    semantic_kind: "Package",
+    structural_metatype_qname: "SysML::Package",
+    classification_qname: "Parts::Package",
+    metatype_qname: "Parts::Package",
+    file_path: "model.sysml",
+    source_scope: "project",
+    qualified_name: "MetaPkg",
+    parent_qualified_name: null,
+    file: 1,
+    start_line: 1,
+    start_col: 1,
+    end_line: 10,
+    end_col: 1,
+    properties: [],
+    relationships: [],
+  },
+  {
+    symbol_id: "meta-child",
+    name: "Wheel",
+    kind: "Element",
+    semantic_kind: "PartDefinition",
+    structural_metatype_qname: "SysML::PartDefinition",
+    classification_qname: "Parts::Part",
+    metatype_qname: "Parts::Part",
+    file_path: "model.sysml",
+    source_scope: "project",
+    qualified_name: "MetaPkg::Wheel",
+    parent_qualified_name: "MetaPkg",
+    file: 1,
+    start_line: 11,
+    start_col: 1,
+    end_line: 20,
+    end_col: 1,
+    properties: [],
+    relationships: [],
+  },
+];
+
+const metadataPreferredRoot = resolvePreferredDiagramRoot(
+  DIAGRAM_TYPES.Package,
+  metadataPreferredSymbols[1]!,
+  metadataPreferredSymbols,
+);
+assertEqual(metadataPreferredRoot?.qualified_name, "MetaPkg", "package root prefers semantic metadata contract");

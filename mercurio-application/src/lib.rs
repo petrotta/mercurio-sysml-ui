@@ -15,14 +15,16 @@ use tauri::{
 };
 use zip::ZipArchive;
 
+mod agent;
 mod commands;
 mod logging;
 
+use commands::ai::AgentSessionState;
 use commands::{
-    app_exit, apply_semantic_edit, call_tool, create_file, create_project,
-    get_user_projects_root, list_dir, list_semantic_edit_actions, preview_semantic_edit,
-    read_file, show_in_explorer, window_close, window_minimize, window_toggle_maximize,
-    write_file,
+    ai_agent_run, ai_test_endpoint, app_exit, apply_semantic_edit, call_tool, create_file, create_project,
+    detect_git_repo, get_user_projects_root, git_commit, git_push, git_stage_paths, git_status,
+    git_unstage_paths, list_dir, list_semantic_edit_actions, preview_semantic_edit, list_tools,
+    read_file, show_in_explorer, window_close, window_minimize, window_toggle_maximize, write_file,
 };
 use logging::{get_logs, log_event, log_frontend, set_app_handle};
 
@@ -40,6 +42,7 @@ pub(crate) struct AppState {
     pub(crate) core: CoreState,
     pub(crate) settings_path: PathBuf,
     pub(crate) project_file_watchers: Mutex<HashMap<String, ActiveProjectFileWatcher>>,
+    pub(crate) agent_sessions: Mutex<HashMap<String, AgentSessionState>>,
 }
 
 const MIN_MAIN_WINDOW_WIDTH: u32 = 960;
@@ -580,6 +583,7 @@ pub fn run() {
             core,
             settings_path: paths.settings_path.clone(),
             project_file_watchers: Mutex::new(HashMap::new()),
+            agent_sessions: Mutex::new(HashMap::new()),
         })
         .setup(move |app| {
             set_app_handle(app.handle().clone());
@@ -665,6 +669,9 @@ pub fn run() {
                 MenuItemBuilder::with_id("view.show_expressions", "Show Expressions")
                     .accelerator("Ctrl+Alt+E")
                     .build(app)?;
+            let show_commit_manager =
+                MenuItemBuilder::with_id("view.show_commit_manager", "Show Commit Manager")
+                    .build(app)?;
             let select_stdlib_path =
                 MenuItemBuilder::with_id("settings.select_stdlib_path", "Select Stdlib Path...")
                     .build(app)?;
@@ -698,6 +705,7 @@ pub fn run() {
             let view_menu = SubmenuBuilder::new(app, "View")
                 .item(&show_logs)
                 .item(&show_expressions)
+                .item(&show_commit_manager)
                 .build()?;
             let settings_menu = SubmenuBuilder::new(app, "Settings")
                 .item(&select_stdlib_path)
@@ -728,6 +736,7 @@ pub fn run() {
                 "build.clear_caches" => Some("clear-caches"),
                 "view.show_logs" => Some("show-logs"),
                 "view.show_expressions" => Some("show-expressions"),
+                "view.show_commit_manager" => Some("show-commit-manager"),
                 "settings.select_stdlib_path" => Some("select-stdlib-path"),
                 "settings.theme_toggle" => Some("theme-toggle"),
                 "settings.theme_light" => Some("theme-light"),
@@ -763,6 +772,15 @@ pub fn run() {
             list_semantic_edit_actions,
             preview_semantic_edit,
             apply_semantic_edit,
+            detect_git_repo,
+            ai_test_endpoint,
+            ai_agent_run,
+            git_status,
+            git_stage_paths,
+            git_unstage_paths,
+            git_commit,
+            git_push,
+            list_tools,
             call_tool,
             get_logs,
             log_frontend,

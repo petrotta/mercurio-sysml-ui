@@ -8,6 +8,7 @@ import {
   type UnsavedCompileInput,
 } from "./compileShared";
 import type { CompileResponse, FileDiagnosticsBucket } from "./contracts";
+import type { AppLogLevel } from "./services/logger";
 
 function countSemanticDiagnostics(fileDiagnostics: FileDiagnosticsBucket[]): number {
   return fileDiagnostics.reduce(
@@ -23,7 +24,7 @@ type UseCompileJobControllerOptions = {
   notifications: {
     setCompileStatus: (status: string) => void;
     appendBuildLogEntries: (
-      entries: Array<{ level: "info" | "warn" | "error"; message: string }>,
+      entries: Array<{ level: AppLogLevel; message: string }>,
     ) => void;
     resetForRoot: (rootPath: string) => void;
     updateRunState: (runId: number | null) => void;

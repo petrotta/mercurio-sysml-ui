@@ -52,6 +52,9 @@ export type SymbolView = {
   symbol_id?: string | null;
   name: string;
   kind: string;
+  semantic_kind?: string | null;
+  structural_metatype_qname?: string | null;
+  classification_qname?: string | null;
   metatype_qname?: string | null;
   file_path: string;
   source_scope?: "project" | "library";

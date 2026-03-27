@@ -240,8 +240,9 @@ pub fn git_unstage_paths(repo_root: String, paths: Vec<String>) -> Result<GitSta
         .map(PathBuf::from)
         .collect();
     let path_slices: Vec<&std::path::Path> = path_refs.iter().map(|path| path.as_path()).collect();
+    let target = repo.revparse_single("HEAD").ok();
     repo
-        .reset_default(None, path_slices.as_slice())
+        .reset_default(target.as_ref(), path_slices.as_slice())
         .map_err(|e| e.to_string())?;
     collect_status(&repo)
 }
@@ -306,4 +307,176 @@ pub fn git_checkout_branch(repo_root: String, name: String) -> Result<(), String
     repo.set_head(&refname).map_err(|e| e.to_string())?;
     repo.checkout_head(None).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{detect_git_repo, git_commit, git_push, git_stage_paths, git_status, git_unstage_paths};
+    use git2::{Repository, Signature};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("mercurio_git_{name}_{stamp}"));
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parent");
+        }
+        fs::write(path, content).expect("write file");
+    }
+
+    fn commit_all(repo: &Repository, message: &str) {
+        let mut index = repo.index().expect("index");
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .expect("add all");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let signature = Signature::now("Mercurio Test", "test@mercurio.local").expect("signature");
+        let parents = repo
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|oid| vec![repo.find_commit(oid).expect("find parent")])
+            .unwrap_or_default();
+        let parent_refs: Vec<&git2::Commit<'_>> = parents.iter().collect();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parent_refs,
+        )
+        .expect("commit");
+    }
+
+    #[test]
+    fn detect_git_repo_returns_repo_info() {
+        let temp = TestDir::new("detect");
+        let repo = Repository::init(temp.path()).expect("init repo");
+        write_file(&temp.path().join("tracked.sysml"), "package Example {}\n");
+        commit_all(&repo, "initial");
+
+        let info = detect_git_repo(temp.path().to_string_lossy().to_string())
+            .expect("detect repo")
+            .expect("repo info");
+
+        assert!(!info.branch.trim().is_empty());
+        assert_ne!(info.branch, "DETACHED");
+        assert_eq!(
+            PathBuf::from(info.repo_root).canonicalize().expect("canonical repo root"),
+            temp.path().canonicalize().expect("canonical temp root")
+        );
+        assert!(info.clean);
+    }
+
+    #[test]
+    fn git_status_collects_unstaged_and_untracked_files() {
+        let temp = TestDir::new("status");
+        let repo = Repository::init(temp.path()).expect("init repo");
+        write_file(&temp.path().join("tracked.sysml"), "package Example {}\n");
+        commit_all(&repo, "initial");
+
+        write_file(&temp.path().join("tracked.sysml"), "package Example { part x; }\n");
+        write_file(&temp.path().join("new.sysml"), "package Added {}\n");
+
+        let status = git_status(temp.path().to_string_lossy().to_string()).expect("git status");
+
+        assert!(status.unstaged.iter().any(|path| path == "tracked.sysml"));
+        assert!(status.untracked.iter().any(|path| path == "new.sysml"));
+        assert!(status.staged.is_empty());
+    }
+
+    #[test]
+    fn git_stage_and_unstage_paths_round_trip() {
+        let temp = TestDir::new("stage_round_trip");
+        let repo = Repository::init(temp.path()).expect("init repo");
+        write_file(&temp.path().join("tracked.sysml"), "package Example {}\n");
+        commit_all(&repo, "initial");
+
+        write_file(&temp.path().join("tracked.sysml"), "package Example { part x; }\n");
+        write_file(&temp.path().join("new.sysml"), "package Added {}\n");
+
+        let staged = git_stage_paths(
+            temp.path().to_string_lossy().to_string(),
+            vec!["tracked.sysml".to_string(), "new.sysml".to_string()],
+        )
+        .expect("stage paths");
+
+        assert!(staged.staged.iter().any(|path| path == "tracked.sysml"));
+        assert!(staged.staged.iter().any(|path| path == "new.sysml"));
+
+        let unstaged = git_unstage_paths(
+            temp.path().to_string_lossy().to_string(),
+            vec!["tracked.sysml".to_string(), "new.sysml".to_string()],
+        )
+        .expect("unstage paths");
+
+        assert!(unstaged.staged.is_empty());
+        assert!(unstaged.unstaged.iter().any(|path| path == "tracked.sysml"));
+        assert!(unstaged.untracked.iter().any(|path| path == "new.sysml"));
+    }
+
+    #[test]
+    fn git_commit_requires_non_empty_message() {
+        let temp = TestDir::new("commit_message");
+        let repo = Repository::init(temp.path()).expect("init repo");
+        write_file(&temp.path().join("tracked.sysml"), "package Example {}\n");
+        commit_all(&repo, "initial");
+
+        write_file(&temp.path().join("tracked.sysml"), "package Example { part x; }\n");
+        let _ = git_stage_paths(
+            temp.path().to_string_lossy().to_string(),
+            vec!["tracked.sysml".to_string()],
+        )
+        .expect("stage file");
+
+        let error = git_commit(temp.path().to_string_lossy().to_string(), "   ".to_string())
+            .expect_err("empty message should fail");
+
+        assert_eq!(error, "Commit message is required");
+    }
+
+    #[test]
+    fn git_push_errors_without_remote() {
+        let temp = TestDir::new("push_without_remote");
+        let repo = Repository::init(temp.path()).expect("init repo");
+        write_file(&temp.path().join("tracked.sysml"), "package Example {}\n");
+        commit_all(&repo, "initial");
+
+        let error = git_push(temp.path().to_string_lossy().to_string(), None)
+            .expect_err("push without remote should fail");
+
+        assert!(
+            error.contains("remote") || error.contains("Remote"),
+            "unexpected error: {error}"
+        );
+    }
 }

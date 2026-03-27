@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use tauri::command;
 
 use mercurio_core::{
+    compile_project_delta_sync_with_options as core_compile_project_delta_sync_with_options,
     evaluate_project_expression as core_evaluate_project_expression,
     get_project_element_attributes as core_get_project_element_attributes,
     get_project_element_property_sections as core_get_project_element_property_sections,
@@ -36,6 +37,14 @@ pub struct ToolCallResult {
     pub ok: bool,
     pub result: Option<Value>,
     pub error: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+    pub read_only: bool,
 }
 
 #[derive(Serialize)]
@@ -266,6 +275,12 @@ fn canonical_tool_name(tool: &str) -> String {
         "get_workspace_tree_snapshot" | "core.get_workspace_tree_snapshot" => {
             "core.get_workspace_tree_snapshot@v1".to_string()
         }
+        "compile_project" | "workspace.compile_project" => {
+            "workspace.compile_project@v1".to_string()
+        }
+        "compile_file" | "workspace.compile_file" => {
+            "workspace.compile_file@v1".to_string()
+        }
         "query_semantic_element" | "core.query_semantic_element" => {
             "core.query_semantic_element@v2".to_string()
         }
@@ -296,6 +311,202 @@ fn canonical_tool_name(tool: &str) -> String {
 
         _ => tool.trim().to_string(),
     }
+}
+
+fn next_tool_run_id() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+pub fn tool_catalog() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "core.get_workspace_startup_snapshot@v1".to_string(),
+            description: "Read the current workspace startup snapshot, including trees and indexed symbols.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["root"],
+                "properties": {
+                    "root": { "type": "string" },
+                    "hydrate_library": { "type": "boolean" },
+                    "prefer_cache": { "type": "boolean" }
+                }
+            }),
+            read_only: true,
+        },
+        ToolDefinition {
+            name: "core.get_workspace_symbol_snapshot@v1".to_string(),
+            description: "Read the current indexed project and library symbols for a workspace.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["root"],
+                "properties": {
+                    "root": { "type": "string" },
+                    "hydrate_library": { "type": "boolean" }
+                }
+            }),
+            read_only: true,
+        },
+        ToolDefinition {
+            name: "core.query_semantic_symbols@v1".to_string(),
+            description: "Query project semantic symbols projected for UI and AI consumption.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["root"],
+                "properties": {
+                    "root": { "type": "string" }
+                }
+            }),
+            read_only: true,
+        },
+        ToolDefinition {
+            name: "core.query_semantic_element@v2".to_string(),
+            description: "Load the semantic projection for a specific qualified name.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["root", "qualified_name"],
+                "properties": {
+                    "root": { "type": "string" },
+                    "qualified_name": { "type": "string" },
+                    "file_path": { "type": "string" }
+                }
+            }),
+            read_only: true,
+        },
+        ToolDefinition {
+            name: "core.get_project_model@v1".to_string(),
+            description: "Read the project model view and expression records.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["root"],
+                "properties": {
+                    "root": { "type": "string" }
+                }
+            }),
+            read_only: true,
+        },
+        ToolDefinition {
+            name: "core.get_project_element_property_sections@v1".to_string(),
+            description: "Read display-ready property sections for a selected project element.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["root", "element_qualified_name"],
+                "properties": {
+                    "root": { "type": "string" },
+                    "element_qualified_name": { "type": "string" },
+                    "file_path": { "type": "string" },
+                    "symbol_kind": { "type": "string" },
+                    "source_scope": { "type": "string" }
+                }
+            }),
+            read_only: true,
+        },
+        ToolDefinition {
+            name: "workspace.compile_project@v1".to_string(),
+            description: "Compile the full workspace and return diagnostics, unresolved references, and refreshed symbols.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["root"],
+                "properties": {
+                    "root": { "type": "string" },
+                    "allow_parse_errors": { "type": "boolean" },
+                    "include_symbols": { "type": "boolean" }
+                }
+            }),
+            read_only: false,
+        },
+        ToolDefinition {
+            name: "workspace.compile_file@v1".to_string(),
+            description: "Compile a single workspace file and return diagnostics plus refreshed semantic results.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["root", "path"],
+                "properties": {
+                    "root": { "type": "string" },
+                    "path": { "type": "string" },
+                    "allow_parse_errors": { "type": "boolean" },
+                    "include_symbols": { "type": "boolean" }
+                }
+            }),
+            read_only: false,
+        },
+        ToolDefinition {
+            name: "fs.read_file@v1".to_string(),
+            description: "Read a file under the workspace root.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["root", "path"],
+                "properties": {
+                    "root": { "type": "string" },
+                    "path": { "type": "string" }
+                }
+            }),
+            read_only: true,
+        },
+        ToolDefinition {
+            name: "fs.list_dir@v1".to_string(),
+            description: "List directories and files under a workspace path.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["root", "path"],
+                "properties": {
+                    "root": { "type": "string" },
+                    "path": { "type": "string" }
+                }
+            }),
+            read_only: true,
+        },
+        ToolDefinition {
+            name: "fs.search_text@v1".to_string(),
+            description: "Search workspace text files for a substring.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["root", "query"],
+                "properties": {
+                    "root": { "type": "string" },
+                    "query": { "type": "string" },
+                    "limit": { "type": "number" }
+                }
+            }),
+            read_only: true,
+        },
+        ToolDefinition {
+            name: "fs.write_file@v1".to_string(),
+            description: "Write a file under the workspace root.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["root", "path", "content"],
+                "properties": {
+                    "root": { "type": "string" },
+                    "path": { "type": "string" },
+                    "content": { "type": "string" },
+                    "create_dirs": { "type": "boolean" }
+                }
+            }),
+            read_only: false,
+        },
+        ToolDefinition {
+            name: "fs.apply_patch@v1".to_string(),
+            description: "Apply a simple string replacement patch to a file under the workspace root.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["root", "path", "find", "replace"],
+                "properties": {
+                    "root": { "type": "string" },
+                    "path": { "type": "string" },
+                    "find": { "type": "string" },
+                    "replace": { "type": "string" },
+                    "replace_all": { "type": "boolean" },
+                    "apply": { "type": "boolean" }
+                }
+            }),
+            read_only: false,
+        },
+    ]
 }
 
 pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Value, String> {
@@ -448,6 +659,49 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
             .await
             .map_err(|e| e.to_string())?
             .and_then(|view| serde_json::to_value(view).map_err(|e| e.to_string()))
+        }
+        "workspace.compile_project@v1" => {
+            let root = arg_string(&args, "root")?;
+            let allow_parse_errors = arg_bool(&args, "allow_parse_errors", true);
+            let include_symbols = arg_bool(&args, "include_symbols", true);
+            let run_id = next_tool_run_id();
+            tauri::async_runtime::spawn_blocking(move || {
+                core_compile_project_delta_sync_with_options(
+                    &core,
+                    root,
+                    run_id,
+                    allow_parse_errors,
+                    None,
+                    Vec::new(),
+                    include_symbols,
+                    |_| {},
+                )
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|response| serde_json::to_value(response).map_err(|e| e.to_string()))
+        }
+        "workspace.compile_file@v1" => {
+            let root = arg_string(&args, "root")?;
+            let path = arg_string(&args, "path")?;
+            let allow_parse_errors = arg_bool(&args, "allow_parse_errors", true);
+            let include_symbols = arg_bool(&args, "include_symbols", true);
+            let run_id = next_tool_run_id();
+            tauri::async_runtime::spawn_blocking(move || {
+                core_compile_project_delta_sync_with_options(
+                    &core,
+                    root,
+                    run_id,
+                    allow_parse_errors,
+                    Some(PathBuf::from(path)),
+                    Vec::new(),
+                    include_symbols,
+                    |_| {},
+                )
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|response| serde_json::to_value(response).map_err(|e| e.to_string()))
         }
         "core.query_semantic_element@v2" => {
             let root = arg_string(&args, "root")?;
@@ -607,6 +861,11 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
         }
         _ => Err(format!("Unknown tool '{}'", tool)),
     }
+}
+
+#[command]
+pub fn list_tools() -> Vec<ToolDefinition> {
+    tool_catalog()
 }
 
 #[command]

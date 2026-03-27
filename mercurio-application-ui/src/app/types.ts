@@ -16,9 +16,24 @@ export type AiEndpoint = {
   name: string;
   url: string;
   type: "chat" | "embeddings";
-  provider: "openai" | "anthropic";
+  provider: "openai" | "azure" | "anthropic";
   model: string;
   token: string;
+};
+
+export type GitRepoInfo = {
+  repo_root: string;
+  branch: string;
+  ahead: number;
+  behind: number;
+  clean: boolean;
+  remote_url: string | null;
+};
+
+export type GitStatus = {
+  staged: string[];
+  unstaged: string[];
+  untracked: string[];
 };
 
 export type TabKind = "file" | "descriptor" | "diagram" | "explore-diagram" | "ai" | "data" | "project-model" | "stdlib-graph";

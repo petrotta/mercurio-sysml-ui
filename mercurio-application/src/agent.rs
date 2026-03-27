@@ -9,9 +9,42 @@ pub struct AgentNextStep {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPlanStepStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Blocked,
+}
+
+impl Default for AgentPlanStepStatus {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct AgentPlanStep {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub status: AgentPlanStepStatus,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct AgentPlan {
+    pub goal: String,
+    #[serde(default)]
+    pub steps: Vec<AgentPlanStep>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct AgentFinal {
     pub summary: String,
+    #[serde(default)]
     pub next_steps: Vec<AgentNextStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<AgentPlan>,
 }
 
 pub fn parse_agent_final(content: &str) -> Result<AgentFinal, String> {

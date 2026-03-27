@@ -6,12 +6,13 @@ import {
 } from "./compileShared";
 import type { SymbolView, WorkspaceSymbolSnapshotResult } from "./contracts";
 import { getWorkspaceSymbolSnapshot } from "./services/semanticApi";
+import type { AppLogLevel } from "./services/logger";
 
 type UseSymbolRefreshControllerOptions = {
   rootPath: string;
   sessionTokenRef: MutableRefObject<number>;
   appendBuildLogEntries: (
-    entries: Array<{ level: "info" | "warn" | "error"; message: string }>,
+    entries: Array<{ level: AppLogLevel; message: string }>,
   ) => void;
   showErrorNotification: (message: string) => void;
 };

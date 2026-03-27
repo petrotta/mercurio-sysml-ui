@@ -11,6 +11,18 @@ Improve perceived startup speed by changing the project-open sequence:
 
 The main optimization target is first visible feedback in the UI, not maximum cache reuse.
 
+## Project Stage
+
+This project is still in early development.
+
+For cache/storage changes, favor simpler forward-only evolution over backward compatibility.
+
+Accepted tradeoff:
+
+- cache schema changes may invalidate old local cache artifacts
+- a cold cache miss after upgrade is acceptable
+- we do not need read-compatibility or migration paths for superseded cache formats unless product requirements change
+
 ## New Startup Contract
 
 ### Desired behavior

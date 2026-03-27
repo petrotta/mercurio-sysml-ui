@@ -1,17 +1,29 @@
 import "./style.css";
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, DragEvent as ReactDragEvent, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import MonacoEditor, { loader, type OnMount } from "@monaco-editor/react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { RECENTS_KEY, ROOT_STORAGE_KEY, THEME_KEY } from "./app/constants";
+import { AI_CHAT_KEY, AI_ENDPOINTS_KEY, RECENTS_KEY, ROOT_STORAGE_KEY, THEME_KEY } from "./app/constants";
+import {
+  runAgent,
+  testAiEndpoint,
+  type AgentNextStep,
+  type AgentPlan,
+  type AgentPlanStepStatus,
+  type AgentResponse,
+} from "./app/agentClient";
 import { formatFileDiagnostic } from "./app/compileShared";
+import { CommitManagerPanel } from "./app/components/CommitManagerPanel";
 import { DiagramCanvas } from "./app/components/DiagramCanvas";
 import { ModelExplorerCanvas } from "./app/components/ModelExplorerCanvas";
+import { commitGit, detectGitRepo, getGitStatus, pushGit, stageGitPaths, unstageGitPaths } from "./app/gitClient";
 import { isPathWithin, normalizePathKey as normalizePath } from "./app/pathUtils";
 import { useFileTree, useProjectTree } from "./app/useProjectTree";
-import { logFrontendEvent } from "./app/services/logger";
+import { logFrontendEvent, type AppLogLevel } from "./app/services/logger";
+import { runWorkspaceStartupSequence } from "./app/startupSequence";
+import { isPackageLikeMetadata, primaryKindLabel } from "./app/symbolMetadata";
 import {
   buildDiagramFileName,
   createDiagramDocument,
@@ -56,18 +68,17 @@ import {
 import { useCompileRunner } from "./app/useCompileRunner";
 import {
   getDefaultStdlib,
-  getExpressionsView,
   getProjectModel,
   getWorkspaceStartupSnapshot,
   getWorkspaceTreeSnapshot,
 } from "./app/services/semanticApi";
 import { PropertiesPanel } from "./app/components/PropertiesPanel";
-import { ParseErrorsPanel } from "./app/components/ParseErrorsPanel";
+import { FileDiagnosticsPanel } from "./app/components/FileDiagnosticsPanel";
+import { ModelErrorsPanel } from "./app/components/ModelErrorsPanel";
 import type {
   CacheClearSummary,
   FileDiagnosticView,
   SymbolView,
-  ExpressionEvaluationResult,
   ProjectModelView,
 } from "./app/contracts";
 import type {
@@ -79,10 +90,16 @@ import type {
   SemanticEditTargetWithLineage,
 } from "./app/semanticEditTypes";
 import type {
+  AiEndpoint,
   FileEntry,
+  GitRepoInfo,
+  GitStatus,
 } from "./app/types";
 
-loader.config({ paths: { vs: "/monaco/vs" } });
+const BASE_URL = import.meta.env.BASE_URL;
+const publicAssetUrl = (path: string): string => `${BASE_URL}${path.replace(/^\/+/, "")}`;
+
+loader.config({ paths: { vs: publicAssetUrl("monaco/vs") } });
 
 type TextSelection = {
   startLine: number;
@@ -91,17 +108,176 @@ type TextSelection = {
   endCol: number;
 };
 
-type HarnessRun = {
+type RightToolId = "properties" | "chat" | "modelErrors" | "cm";
+type BottomToolId = "logs";
+type CommitManagerBusyState = "refresh" | "stage" | "unstage" | "commit" | "push" | "generate" | null;
+type LogFilterLevel = "all" | AppLogLevel;
+
+type ChatMessage = {
   id: number;
-  kind: "project" | "file";
-  ok: boolean;
-  budgetOk: boolean;
-  durationMs: number;
-  progressUpdates: number;
+  role: "assistant" | "user";
+  text: string;
   at: string;
 };
 
-type ToolTabId = "tooling" | "logs" | "expressions";
+type ChatEndpointTestState = {
+  kind: "testing" | "success" | "error";
+  message: string;
+};
+
+const DEFAULT_CHAT_ENDPOINT: AiEndpoint = {
+  id: "default-chat",
+  name: "Default Chat",
+  url: "",
+  type: "chat",
+  provider: "openai",
+  model: "gpt-4o-mini",
+  token: "",
+};
+
+type ChatEndpointState = {
+  endpoints: AiEndpoint[];
+  activeId: string;
+};
+
+function normalizeAiProvider(value: unknown): AiEndpoint["provider"] {
+  return value === "anthropic"
+    ? "anthropic"
+    : value === "azure"
+      ? "azure"
+      : "openai";
+}
+
+function sanitizeAiEndpoint(value: unknown): AiEndpoint | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<AiEndpoint>;
+  if (typeof candidate.id !== "string") return null;
+  if (typeof candidate.url !== "string") return null;
+  if (typeof candidate.model !== "string") return null;
+  if (typeof candidate.token !== "string") return null;
+  if (typeof candidate.name !== "string") return null;
+  const type = candidate.type === "embeddings" ? "embeddings" : "chat";
+  return {
+    ...DEFAULT_CHAT_ENDPOINT,
+    ...candidate,
+    type,
+    provider: normalizeAiProvider(candidate.provider),
+  };
+}
+
+function createChatEndpoint(name?: string): AiEndpoint {
+  const suffix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  return {
+    ...DEFAULT_CHAT_ENDPOINT,
+    id: `chat-${suffix}`,
+    name: name || "New Chat Endpoint",
+  };
+}
+
+function ensureChatEndpointState(endpoints: AiEndpoint[], activeId: string): ChatEndpointState {
+  const normalized = endpoints.length ? endpoints : [{ ...DEFAULT_CHAT_ENDPOINT }];
+  const selected = normalized.find((endpoint) => endpoint.id === activeId) || normalized[0];
+  return {
+    endpoints: normalized,
+    activeId: selected.id,
+  };
+}
+
+function readPersistedAiEndpoints(): AiEndpoint[] {
+  const storage = window.localStorage;
+  if (!storage) return [];
+  try {
+    const parsed = JSON.parse(storage.getItem(AI_ENDPOINTS_KEY) || "[]");
+    if (Array.isArray(parsed)) {
+      return parsed
+        .map((entry) => sanitizeAiEndpoint(entry))
+        .filter((entry): entry is AiEndpoint => !!entry);
+    }
+  } catch {
+    // Ignore invalid persisted endpoint state and fall back to defaults.
+  }
+  return [];
+}
+
+function loadChatEndpointState(): ChatEndpointState {
+  const storage = window.localStorage;
+  if (!storage) return ensureChatEndpointState([{ ...DEFAULT_CHAT_ENDPOINT }], DEFAULT_CHAT_ENDPOINT.id);
+  const selectedId = (storage.getItem(AI_CHAT_KEY) || "").trim();
+  const chatEndpoints = readPersistedAiEndpoints().filter((endpoint) => endpoint.type === "chat");
+  return ensureChatEndpointState(chatEndpoints, selectedId);
+}
+
+function persistChatEndpointState(state: ChatEndpointState): void {
+  const storage = window.localStorage;
+  if (!storage) return;
+  const normalized = ensureChatEndpointState(state.endpoints, state.activeId);
+  const preserved = readPersistedAiEndpoints().filter((endpoint) => endpoint.type !== "chat");
+  storage.setItem(AI_ENDPOINTS_KEY, JSON.stringify([...preserved, ...normalized.endpoints]));
+  storage.setItem(AI_CHAT_KEY, normalized.activeId);
+}
+
+function formatAgentResponse(response: AgentResponse): string {
+  const parts: string[] = [];
+  const message = (response.message || "").trim();
+  if (message) {
+    parts.push(message);
+  }
+  if (response.steps && response.steps.length > 0) {
+    parts.push(`Tools:\n${response.steps.map((step) => `- ${step.detail}`).join("\n")}`);
+  }
+  if (response.final_error) {
+    parts.push(`Response parse warning: ${response.final_error}`);
+  }
+  if (parts.length === 0) {
+    return "The agent returned no message.";
+  }
+  return parts.join("\n\n");
+}
+
+function isGitStatusClean(status: GitStatus | null | undefined): boolean {
+  return !status || (
+    status.staged.length === 0
+    && status.unstaged.length === 0
+    && status.untracked.length === 0
+  );
+}
+
+function resolveRepoRelativePath(repoRoot: string, relativePath: string): string {
+  const base = `${repoRoot || ""}`.trim().replace(/[\\/]+$/, "");
+  const suffix = `${relativePath || ""}`.trim().replace(/^[\\/]+/, "");
+  if (!base) return suffix;
+  if (!suffix) return base;
+  return `${base}/${suffix.replace(/[\\/]+/g, "/")}`;
+}
+
+function sanitizeGeneratedCommitMessage(text: string): string {
+  let value = `${text || ""}`.trim();
+  if (!value) return "";
+  if (value.startsWith("```")) {
+    value = value.replace(/^```[^\n]*\n?/, "").replace(/\n?```$/, "").trim();
+  }
+  value = value.replace(/^commit message:\s*/i, "").trim();
+  if (
+    (value.startsWith("\"") && value.endsWith("\""))
+    || (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    value = value.slice(1, -1).trim();
+  }
+  return value;
+}
+
+function formatPlanStepStatus(status: AgentPlanStepStatus): string {
+  switch (status) {
+    case "in_progress":
+      return "In Progress";
+    case "completed":
+      return "Completed";
+    case "blocked":
+      return "Blocked";
+    default:
+      return "Pending";
+  }
+}
 
 type SymbolTreeNode = {
   symbol: SymbolView;
@@ -253,8 +429,6 @@ type StdlibPathOption = {
 
 const FILE_SYMBOL_RENDER_LIMIT = 300;
 const TAB_DROPDOWN_THRESHOLD = 12;
-const HARNESS_COMPILE_BUDGET_MS = 2000;
-const HARNESS_PROGRESS_UPDATE_BUDGET = 24;
 const SYSML_LANGUAGE_ID = "mercurio-sysml";
 const LEFT_PANE_WIDTH_KEY = "mercurio.simpleUi.leftPaneWidth";
 const DEFAULT_LEFT_PANE_WIDTH = 320;
@@ -264,21 +438,23 @@ const RIGHT_PANE_WIDTH_KEY = "mercurio.simpleUi.rightPaneWidth";
 const DEFAULT_RIGHT_PANE_WIDTH = 420;
 const RIGHT_PANE_MIN_WIDTH = 300;
 const RIGHT_PANE_MAX_WIDTH = 820;
-const RIGHT_PANEL_SPLIT_KEY = "mercurio.simpleUi.rightPanelSplitRatio";
-const RIGHT_PANEL_SPLIT_MIN = 0.12;
-const RIGHT_PANEL_SPLIT_MAX = 0.88;
-const DEFAULT_RIGHT_PANEL_SPLIT = 0.66;
-const CENTER_HARNESS_SPLIT_KEY = "mercurio.simpleUi.centerHarnessSplitRatio";
-const CENTER_HARNESS_SPLIT_MIN = 0.08;
-const CENTER_HARNESS_SPLIT_MAX = 0.94;
-const DEFAULT_CENTER_HARNESS_SPLIT = 0.34;
+const RIGHT_TOOL_STRIP_WIDTH = 42;
 const CENTER_PANE_MIN_WIDTH = 480;
 const MAIN_LAYOUT_NON_CONTENT_WIDTH = 32;
 const MAX_RECENT_PROJECTS = 12;
+const LOG_LEVEL_FILTER_OPTIONS: Array<{ value: LogFilterLevel; label: string }> = [
+  { value: "all", label: "All Levels" },
+  { value: "debug", label: "Debug" },
+  { value: "info", label: "Info" },
+  { value: "warn", label: "Warn" },
+  { value: "error", label: "Error" },
+];
 const RECENT_PROJECT_BROWSE_VALUE = "__browse__";
 const STDLIB_PATH_OPTIONS_KEY = "mercurio.simpleUi.stdlibPathOptions";
 const PROJECT_FILES_SHOW_BY_FILE_KEY = "mercurio.simpleUi.projectFilesShowByFile";
 const AUTO_BUILD_ACTIVE_FILE_KEY = "mercurio.simpleUi.autoBuildActiveFile";
+const ACTIVE_RIGHT_TOOL_KEY = "mercurio.simpleUi.activeRightTool";
+const ACTIVE_BOTTOM_TOOL_KEY = "mercurio.simpleUi.activeBottomTool";
 const AUTO_BUILD_DEBOUNCE_MS = 900;
 const AUTO_BUILD_MIN_INTERVAL_MS = 2500;
 const FILE_DIAGNOSTIC_MARKER_OWNER = "mercurio.diagnostics";
@@ -300,6 +476,10 @@ const UI_ICON = {
   type: "\u25FC",
   bullet: "\u2022",
   settings: "\u2699",
+  properties: "\u25A4",
+  chat: String.fromCodePoint(0x1F4AC),
+  error: "\u26A0",
+  log: "\u2261",
   check: "\u2713",
   minimize: "\u2014",
   maximize: "\u25FB",
@@ -394,27 +574,6 @@ function parseRightPaneWidth(raw: string | null, viewportWidth: number, leftPane
   return clampRightPaneWidth(parsed, viewportWidth, leftPaneWidth);
 }
 
-function parseRightPanelSplitRatio(raw: string | null): number {
-  const parsed = Number(raw || "");
-  if (!Number.isFinite(parsed)) return DEFAULT_RIGHT_PANEL_SPLIT;
-  const value = parsed > 1 && parsed <= 100 ? parsed / 100 : parsed;
-  if (!Number.isFinite(value)) return DEFAULT_RIGHT_PANEL_SPLIT;
-  return Math.max(RIGHT_PANEL_SPLIT_MIN, Math.min(RIGHT_PANEL_SPLIT_MAX, value));
-}
-
-function parseCenterHarnessSplitRatio(raw: string | null): number {
-  const parsed = Number(raw || "");
-  if (!Number.isFinite(parsed)) return DEFAULT_CENTER_HARNESS_SPLIT;
-  const value = parsed > 1 && parsed <= 100 ? parsed / 100 : parsed;
-  if (!Number.isFinite(value)) return DEFAULT_CENTER_HARNESS_SPLIT;
-  return Math.max(CENTER_HARNESS_SPLIT_MIN, Math.min(CENTER_HARNESS_SPLIT_MAX, value));
-}
-
-function clampCenterHarnessSplitRatio(next: number): number {
-  const value = Number.isFinite(next) ? next : DEFAULT_CENTER_HARNESS_SPLIT;
-  return Math.max(CENTER_HARNESS_SPLIT_MIN, Math.min(CENTER_HARNESS_SPLIT_MAX, value));
-}
-
 function readRecentProjects(): string[] {
   try {
     const raw = window.localStorage?.getItem(RECENTS_KEY) || "[]";
@@ -486,46 +645,6 @@ function persistStdlibPathOptions(options: StdlibPathOption[]): void {
     window.localStorage?.setItem(STDLIB_PATH_OPTIONS_KEY, JSON.stringify(normalized));
   } catch {
     // best-effort persistence
-  }
-}
-
-function formatDurationMs(ms: number | null | undefined): string {
-  if (ms === null || ms === undefined || !Number.isFinite(ms) || ms < 0) {
-    return "-";
-  }
-  const totalSeconds = Math.floor(ms / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
-  if (minutes > 0) return `${minutes}m ${seconds}s`;
-  return `${seconds}s`;
-}
-
-async function copyTextToClipboard(text: string): Promise<boolean> {
-  try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
-  } catch {
-    // Fallback below.
-  }
-  try {
-    const textArea = document.createElement("textarea");
-    textArea.value = text;
-    textArea.setAttribute("readonly", "true");
-    textArea.style.position = "fixed";
-    textArea.style.left = "-10000px";
-    textArea.style.top = "-10000px";
-    document.body.appendChild(textArea);
-    textArea.focus();
-    textArea.select();
-    const copied = document.execCommand("copy");
-    document.body.removeChild(textArea);
-    return copied;
-  } catch {
-    return false;
   }
 }
 
@@ -664,19 +783,8 @@ function symbolKindIcon(kind: string | null | undefined): string {
   return UI_ICON.bullet;
 }
 
-function shortMetatypeName(metatypeQname: string | null | undefined): string {
-  const raw = (metatypeQname || "").trim();
-  if (!raw) return "";
-  const withoutRootPrefix = raw.replace(/^(sysml|kerml)::/i, "");
-  const parts = withoutRootPrefix.split("::").filter(Boolean);
-  if (!parts.length) return withoutRootPrefix;
-  return parts[parts.length - 1] || withoutRootPrefix;
-}
-
 function symbolKindLabel(symbol: SymbolView): string {
-  const metatypeLabel = shortMetatypeName(symbol.metatype_qname);
-  if (metatypeLabel) return metatypeLabel;
-  return symbol.kind || "?";
+  return primaryKindLabel(symbol);
 }
 
 function fileDiagnosticToMarker(
@@ -973,9 +1081,7 @@ function canDragSymbol(symbol: SymbolView): boolean {
 }
 
 function isPackageLike(symbol: SymbolView): boolean {
-  const kind = `${symbol.kind || ""}`.toLowerCase();
-  const metatype = `${symbol.metatype_qname || ""}`.toLowerCase();
-  return kind.includes("package") || metatype.endsWith("::package") || metatype === "package";
+  return isPackageLikeMetadata(symbol);
 }
 
 function canDropSymbolOnPackage(source: SymbolView, target: SymbolView): boolean {
@@ -994,35 +1100,6 @@ function canDropSymbolOnPackage(source: SymbolView, target: SymbolView): boolean
   if (targetQname.startsWith(`${sourceQname}::`)) return false;
   return true;
 }
-
-const BuildLogList = memo(function BuildLogList({
-  entries,
-}: {
-  entries: Array<{
-    id: number;
-    at: string;
-    timestampUtc?: string;
-    kind: string;
-    level: "info" | "warn" | "error";
-    message: string;
-  }>;
-}) {
-  if (!entries.length) {
-    return <div className="muted">No build events yet.</div>;
-  }
-  return (
-    <>
-      {entries.slice(-120).map((entry) => (
-        <div key={entry.id} className={`simple-build-progress-row ${entry.level}`}>
-          <span className="simple-build-progress-at" title={entry.timestampUtc || entry.at}>{entry.at}</span>
-          <span className="simple-build-progress-level">{entry.level}</span>
-          <span className="simple-build-progress-kind" title={entry.kind}>{entry.kind}</span>
-          <span className="simple-build-progress-message">{entry.message}</span>
-        </div>
-      ))}
-    </>
-  );
-});
 
 export function App() {
   const initialViewportWidth =
@@ -1046,7 +1123,6 @@ export function App() {
   const [dirty, setDirty] = useState(false);
   const [cursorPos, setCursorPos] = useState<{ line: number; col: number } | null>(null);
   const [selectedSymbol, setSelectedSymbol] = useState<SymbolView | null>(null);
-  const [harnessRuns, setHarnessRuns] = useState<HarnessRun[]>([]);
   const [backgroundJobs, setBackgroundJobs] = useState<BackgroundJobsSnapshot>({
     total: 0,
     cancelable: 0,
@@ -1091,11 +1167,38 @@ export function App() {
   const [dragTabPath, setDragTabPath] = useState<string | null>(null);
   const [dragOverTabPath, setDragOverTabPath] = useState<string | null>(null);
   const [diagramDragHover, setDiagramDragHover] = useState(false);
-  const [activeToolTab, setActiveToolTab] = useState<ToolTabId>("logs");
-  const [expressionInput, setExpressionInput] = useState("1 + 2 * 3");
-  const [expressionResult, setExpressionResult] = useState<ExpressionEvaluationResult | null>(null);
-  const [expressionPending, setExpressionPending] = useState(false);
-  const [expressionRequestError, setExpressionRequestError] = useState("");
+  const [activeRightTool, setActiveRightTool] = useState<RightToolId | null>(() => {
+    const raw = (window.localStorage?.getItem(ACTIVE_RIGHT_TOOL_KEY) || "").trim();
+    return raw === "properties" || raw === "chat" || raw === "modelErrors" || raw === "cm" ? raw : "properties";
+  });
+  const [activeBottomTool, setActiveBottomTool] = useState<BottomToolId | null>(() => {
+    const raw = (window.localStorage?.getItem(ACTIVE_BOTTOM_TOOL_KEY) || "").trim();
+    return raw === "logs" ? raw : null;
+  });
+  const [logFilterLevel, setLogFilterLevel] = useState<LogFilterLevel>("all");
+  const [logFilterText, setLogFilterText] = useState("");
+  const [chatDraft, setChatDraft] = useState("");
+  const [chatSessionId, setChatSessionId] = useState<string | null>(null);
+  const [chatPlan, setChatPlan] = useState<AgentPlan | null>(null);
+  const [chatSuggestedNextSteps, setChatSuggestedNextSteps] = useState<AgentNextStep[]>([]);
+  const [chatEndpointState, setChatEndpointState] = useState<ChatEndpointState>(() => loadChatEndpointState());
+  const [chatEndpointTests, setChatEndpointTests] = useState<Record<string, ChatEndpointTestState>>({});
+  const [chatConfigOpen, setChatConfigOpen] = useState(false);
+  const [chatBusy, setChatBusy] = useState(false);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
+    {
+      id: 1,
+      role: "assistant",
+      text: "Use the gear button to configure chat endpoints for the workspace assistant.",
+      at: new Date().toLocaleTimeString(),
+    },
+  ]);
+  const [cmRepoInfo, setCmRepoInfo] = useState<GitRepoInfo | null>(null);
+  const [cmStatus, setCmStatus] = useState<GitStatus | null>(null);
+  const [cmCommitMessage, setCmCommitMessage] = useState("");
+  const [cmLoading, setCmLoading] = useState(false);
+  const [cmError, setCmError] = useState("");
+  const [cmBusyState, setCmBusyState] = useState<CommitManagerBusyState>(null);
   const [autoBuildActiveFile, setAutoBuildActiveFile] = useState<boolean>(() =>
     window.localStorage?.getItem(AUTO_BUILD_ACTIVE_FILE_KEY) === "1",
   );
@@ -1107,17 +1210,22 @@ export function App() {
       initialRightPaneWidth,
     ),
   );
-  const [rightPanelSplitRatio, setRightPanelSplitRatio] = useState<number>(() =>
-    parseRightPanelSplitRatio(window.localStorage?.getItem(RIGHT_PANEL_SPLIT_KEY)),
-  );
-  const [centerHarnessSplitRatio, setCenterHarnessSplitRatio] = useState<number>(() =>
-    parseCenterHarnessSplitRatio(window.localStorage?.getItem(CENTER_HARNESS_SPLIT_KEY)),
-  );
   const [leftPaneDragging, setLeftPaneDragging] = useState(false);
   const [rightPaneDragging, setRightPaneDragging] = useState(false);
-  const [rightPanelSplitDragging, setRightPanelSplitDragging] = useState(false);
-  const [centerHarnessSplitDragging, setCenterHarnessSplitDragging] = useState(false);
   const shouldShowTabDropdown = tabsOverflow || openTabs.length > TAB_DROPDOWN_THRESHOLD;
+  const compactTabsMode = openTabs.length > TAB_DROPDOWN_THRESHOLD;
+  const activeOpenTab = useMemo(
+    () => {
+      if (!openTabs.length) return null;
+      if (!activeFilePath) return openTabs[openTabs.length - 1] || openTabs[0] || null;
+      const activeKey = normalizePath(activeFilePath);
+      return openTabs.find((tab) => normalizePath(tab.path) === activeKey) || openTabs[openTabs.length - 1] || openTabs[0] || null;
+    },
+    [activeFilePath, openTabs],
+  );
+  const visibleTabs = compactTabsMode
+    ? (activeOpenTab ? [activeOpenTab] : [])
+    : openTabs;
 
   const {
     rootPath: projectTreeRootPath,
@@ -1155,11 +1263,8 @@ export function App() {
     symbolsStatus,
     parsedFiles,
     fileDiagnosticPaths,
-    progressUiUpdates,
-    droppedCompileRequests,
     buildLogEntries,
     clearBuildLogs,
-    buildProgress,
     activeLibraryPath,
     symbolIndexError,
     semanticRefreshVersion,
@@ -1193,12 +1298,18 @@ export function App() {
     () => buildSymbolOwnershipTree(projectSymbols),
     [projectSymbols],
   );
+  const chatEndpoints = chatEndpointState.endpoints;
+  const activeChatEndpointId = chatEndpointState.activeId;
+  const activeChatEndpoint = useMemo(
+    () => chatEndpoints.find((endpoint) => endpoint.id === activeChatEndpointId)
+      || chatEndpoints[0]
+      || { ...DEFAULT_CHAT_ENDPOINT },
+    [activeChatEndpointId, chatEndpoints],
+  );
   const librarySymbolRoots = useMemo(
     () => buildSymbolOwnershipTree(librarySymbols),
     [librarySymbols],
   );
-  const [buildClockTick, setBuildClockTick] = useState(0);
-
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null);
   const monacoRef = useRef<Parameters<OnMount>[1] | null>(null);
   const cursorListenerRef = useRef<{ dispose: () => void } | null>(null);
@@ -1207,8 +1318,6 @@ export function App() {
   const dirtyRef = useRef(false);
   const fileOpenReqRef = useRef(0);
   const contentRef = useRef("");
-  const harnessRunIdRef = useRef(0);
-  const progressUiUpdatesRef = useRef(0);
   const cursorFlushTimerRef = useRef<number | undefined>(undefined);
   const pendingCursorRef = useRef<{ line: number; col: number } | null>(null);
   const leftPaneWidthRef = useRef(leftPaneWidth);
@@ -1218,26 +1327,77 @@ export function App() {
   const newFileNameInputRef = useRef<HTMLInputElement | null>(null);
   const newDiagramNameInputRef = useRef<HTMLInputElement | null>(null);
   const rightPanelRef = useRef<HTMLElement | null>(null);
-const centerPanelRef = useRef<HTMLElement | null>(null);
-const leftPaneDragRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
-const rightPaneDragRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
-const rightPanelSplitDragRef = useRef<{
-  pointerId: number | null;
-  startY: number;
-  startRatio: number;
-  captureTarget: HTMLElement | null;
-} | null>(null);
-const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; startRatio: number } | null>(null);
+  const centerPanelRef = useRef<HTMLElement | null>(null);
+  const leftPaneDragRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
+  const rightPaneDragRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
   const projectFilesChangedTimerRef = useRef<number | undefined>(undefined);
   const projectWatcherRootRef = useRef("");
   const libraryFilesChangedTimerRef = useRef<number | undefined>(undefined);
   const libraryWatcherRootRef = useRef("");
+  const cmRefreshTimerRef = useRef<number | undefined>(undefined);
   const projectFilesSettingsButtonRef = useRef<HTMLDivElement | null>(null);
   const autoBuildTimerRef = useRef<number | undefined>(undefined);
   const autoBuildQueuedRef = useRef(false);
   const lastAutoBuildAtRef = useRef<number>(0);
   const compileRunIdRef = useRef<number | null>(compileRunId ?? null);
   const workspaceStartupRequestRef = useRef(0);
+  const cmStagedPaths = useMemo(
+    () => Array.from(new Set((cmStatus?.staged || []).map((path) => `${path || ""}`.trim()).filter(Boolean))),
+    [cmStatus],
+  );
+  const canGenerateCommitMessage = !!activeChatEndpoint.url.trim();
+  const cmGenerateDisabledReason = canGenerateCommitMessage
+    ? ""
+    : "Configure a chat endpoint to generate commit messages.";
+
+  const applyCommitManagerStatus = useCallback((status: GitStatus | null) => {
+    setCmStatus(status);
+    setCmRepoInfo((prev) => (prev ? { ...prev, clean: isGitStatusClean(status) } : prev));
+  }, []);
+
+  const refreshCommitManager = useCallback(async (options?: { silent?: boolean }) => {
+    const activeRoot = rootPath.trim();
+    if (!activeRoot) {
+      setCmRepoInfo(null);
+      setCmStatus(null);
+      setCmError("");
+      setCmLoading(false);
+      return;
+    }
+    if (!options?.silent) {
+      setCmLoading(true);
+    }
+    setCmError("");
+    try {
+      const repo = await detectGitRepo(activeRoot);
+      if (!repo) {
+        setCmRepoInfo(null);
+        setCmStatus(null);
+        return;
+      }
+      const status = await getGitStatus(repo.repo_root);
+      setCmRepoInfo({ ...repo, clean: isGitStatusClean(status) });
+      setCmStatus(status);
+    } catch (error) {
+      const message = `Git refresh failed: ${String(error)}`;
+      setCmError(message);
+      setCompileStatus(message);
+    } finally {
+      if (!options?.silent) {
+        setCmLoading(false);
+      }
+    }
+  }, [rootPath, setCompileStatus]);
+
+  const scheduleCommitManagerRefresh = useCallback(() => {
+    if (cmRefreshTimerRef.current !== undefined) {
+      window.clearTimeout(cmRefreshTimerRef.current);
+    }
+    cmRefreshTimerRef.current = window.setTimeout(() => {
+      cmRefreshTimerRef.current = undefined;
+      void refreshCommitManager({ silent: true });
+    }, 250);
+  }, [refreshCommitManager]);
 
   const syncViewportHeight = useCallback(() => {
     const viewportHeight =
@@ -1258,24 +1418,12 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   }, [dirty]);
 
   useEffect(() => {
-    progressUiUpdatesRef.current = progressUiUpdates;
-  }, [progressUiUpdates]);
-
-  useEffect(() => {
     leftPaneWidthRef.current = leftPaneWidth;
   }, [leftPaneWidth]);
 
   useEffect(() => {
     rightPaneWidthRef.current = rightPaneWidth;
   }, [rightPaneWidth]);
-
-  useEffect(() => {
-    if (!buildProgress.running) return;
-    const timer = window.setInterval(() => {
-      setBuildClockTick((prev) => prev + 1);
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, [buildProgress.running]);
 
   useEffect(() => {
     window.localStorage?.setItem(THEME_KEY, appTheme);
@@ -1295,19 +1443,30 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   }, [recentProjects]);
 
   useEffect(() => {
-    window.localStorage?.setItem(RIGHT_PANEL_SPLIT_KEY, String(Math.round(rightPanelSplitRatio * 1000) / 1000));
-  }, [rightPanelSplitRatio]);
-
-  useEffect(() => {
-    window.localStorage?.setItem(CENTER_HARNESS_SPLIT_KEY, String(Math.round(centerHarnessSplitRatio * 1000) / 1000));
-  }, [centerHarnessSplitRatio]);
-
-  useEffect(() => {
     window.localStorage?.setItem(PROJECT_FILES_SHOW_BY_FILE_KEY, projectFilesShowByFile ? "1" : "0");
   }, [projectFilesShowByFile]);
 
+  useEffect(() => {
+    if (activeRightTool) {
+      window.localStorage?.setItem(ACTIVE_RIGHT_TOOL_KEY, activeRightTool);
+    } else {
+      window.localStorage?.removeItem(ACTIVE_RIGHT_TOOL_KEY);
+    }
+  }, [activeRightTool]);
+
+  useEffect(() => {
+    if (activeBottomTool) {
+      window.localStorage?.setItem(ACTIVE_BOTTOM_TOOL_KEY, activeBottomTool);
+    } else {
+      window.localStorage?.removeItem(ACTIVE_BOTTOM_TOOL_KEY);
+    }
+  }, [activeBottomTool]);
+  useEffect(() => {
+    persistChatEndpointState(chatEndpointState);
+  }, [chatEndpointState]);
+
   const reportStartupEvent = useCallback((
-    level: "info" | "warn" | "error",
+    level: AppLogLevel,
     message: string,
   ) => {
     const text = `${message || ""}`.trim();
@@ -1368,25 +1527,30 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     const diagnostics = snapshot?.diagnostics || [];
     const backendTimings = snapshot?.timings;
     const symbolTimings = snapshot?.symbol_timings;
+    const cacheMissReason = diagnostics
+      .find((diagnostic) => diagnostic.startsWith("Workspace cache miss reason: "))
+      ?.replace("Workspace cache miss reason: ", "")
+      ?.trim() || "";
     for (const diagnostic of diagnostics) {
       if (/(failed|error)/i.test(`${diagnostic || ""}`)) {
         showErrorNotification(diagnostic);
       }
+      reportStartupEvent("debug", `workspace startup diagnostic root=${trimmed} message=${diagnostic}`);
     }
     reportStartupEvent(
       snapshot?.cache_hit ? "info" : "warn",
-      `workspace startup snapshot duration_ms=${durationMs} cache_hit=${snapshot?.cache_hit ? "true" : "false"} project_symbols=${snapshot?.project_symbols?.length || 0} library_symbols=${snapshot?.library_symbols?.length || 0} project_semantic_projections=${snapshot?.project_semantic_projection_count || 0} diagnostics=${diagnostics.length}`,
+      `workspace startup snapshot duration_ms=${durationMs} cache_hit=${snapshot?.cache_hit ? "true" : "false"} project_symbols=${snapshot?.project_symbols?.length || 0} library_symbols=${snapshot?.library_symbols?.length || 0} project_semantic_projections=${snapshot?.project_semantic_projection_count || 0} diagnostics=${diagnostics.length}${cacheMissReason ? ` cache_miss_reason=${cacheMissReason}` : ""}`,
     );
     if (backendTimings) {
       const frontendOverheadMs = Math.max(0, durationMs - (backendTimings.total_duration_ms || 0));
       reportStartupEvent(
-        "info",
-        `workspace startup backend timings total_ms=${backendTimings.total_duration_ms} frontend_overhead_ms=${frontendOverheadMs} cache_load_ms=${backendTimings.cache_load_ms} cache_seed_symbol_index_ms=${backendTimings.cache_seed_symbol_index_ms} cache_seed_projection_ms=${backendTimings.cache_seed_projection_ms} project_tree_collect_ms=${backendTimings.project_tree_collect_ms} symbol_snapshot_ms=${backendTimings.symbol_snapshot_ms} library_tree_collect_ms=${backendTimings.library_tree_collect_ms}`,
+        "debug",
+        `workspace startup backend timings total_ms=${backendTimings.total_duration_ms} frontend_overhead_ms=${frontendOverheadMs} cache_load_ms=${backendTimings.cache_load_ms} cache_seed_symbol_index_ms=${backendTimings.cache_seed_symbol_index_ms} cache_seed_projection_ms=${backendTimings.cache_seed_projection_ms} symbol_snapshot_ms=${backendTimings.symbol_snapshot_ms}`,
       );
     }
     if (symbolTimings) {
       reportStartupEvent(
-        "info",
+        "debug",
         `workspace symbol snapshot timings total_ms=${symbolTimings.total_duration_ms} seed_symbol_index_ms=${symbolTimings.seed_symbol_index_ms} project_query_ms=${symbolTimings.project_query_ms} library_query_ms=${symbolTimings.library_query_ms} library_hydration_ms=${symbolTimings.library_hydration_ms} library_requery_ms=${symbolTimings.library_requery_ms} library_metadata_ms=${symbolTimings.library_metadata_ms}`,
       );
     }
@@ -1400,7 +1564,10 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       return true;
     }
     setCompileStatus("Startup: no workspace cache; compiling project");
-    reportStartupEvent("warn", `workspace cache miss root=${trimmed}; compile fallback starting`);
+    reportStartupEvent(
+      "warn",
+      `workspace cache miss root=${trimmed}${cacheMissReason ? ` reason=${cacheMissReason}` : ""}; compile fallback starting`,
+    );
     const ok = await runCompile();
     reportStartupEvent(
       ok ? "info" : "warn",
@@ -1430,17 +1597,22 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     let active = true;
     setTreeError("");
     void (async () => {
-      const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
-      reportStartupEvent("info", `startup sequence begin root=${rootPath}`);
+      reportStartupEvent("debug", `startup sequence begin root=${rootPath}`);
       try {
-        await loadLiveWorkspaceTrees(rootPath);
+        const startup = await runWorkspaceStartupSequence({
+          loadLiveWorkspaceTrees: () => loadLiveWorkspaceTrees(rootPath),
+          loadCachedWorkspaceSymbols: () => loadCachedWorkspaceSymbols(rootPath),
+          onSymbolsReady: (elapsedMs) => {
+            reportStartupEvent("debug", `startup symbols ready root=${rootPath} duration_ms=${elapsedMs}`);
+          },
+          onTreesReady: (elapsedMs) => {
+            reportStartupEvent("debug", `startup trees ready root=${rootPath} duration_ms=${elapsedMs}`);
+          },
+        });
         if (!active) return;
-        const startupOk = await loadCachedWorkspaceSymbols(rootPath);
-        if (!active) return;
-        const durationMs = Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt);
         reportStartupEvent(
-          startupOk ? "info" : "warn",
-          `startup sequence complete root=${rootPath} duration_ms=${durationMs} ok=${startupOk ? "true" : "false"}`,
+          startup.startupOk ? "info" : "warn",
+          `startup sequence complete root=${rootPath} duration_ms=${startup.totalMs} ok=${startup.startupOk ? "true" : "false"} symbols_ready_ms=${startup.symbolsReadyMs} trees_ready_ms=${startup.treesReadyMs}`,
         );
       } catch (error) {
         if (!active) return;
@@ -1535,9 +1707,30 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
   }, [compileRunId]);
 
   useEffect(() => {
-    setExpressionResult(null);
-    setExpressionRequestError("");
+    void refreshCommitManager();
+  }, [refreshCommitManager]);
+
+  useEffect(() => {
+    setCmCommitMessage("");
+    setCmError("");
+    setCmBusyState(null);
   }, [rootPath]);
+
+  useEffect(() => {
+    const repoRoot = cmRepoInfo?.repo_root || "";
+    if (!repoRoot) return;
+    const unlistenPromise = listen<ProjectFilesChangedEvent>("project-files-changed", (event) => {
+      const payload = event.payload;
+      const changedPath = `${payload?.path || ""}`.trim();
+      const changedRoot = `${payload?.root || ""}`.trim();
+      if (isPathWithin(changedPath, repoRoot) || isPathWithin(changedRoot, repoRoot)) {
+        scheduleCommitManagerRefresh();
+      }
+    });
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten()).catch(() => {});
+    };
+  }, [cmRepoInfo?.repo_root, scheduleCommitManagerRefresh]);
 
   useEffect(() => {
     let active = true;
@@ -1594,8 +1787,10 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     const handleResize = () => {
       syncViewportHeight();
       const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 0;
-      const nextRight = clampRightPaneWidth(rightPaneWidthRef.current, viewportWidth, leftPaneWidthRef.current);
-      const nextLeft = clampLeftPaneWidth(leftPaneWidthRef.current, viewportWidth, nextRight);
+      const preferredRight = clampRightPaneWidth(rightPaneWidthRef.current, viewportWidth, leftPaneWidthRef.current);
+      const effectiveRight = activeRightTool ? preferredRight + RIGHT_TOOL_STRIP_WIDTH : RIGHT_TOOL_STRIP_WIDTH;
+      const nextLeft = clampLeftPaneWidth(leftPaneWidthRef.current, viewportWidth, effectiveRight);
+      const nextRight = clampRightPaneWidth(rightPaneWidthRef.current, viewportWidth, nextLeft);
       setRightPaneWidth(nextRight);
       setLeftPaneWidth(nextLeft);
       editorRef.current?.layout();
@@ -1608,24 +1803,22 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       window.removeEventListener("resize", handleResize);
       visualViewport?.removeEventListener("resize", handleResize);
     };
-  }, [syncViewportHeight]);
+  }, [activeRightTool, syncViewportHeight]);
 
   useEffect(() => {
     document.body.classList.toggle("simple-ui-resizing", leftPaneDragging || rightPaneDragging);
-    document.body.classList.toggle(
-      "simple-ui-resizing-vertical",
-      rightPanelSplitDragging || centerHarnessSplitDragging,
-    );
     return () => {
       document.body.classList.remove("simple-ui-resizing");
       document.body.classList.remove("simple-ui-resizing-vertical");
     };
-  }, [leftPaneDragging, rightPaneDragging, rightPanelSplitDragging, centerHarnessSplitDragging]);
+  }, [leftPaneDragging, rightPaneDragging]);
 
   const syncMonacoLayout = useCallback(() => {
     const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 0;
-    const nextRight = clampRightPaneWidth(rightPaneWidthRef.current, viewportWidth, leftPaneWidthRef.current);
-    const nextLeft = clampLeftPaneWidth(leftPaneWidthRef.current, viewportWidth, nextRight);
+    const preferredRight = clampRightPaneWidth(rightPaneWidthRef.current, viewportWidth, leftPaneWidthRef.current);
+    const effectiveRight = activeRightTool ? preferredRight + RIGHT_TOOL_STRIP_WIDTH : RIGHT_TOOL_STRIP_WIDTH;
+    const nextLeft = clampLeftPaneWidth(leftPaneWidthRef.current, viewportWidth, effectiveRight);
+    const nextRight = clampRightPaneWidth(rightPaneWidthRef.current, viewportWidth, nextLeft);
     if (nextRight !== rightPaneWidthRef.current) {
       setRightPaneWidth(nextRight);
     }
@@ -1633,7 +1826,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       setLeftPaneWidth(nextLeft);
     }
     editorRef.current?.layout();
-  }, []);
+  }, [activeRightTool]);
 
   useEffect(() => {
     const frames: number[] = [];
@@ -2406,42 +2599,15 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     }
   }, [activeFilePath, openTabs, projectModel, projectSymbols, setCompileStatus]);
 
-  const addHarnessRun = useCallback((
-    kind: "project" | "file",
-    ok: boolean,
-    durationMs: number,
-    progressUpdates: number,
-  ) => {
-    const budgetOk =
-      durationMs <= HARNESS_COMPILE_BUDGET_MS
-      && progressUpdates <= HARNESS_PROGRESS_UPDATE_BUDGET;
-    harnessRunIdRef.current += 1;
-    const run: HarnessRun = {
-      id: harnessRunIdRef.current,
-      kind,
-      ok,
-      budgetOk,
-      durationMs,
-      progressUpdates,
-      at: new Date().toLocaleTimeString(),
-    };
-    setHarnessRuns((prev) => [run, ...prev].slice(0, 16));
-  }, []);
-
   const compileProject = useCallback(async (): Promise<boolean> => {
     if (!rootPath) {
       setCompileStatus("Compile requires a project root");
       return false;
     }
     const unsaved = collectUnsavedCompileInputs();
-    const progressBefore = progressUiUpdatesRef.current;
-    const start = typeof performance !== "undefined" ? performance.now() : Date.now();
     const ok = await runCompile(undefined, unsaved);
-    const elapsed = (typeof performance !== "undefined" ? performance.now() : Date.now()) - start;
-    const progressAfter = progressUiUpdatesRef.current;
-    addHarnessRun("project", ok, elapsed, Math.max(0, progressAfter - progressBefore));
     return ok;
-  }, [rootPath, runCompile, setCompileStatus, collectUnsavedCompileInputs, addHarnessRun]);
+  }, [rootPath, runCompile, setCompileStatus, collectUnsavedCompileInputs]);
 
   const compileActiveFile = useCallback(async (): Promise<boolean> => {
     if (!rootPath) {
@@ -2452,14 +2618,9 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       return compileProject();
     }
     const unsaved = collectUnsavedCompileInputs();
-    const progressBefore = progressUiUpdatesRef.current;
-    const start = typeof performance !== "undefined" ? performance.now() : Date.now();
     const ok = await runCompile(activeFilePath, unsaved);
-    const elapsed = (typeof performance !== "undefined" ? performance.now() : Date.now()) - start;
-    const progressAfter = progressUiUpdatesRef.current;
-    addHarnessRun("file", ok, elapsed, Math.max(0, progressAfter - progressBefore));
     return ok;
-  }, [rootPath, activeFilePath, runCompile, compileProject, setCompileStatus, collectUnsavedCompileInputs, addHarnessRun]);
+  }, [rootPath, activeFilePath, runCompile, compileProject, setCompileStatus, collectUnsavedCompileInputs]);
 
   const getCurrentTextForPath = useCallback(async (path: string): Promise<string> => {
     const pathKey = normalizePath(path);
@@ -2561,7 +2722,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       source_symbol_id: source.symbol_id || "",
       source_qualified_name: source.qualified_name || source.name || "",
       source_name: source.name || "",
-      source_kind: source.kind || symbolKindLabel(source),
+      source_kind: source.semantic_kind || source.kind || symbolKindLabel(source),
       source_file_path: source.file_path,
       source_parent_qualified_name: source.parent_qualified_name || "",
       source_start_line: `${source.start_line || 0}`,
@@ -2952,14 +3113,17 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       case "clear-caches":
         await clearAllCaches();
         return;
-      case "show-tooling":
-        setActiveToolTab("tooling");
+      case "show-properties":
+        setActiveRightTool("properties");
         return;
-      case "show-logs":
-        setActiveToolTab("logs");
+      case "show-model-errors":
+        setActiveRightTool("modelErrors");
         return;
-      case "show-expressions":
-        setActiveToolTab("expressions");
+      case "show-commit-manager":
+        setActiveRightTool("cm");
+        return;
+      case "open-chat":
+        setActiveRightTool("chat");
         return;
       case "select-stdlib-path": {
         setStdlibManagerOpen(true);
@@ -2995,7 +3159,6 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
     compileProject,
     compileActiveFile,
     clearAllCaches,
-    setActiveToolTab,
     setStdlibManagerOpen,
     setAboutWindowOpen,
     toggleTheme,
@@ -3021,7 +3184,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
         return;
       }
       void logFrontendEvent({
-        level: "info",
+        level: "debug",
         kind: "watcher",
         message: `project refresh root=${activeRoot}`,
       }).catch(() => {});
@@ -3052,7 +3215,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
         return;
       }
       void logFrontendEvent({
-        level: "info",
+        level: "debug",
         kind: "watcher",
         message: `library refresh root=${activeRoot}`,
       }).catch(() => {});
@@ -3154,7 +3317,7 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
         || (!!libraryRoot && !!changedPath && isPathWithin(changedPath, libraryRoot));
 
       void logFrontendEvent({
-        level: "info",
+        level: "debug",
         kind: "watcher",
         message: `event kind=${payload?.kind || ""} root=${changedRoot} path=${changedPath} projectAffected=${projectAffected} libraryAffected=${libraryAffected}`,
       }).catch(() => {});
@@ -3202,6 +3365,15 @@ const centerHarnessSplitDragRef = useRef<{ pointerId: number; startY: number; st
       if (libraryWatcherRootRef.current) {
         void stopProjectFileWatcher(libraryWatcherRootRef.current);
         libraryWatcherRootRef.current = "";
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (cmRefreshTimerRef.current !== undefined) {
+        window.clearTimeout(cmRefreshTimerRef.current);
+        cmRefreshTimerRef.current = undefined;
       }
     };
   }, []);
@@ -3897,148 +4069,6 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
     }
   }, []);
 
-  const clampRightPanelSplitRatio = useCallback((value: number): number => {
-    if (!Number.isFinite(value)) return DEFAULT_RIGHT_PANEL_SPLIT;
-    return Math.max(RIGHT_PANEL_SPLIT_MIN, Math.min(RIGHT_PANEL_SPLIT_MAX, value));
-  }, []);
-
-  const updateRightPanelSplit = useCallback(
-    (clientY: number) => {
-      const drag = rightPanelSplitDragRef.current;
-      if (!drag) return;
-      const panel = rightPanelRef.current;
-      if (!panel) return;
-      const panelHeight = panel.clientHeight;
-      if (!panelHeight) return;
-      const deltaY = clientY - drag.startY;
-      const next = drag.startRatio + deltaY / panelHeight;
-      const clamped = clampRightPanelSplitRatio(next);
-      if (Math.abs(clamped - rightPanelSplitRatio) > 0.0001) {
-        setRightPanelSplitRatio(clamped);
-      }
-    },
-    [clampRightPanelSplitRatio, rightPanelSplitRatio],
-  );
-
-  const stopRightPanelSplitDragById = useCallback((pointerId: number | null) => {
-    const drag = rightPanelSplitDragRef.current;
-    if (!drag || (pointerId !== null && drag.pointerId !== null && drag.pointerId !== pointerId)) return;
-    rightPanelSplitDragRef.current = null;
-    setRightPanelSplitDragging(false);
-    if (drag.pointerId !== null && drag.captureTarget && drag.captureTarget.hasPointerCapture(drag.pointerId)) {
-      drag.captureTarget.releasePointerCapture(drag.pointerId);
-    }
-  }, []);
-
-  const handleRightPanelSplitPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    const panel = rightPanelRef.current;
-    if (!panel) return;
-    rightPanelSplitDragRef.current = {
-      pointerId: event.pointerId,
-      startY: event.clientY,
-      startRatio: rightPanelSplitRatio,
-      captureTarget: event.currentTarget,
-    };
-    setRightPanelSplitDragging(true);
-    event.currentTarget.setPointerCapture(event.pointerId);
-    event.preventDefault();
-  }, [rightPanelSplitRatio]);
-
-  const handleRightPanelSplitPointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    const drag = rightPanelSplitDragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    updateRightPanelSplit(event.clientY);
-  }, [updateRightPanelSplit]);
-
-  const stopRightPanelSplitDrag = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    stopRightPanelSplitDragById(event.pointerId);
-  }, [stopRightPanelSplitDragById]);
-
-  const handleRightPanelSplitMouseDown = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
-    if (event.button !== 0) return;
-    const panel = rightPanelRef.current;
-    if (!panel) return;
-    rightPanelSplitDragRef.current = {
-      pointerId: null,
-      startY: event.clientY,
-      startRatio: rightPanelSplitRatio,
-      captureTarget: event.currentTarget,
-    };
-    setRightPanelSplitDragging(true);
-    event.preventDefault();
-  }, [rightPanelSplitRatio]);
-
-  useEffect(() => {
-    if (!rightPanelSplitDragging) return;
-    const onPointerMove = (event: PointerEvent) => {
-      const drag = rightPanelSplitDragRef.current;
-      if (!drag || drag.pointerId === null || drag.pointerId !== event.pointerId) return;
-      updateRightPanelSplit(event.clientY);
-    };
-    const onPointerUp = (event: PointerEvent) => {
-      stopRightPanelSplitDragById(event.pointerId);
-    };
-    const onMouseMove = (event: MouseEvent) => {
-      const drag = rightPanelSplitDragRef.current;
-      if (!drag || drag.pointerId !== null) return;
-      updateRightPanelSplit(event.clientY);
-    };
-    const onMouseUp = () => {
-      stopRightPanelSplitDragById(null);
-    };
-    window.addEventListener("pointermove", onPointerMove);
-    window.addEventListener("pointerup", onPointerUp);
-    window.addEventListener("pointercancel", onPointerUp);
-    window.addEventListener("mousemove", onMouseMove);
-    window.addEventListener("mouseup", onMouseUp);
-    return () => {
-      window.removeEventListener("pointermove", onPointerMove);
-      window.removeEventListener("pointerup", onPointerUp);
-      window.removeEventListener("pointercancel", onPointerUp);
-      window.removeEventListener("mousemove", onMouseMove);
-      window.removeEventListener("mouseup", onMouseUp);
-    };
-  }, [clampRightPanelSplitRatio, rightPanelSplitDragging, rightPanelSplitRatio, stopRightPanelSplitDragById, updateRightPanelSplit]);
-
-  const handleCenterHarnessResizerPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    if (event.button !== 0) return;
-    const panel = centerPanelRef.current;
-    if (!panel) return;
-    centerHarnessSplitDragRef.current = {
-      pointerId: event.pointerId,
-      startY: event.clientY,
-      startRatio: centerHarnessSplitRatio,
-    };
-    setCenterHarnessSplitDragging(true);
-    event.currentTarget.setPointerCapture(event.pointerId);
-    event.preventDefault();
-  }, [centerHarnessSplitRatio]);
-
-  const handleCenterHarnessResizerPointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    const drag = centerHarnessSplitDragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    const panel = centerPanelRef.current;
-    const panelHeight = panel?.clientHeight || 0;
-    if (!panelHeight) return;
-    const delta = event.clientY - drag.startY;
-    const next = drag.startRatio - delta / panelHeight;
-    const clamped = clampCenterHarnessSplitRatio(next);
-    if (Math.abs(clamped - centerHarnessSplitRatio) > 0.0001) {
-      setCenterHarnessSplitRatio(clamped);
-    }
-    editorRef.current?.layout();
-  }, [centerHarnessSplitRatio]);
-
-  const stopCenterHarnessResizerDrag = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    const drag = centerHarnessSplitDragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    centerHarnessSplitDragRef.current = null;
-    setCenterHarnessSplitDragging(false);
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-  }, []);
-
   const editorLanguage = useMemo(
     () => editorLanguageForPath(activeFilePath),
     [activeFilePath],
@@ -4531,22 +4561,6 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
     toggleLibraryFileSymbols,
   ]);
 
-  const harnessMaxDuration = useMemo(
-    () => Math.max(1, ...harnessRuns.map((run) => run.durationMs)),
-    [harnessRuns],
-  );
-  const harnessAvgDuration = useMemo(
-    () =>
-      harnessRuns.length
-        ? harnessRuns.reduce((sum, run) => sum + run.durationMs, 0) / harnessRuns.length
-        : 0,
-    [harnessRuns],
-  );
-  const harnessBudgetFailures = useMemo(
-    () => harnessRuns.filter((run) => !run.budgetOk).length,
-    [harnessRuns],
-  );
-
   const activeTab = useMemo(() => {
     if (!activeFilePath) return null;
     const key = normalizePath(activeFilePath);
@@ -4614,120 +4628,654 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
   const activeFileName = activeTab?.name || (activeFilePath ? displayNameForPath(activeFilePath) : "No file selected");
   const showCenterWelcome = !activeFilePath && openTabs.length === 0;
   const projectFolderLabel = rootPath ? (rootPath.split(/[\\/]/).filter(Boolean).pop() || rootPath) : "none";
+  const activeFileParseBucket = useMemo(
+    () => activeFilePath
+      ? compileToast.fileDiagnostics.find((entry) => normalizePath(entry.path) === normalizePath(activeFilePath)) || null
+      : null,
+    [activeFilePath, compileToast.fileDiagnostics],
+  );
+  const activeFileParseDiagnostics = useMemo(
+    () => (activeFileParseBucket?.diagnostics || []).filter((diagnostic) => diagnostic.source === "parse"),
+    [activeFileParseBucket],
+  );
+  const modelDiagnosticBuckets = useMemo(
+    () => compileToast.fileDiagnostics
+      .map((entry) => ({
+        path: entry.path,
+        diagnostics: (entry.diagnostics || []).filter((diagnostic) => diagnostic.source !== "parse"),
+      }))
+      .filter((entry) => entry.diagnostics.length > 0),
+    [compileToast.fileDiagnostics],
+  );
+  const workspaceProblemCount = rightPanelWorkspaceErrors.length
+    + modelDiagnosticBuckets.reduce((sum, entry) => sum + entry.diagnostics.length, 0);
+  const effectiveRightPaneWidth = activeRightTool ? rightPaneWidth : 0;
   const mainLayoutStyle = useMemo(
     () => ({
-      "--simple-left-pane-width": `${leftPaneWidth}px`,
-      "--simple-right-pane-width": `${rightPaneWidth}px`,
+      gridTemplateColumns: `minmax(220px, ${leftPaneWidth}px) minmax(420px, 1fr) ${effectiveRightPaneWidth}px`,
     } as CSSProperties),
-    [leftPaneWidth, rightPaneWidth],
+    [effectiveRightPaneWidth, leftPaneWidth],
   );
-  const rightPanelLayoutStyle = useMemo(
-    () =>
-      ({
-        "--simple-right-top-panel-size": `${Math.max(0, Math.min(1, rightPanelSplitRatio)).toFixed(3)}`,
-        "--simple-right-bottom-panel-size": `${Math.max(0, Math.min(1, 1 - rightPanelSplitRatio)).toFixed(3)}`,
-      }) as CSSProperties,
-    [rightPanelSplitRatio],
-  );
-  const centerHarnessSizeStyle = useMemo(
-    () => `${Math.round(centerHarnessSplitRatio * 100)}%`,
-    [centerHarnessSplitRatio],
-  );
-  const centerLayoutStyle = useMemo(
-    () =>
-      ({
-        "--simple-center-harness-size": centerHarnessSizeStyle,
-      }) as CSSProperties,
-    [centerHarnessSizeStyle],
-  );
-  const buildElapsedMs = useMemo(() => {
-    if (!buildProgress.startedAtMs) return null;
-    return Date.now() - buildProgress.startedAtMs;
-  }, [buildProgress.startedAtMs, buildClockTick]);
-  const buildIdleMs = useMemo(() => {
-    if (!buildProgress.lastEventAtMs) return null;
-    return Date.now() - buildProgress.lastEventAtMs;
-  }, [buildProgress.lastEventAtMs, buildClockTick]);
-  const buildStalled = !!buildProgress.running && (buildIdleMs ?? 0) >= 10_000;
-  const buildStalledHint = useMemo(() => {
-    if (!buildStalled) return null;
-    const where = buildProgress.file
-      ? `${buildProgress.stage}: ${buildProgress.file}`
-      : buildProgress.stage;
-    return `No progress for ${formatDurationMs(buildIdleMs)} at ${where}`;
-  }, [buildStalled, buildProgress.stage, buildProgress.file, buildIdleMs]);
-  const buildProgressText = useMemo(() => {
-    const lines: string[] = [];
-    lines.push(`status: ${compileStatus}`);
-    lines.push(`run: ${buildProgress.runId ?? "-"}`);
-    lines.push(`stage: ${buildProgress.stage}${buildProgress.file ? ` | ${buildProgress.file}` : ""}`);
-    lines.push(`elapsed: ${formatDurationMs(buildElapsedMs)}`);
-    lines.push(`last_event_age: ${formatDurationMs(buildIdleMs)}`);
-    lines.push(`event_count: ${buildProgress.eventCount}`);
-    if (buildStalledHint) {
-      lines.push(`stalled: ${buildStalledHint}`);
-    }
-    lines.push("");
-    for (const entry of buildLogEntries) {
-      const timestamp = entry.timestampUtc || entry.at;
-      lines.push(`${timestamp}\t${entry.level.toUpperCase()}\t${entry.kind}\t${entry.message}`);
-    }
-    return lines.join("\n");
-  }, [
-    compileStatus,
-    buildProgress.runId,
-    buildProgress.stage,
-    buildProgress.file,
-    buildProgress.eventCount,
-    buildElapsedMs,
-    buildIdleMs,
-    buildStalledHint,
-    buildLogEntries,
-  ]);
-  const copyBuildProgress = useCallback(async () => {
-    const copied = await copyTextToClipboard(buildProgressText);
-    if (copied) {
-      setCompileStatus("Build progress copied");
-    } else {
-      setCompileStatus("Copy failed");
-    }
-  }, [buildProgressText, setCompileStatus]);
-  const openToolTab = useCallback((tab: ToolTabId) => {
-    setActiveToolTab(tab);
+  const centerLayoutStyle = useMemo(() => ({}) as CSSProperties, []);
+  const toggleRightTool = useCallback((tool: RightToolId) => {
+    setActiveRightTool((prev) => (prev === tool ? null : tool));
   }, []);
-  const evaluateExpressionInput = useCallback(async () => {
-    if (!rootPath) {
-      setExpressionResult(null);
-      setExpressionRequestError("");
-      setCompileStatus("Select a project root first");
-      return;
-    }
-    const source = expressionInput.trim();
-    if (!source) {
-      setExpressionResult(null);
-      setExpressionRequestError("");
-      setCompileStatus("Enter an expression");
-      return;
-    }
-    setExpressionPending(true);
-    setExpressionRequestError("");
+  const toggleBottomTool = useCallback((tool: BottomToolId) => {
+    setActiveBottomTool((prev) => (prev === tool ? null : tool));
+  }, []);
+  const updateChatEndpoint = useCallback((endpointId: string, patch: Partial<AiEndpoint>) => {
+    setChatEndpointTests((prev) => {
+      if (!(endpointId in prev)) return prev;
+      const next = { ...prev };
+      delete next[endpointId];
+      return next;
+    });
+    setChatEndpointState((prev) => ({
+      ...prev,
+      endpoints: prev.endpoints.map((endpoint) => (
+        endpoint.id === endpointId
+          ? {
+            ...endpoint,
+            ...patch,
+            provider: normalizeAiProvider(patch.provider ?? endpoint.provider),
+            type: "chat",
+          }
+          : endpoint
+      )),
+    }));
+  }, []);
+  const addChatEndpoint = useCallback(() => {
+    const endpoint = createChatEndpoint(`Chat ${chatEndpoints.length + 1}`);
+    setChatEndpointState((prev) => ({
+      endpoints: [...prev.endpoints, endpoint],
+      activeId: endpoint.id,
+    }));
+  }, [chatEndpoints.length]);
+  const setCurrentChatEndpoint = useCallback((endpointId: string) => {
+    setChatEndpointState((prev) => ensureChatEndpointState(prev.endpoints, endpointId));
+  }, []);
+  const removeChatEndpoint = useCallback((endpointId: string) => {
+    setChatEndpointTests((prev) => {
+      if (!(endpointId in prev)) return prev;
+      const next = { ...prev };
+      delete next[endpointId];
+      return next;
+    });
+    setChatEndpointState((prev) => {
+      const nextEndpoints = prev.endpoints.filter((endpoint) => endpoint.id !== endpointId);
+      if (!nextEndpoints.length) {
+        const fallback = createChatEndpoint("Default Chat");
+        return {
+          endpoints: [fallback],
+          activeId: fallback.id,
+        };
+      }
+      const nextActiveId = prev.activeId === endpointId ? nextEndpoints[0].id : prev.activeId;
+      return ensureChatEndpointState(nextEndpoints, nextActiveId);
+    });
+  }, []);
+  const testChatEndpoint = useCallback(async (endpoint: AiEndpoint) => {
+    const endpointId = endpoint.id;
+    setChatEndpointTests((prev) => ({
+      ...prev,
+      [endpointId]: { kind: "testing", message: "Testing..." },
+    }));
     try {
-      const view = await getExpressionsView(rootPath, source);
-      setExpressionResult(view.evaluation || null);
-      setCompileStatus(`Expression result: ${view.evaluation?.result || "-"}`);
+      const response = await testAiEndpoint({
+        url: endpoint.url.trim(),
+        type: endpoint.type,
+        provider: endpoint.provider,
+        model: endpoint.model.trim() || null,
+        token: endpoint.token.trim() || null,
+      });
+      if (response.ok) {
+        setChatEndpointTests((prev) => ({
+          ...prev,
+          [endpointId]: { kind: "success", message: "Connection succeeded." },
+        }));
+        return;
+      }
+      const detail = (response.detail || "").trim();
+      const statusLabel = response.status ? `${response.status} ` : "";
+      setChatEndpointTests((prev) => ({
+        ...prev,
+        [endpointId]: {
+          kind: "error",
+          message: detail ? `${statusLabel}${detail}`.trim() : "Connection failed.",
+        },
+      }));
     } catch (error) {
-      const message = String(error);
-      setExpressionRequestError(message);
-      setCompileStatus(`Expression evaluation failed: ${message}`);
-    } finally {
-      setExpressionPending(false);
+      const message = error instanceof Error ? error.message : String(error);
+      setChatEndpointTests((prev) => ({
+        ...prev,
+        [endpointId]: { kind: "error", message: message || "Connection failed." },
+      }));
     }
-  }, [expressionInput, rootPath, setCompileStatus]);
-  const clearExpressionTool = useCallback(() => {
-    setExpressionInput("");
-    setExpressionResult(null);
-    setExpressionRequestError("");
   }, []);
+  const sendChatMessage = useCallback(async (overrideMessage?: string) => {
+    const source = (overrideMessage ?? chatDraft).trim();
+    if (!source || chatBusy) return;
+    if (!activeChatEndpoint.url.trim()) {
+      setCompileStatus("Chat requires an endpoint URL.");
+      return;
+    }
+    const at = new Date().toLocaleTimeString();
+    const contextLines = [
+      rootPath ? `root=${rootPath}` : "",
+      selectedSymbol?.qualified_name ? `selection=${selectedSymbol.qualified_name}` : "",
+      activeFilePath ? `file=${displayNameForPath(activeFilePath)}` : "",
+      compileStatus ? `compile_status=${compileStatus}` : "",
+    ].filter(Boolean);
+    const userContext = contextLines.length > 0
+      ? `${source}\n\nWorkspace context:\n${contextLines.map((line) => `- ${line}`).join("\n")}`
+      : source;
+    const conversation = [
+      ...chatMessages.map((message) => ({ role: message.role, content: message.text })),
+      { role: "user" as const, content: userContext },
+    ];
+    setChatMessages((prev) => [...prev, { id: prev.length + 1, role: "user", text: source, at }]);
+    setChatDraft("");
+    setChatBusy(true);
+    setCompileStatus("Chat: contacting model...");
+    try {
+      const response = await runAgent({
+        session_id: chatSessionId,
+        url: activeChatEndpoint.url.trim(),
+        provider: activeChatEndpoint.provider,
+        model: activeChatEndpoint.model.trim() || null,
+        token: activeChatEndpoint.token.trim() || null,
+        root: rootPath || null,
+        messages: conversation,
+        max_tokens: 1024,
+        enable_tools: true,
+      });
+      setChatSessionId(response.session_id || null);
+      setChatPlan(response.final_response?.plan || response.plan || null);
+      setChatSuggestedNextSteps(response.final_response?.next_steps || []);
+      const replyAt = new Date().toLocaleTimeString();
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          id: prev.length + 1,
+          role: "assistant",
+          text: formatAgentResponse(response),
+          at: replyAt,
+        },
+      ]);
+      setCompileStatus("Chat: response received");
+    } catch (error) {
+      const replyAt = new Date().toLocaleTimeString();
+      const message = error instanceof Error ? error.message : String(error);
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          id: prev.length + 1,
+          role: "assistant",
+          text: `Chat failed: ${message}`,
+          at: replyAt,
+        },
+      ]);
+      setCompileStatus(`Chat failed: ${message}`);
+    } finally {
+      setChatBusy(false);
+    }
+  }, [
+    activeFilePath,
+    activeChatEndpoint,
+    chatSessionId,
+    chatBusy,
+    chatDraft,
+    chatMessages,
+    compileStatus,
+    displayNameForPath,
+    rootPath,
+    selectedSymbol,
+    setCompileStatus,
+  ]);
+  const openCommitManagerPath = useCallback((path: string) => {
+    if (!cmRepoInfo) return;
+    void openFilePath(resolveRepoRelativePath(cmRepoInfo.repo_root, path));
+  }, [cmRepoInfo, openFilePath]);
+  const stageCommitManagerPaths = useCallback(async (paths: string[]) => {
+    if (!cmRepoInfo) return;
+    const nextPaths = Array.from(new Set(paths.map((path) => `${path || ""}`.trim()).filter(Boolean)));
+    if (!nextPaths.length) return;
+    setCmBusyState("stage");
+    setCmError("");
+    try {
+      const nextStatus = await stageGitPaths(cmRepoInfo.repo_root, nextPaths);
+      applyCommitManagerStatus(nextStatus);
+    } catch (error) {
+      const message = `Stage failed: ${String(error)}`;
+      setCmError(message);
+      setCompileStatus(message);
+    } finally {
+      setCmBusyState(null);
+    }
+  }, [applyCommitManagerStatus, cmRepoInfo, setCompileStatus]);
+  const unstageCommitManagerPaths = useCallback(async (paths: string[]) => {
+    if (!cmRepoInfo) return;
+    const nextPaths = Array.from(new Set(paths.map((path) => `${path || ""}`.trim()).filter(Boolean)));
+    if (!nextPaths.length) return;
+    setCmBusyState("unstage");
+    setCmError("");
+    try {
+      const nextStatus = await unstageGitPaths(cmRepoInfo.repo_root, nextPaths);
+      applyCommitManagerStatus(nextStatus);
+    } catch (error) {
+      const message = `Unstage failed: ${String(error)}`;
+      setCmError(message);
+      setCompileStatus(message);
+    } finally {
+      setCmBusyState(null);
+    }
+  }, [applyCommitManagerStatus, cmRepoInfo, setCompileStatus]);
+  const commitFromCommitManager = useCallback(async () => {
+    if (!cmRepoInfo) return;
+    const message = cmCommitMessage.trim();
+    if (!message) return;
+    setCmBusyState("commit");
+    setCmError("");
+    try {
+      const oid = await commitGit(cmRepoInfo.repo_root, message);
+      setCmCommitMessage("");
+      setCompileStatus(`Commit created: ${oid}`);
+      await refreshCommitManager({ silent: true });
+    } catch (error) {
+      const nextMessage = `Commit failed: ${String(error)}`;
+      setCmError(nextMessage);
+      setCompileStatus(nextMessage);
+    } finally {
+      setCmBusyState(null);
+    }
+  }, [cmCommitMessage, cmRepoInfo, refreshCommitManager, setCompileStatus]);
+  const pushFromCommitManager = useCallback(async () => {
+    if (!cmRepoInfo) return;
+    setCmBusyState("push");
+    setCmError("");
+    try {
+      await pushGit(cmRepoInfo.repo_root);
+      setCompileStatus(`Pushed ${cmRepoInfo.branch} to origin.`);
+      await refreshCommitManager({ silent: true });
+    } catch (error) {
+      const message = `Push failed: ${String(error)}`;
+      setCmError(message);
+      setCompileStatus(message);
+    } finally {
+      setCmBusyState(null);
+    }
+  }, [cmRepoInfo, refreshCommitManager, setCompileStatus]);
+  const generateCommitManagerMessage = useCallback(async () => {
+    if (!cmRepoInfo || !cmStagedPaths.length) return;
+    if (!activeChatEndpoint.url.trim()) {
+      setCmError("Configure a chat endpoint to generate commit messages.");
+      return;
+    }
+    setCmBusyState("generate");
+    setCmError("");
+    try {
+      const response = await runAgent({
+        url: activeChatEndpoint.url.trim(),
+        provider: activeChatEndpoint.provider,
+        model: activeChatEndpoint.model.trim() || null,
+        token: activeChatEndpoint.token.trim() || null,
+        root: cmRepoInfo.repo_root || rootPath || null,
+        messages: [
+          {
+            role: "user",
+            content: [
+              "Write a git commit message for the staged changes below.",
+              "Return only the commit message text.",
+              "Use a concise imperative subject line.",
+              "Add a blank line and short body only if it is clearly useful.",
+              "Do not use code fences, quotes, or explanations.",
+              "",
+              `Branch: ${cmRepoInfo.branch}`,
+              "Staged files:",
+              ...cmStagedPaths.map((path) => `- ${path}`),
+            ].join("\n"),
+          },
+        ],
+        max_tokens: 160,
+        enable_tools: false,
+      });
+      const nextMessage = sanitizeGeneratedCommitMessage(response.message);
+      if (!nextMessage) {
+        throw new Error("The model returned an empty commit message.");
+      }
+      setCmCommitMessage(nextMessage);
+      setCompileStatus("Commit message generated.");
+    } catch (error) {
+      const message = `Commit message generation failed: ${String(error)}`;
+      setCmError(message);
+      setCompileStatus(message);
+    } finally {
+      setCmBusyState(null);
+    }
+  }, [activeChatEndpoint, cmRepoInfo, cmStagedPaths, rootPath, setCompileStatus]);
+  const renderRightTool = useCallback((): ReactNode => {
+    if (activeRightTool === "properties") {
+      return (
+        <PropertiesPanel
+          rootPath={rootPath}
+          selectedSymbol={selectedSymbol}
+          semanticRefreshVersion={semanticRefreshVersion}
+          onSelectQualifiedName={selectQualifiedName}
+          onMinimize={() => setActiveRightTool(null)}
+        />
+      );
+    }
+    if (activeRightTool === "modelErrors") {
+      return (
+        <ModelErrorsPanel
+          workspaceErrors={rightPanelWorkspaceErrors}
+          fileDiagnostics={modelDiagnosticBuckets}
+          collapsedFiles={collapsedParseErrorFiles}
+          normalizePath={normalizePath}
+          displayNameForPath={displayNameForPath}
+          toggleFile={toggleParseErrorFile}
+          openDiagnostic={openDiagnostic}
+          onMinimize={() => setActiveRightTool(null)}
+        />
+      );
+    }
+    if (activeRightTool === "cm") {
+      return (
+        <CommitManagerPanel
+          rootPath={rootPath}
+          repoInfo={cmRepoInfo}
+          status={cmStatus}
+          loading={cmLoading}
+          error={cmError}
+          commitMessage={cmCommitMessage}
+          actionBusy={cmBusyState === "refresh" || cmBusyState === "stage" || cmBusyState === "unstage"}
+          commitBusy={cmBusyState === "commit"}
+          pushBusy={cmBusyState === "push"}
+          generateBusy={cmBusyState === "generate"}
+          canGenerate={canGenerateCommitMessage}
+          generateDisabledReason={cmGenerateDisabledReason}
+          onCommitMessageChange={setCmCommitMessage}
+          onRefresh={() => {
+            setCmBusyState("refresh");
+            void refreshCommitManager()
+              .finally(() => setCmBusyState(null));
+          }}
+          onStagePaths={(paths) => { void stageCommitManagerPaths(paths); }}
+          onUnstagePaths={(paths) => { void unstageCommitManagerPaths(paths); }}
+          onOpenPath={openCommitManagerPath}
+          onCommit={() => { void commitFromCommitManager(); }}
+          onGenerateMessage={() => { void generateCommitManagerMessage(); }}
+          onPush={() => { void pushFromCommitManager(); }}
+          onMinimize={() => setActiveRightTool(null)}
+        />
+      );
+    }
+    if (activeRightTool === "chat") {
+      return (
+        <div className="simple-right-section simple-right-tool-panel">
+          <div className="panel-header simple-properties-panel-header">
+            <strong>Chat</strong>
+            <div className="simple-chat-header-actions">
+              <button
+                type="button"
+                className="ghost simple-chat-header-icon"
+                onClick={() => setChatConfigOpen(true)}
+                title="Configure chat endpoints"
+                aria-label="Configure chat endpoints"
+              >
+                ⚙
+              </button>
+              <button
+                type="button"
+                className="ghost simple-panel-minimize"
+                onClick={() => setActiveRightTool(null)}
+                title="Minimize side panel"
+              >
+                -
+              </button>
+            </div>
+          </div>
+          <div className="simple-ui-scroll simple-chat-dock-body">
+            <div className="simple-chat-config-summary">
+              <div className="simple-chat-header-current">
+                <strong>{activeChatEndpoint.name || "Unnamed endpoint"}</strong>
+                <span className="muted">
+                  {activeChatEndpoint.provider === "azure"
+                    ? "Azure OpenAI"
+                    : activeChatEndpoint.provider === "anthropic"
+                      ? "Anthropic"
+                      : "OpenAI Compatible"}
+                </span>
+              </div>
+              <div className="muted simple-chat-endpoint-url">
+                {activeChatEndpoint.url.trim() || "No endpoint URL configured"}
+              </div>
+            </div>
+            {chatPlan ? (
+              <div className="simple-chat-plan">
+                <div className="simple-chat-plan-header">
+                  <strong>Plan</strong>
+                  {chatSessionId ? <span className="muted">Session {chatSessionId.slice(-8)}</span> : null}
+                </div>
+                {chatPlan.goal.trim() ? <div className="simple-chat-plan-goal">{chatPlan.goal}</div> : null}
+                {chatPlan.steps.length ? (
+                  <div className="simple-chat-plan-steps">
+                    {chatPlan.steps.map((step) => (
+                      <div key={step.id} className={`simple-chat-plan-step ${step.status}`}>
+                        <div className="simple-chat-plan-step-head">
+                          <strong>{step.label}</strong>
+                          <span className="muted">{formatPlanStepStatus(step.status)}</span>
+                        </div>
+                        <div className="muted simple-chat-plan-step-id">Step {step.id}</div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="muted">No plan steps yet.</div>
+                )}
+              </div>
+            ) : null}
+            {chatSuggestedNextSteps.length ? (
+              <div className="simple-chat-suggestions">
+                <div className="simple-chat-plan-header">
+                  <strong>Suggested Next Steps</strong>
+                </div>
+                <div className="simple-chat-suggestion-list">
+                  {chatSuggestedNextSteps.map((step) => (
+                    <button
+                      key={step.id}
+                      type="button"
+                      className={`ghost simple-chat-suggestion ${step.recommended ? "recommended" : ""}`}
+                      disabled={chatBusy}
+                      onClick={() => { void sendChatMessage(step.action); }}
+                    >
+                      {step.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            <div className="simple-chat-thread">
+              {chatMessages.map((message) => (
+                <div key={`${message.id}-${message.at}`} className={`simple-chat-message ${message.role}`}>
+                  <div className="simple-chat-message-meta">
+                    <strong>{message.role === "assistant" ? "Assistant" : "You"}</strong>
+                    <span className="muted">{message.at}</span>
+                  </div>
+                  <div className="simple-chat-message-text">{message.text}</div>
+                </div>
+              ))}
+            </div>
+            <label className="simple-chat-composer">
+              <span className="muted">Message</span>
+              <textarea
+                value={chatDraft}
+                onChange={(event) => setChatDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+                    event.preventDefault();
+                    void sendChatMessage();
+                  }
+                }}
+                placeholder="Ask about the current model, file, or selection."
+              />
+            </label>
+            <div className="simple-chat-dock-actions">
+              <button
+                type="button"
+                className="ghost"
+                onClick={() => {
+                  setChatSessionId(null);
+                  setChatPlan(null);
+                  setChatSuggestedNextSteps([]);
+                  setChatDraft("");
+                  setChatMessages((prev) => prev.slice(0, 1));
+                }}
+              >
+                Clear
+              </button>
+              <button type="button" onClick={() => { void sendChatMessage(); }} disabled={!chatDraft.trim() || chatBusy}>
+                {chatBusy ? "Sending..." : "Send"}
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+    return null;
+  }, [
+    activeRightTool,
+    activeChatEndpoint,
+    chatBusy,
+    chatDraft,
+    chatMessages,
+    chatPlan,
+    chatSessionId,
+    chatSuggestedNextSteps,
+    cmBusyState,
+    cmCommitMessage,
+    cmError,
+    cmGenerateDisabledReason,
+    cmLoading,
+    cmRepoInfo,
+    cmStatus,
+    collapsedParseErrorFiles,
+    canGenerateCommitMessage,
+    commitFromCommitManager,
+    displayNameForPath,
+    generateCommitManagerMessage,
+    modelDiagnosticBuckets,
+    normalizePath,
+    openCommitManagerPath,
+    openDiagnostic,
+    pushFromCommitManager,
+    refreshCommitManager,
+    rightPanelWorkspaceErrors,
+    rootPath,
+    selectQualifiedName,
+    selectedSymbol,
+    semanticRefreshVersion,
+    sendChatMessage,
+    stageCommitManagerPaths,
+    toggleParseErrorFile,
+    unstageCommitManagerPaths,
+  ]);
+  const filteredBuildLogEntries = useMemo(() => {
+    const textFilter = logFilterText.trim().toLowerCase();
+    const filtered = buildLogEntries.filter((entry) => {
+      if (logFilterLevel !== "all" && entry.level !== logFilterLevel) {
+        return false;
+      }
+      if (!textFilter) {
+        return true;
+      }
+      const haystack = [
+        entry.at,
+        entry.timestampUtc || "",
+        entry.level,
+        entry.kind,
+        entry.message,
+      ].join(" ").toLowerCase();
+      return haystack.includes(textFilter);
+    });
+    return filtered.slice(-400).reverse();
+  }, [buildLogEntries, logFilterLevel, logFilterText]);
+
+  const renderBottomTool = useCallback((): ReactNode => {
+    if (activeBottomTool !== "logs") return null;
+    return (
+      <section className="panel simple-bottom-log-panel">
+        <div className="panel-header simple-bottom-log-header">
+          <strong>Logs</strong>
+          <div className="simple-bottom-log-actions">
+            <span className="muted">
+              {filteredBuildLogEntries.length} of {buildLogEntries.length} entries
+            </span>
+            <label className="simple-bottom-log-filter">
+              <span className="muted">Level</span>
+              <select
+                value={logFilterLevel}
+                onChange={(event) => setLogFilterLevel(event.target.value as LogFilterLevel)}
+                aria-label="Filter logs by level"
+              >
+                {LOG_LEVEL_FILTER_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+            </label>
+            <label className="simple-bottom-log-filter simple-bottom-log-search">
+              <span className="muted">Filter</span>
+              <input
+                value={logFilterText}
+                onChange={(event) => setLogFilterText(event.target.value)}
+                placeholder="Search kind or message"
+                aria-label="Filter logs by text"
+              />
+            </label>
+            <button type="button" className="ghost" onClick={clearBuildLogs} disabled={!buildLogEntries.length}>
+              Clear
+            </button>
+            <button type="button" className="ghost" onClick={() => setActiveBottomTool(null)}>
+              Close
+            </button>
+          </div>
+        </div>
+        <div className="simple-ui-scroll simple-bottom-log-list">
+          {buildLogEntries.length ? (
+            filteredBuildLogEntries.length ? (
+              <div className="simple-bottom-log-table" role="table" aria-label="Application logs">
+                <div className="simple-bottom-log-table-head" role="row">
+                  <span>Time</span>
+                  <span>Level</span>
+                  <span>Source</span>
+                  <span>Message</span>
+                </div>
+                {filteredBuildLogEntries.map((entry) => (
+                  <div key={entry.id} className={`simple-bottom-log-row ${entry.level}`} role="row">
+                    <span className="simple-bottom-log-time" title={entry.timestampUtc || entry.at}>{entry.at}</span>
+                    <span className={`simple-bottom-log-level ${entry.level}`}>{entry.level}</span>
+                    <span className="simple-bottom-log-kind" title={entry.kind}>{entry.kind}</span>
+                    <span className="simple-bottom-log-message">{entry.message}</span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="muted">No log entries match the current filter.</div>
+            )
+          ) : (
+            <div className="muted">No log entries yet.</div>
+          )}
+        </div>
+      </section>
+    );
+  }, [
+    activeBottomTool,
+    buildLogEntries,
+    clearBuildLogs,
+    filteredBuildLogEntries,
+    logFilterLevel,
+    logFilterText,
+  ]);
 
   const backgroundJobsTitle = useMemo(() => {
     if (!backgroundJobs.jobs.length) {
@@ -4788,7 +5336,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
       >
         <div className="native-titlebar-left">
           <span className="app-mark">
-            <img src="/app-icon.png" alt="Mercurio" className="app-mark-image" />
+            <img src={publicAssetUrl("app-icon.png")} alt="Mercurio" className="app-mark-image" />
           </span>
           <span className="native-titlebar-name">Mercurio SysML</span>
           <nav className="menu-bar menu-bar-inline" aria-label="Application menu">
@@ -4848,14 +5396,17 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
               </button>
               {menuOpen === "view" ? (
                 <div className="menu-bar-dropdown">
-                  <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); openToolTab("tooling"); }}>
-                    {activeToolTab === "tooling" ? `${UI_ICON.check} ` : ""}Show Tooling
+                  <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); toggleRightTool("properties"); }}>
+                    {activeRightTool === "properties" ? `${UI_ICON.check} ` : ""}Show Properties
                   </button>
-                  <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); openToolTab("logs"); }}>
-                    {activeToolTab === "logs" ? `${UI_ICON.check} ` : ""}Show Logs
+                  <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); toggleRightTool("modelErrors"); }}>
+                    {activeRightTool === "modelErrors" ? `${UI_ICON.check} ` : ""}Show Model Errors
                   </button>
-                  <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); openToolTab("expressions"); }}>
-                    {activeToolTab === "expressions" ? `${UI_ICON.check} ` : ""}Show Expressions
+                  <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); toggleRightTool("cm"); }}>
+                    {activeRightTool === "cm" ? `${UI_ICON.check} ` : ""}Show Commit Manager
+                  </button>
+                  <button type="button" className="ghost menu-bar-entry" onClick={() => { setMenuOpen(null); toggleRightTool("chat"); }}>
+                    {activeRightTool === "chat" ? `${UI_ICON.check} ` : ""}Show Chat
                   </button>
                 </div>
               ) : null}
@@ -4939,6 +5490,7 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
         </div>
       </header>
 
+      <div className={`simple-ui-workbench ${activeBottomTool ? "with-bottom-tool" : ""}`}>
       <main className="simple-ui-main" style={mainLayoutStyle}>
         <aside className="panel simple-ui-left">
           <div className="panel-header simple-tree-panel-header">
@@ -5136,9 +5688,9 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
           <div className="simple-center-workspace">
             <div className="simple-center-editor-stack">
               <div className="simple-editor-tabs">
-                <div ref={tabsStripRef} className="simple-editor-tabs-strip">
-                  {openTabs.length ? (
-                    openTabs.map((tab) => {
+                <div ref={tabsStripRef} className={`simple-editor-tabs-strip ${compactTabsMode ? "compact" : ""}`}>
+                  {visibleTabs.length ? (
+                    visibleTabs.map((tab) => {
                       const tabKey = normalizePath(tab.path);
                       const isActive = !!activeFilePath && normalizePath(activeFilePath) === tabKey;
                       const tabDirty = isActive ? dirty : tab.dirty;
@@ -5236,8 +5788,39 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                           const tabKey = normalizePath(tab.path);
                           const isActive = !!activeFilePath && normalizePath(activeFilePath) === tabKey;
                           const tabDirty = isActive ? dirty : tab.dirty;
+                          const isDragSource = !!dragTabPath && normalizePath(dragTabPath) === tabKey;
+                          const isDropTarget = !!dragOverTabPath && normalizePath(dragOverTabPath) === tabKey;
                           return (
-                            <div key={`dropdown:${tab.path}`} className={`simple-editor-tabs-dropdown-row ${isActive ? "active" : ""}`}>
+                            <div
+                              key={`dropdown:${tab.path}`}
+                              className={`simple-editor-tabs-dropdown-row ${isActive ? "active" : ""} ${isDragSource ? "drag-source" : ""} ${isDropTarget ? "drop-target" : ""}`}
+                              draggable
+                              onDragStart={(event) => {
+                                setDragTabPath(tab.path);
+                                setDragOverTabPath(tab.path);
+                                event.dataTransfer.effectAllowed = "move";
+                                event.dataTransfer.setData("text/plain", tab.path);
+                              }}
+                              onDragOver={(event) => {
+                                event.preventDefault();
+                                if (dragOverTabPath !== tab.path) {
+                                  setDragOverTabPath(tab.path);
+                                }
+                                event.dataTransfer.dropEffect = "move";
+                              }}
+                              onDrop={(event) => {
+                                event.preventDefault();
+                                const fromPath = dragTabPath || event.dataTransfer.getData("text/plain");
+                                if (!fromPath) return;
+                                reorderOpenTabs(fromPath, tab.path);
+                                setDragTabPath(null);
+                                setDragOverTabPath(null);
+                              }}
+                              onDragEnd={() => {
+                                setDragTabPath(null);
+                                setDragOverTabPath(null);
+                              }}
+                            >
                               <button
                                 type="button"
                                 className="ghost simple-editor-tabs-dropdown-item"
@@ -5380,6 +5963,16 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                 </div>
               ) : (
                 <>
+                  {activeFilePath && activeFileParseDiagnostics.length ? (
+                    <FileDiagnosticsPanel
+                      filePath={activeFilePath}
+                      diagnostics={activeFileParseDiagnostics}
+                      collapsed={!!collapsedParseErrorFiles[normalizePath(activeFilePath)]}
+                      displayNameForPath={displayNameForPath}
+                      onToggleCollapsed={() => toggleParseErrorFile(activeFilePath)}
+                      openDiagnostic={(diagnostic) => openDiagnostic(activeFilePath, diagnostic)}
+                    />
+                  ) : null}
                   {activeExplorerTab && activeExplorerGraph ? (
                     <ModelExplorerCanvas
                       graph={activeExplorerGraph}
@@ -5484,225 +6077,105 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
                 </>
               )}
             </div>
-            <div
-              className={`simple-harness-resizer ${centerHarnessSplitDragging ? "active" : ""}`}
-              role="separator"
-              aria-orientation="horizontal"
-              aria-label="Resize tooling area"
-              onPointerDown={handleCenterHarnessResizerPointerDown}
-              onPointerMove={handleCenterHarnessResizerPointerMove}
-              onPointerUp={stopCenterHarnessResizerDrag}
-              onPointerCancel={stopCenterHarnessResizerDrag}
-            />
-            <div className="simple-tooling">
-              <div className="panel-header simple-tooling-header">
-                <div className="simple-tooling-tabs" role="tablist" aria-label="Tooling tabs">
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={activeToolTab === "tooling"}
-                    className={`ghost simple-tool-tab ${activeToolTab === "tooling" ? "active" : ""}`}
-                    onClick={() => setActiveToolTab("tooling")}
-                  >
-                    Tooling
-                  </button>
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={activeToolTab === "logs"}
-                    className={`ghost simple-tool-tab ${activeToolTab === "logs" ? "active" : ""}`}
-                    onClick={() => openToolTab("logs")}
-                  >
-                    Logs
-                  </button>
-                  <button
-                    type="button"
-                    role="tab"
-                    aria-selected={activeToolTab === "expressions"}
-                    className={`ghost simple-tool-tab ${activeToolTab === "expressions" ? "active" : ""}`}
-                    onClick={() => openToolTab("expressions")}
-                  >
-                    Expressions
-                  </button>
-                </div>
-                <div className="simple-tooling-actions">
-                  {activeToolTab === "logs" ? (
-                    <>
-                      <button type="button" className="ghost" onClick={() => void copyBuildProgress()}>
-                        Copy Logs
-                      </button>
-                      <button type="button" className="ghost" onClick={clearBuildLogs}>
-                        Clear
-                      </button>
-                    </>
-                  ) : null}
-                  {activeToolTab === "expressions" ? (
-                    <>
-                      <button
-                        type="button"
-                        className="ghost"
-                        onClick={() => void evaluateExpressionInput()}
-                        disabled={expressionPending}
-                      >
-                        {expressionPending ? "Evaluating..." : "Evaluate"}
-                      </button>
-                      <button type="button" className="ghost" onClick={clearExpressionTool} disabled={expressionPending}>
-                        Clear
-                      </button>
-                    </>
-                  ) : null}
-                </div>
-              </div>
-              <div className="simple-tooling-body">
-                {activeToolTab === "logs" ? (
-                  <div className="simple-log-tool" role="tabpanel" aria-label="Logs tool">
-                    <div className="simple-build-progress-status muted">{compileStatus}</div>
-                    <div className="simple-build-progress-meta muted">
-                      <span>run {buildProgress.runId ?? "-"}</span>
-                      <span>stage {buildProgress.stage}</span>
-                      <span>events {buildProgress.eventCount}</span>
-                      <span>elapsed {formatDurationMs(buildElapsedMs)}</span>
-                      <span>last event {formatDurationMs(buildIdleMs)} ago</span>
-                    </div>
-                    {buildStalledHint ? (
-                      <div className="simple-build-progress-stalled">{buildStalledHint}</div>
-                    ) : null}
-                    {buildProgress.file ? (
-                      <div className="simple-build-progress-file">{buildProgress.file}</div>
-                    ) : null}
-                    <div className="simple-build-progress-list">
-                      <BuildLogList entries={buildLogEntries} />
-                    </div>
-                    <div className="simple-harness-runs" aria-label="Recent runs">
-                      {harnessRuns.length ? (
-                        harnessRuns.map((run) => {
-                          const width = `${Math.max(6, Math.round((run.durationMs / harnessMaxDuration) * 100))}%`;
-                          const runOk = run.ok && run.budgetOk;
-                          return (
-                            <div key={run.id} className="simple-harness-row">
-                              <span>{run.at}</span>
-                              <span>{run.kind}</span>
-                              <span className={runOk ? "ok" : "error"}>{runOk ? "ok" : "fail"}</span>
-                              <span>{Math.round(run.durationMs)} ms</span>
-                              <span>{run.progressUpdates} ui</span>
-                              <div className="simple-harness-bar">
-                                <div className={`simple-harness-bar-fill ${runOk ? "ok" : "error"}`} style={{ width }} />
-                              </div>
-                            </div>
-                          );
-                        })
-                      ) : (
-                        <div className="muted">No runs yet.</div>
-                      )}
-                    </div>
-                  </div>
-                ) : activeToolTab === "expressions" ? (
-                  <div className="simple-expression-tool" role="tabpanel" aria-label="Expressions tool">
-                    <label className="simple-expression-editor">
-                      <span className="muted">Expression</span>
-                      <textarea
-                        className="simple-expression-input"
-                        value={expressionInput}
-                        onChange={(event) => setExpressionInput(event.target.value)}
-                        onKeyDown={(event) => {
-                          if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
-                            event.preventDefault();
-                            void evaluateExpressionInput();
-                          }
-                        }}
-                        spellCheck={false}
-                        placeholder="Type an expression like 1 + 2 * 3"
-                      />
-                    </label>
-                    <div className="simple-expression-hint muted">Press Ctrl+Enter to evaluate.</div>
-                    <div className="simple-expression-results">
-                      {expressionRequestError ? (
-                        <div className="error">{expressionRequestError}</div>
-                      ) : null}
-                      {expressionResult ? (
-                        <div className="simple-expression-grid">
-                          <span className="muted">Expression</span>
-                          <span>{expressionResult.expression}</span>
-                          <span className="muted">Result</span>
-                          <span>{expressionResult.result}</span>
-                        </div>
-                      ) : (
-                        <div className="muted">Enter an expression and evaluate it against the current project.</div>
-                      )}
-                    </div>
-                  </div>
-                ) : (
-                  <div className="simple-harness-runs simple-tooling-panel" role="tabpanel" aria-label="Tooling tab">
-                    <div className="muted">
-                      avg {Math.round(harnessAvgDuration)} ms | max {Math.round(harnessMaxDuration)} ms | ui updates {progressUiUpdates} | dropped requests {droppedCompileRequests} | budget failures {harnessBudgetFailures}
-                    </div>
-                    {harnessRuns.length ? (
-                      harnessRuns.map((run) => {
-                        const width = `${Math.max(6, Math.round((run.durationMs / harnessMaxDuration) * 100))}%`;
-                        const runOk = run.ok && run.budgetOk;
-                        return (
-                          <div key={run.id} className="simple-harness-row">
-                            <span>{run.at}</span>
-                            <span>{run.kind}</span>
-                            <span className={runOk ? "ok" : "error"}>{runOk ? "ok" : "fail"}</span>
-                            <span>{Math.round(run.durationMs)} ms</span>
-                            <span>{run.progressUpdates} ui</span>
-                            <div className="simple-harness-bar">
-                              <div className={`simple-harness-bar-fill ${runOk ? "ok" : "error"}`} style={{ width }} />
-                            </div>
-                          </div>
-                        );
-                      })
-                    ) : (
-                      <div className="muted">No runs yet.</div>
-                    )}
-                  </div>
-                )}
-              </div>
-            </div>
           </div>
         </section>
 
-        <aside className="panel simple-ui-right" ref={rightPanelRef} style={rightPanelLayoutStyle}>
-          <div
-            className={`simple-ui-right-resizer ${rightPaneDragging ? "active" : ""}`}
-            role="separator"
-            aria-orientation="vertical"
-            aria-label="Resize properties panel"
-            onPointerDown={handleRightPaneResizerPointerDown}
-            onPointerMove={handleRightPaneResizerPointerMove}
-            onPointerUp={stopRightPaneResizerDrag}
-            onPointerCancel={stopRightPaneResizerDrag}
-          />
-          <PropertiesPanel
-            rootPath={rootPath}
-            selectedSymbol={selectedSymbol}
-            semanticRefreshVersion={semanticRefreshVersion}
-            onSelectQualifiedName={selectQualifiedName}
-            onOpenExplorer={() => openModelExplorerForSymbol(selectedSymbol)}
-          />
-          <div
-            className={`simple-right-splitter ${rightPanelSplitDragging ? "active" : ""}`}
-            role="separator"
-            aria-orientation="horizontal"
-            aria-label="Resize properties and parse errors"
-            onPointerDown={handleRightPanelSplitPointerDown}
-            onMouseDown={handleRightPanelSplitMouseDown}
-            onPointerMove={handleRightPanelSplitPointerMove}
-            onPointerUp={stopRightPanelSplitDrag}
-            onPointerCancel={stopRightPanelSplitDrag}
-          />
-          <ParseErrorsPanel
-            compileToast={compileToast}
-            workspaceErrors={rightPanelWorkspaceErrors}
-            collapsedParseErrorFiles={collapsedParseErrorFiles}
-            normalizePath={normalizePath}
-            displayNameForPath={displayNameForPath}
-            toggleParseErrorFile={toggleParseErrorFile}
-            openDiagnostic={openDiagnostic}
-          />
+        <aside
+          className={`simple-ui-right simple-right-tool-dock ${activeRightTool ? "open" : "collapsed"}`}
+          ref={rightPanelRef}
+        >
+          {activeRightTool ? (
+            <div
+              className={`simple-ui-right-resizer ${rightPaneDragging ? "active" : ""}`}
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize right tool panel"
+              onPointerDown={handleRightPaneResizerPointerDown}
+              onPointerMove={handleRightPaneResizerPointerMove}
+              onPointerUp={stopRightPaneResizerDrag}
+              onPointerCancel={stopRightPaneResizerDrag}
+            />
+          ) : null}
+          <div className={`simple-right-tool-content ${activeRightTool ? "panel open" : "collapsed"}`}>
+            {renderRightTool()}
+          </div>
         </aside>
       </main>
+      <aside className="simple-right-toolstrip-shell">
+        <div className="simple-right-toolstrip" aria-label="Right tools">
+          <div className="simple-right-toolstrip-top" role="tablist" aria-label="Primary right tools">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeRightTool === "properties"}
+              aria-label="Properties"
+              className={`ghost simple-right-tool-btn ${activeRightTool === "properties" ? "active" : ""}`}
+              onClick={() => toggleRightTool("properties")}
+              title="Properties"
+            >
+              <span className="simple-right-tool-icon" aria-hidden="true">{UI_ICON.properties}</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeRightTool === "modelErrors"}
+              aria-label="Model Errors"
+              className={`ghost simple-right-tool-btn ${activeRightTool === "modelErrors" ? "active" : ""}`}
+              onClick={() => toggleRightTool("modelErrors")}
+              title={workspaceProblemCount ? `Model Errors (${workspaceProblemCount})` : "Model Errors"}
+            >
+              <span className="simple-right-tool-icon" aria-hidden="true">{UI_ICON.error}</span>
+              {workspaceProblemCount ? <span className="simple-right-tool-badge">{workspaceProblemCount}</span> : null}
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeRightTool === "cm"}
+              aria-label="Commit Manager"
+              className={`ghost simple-right-tool-btn ${activeRightTool === "cm" ? "active" : ""}`}
+              onClick={() => toggleRightTool("cm")}
+              title="Commit Manager"
+            >
+              <span className="simple-right-tool-icon simple-right-tool-icon-cm" aria-hidden="true">
+                <svg viewBox="0 0 20 20" className="simple-right-tool-icon-svg">
+                  <path d="M2.75 10H6.2" />
+                  <path d="M13.8 10H17.25" />
+                  <circle cx="10" cy="10" r="4.4" />
+                </svg>
+              </span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeRightTool === "chat"}
+              aria-label="Chat"
+              className={`ghost simple-right-tool-btn ${activeRightTool === "chat" ? "active" : ""}`}
+              onClick={() => toggleRightTool("chat")}
+              title="Chat"
+            >
+              <span className="simple-right-tool-icon" aria-hidden="true">{UI_ICON.chat}</span>
+            </button>
+          </div>
+          <div className="simple-right-toolstrip-bottom">
+            <button
+              type="button"
+              aria-pressed={activeBottomTool === "logs"}
+              aria-label="Logs"
+              className={`ghost simple-right-tool-btn ${activeBottomTool === "logs" ? "active" : ""}`}
+              onClick={() => toggleBottomTool("logs")}
+              title={`Logs${buildLogEntries.length ? ` (${buildLogEntries.length})` : ""}`}
+            >
+              <span className="simple-right-tool-icon" aria-hidden="true">{UI_ICON.log}</span>
+            </button>
+          </div>
+        </div>
+      </aside>
+      {activeBottomTool ? (
+        <div className="simple-bottom-drawer simple-bottom-log-drawer">
+          {renderBottomTool()}
+        </div>
+      ) : null}
+      </div>
 
       {semanticEditDialog ? (
         <div
@@ -5849,6 +6322,148 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
               {semanticEditDialog.dirtySincePreview
                 ? "Preview is stale. Run Preview again before Apply."
                 : "Apply writes the updated text to disk and refreshes the model."}
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {chatConfigOpen ? (
+        <div
+          className="simple-modal-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setChatConfigOpen(false);
+            }
+          }}
+        >
+          <section
+            className="simple-modal simple-chat-endpoint-manager"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Chat endpoint options"
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            <div className="simple-modal-header">
+              <strong>Chat Endpoints</strong>
+              <div className="simple-modal-header-actions">
+                <button type="button" className="ghost" onClick={addChatEndpoint}>
+                  Add
+                </button>
+                <button type="button" className="ghost" onClick={() => setChatConfigOpen(false)}>
+                  Done
+                </button>
+              </div>
+            </div>
+            <div className="simple-modal-body simple-chat-endpoint-body">
+              <div className="simple-stdlib-meta muted">
+                <span>Current endpoint: {activeChatEndpoint.name || "-"}</span>
+                <span>{activeChatEndpoint.url.trim() || "No endpoint URL configured"}</span>
+              </div>
+              {chatEndpoints.length ? (
+                <div className="simple-chat-endpoint-list">
+                  {chatEndpoints.map((endpoint) => {
+                    const isActive = endpoint.id === activeChatEndpointId;
+                    const testState = chatEndpointTests[endpoint.id];
+                    return (
+                      <div key={endpoint.id} className={`simple-chat-endpoint-card ${isActive ? "active" : ""}`}>
+                        <div className="simple-chat-endpoint-grid">
+                          <label className="simple-chat-field">
+                            <span className="muted">Name</span>
+                            <input
+                              type="text"
+                              value={endpoint.name}
+                              onChange={(event) => updateChatEndpoint(endpoint.id, { name: event.target.value })}
+                              placeholder="Endpoint name"
+                            />
+                          </label>
+                          <label className="simple-chat-field">
+                            <span className="muted">Provider</span>
+                            <select
+                              value={endpoint.provider}
+                              onChange={(event) => updateChatEndpoint(endpoint.id, { provider: event.target.value as AiEndpoint["provider"] })}
+                            >
+                              <option value="openai">OpenAI Compatible</option>
+                              <option value="azure">Azure OpenAI</option>
+                              <option value="anthropic">Anthropic</option>
+                            </select>
+                          </label>
+                          <label className="simple-chat-field">
+                            <span className="muted">{endpoint.provider === "azure" ? "Deployment" : "Model"}</span>
+                            <input
+                              type="text"
+                              value={endpoint.model}
+                              onChange={(event) => updateChatEndpoint(endpoint.id, { model: event.target.value })}
+                              placeholder={
+                                endpoint.provider === "anthropic"
+                                  ? "claude-3-5-sonnet-latest"
+                                  : endpoint.provider === "azure"
+                                    ? "your-deployment-name"
+                                    : "gpt-4o-mini"
+                              }
+                            />
+                          </label>
+                          <label className="simple-chat-field simple-chat-endpoint-span-2">
+                            <span className="muted">Endpoint URL</span>
+                            <input
+                              type="text"
+                              value={endpoint.url}
+                              onChange={(event) => updateChatEndpoint(endpoint.id, { url: event.target.value })}
+                              placeholder={
+                                endpoint.provider === "anthropic"
+                                  ? "https://api.anthropic.com"
+                                  : endpoint.provider === "azure"
+                                    ? "https://your-resource.openai.azure.com"
+                                    : "https://api.openai.com/v1"
+                              }
+                            />
+                          </label>
+                          <label className="simple-chat-field">
+                            <span className="muted">Token</span>
+                            <input
+                              type="password"
+                              value={endpoint.token}
+                              onChange={(event) => updateChatEndpoint(endpoint.id, { token: event.target.value })}
+                              placeholder="API token"
+                            />
+                          </label>
+                        </div>
+                        <div className="simple-chat-endpoint-actions">
+                          {isActive ? <span className="simple-stdlib-active-tag">Current</span> : null}
+                          {testState ? (
+                            <span className={`simple-chat-endpoint-test-status ${testState.kind}`}>
+                              {testState.message}
+                            </span>
+                          ) : null}
+                          <button
+                            type="button"
+                            className="ghost"
+                            disabled={testState?.kind === "testing"}
+                            onClick={() => void testChatEndpoint(endpoint)}
+                          >
+                            {testState?.kind === "testing" ? "Testing..." : "Test"}
+                          </button>
+                          <button
+                            type="button"
+                            className="ghost"
+                            disabled={isActive}
+                            onClick={() => setCurrentChatEndpoint(endpoint.id)}
+                          >
+                            Set Current
+                          </button>
+                          <button type="button" className="ghost" onClick={() => removeChatEndpoint(endpoint.id)}>
+                            Delete
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="muted simple-stdlib-empty">No chat endpoints yet. Add one to start.</div>
+              )}
+            </div>
+            <div className="simple-modal-footer muted">
+              The current endpoint is used for chat requests in the side panel.
             </div>
           </section>
         </div>
@@ -6450,8 +7065,6 @@ const handleRightPaneResizerPointerDown = useCallback((event: ReactPointerEvent<
           <span title={backgroundJobsTitle}>Jobs: {backgroundJobs.total}</span>
           <span>Project symbols: {projectSymbols.length}</span>
           <span>Unresolved: {unresolvedCount}</span>
-          <span>UI updates: {progressUiUpdates}</span>
-          <span>Dropped compiles: {droppedCompileRequests}</span>
         </div>
       </footer>
     </div>

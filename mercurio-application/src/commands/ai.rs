@@ -6,10 +6,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::command;
 use mercurio_core::resolve_under_root;
 
-use crate::agent::{AgentFinal, parse_agent_final};
+use crate::agent::{AgentFinal, AgentPlan, AgentPlanStep, AgentPlanStepStatus, parse_agent_final};
 use crate::commands::tools::{execute_tool, tool_catalog};
 use crate::AppState;
 
@@ -30,6 +32,7 @@ pub struct AiMessagePayload {
 
 #[derive(Deserialize)]
 pub struct AiAgentPayload {
+    session_id: Option<String>,
     url: String,
     provider: Option<String>,
     model: Option<String>,
@@ -48,21 +51,31 @@ pub struct AiAgentStep {
 
 #[derive(Serialize)]
 pub struct AiAgentResponse {
+    session_id: String,
     message: String,
     steps: Vec<AiAgentStep>,
+    plan: Option<AgentPlan>,
     final_response: Option<AgentFinal>,
     final_error: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct AgentSessionState {
+    pub plan: Option<AgentPlan>,
+    pub turn_count: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AiProvider {
     OpenAi,
+    AzureOpenAi,
     Anthropic,
 }
 
 impl AiProvider {
     fn from_input(value: Option<&str>) -> Self {
         match value.unwrap_or("openai").trim().to_lowercase().as_str() {
+            "azure" | "azure_openai" | "azure-openai" => Self::AzureOpenAi,
             "anthropic" => Self::Anthropic,
             _ => Self::OpenAi,
         }
@@ -70,8 +83,8 @@ impl AiProvider {
 }
 
 trait ProviderAdapter: Sync {
-    fn chat_url(&self, base: &str) -> String;
-    fn test_url(&self, base: &str, endpoint_type: &str) -> Result<String, String>;
+    fn chat_url(&self, base: &str, model: Option<&str>) -> Result<String, String>;
+    fn test_url(&self, base: &str, endpoint_type: &str, model: Option<&str>) -> Result<String, String>;
     fn test_body(&self, endpoint_type: &str, model: Option<&str>) -> serde_json::Value;
     fn chat_body(
         &self,
@@ -84,7 +97,52 @@ trait ProviderAdapter: Sync {
 }
 
 struct OpenAiAdapter;
+struct AzureOpenAiAdapter;
 struct AnthropicAdapter;
+
+const AZURE_OPENAI_API_VERSION: &str = "2024-10-21";
+const MAX_AGENT_STEPS: usize = 10;
+static AGENT_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_agent_session_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or(0);
+    let count = AGENT_SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("agent-{now:x}-{count:x}")
+}
+
+fn load_agent_session(
+    state: &tauri::State<'_, AppState>,
+    session_id: &str,
+) -> Result<Option<AgentSessionState>, String> {
+    let sessions = state
+        .agent_sessions
+        .lock()
+        .map_err(|_| "Agent session store is unavailable".to_string())?;
+    Ok(sessions.get(session_id).cloned())
+}
+
+fn save_agent_session(
+    state: &tauri::State<'_, AppState>,
+    session_id: &str,
+    plan: Option<AgentPlan>,
+) -> Result<(), String> {
+    let mut sessions = state
+        .agent_sessions
+        .lock()
+        .map_err(|_| "Agent session store is unavailable".to_string())?;
+    let entry = sessions
+        .entry(session_id.to_string())
+        .or_insert(AgentSessionState {
+            plan: None,
+            turn_count: 0,
+        });
+    entry.plan = plan;
+    entry.turn_count = entry.turn_count.saturating_add(1);
+    Ok(())
+}
 
 fn normalize_openai_url(base: &str, suffix: &str) -> String {
     if base.contains(suffix) {
@@ -106,16 +164,53 @@ fn normalize_anthropic_url(base: &str, suffix: &str) -> String {
     format!("{}{}", trimmed, suffix)
 }
 
-impl ProviderAdapter for OpenAiAdapter {
-    fn chat_url(&self, base: &str) -> String {
-        normalize_openai_url(base, "/chat/completions")
+fn append_query_param(url: &str, key: &str, value: &str) -> String {
+    if url.contains(&format!("{key}=")) {
+        return url.to_string();
+    }
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}{key}={value}")
+}
+
+fn normalize_azure_openai_url(
+    base: &str,
+    deployment: Option<&str>,
+    suffix: &str,
+) -> Result<String, String> {
+    let trimmed = base.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("Azure OpenAI endpoint URL is required.".to_string());
     }
 
-    fn test_url(&self, base: &str, endpoint_type: &str) -> Result<String, String> {
+    let url = if trimmed.contains("/openai/deployments/") {
+        if trimmed.contains(suffix) {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed}{suffix}")
+        }
+    } else {
+        let deployment = deployment
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                "Azure OpenAI requires the deployment name in the model field when the URL is a resource endpoint.".to_string()
+            })?;
+        format!("{trimmed}/openai/deployments/{deployment}{suffix}")
+    };
+
+    Ok(append_query_param(&url, "api-version", AZURE_OPENAI_API_VERSION))
+}
+
+impl ProviderAdapter for OpenAiAdapter {
+    fn chat_url(&self, base: &str, _model: Option<&str>) -> Result<String, String> {
+        Ok(normalize_openai_url(base, "/chat/completions"))
+    }
+
+    fn test_url(&self, base: &str, endpoint_type: &str, model: Option<&str>) -> Result<String, String> {
         if endpoint_type == "embeddings" {
             Ok(normalize_openai_url(base, "/embeddings"))
         } else {
-            Ok(self.chat_url(base))
+            self.chat_url(base, model)
         }
     }
 
@@ -176,16 +271,88 @@ impl ProviderAdapter for OpenAiAdapter {
     }
 }
 
-impl ProviderAdapter for AnthropicAdapter {
-    fn chat_url(&self, base: &str) -> String {
-        normalize_anthropic_url(base, "/v1/messages")
+impl ProviderAdapter for AzureOpenAiAdapter {
+    fn chat_url(&self, base: &str, model: Option<&str>) -> Result<String, String> {
+        normalize_azure_openai_url(base, model, "/chat/completions")
     }
 
-    fn test_url(&self, base: &str, endpoint_type: &str) -> Result<String, String> {
+    fn test_url(&self, base: &str, endpoint_type: &str, model: Option<&str>) -> Result<String, String> {
+        if endpoint_type == "embeddings" {
+            normalize_azure_openai_url(base, model, "/embeddings")
+        } else {
+            self.chat_url(base, model)
+        }
+    }
+
+    fn test_body(&self, endpoint_type: &str, model: Option<&str>) -> serde_json::Value {
+        if endpoint_type == "embeddings" {
+            serde_json::json!({
+                "input": "ping",
+            })
+        } else {
+            let _ = model;
+            serde_json::json!({
+                "messages": [{ "role": "user", "content": "ping" }],
+                "max_tokens": 1,
+            })
+        }
+    }
+
+    fn chat_body(
+        &self,
+        _model: Option<&str>,
+        messages: &[AiMessagePayload],
+        max_tokens: u32,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "messages": messages,
+            "max_tokens": max_tokens,
+        })
+    }
+
+    fn apply_auth(&self, request: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::RequestBuilder {
+        if let Some(token) = token {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                if trimmed.to_ascii_lowercase().starts_with("bearer ") {
+                    return request.header("Authorization", trimmed);
+                }
+                return request.header("api-key", trimmed);
+            }
+        }
+        request
+    }
+
+    fn extract_text(&self, value: &serde_json::Value) -> String {
+        value
+            .get("choices")
+            .and_then(|choices| choices.get(0))
+            .and_then(|choice| choice.get("message"))
+            .and_then(|message| message.get("content"))
+            .and_then(|content| content.as_str())
+            .or_else(|| {
+                value
+                    .get("choices")
+                    .and_then(|choices| choices.get(0))
+                    .and_then(|choice| choice.get("text"))
+                    .and_then(|text| text.as_str())
+            })
+            .or_else(|| value.get("message").and_then(|message| message.as_str()))
+            .unwrap_or("")
+            .to_string()
+    }
+}
+
+impl ProviderAdapter for AnthropicAdapter {
+    fn chat_url(&self, base: &str, _model: Option<&str>) -> Result<String, String> {
+        Ok(normalize_anthropic_url(base, "/v1/messages"))
+    }
+
+    fn test_url(&self, base: &str, endpoint_type: &str, model: Option<&str>) -> Result<String, String> {
         if endpoint_type == "embeddings" {
             return Err("Embeddings are not supported for Anthropic endpoints in this client yet.".to_string());
         }
-        Ok(self.chat_url(base))
+        self.chat_url(base, model)
     }
 
     fn test_body(&self, _endpoint_type: &str, model: Option<&str>) -> serde_json::Value {
@@ -241,9 +408,11 @@ impl ProviderAdapter for AnthropicAdapter {
 
 fn adapter_for(provider: AiProvider) -> &'static (dyn ProviderAdapter + Sync) {
     static OPENAI: OpenAiAdapter = OpenAiAdapter;
+    static AZURE_OPENAI: AzureOpenAiAdapter = AzureOpenAiAdapter;
     static ANTHROPIC: AnthropicAdapter = AnthropicAdapter;
     match provider {
         AiProvider::OpenAi => &OPENAI,
+        AiProvider::AzureOpenAi => &AZURE_OPENAI,
         AiProvider::Anthropic => &ANTHROPIC,
     }
 }
@@ -251,6 +420,11 @@ fn adapter_for(provider: AiProvider) -> &'static (dyn ProviderAdapter + Sync) {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum AgentAction {
+    PlanUpdate {
+        goal: Option<String>,
+        #[serde(default)]
+        steps: Vec<AgentPlanStep>,
+    },
     Final {
         content: String,
     },
@@ -333,6 +507,19 @@ fn parse_agent_action(text: &str) -> Option<AgentAction> {
     if let Ok(value) = serde_json::from_str::<Value>(text.trim()) {
         if let Some(obj) = value.as_object() {
             if let Some(action) = obj.get("action").and_then(|v| v.as_str()) {
+                if action.eq_ignore_ascii_case("plan_update") {
+                    let goal = obj
+                        .get("goal")
+                        .and_then(|v| v.as_str())
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty());
+                    let steps = obj
+                        .get("steps")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value::<Vec<AgentPlanStep>>(value).ok())
+                        .unwrap_or_default();
+                    return Some(AgentAction::PlanUpdate { goal, steps });
+                }
                 if action.eq_ignore_ascii_case("list_tools") {
                     return Some(AgentAction::ListTools);
                 }
@@ -411,6 +598,27 @@ fn parse_agent_action(text: &str) -> Option<AgentAction> {
             if lower.contains("tool: list_tools") || lower.contains("tool : list_tools") {
                 tool_name = Some("list_tools".to_string());
             }
+        }
+        if action_name
+            .as_deref()
+            .is_some_and(|value| value.eq_ignore_ascii_case("plan_update"))
+        {
+            let goal = trimmed
+                .lines()
+                .map(str::trim)
+                .find_map(|line| {
+                    let lower = line.to_ascii_lowercase();
+                    if !lower.starts_with("goal:") {
+                        return None;
+                    }
+                    line.split_once(':')
+                        .map(|(_, value)| clean_token(value))
+                        .filter(|value| !value.is_empty())
+                });
+            return Some(AgentAction::PlanUpdate {
+                goal,
+                steps: Vec::new(),
+            });
         }
         if action_name
             .as_deref()
@@ -536,6 +744,98 @@ fn parse_agent_actions(text: &str) -> Vec<AgentAction> {
     }
 
     actions
+}
+
+fn forced_final_prompt() -> String {
+    r#"Stop using tools. Return a final response now.
+
+Respond ONLY with:
+{"action":"final","content":"...json..."}
+
+The content string must be valid JSON with this exact shape:
+{
+  "summary": "short summary for the user",
+  "next_steps": [
+    { "id": "1", "label": "step text", "recommended": true, "action": "message to the agent" }
+  ]
+}"#
+        .to_string()
+}
+
+fn normalize_plan(goal: Option<String>, steps: Vec<AgentPlanStep>, existing: Option<&AgentPlan>) -> Option<AgentPlan> {
+    let normalized_steps: Vec<AgentPlanStep> = steps
+        .into_iter()
+        .filter_map(|step| {
+            let id = step.id.trim().to_string();
+            let label = step.label.trim().to_string();
+            if id.is_empty() || label.is_empty() {
+                return None;
+            }
+            Some(AgentPlanStep {
+                id,
+                label,
+                status: step.status,
+            })
+        })
+        .collect();
+    let resolved_goal = goal
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| existing.map(|plan| plan.goal.clone()))
+        .unwrap_or_default();
+    if resolved_goal.is_empty() && normalized_steps.is_empty() {
+        return None;
+    }
+    Some(AgentPlan {
+        goal: resolved_goal,
+        steps: normalized_steps,
+    })
+}
+
+fn format_plan_for_prompt(plan: &AgentPlan) -> String {
+    let mut lines = Vec::new();
+    if !plan.goal.trim().is_empty() {
+        lines.push(format!("Current goal: {}", plan.goal.trim()));
+    }
+    if !plan.steps.is_empty() {
+        lines.push("Current plan:".to_string());
+        for step in &plan.steps {
+            let status = match step.status {
+                AgentPlanStepStatus::Pending => "pending",
+                AgentPlanStepStatus::InProgress => "in_progress",
+                AgentPlanStepStatus::Completed => "completed",
+                AgentPlanStepStatus::Blocked => "blocked",
+            };
+            lines.push(format!("- [{}] {}: {}", status, step.id, step.label));
+        }
+    }
+    lines.join("\n")
+}
+
+fn synthesize_agent_message(steps: &[AiAgentStep], last_tool_result: Option<&str>) -> String {
+    let successful_tools: Vec<&str> = steps
+        .iter()
+        .filter(|step| step.kind == "tool")
+        .map(|step| step.detail.as_str())
+        .collect();
+    if let Some(result) = last_tool_result {
+        if successful_tools.is_empty() {
+            format!("Agent stopped before producing a final answer.\n\nLast tool result:\n{}", result)
+        } else {
+            format!(
+                "Agent completed tool work but did not produce a final answer.\n\nCompleted tools:\n- {}\n\nLast tool result:\n{}",
+                successful_tools.join("\n- "),
+                result
+            )
+        }
+    } else if successful_tools.is_empty() {
+        "Agent stopped before producing a final answer.".to_string()
+    } else {
+        format!(
+            "Agent completed tool work but did not produce a final answer.\n\nCompleted tools:\n- {}",
+            successful_tools.join("\n- ")
+        )
+    }
 }
 
 fn read_file_under_root(root: &Path, path: &str) -> Result<String, String> {
@@ -680,6 +980,7 @@ fn apply_patch_under_root(
 
 fn run_agent_tool(action: AgentAction, root: Option<&Path>) -> Result<ToolOutcome, String> {
     match action {
+        AgentAction::PlanUpdate { .. } => Err("Use plan_update handling path".to_string()),
         AgentAction::Final { content } => Ok(ToolOutcome {
             detail: "final".to_string(),
             result: content,
@@ -764,7 +1065,7 @@ pub async fn ai_test_endpoint(payload: AiEndpointPayload) -> Result<serde_json::
     let provider = AiProvider::from_input(payload.provider.as_deref());
     let adapter = adapter_for(provider);
     let endpoint_type = payload.r#type.to_lowercase();
-    let url = match adapter.test_url(&payload.url, &endpoint_type) {
+    let url = match adapter.test_url(&payload.url, &endpoint_type, payload.model.as_deref()) {
         Ok(url) => url,
         Err(detail) => {
             return Ok(serde_json::json!({
@@ -803,6 +1104,14 @@ pub async fn ai_agent_run(
     let adapter = adapter_for(provider);
     let root_path = payload.root.as_ref().map(PathBuf::from);
     let root = root_path.as_deref();
+    let session_id = payload
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(next_agent_session_id);
+    let mut current_plan = load_agent_session(&state, &session_id)?.and_then(|session| session.plan);
 
     let mut steps = Vec::new();
     let mut last_tool_result: Option<String> = None;
@@ -830,12 +1139,17 @@ pub async fn ai_agent_run(
                 )
             })
             .unwrap_or_else(|| "\nWorkspace root: (unknown)\nAll tool paths must be under the workspace root.".to_string());
+        let plan_note = current_plan
+            .as_ref()
+            .map(|plan| format!("\n{}", format_plan_for_prompt(plan)))
+            .unwrap_or_else(|| "\nCurrent plan: (none yet)".to_string());
         conversation.insert(
             0,
             AiMessagePayload {
                 role: "system".to_string(),
                 content: {
                     let prompt = r#"You are a coding assistant with local tools. Respond ONLY with JSON using one of these actions:
+{"action":"plan_update","goal":"...","steps":[{"id":"1","label":"...","status":"in_progress"}]}
 {"action":"list_tools"}
 {"action":"call_tool","tool":"tool_name@v1","args":{...}}
 {"action":"final","content":"...json..."}
@@ -843,6 +1157,7 @@ pub async fn ai_agent_run(
 Legacy actions are still accepted: {"action":"read_file","path":"..."}, {"action":"list_dir","path":"..."}, {"action":"search_text","query":"...","limit":20}, {"action":"write_file","path":"...","content":"...","create_dirs":true}, {"action":"apply_patch","path":"...","find":"...","replace":"...","replace_all":false,"apply":false}.
 Use apply_patch with apply=false first to preview; only set apply=true when confident.
 All tool paths MUST be under the workspace root. Prefer relative paths like "src/foo.sysml". If a user gives an absolute path, ensure it is within the workspace root; otherwise refuse and ask for a path under the root.
+For tasks that need more than one action, emit plan_update before or alongside tool use so the user can see the plan. Reuse and refine the existing plan instead of replacing it gratuitously. Keep step ids stable when possible. Use statuses pending, in_progress, completed, or blocked.
 
 When you are done, respond with {{"action":"final","content":"..."}} where content is a JSON object encoded as a string in this exact shape:
 {{
@@ -850,18 +1165,25 @@ When you are done, respond with {{"action":"final","content":"..."}} where conte
   "next_steps": [
     {{ "id": "1", "label": "step text", "recommended": true, "action": "message to the agent" }},
     {{ "id": "2", "label": "step text", "recommended": false, "action": "message to the agent" }}
-  ]
+  ],
+  "plan": {{
+    "goal": "overall goal",
+    "steps": [
+      {{ "id": "1", "label": "step text", "status": "completed" }},
+      {{ "id": "2", "label": "step text", "status": "pending" }}
+    ]
+  }}
 }}
 Mark 1-3 steps with recommended=true. Do not include any extra text outside the JSON."#
                         .to_string();
-                    prompt + &root_note
+                    prompt + &root_note + &plan_note
                 },
             },
         );
     }
 
-    for _ in 0..6 {
-        let url = adapter.chat_url(&payload.url);
+    for _ in 0..MAX_AGENT_STEPS {
+        let url = adapter.chat_url(&payload.url, payload.model.as_deref())?;
         let body = adapter.chat_body(
             payload.model.as_deref(),
             &conversation,
@@ -880,9 +1202,12 @@ Mark 1-3 steps with recommended=true. Do not include any extra text outside the 
             } else {
                 text
             };
+            save_agent_session(&state, &session_id, current_plan.clone())?;
             return Ok(AiAgentResponse {
+                session_id,
                 message,
                 steps,
+                plan: current_plan,
                 final_response: None,
                 final_error: None,
             });
@@ -899,65 +1224,84 @@ Mark 1-3 steps with recommended=true. Do not include any extra text outside the 
             } else {
                 text
             };
+            save_agent_session(&state, &session_id, current_plan.clone())?;
             return Ok(AiAgentResponse {
+                session_id,
                 message,
                 steps,
+                plan: current_plan,
                 final_response: None,
                 final_error: None,
             });
         }
 
         for action in actions {
-            if let AgentAction::Final { content } = action {
-                match parse_agent_final(&content) {
-                    Ok(final_response) => {
+            match action {
+                AgentAction::PlanUpdate { goal, steps: plan_steps } => {
+                    current_plan = normalize_plan(goal, plan_steps, current_plan.as_ref());
+                    let detail = if let Some(plan) = current_plan.as_ref() {
+                        if plan.steps.is_empty() {
+                            format!("plan_update: goal={}", plan.goal)
+                        } else {
+                            format!("plan_update: {} steps", plan.steps.len())
+                        }
+                    } else {
+                        "plan_update: cleared".to_string()
+                    };
+                    steps.push(AiAgentStep {
+                        kind: "plan".to_string(),
+                        detail: detail.clone(),
+                    });
+                    if let Some(plan) = current_plan.as_ref() {
+                        conversation.push(AiMessagePayload {
+                            role: "assistant".to_string(),
+                            content: serde_json::json!({
+                                "action": "plan_update",
+                                "goal": plan.goal,
+                                "steps": plan.steps,
+                            })
+                            .to_string(),
+                        });
+                        conversation.push(AiMessagePayload {
+                            role: "user".to_string(),
+                            content: format!("Plan updated:\n{}", format_plan_for_prompt(plan)),
+                        });
+                    }
+                }
+                AgentAction::Final { content } => match parse_agent_final(&content) {
+                    Ok(mut final_response) => {
+                        if final_response.plan.is_none() {
+                            final_response.plan = current_plan.clone();
+                        } else {
+                            current_plan = final_response.plan.clone();
+                        }
+                        save_agent_session(&state, &session_id, current_plan.clone())?;
                         return Ok(AiAgentResponse {
+                            session_id,
                             message: final_response.summary.clone(),
                             steps,
+                            plan: current_plan,
                             final_response: Some(final_response),
                             final_error: None,
                         });
                     }
                     Err(error) => {
+                        save_agent_session(&state, &session_id, current_plan.clone())?;
                         return Ok(AiAgentResponse {
+                            session_id,
                             message: content,
                             steps,
+                            plan: current_plan,
                             final_response: None,
                             final_error: Some(error),
                         });
                     }
-                }
-            }
-
-            let outcome = match action {
-                AgentAction::ListTools => Ok(ToolOutcome {
-                    detail: "list_tools".to_string(),
-                    result: serde_json::to_string(&tool_catalog()).map_err(|e| e.to_string())?,
-                }),
-                AgentAction::CallTool { tool, mut args } => {
-                    if args.get("root").is_none() {
-                        if let Some(root) = root {
-                            if tool.starts_with("fs.") || tool.starts_with("core.") {
-                                args["root"] = Value::String(root.to_string_lossy().to_string());
-                            }
-                        }
-                    }
-                    let value = execute_tool(state.core.clone(), &tool, args).await?;
-                    let result = if value.is_string() {
-                        value.as_str().unwrap_or_default().to_string()
-                    } else {
-                        value.to_string()
+                },
+                AgentAction::ListTools => {
+                    let outcome = ToolOutcome {
+                        detail: "list_tools".to_string(),
+                        result: serde_json::to_string(&tool_catalog()).map_err(|e| e.to_string())?,
                     };
-                    Ok(ToolOutcome {
-                        detail: format!("call_tool:{}", tool),
-                        result,
-                    })
-                }
-                other => run_agent_tool(other, root),
-            };
-
-            match outcome {
-                Ok(outcome) => {
                     last_tool_result = Some(outcome.result.clone());
                     steps.push(AiAgentStep {
                         kind: "tool".to_string(),
@@ -976,31 +1320,154 @@ Mark 1-3 steps with recommended=true. Do not include any extra text outside the 
                         content: format!("Tool result: {}", outcome.result),
                     });
                 }
-                Err(error) => {
+                AgentAction::CallTool { tool, mut args } => {
+                    if args.get("root").is_none() {
+                        if let Some(root) = root {
+                            if tool.starts_with("fs.")
+                                || tool.starts_with("core.")
+                                || tool.starts_with("workspace.")
+                                || tool.starts_with("semantic.")
+                            {
+                                args["root"] = Value::String(root.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                    let value = execute_tool(state.core.clone(), &tool, args).await?;
+                    let result = if value.is_string() {
+                        value.as_str().unwrap_or_default().to_string()
+                    } else {
+                        value.to_string()
+                    };
+                    let outcome = ToolOutcome {
+                        detail: format!("call_tool:{}", tool),
+                        result,
+                    };
+                    last_tool_result = Some(outcome.result.clone());
                     steps.push(AiAgentStep {
-                        kind: "tool_error".to_string(),
-                        detail: error.clone(),
+                        kind: "tool".to_string(),
+                        detail: outcome.detail.clone(),
+                    });
+                    conversation.push(AiMessagePayload {
+                        role: "assistant".to_string(),
+                        content: serde_json::json!({
+                            "action": "tool_result",
+                            "detail": outcome.detail,
+                        })
+                        .to_string(),
                     });
                     conversation.push(AiMessagePayload {
                         role: "user".to_string(),
-                        content: format!("Tool error: {}", error),
+                        content: format!("Tool result: {}", outcome.result),
                     });
                 }
+                other => match run_agent_tool(other, root) {
+                    Ok(outcome) => {
+                        last_tool_result = Some(outcome.result.clone());
+                        steps.push(AiAgentStep {
+                            kind: "tool".to_string(),
+                            detail: outcome.detail.clone(),
+                        });
+                        conversation.push(AiMessagePayload {
+                            role: "assistant".to_string(),
+                            content: serde_json::json!({
+                                "action": "tool_result",
+                                "detail": outcome.detail,
+                            })
+                            .to_string(),
+                        });
+                        conversation.push(AiMessagePayload {
+                            role: "user".to_string(),
+                            content: format!("Tool result: {}", outcome.result),
+                        });
+                    }
+                    Err(error) => {
+                        steps.push(AiAgentStep {
+                            kind: "tool_error".to_string(),
+                            detail: error.clone(),
+                        });
+                        conversation.push(AiMessagePayload {
+                            role: "user".to_string(),
+                            content: format!("Tool error: {}", error),
+                        });
+                    }
+                },
             }
         }
     }
 
-    let message = if let Some(result) = last_tool_result.as_deref() {
-        format!(
-            "Agent stopped after max steps without a final answer.\n\nLast tool result:\n{}",
-            clamp_tool_result(result)
-        )
-    } else {
-        "Agent stopped after max steps without a final answer.".to_string()
-    };
+    let mut final_conversation = conversation.clone();
+    final_conversation.push(AiMessagePayload {
+        role: "user".to_string(),
+        content: forced_final_prompt(),
+    });
+
+    let forced_url = adapter.chat_url(&payload.url, payload.model.as_deref())?;
+    let forced_body = adapter.chat_body(
+        payload.model.as_deref(),
+        &final_conversation,
+        payload.max_tokens.unwrap_or(512),
+    );
+    if let Ok(response) = request_json(forced_url, payload.token.as_deref(), forced_body, adapter).await {
+        let text = adapter.extract_text(&response);
+        if let Some(AgentAction::Final { content }) = parse_agent_action(&text) {
+            match parse_agent_final(&content) {
+                Ok(mut final_response) => {
+                    if final_response.plan.is_none() {
+                        final_response.plan = current_plan.clone();
+                    } else {
+                        current_plan = final_response.plan.clone();
+                    }
+                    save_agent_session(&state, &session_id, current_plan.clone())?;
+                    return Ok(AiAgentResponse {
+                        session_id,
+                        message: final_response.summary.clone(),
+                        steps,
+                        plan: current_plan,
+                        final_response: Some(final_response),
+                        final_error: None,
+                    });
+                }
+                Err(error) => {
+                    let clamped_last = last_tool_result.as_deref().map(clamp_tool_result);
+                    let message = if content.trim().is_empty() {
+                        synthesize_agent_message(&steps, clamped_last.as_deref())
+                    } else {
+                        content
+                    };
+                    save_agent_session(&state, &session_id, current_plan.clone())?;
+                    return Ok(AiAgentResponse {
+                        session_id,
+                        message,
+                        steps,
+                        plan: current_plan,
+                        final_response: None,
+                        final_error: Some(error),
+                    });
+                }
+            }
+        }
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            save_agent_session(&state, &session_id, current_plan.clone())?;
+            return Ok(AiAgentResponse {
+                session_id,
+                message: trimmed.to_string(),
+                steps,
+                plan: current_plan,
+                final_response: None,
+                final_error: Some("Forced finalization response was not in the expected format".to_string()),
+            });
+        }
+    }
+
+    let clamped_last = last_tool_result.as_deref().map(clamp_tool_result);
+    let message = synthesize_agent_message(&steps, clamped_last.as_deref());
+    save_agent_session(&state, &session_id, current_plan.clone())?;
     Ok(AiAgentResponse {
+        session_id,
         message,
         steps,
+        plan: current_plan,
         final_response: None,
         final_error: Some("Agent stopped after max steps".to_string()),
     })

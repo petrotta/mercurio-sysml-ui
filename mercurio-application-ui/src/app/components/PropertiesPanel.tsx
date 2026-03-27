@@ -6,7 +6,7 @@ type PropertiesPanelProps = {
   selectedSymbol: SymbolView | null;
   semanticRefreshVersion: number;
   onSelectQualifiedName: (qualifiedName: string) => void;
-  onOpenExplorer: () => void;
+  onMinimize: () => void;
 };
 
 export function PropertiesPanel({
@@ -14,14 +14,14 @@ export function PropertiesPanel({
   selectedSymbol,
   semanticRefreshVersion,
   onSelectQualifiedName,
-  onOpenExplorer,
+  onMinimize,
 }: PropertiesPanelProps) {
   return (
-    <div className="simple-right-section simple-right-top-section">
+    <div className="simple-right-section simple-right-top-section simple-right-tool-panel">
       <div className="panel-header simple-properties-panel-header">
         <strong>Properties</strong>
-        <button type="button" className="ghost" onClick={onOpenExplorer} disabled={!selectedSymbol}>
-          Model Explorer
+        <button type="button" className="ghost simple-panel-minimize" onClick={onMinimize} title="Minimize side panel">
+          -
         </button>
       </div>
       <div className="simple-ui-scroll simple-properties-host">

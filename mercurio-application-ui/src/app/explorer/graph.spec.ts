@@ -317,3 +317,60 @@ assertOk(directedGraph.diagnostics.some((diagnostic) => diagnostic.includes("Cou
 
 assertEqual(canExpandExplorerNode("Vehicle", workspaceSymbols), true, "definitions can expand");
 assertEqual(canExpandExplorerNode("Vehicle::engine", workspaceSymbols), false, "usage nodes do not expand");
+
+const metadataContractSymbols: SymbolView[] = [
+  {
+    symbol_id: "semantic-definition",
+    name: "SemanticDefinition",
+    kind: "Element",
+    semantic_kind: "PartDefinition",
+    structural_metatype_qname: "SysML::PartDefinition",
+    classification_qname: "Parts::Part",
+    metatype_qname: "Parts::Part",
+    file_path: "model.sysml",
+    source_scope: "project",
+    qualified_name: "SemanticDefinition",
+    parent_qualified_name: null,
+    file: 1,
+    start_line: 1,
+    start_col: 1,
+    end_line: 5,
+    end_col: 1,
+    properties: [],
+  },
+  {
+    symbol_id: "semantic-usage",
+    name: "semanticUsage",
+    kind: "Element",
+    semantic_kind: "PartUsage",
+    structural_metatype_qname: "SysML::Usage",
+    classification_qname: "Parts::Part",
+    metatype_qname: "Parts::Part",
+    file_path: "model.sysml",
+    source_scope: "project",
+    qualified_name: "Owner::semanticUsage",
+    parent_qualified_name: "Owner",
+    file: 1,
+    start_line: 6,
+    start_col: 1,
+    end_line: 6,
+    end_col: 20,
+    properties: [],
+    structural_type: {
+      feature_name: "type",
+      label: "semanticUsage",
+      target: "SemanticDefinition",
+      target_metatype_qname: "SysML::PartDefinition",
+      declared_type_qname: "SemanticDefinition",
+      metamodel_feature_qname: "sysml::Usage::type",
+    },
+  },
+];
+
+assertEqual(canExpandExplorerNode("SemanticDefinition", metadataContractSymbols), true, "semantic kind drives expandable definitions");
+assertEqual(canExpandExplorerNode("Owner::semanticUsage", metadataContractSymbols), false, "semantic kind keeps usages collapsed");
+assertEqual(
+  resolvePreferredExplorerRoot(metadataContractSymbols[1]!, metadataContractSymbols)?.qualified_name,
+  "SemanticDefinition",
+  "usage root prefers semantic metadata contract",
+);

@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
+export type AppLogLevel = "debug" | "info" | "warn" | "error";
+
 export type BackendLogRecord = {
   seq: number;
   timestamp_utc: string;
@@ -19,7 +21,7 @@ export async function logFrontendEvent({
   kind = "frontend",
   message,
 }: {
-  level: "info" | "warn" | "error";
+  level: AppLogLevel;
   kind?: string;
   message: string;
 }): Promise<void> {
@@ -48,8 +50,9 @@ export function formatBackendLogTimestamp(timestampUtc: string): string {
   });
 }
 
-export function normalizeBackendLogLevel(level: string): "info" | "warn" | "error" {
+export function normalizeBackendLogLevel(level: string): AppLogLevel {
   const normalized = `${level || ""}`.trim().toLowerCase();
+  if (normalized === "debug" || normalized === "trace") return "debug";
   if (normalized === "error") return "error";
   if (normalized === "warn" || normalized === "warning") return "warn";
   return "info";

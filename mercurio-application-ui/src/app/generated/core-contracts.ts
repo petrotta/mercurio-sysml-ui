@@ -85,6 +85,9 @@ export type IndexedSymbolView = {
   qualified_name: string;
   parent_qualified_name: string | null;
   kind: string;
+  semantic_kind: string | null;
+  structural_metatype_qname: string | null;
+  classification_qname: string | null;
   metatype_qname: string | null;
   file_path: string;
   start_line: number;
@@ -121,14 +124,10 @@ export type WorkspaceStartupSnapshotTimingsView = {
   cache_load_ms: number;
   cache_seed_symbol_index_ms: number;
   cache_seed_projection_ms: number;
-  project_tree_collect_ms: number;
   symbol_snapshot_ms: number;
-  library_tree_collect_ms: number;
 };
 
 export type WorkspaceStartupSnapshotResult = {
-  project_tree: WorkspaceTreeEntryView[];
-  library_tree: WorkspaceTreeEntryView[];
   project_symbols: IndexedSymbolView[];
   library_symbols: IndexedSymbolView[];
   project_semantic_projection_count: number;

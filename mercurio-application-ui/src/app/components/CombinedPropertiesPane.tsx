@@ -7,6 +7,7 @@ import type {
   ProjectElementPropertySectionsView,
   SymbolView,
 } from "../contracts";
+import { classificationQnameOf, semanticKindOf, structuralMetatypeOf } from "../symbolMetadata";
 
 type CombinedPropertiesPaneProps = {
   rootPath: string;
@@ -205,6 +206,9 @@ export function CombinedPropertiesPane({
       .filter((section) => section.rows.length > 0 || !section.label);
   }, [hideEmptyAttributes, sections]);
   const metatypeQname = (propertySectionsView?.metatype_qname || "").trim();
+  const semanticKind = semanticKindOf(symbol || {});
+  const structuralMetatypeQname = structuralMetatypeOf(symbol || {}) || metatypeQname;
+  const classificationQname = classificationQnameOf(symbol || {});
   const directMetatypeAttributes = propertySectionsView?.direct_metatype_attributes || [];
   const inheritedMetatypeAttributes = propertySectionsView?.inherited_metatype_attributes || [];
   const metatypeAttributeCount = directMetatypeAttributes.length + inheritedMetatypeAttributes.length;
@@ -281,7 +285,9 @@ export function CombinedPropertiesPane({
             <div className="simple-modal-body">
               <div className="simple-metatype-attributes-meta">
                 <div><strong>Element:</strong> {propertySectionsView?.element_qualified_name || "-"}</div>
-                <div><strong>Metatype:</strong> {metatypeQname || "-"}</div>
+                <div><strong>Semantic Kind:</strong> {semanticKind || "-"}</div>
+                <div><strong>Structural Metatype:</strong> {structuralMetatypeQname || "-"}</div>
+                <div><strong>Classification:</strong> {classificationQname || "-"}</div>
               </div>
               <MetatypeAttributeTable
                 title={`Direct Attributes (${directMetatypeAttributes.length})`}
@@ -318,35 +324,61 @@ export function CombinedPropertiesPane({
               type="button"
               className="ghost"
               onClick={() => setMetatypePopupOpen(true)}
-              disabled={!symbol || propertySectionsLoading || !metatypeQname}
+              disabled={!symbol || propertySectionsLoading || !structuralMetatypeQname}
               title={
                 propertySectionsLoading
                   ? "Loading metatype attributes..."
-                  : metatypeQname
-                    ? `Show direct and inherited attributes for ${metatypeQname}`
-                    : (propertySectionsError || "Metatype is unresolved for this element.")
+                  : structuralMetatypeQname
+                    ? `Show direct and inherited attributes for ${structuralMetatypeQname}`
+                    : (propertySectionsError || "Structural metatype is unresolved for this element.")
               }
             >
               Metatype Attributes
               {metatypeAttributeCount ? ` (${metatypeAttributeCount})` : ""}
             </button>
           </div>
-          {metatypeQname ? (
+          {semanticKind ? (
             <div style={{ display: "grid", gap: 2 }}>
-              <strong>semantic.metatype</strong>
+              <strong>semantic.kind</strong>
+              <div>{semanticKind}</div>
+            </div>
+          ) : null}
+          {structuralMetatypeQname ? (
+            <div style={{ display: "grid", gap: 2 }}>
+              <strong>semantic.structural_metatype</strong>
               <div>
-                {onSelectQualifiedName && metatypeQname.includes("::") && !/\s/.test(metatypeQname) ? (
+                {onSelectQualifiedName && structuralMetatypeQname.includes("::") && !/\s/.test(structuralMetatypeQname) ? (
                   <button
                     type="button"
                     className="ghost"
                     style={{ padding: 0, font: "inherit", textDecoration: "underline" }}
-                    onClick={() => onSelectQualifiedName(metatypeQname)}
-                    title={`Select ${metatypeQname} in project tree`}
+                    onClick={() => onSelectQualifiedName(structuralMetatypeQname)}
+                    title={`Select ${structuralMetatypeQname} in project tree`}
                   >
-                    {metatypeQname}
+                    {structuralMetatypeQname}
                   </button>
                 ) : (
-                  metatypeQname
+                  structuralMetatypeQname
+                )}
+              </div>
+            </div>
+          ) : null}
+          {classificationQname ? (
+            <div style={{ display: "grid", gap: 2 }}>
+              <strong>semantic.classification</strong>
+              <div>
+                {onSelectQualifiedName && classificationQname.includes("::") && !/\s/.test(classificationQname) ? (
+                  <button
+                    type="button"
+                    className="ghost"
+                    style={{ padding: 0, font: "inherit", textDecoration: "underline" }}
+                    onClick={() => onSelectQualifiedName(classificationQname)}
+                    title={`Select ${classificationQname} in project tree`}
+                  >
+                    {classificationQname}
+                  </button>
+                ) : (
+                  classificationQname
                 )}
               </div>
             </div>

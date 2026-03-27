@@ -4,6 +4,7 @@ import type {
   SymbolView,
 } from "../contracts.js";
 import type { DiagramPoint } from "../diagrams/file.js";
+import { isDefinitionLikeMetadata, primaryKindLabel } from "../symbolMetadata.js";
 
 export type ExplorerEdgeKind = "ownsDefinition" | "specializes" | "directedRelationship";
 
@@ -57,10 +58,6 @@ function normalizeKey(value: string | null | undefined): string {
   return `${value || ""}`.trim();
 }
 
-function normalizeLower(value: string | null | undefined): string {
-  return normalizeKey(value).toLowerCase();
-}
-
 function stableIdentity(element: {
   qualified_name?: string | null;
   file_path?: string | null;
@@ -73,13 +70,8 @@ function stableIdentity(element: {
   return `${normalizeKey(element.file_path)}|${normalizeKey(element.name)}|${element.start_line || 0}|${element.start_col || 0}`;
 }
 
-function isDefinitionKind(kind: string | null | undefined, metatype: string | null | undefined): boolean {
-  const kindValue = normalizeLower(kind);
-  const metatypeValue = normalizeLower(metatype);
-  return kindValue.includes("definition")
-    || metatypeValue.includes("definition")
-    || kindValue === "package"
-    || metatypeValue.endsWith("::package");
+function isDefinitionKind(symbol: SymbolView | null | undefined): boolean {
+  return !!symbol && isDefinitionLikeMetadata(symbol);
 }
 
 function formatAttribute(attribute: { name: string; declared_type: string | null; multiplicity: string | null }): string {
@@ -108,7 +100,13 @@ function buildNode(
     startLine: element?.start_line || symbol?.start_line || 1,
     startCol: element?.start_col || symbol?.start_col || 1,
     name: element?.name || symbol?.name || qualifiedName || "<anonymous>",
-    kind: element?.kind || symbol?.kind || "?",
+    kind: primaryKindLabel({
+      kind: element?.kind || symbol?.kind || "?",
+      semantic_kind: symbol?.semantic_kind || symbol?.kind || null,
+      structural_metatype_qname: symbol?.structural_metatype_qname || null,
+      classification_qname: symbol?.classification_qname || null,
+      metatype_qname: symbol?.metatype_qname || element?.metatype_qname || null,
+    }),
     isRoot: qualifiedName === rootQualifiedName,
     relationOnly,
     attributes: (element?.attributes || []).slice(0, 6).map(formatAttribute),
@@ -126,7 +124,7 @@ function endpointToDefinitionQname(
   seen.add(key);
   const symbol = symbolsByQualified.get(key);
   if (!symbol) return key;
-  if (isDefinitionKind(symbol.kind, symbol.metatype_qname)) {
+  if (isDefinitionKind(symbol)) {
     return key;
   }
   const structuralTarget = normalizeKey(symbol.structural_type?.target);
@@ -141,7 +139,7 @@ function preferredRootFromSymbol(
   symbolsByQualified: Map<string, SymbolView>,
 ): SymbolView | null {
   if (!symbol) return null;
-  if (isDefinitionKind(symbol.kind, symbol.metatype_qname)) {
+  if (isDefinitionKind(symbol)) {
     return symbol;
   }
   const structuralTarget = normalizeKey(symbol.structural_type?.target);
@@ -255,7 +253,7 @@ export function buildExplorerGraph({
       const childQname = normalizeKey(child.qualified_name);
       if (!childQname) continue;
       carrierQualifiedNames.add(childQname);
-      if (isDefinitionKind(child.kind, child.metatype_qname)) {
+      if (isDefinitionKind(child)) {
         const childNode = ensureNode(childQname, "structural");
         if (!childNode) continue;
         addEdge(edges, {
@@ -409,5 +407,5 @@ export function canExpandExplorerNode(
   workspaceSymbols: SymbolView[],
 ): boolean {
   const target = workspaceSymbols.find((symbol) => normalizeKey(symbol.qualified_name) === normalizeKey(qualifiedName));
-  return !!target && isDefinitionKind(target.kind, target.metatype_qname);
+  return !!target && isDefinitionKind(target);
 }

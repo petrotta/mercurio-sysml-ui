@@ -7,6 +7,7 @@ import type {
 } from "../contracts.js";
 import type { DiagramDocument, DiagramPoint } from "./file.js";
 import { DIAGRAM_TYPES, type DiagramType } from "./model.js";
+import { isPackageLikeMetadata, primaryKindLabel } from "../symbolMetadata.js";
 
 export type DiagramGraphNode = {
   id: string;
@@ -55,10 +56,8 @@ function stableElementIdentity(element: {
   return `${normalizeKey(element.file_path)}|${normalizeKey(element.name)}|${element.start_line || 0}|${element.start_col || 0}`;
 }
 
-function isPackageKind(kind: string | null | undefined, metatype: string | null | undefined): boolean {
-  const kindValue = normalizeKey(kind).toLowerCase();
-  const metatypeValue = normalizeKey(metatype).toLowerCase();
-  return kindValue.includes("package") || metatypeValue.endsWith("::package");
+function isPackageKind(symbol: SymbolView | null | undefined): boolean {
+  return !!symbol && isPackageLikeMetadata(symbol);
 }
 
 function formatAttribute(attribute: ProjectModelAttributeView): string {
@@ -82,7 +81,7 @@ function nearestPackageAncestor(
 ): SymbolView | null {
   let current = symbol;
   while (current) {
-    if (isPackageKind(current.kind, current.metatype_qname)) {
+    if (isPackageKind(current)) {
       return current;
     }
     const parentQualified = normalizeKey(current.parent_qualified_name);
@@ -139,7 +138,13 @@ function buildGraphNode(
     startLine: element?.start_line || symbol.start_line || 1,
     startCol: element?.start_col || symbol.start_col || 1,
     name: element?.name || symbol.name || symbol.qualified_name || "<anonymous>",
-    kind: element?.kind || symbol.kind || "?",
+    kind: primaryKindLabel({
+      kind: element?.kind || symbol.kind || "?",
+      semantic_kind: symbol.semantic_kind || symbol.kind || null,
+      structural_metatype_qname: symbol.structural_metatype_qname || null,
+      classification_qname: symbol.classification_qname || null,
+      metatype_qname: symbol.metatype_qname || element?.metatype_qname || null,
+    }),
     isRoot,
     attributes,
     documentation: element?.documentation || symbol.doc || null,
@@ -221,7 +226,7 @@ export function buildDiagramGraph(
   const children = projectSymbols.filter((symbol) => normalizeKey(symbol.parent_qualified_name) === normalizeKey(rootSymbol.qualified_name));
   const includedSymbols = [rootSymbol];
   if (document.diagram_type === DIAGRAM_TYPES.Package) {
-    includedSymbols.push(...children.filter((symbol) => isPackageKind(symbol.kind, symbol.metatype_qname)));
+    includedSymbols.push(...children.filter((symbol) => isPackageKind(symbol)));
   } else {
     includedSymbols.push(...children);
   }

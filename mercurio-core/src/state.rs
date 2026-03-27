@@ -12,9 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::settings::AppSettings;
 use crate::stdlib::clear_all_persisted_stdlib_indexes;
-use crate::workspace_ir_cache::{
-    clear_all_workspace_ir_caches, flush_pending_workspace_ir_cache_persists,
-};
+use crate::workspace_ir_cache::clear_all_workspace_ir_caches;
 
 #[derive(Serialize, Clone)]
 pub struct CompileDiagnosticView {
@@ -83,12 +81,6 @@ pub(crate) struct BackgroundJobState {
     cancel_compile_run_id: Option<u64>,
 }
 
-#[derive(Clone)]
-pub(crate) struct PendingWorkspaceIrPersist {
-    pub(crate) generation: u64,
-    pub(crate) stdlib_signature: Option<String>,
-}
-
 #[derive(Serialize, Clone)]
 pub struct BackgroundJobView {
     pub id: u64,
@@ -122,9 +114,7 @@ pub struct CoreState {
     pub(crate) symbol_index: Arc<Mutex<SymbolIndex>>,
     pub(crate) background_jobs: Arc<Mutex<HashMap<u64, BackgroundJobState>>>,
     pub(crate) next_background_job_id: Arc<AtomicU64>,
-    pub(crate) next_workspace_ir_persist_id: Arc<AtomicU64>,
-    pub(crate) pending_workspace_ir_persists:
-        Arc<Mutex<HashMap<String, PendingWorkspaceIrPersist>>>,
+    pub(crate) workspace_ir_persist_lock: Arc<Mutex<()>>,
     pub stdlib_root: PathBuf,
     pub settings: Arc<Mutex<AppSettings>>,
 }
@@ -167,8 +157,7 @@ impl CoreState {
             symbol_index: Arc::new(Mutex::new(symbol_index)),
             background_jobs: Arc::new(Mutex::new(HashMap::new())),
             next_background_job_id: Arc::new(AtomicU64::new(1)),
-            next_workspace_ir_persist_id: Arc::new(AtomicU64::new(1)),
-            pending_workspace_ir_persists: Arc::new(Mutex::new(HashMap::new())),
+            workspace_ir_persist_lock: Arc::new(Mutex::new(())),
             stdlib_root,
             settings: Arc::new(Mutex::new(settings)),
         }
@@ -254,12 +243,6 @@ impl CoreState {
     }
 
     pub fn clear_runtime_caches(&self) -> Result<CacheClearSummary, String> {
-        let pending_workspace_ir_persists = self
-            .pending_workspace_ir_persists
-            .lock()
-            .map_err(|_| "Pending workspace IR persist lock poisoned".to_string())?
-            .len();
-        flush_pending_workspace_ir_cache_persists(self, None)?;
         let workspace_snapshot_entries = {
             let mut cache = self
                 .workspace_snapshot_cache
@@ -306,9 +289,6 @@ impl CoreState {
             canceled.clear();
             count
         };
-        if let Ok(mut pending_persists) = self.pending_workspace_ir_persists.lock() {
-            pending_persists.clear();
-        }
         let workspace_ir_cache_files_deleted = clear_all_workspace_ir_caches()?;
         let stdlib_index_cache_files_deleted = clear_all_persisted_stdlib_indexes()?;
         Ok(CacheClearSummary {
@@ -317,7 +297,7 @@ impl CoreState {
             parsed_file_entries,
             file_mtime_entries,
             canceled_compile_entries,
-            pending_workspace_ir_persists,
+            pending_workspace_ir_persists: 0,
             workspace_ir_cache_files_deleted,
             stdlib_index_cache_files_deleted,
             symbol_index_cleared,
@@ -326,7 +306,6 @@ impl CoreState {
 
     #[cfg(test)]
     pub(crate) fn clear_in_memory_caches_for_tests(&self) -> Result<(), String> {
-        flush_pending_workspace_ir_cache_persists(self, None)?;
         if let Ok(mut cache) = self.workspace_snapshot_cache.lock() {
             cache.clear();
         }
@@ -342,9 +321,6 @@ impl CoreState {
         }
         if let Ok(mut canceled) = self.canceled_compiles.lock() {
             canceled.clear();
-        }
-        if let Ok(mut pending) = self.pending_workspace_ir_persists.lock() {
-            pending.clear();
         }
         Ok(())
     }

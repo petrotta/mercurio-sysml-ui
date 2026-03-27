@@ -50,6 +50,7 @@ fn app_handle_store() -> &'static Mutex<Option<tauri::AppHandle>> {
 
 fn normalize_level(level: &str) -> String {
     match level.trim().to_ascii_uppercase().as_str() {
+        "DEBUG" | "TRACE" => "DEBUG".to_string(),
         "ERROR" => "ERROR".to_string(),
         "WARN" | "WARNING" => "WARN".to_string(),
         _ => "INFO".to_string(),

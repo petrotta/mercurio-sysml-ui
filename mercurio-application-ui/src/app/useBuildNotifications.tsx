@@ -9,6 +9,7 @@ import {
   getBackendLogs,
   logFrontendEvent,
   normalizeBackendLogLevel,
+  type AppLogLevel,
   type BackendLogRecord,
 } from "./services/logger";
 
@@ -25,11 +26,11 @@ export type CompileToast = {
 };
 
 export type BuildLogEntry = {
-  id: number;
+  id: string;
   at: string;
   timestampUtc?: string;
   kind: string;
-  level: "info" | "warn" | "error";
+  level: AppLogLevel;
   message: string;
 };
 
@@ -83,11 +84,11 @@ export function useBuildNotifications({ currentRunIdRef }: UseBuildNotifications
   const progressEventCountRef = useRef(0);
 
   const appendLocalBuildLogEntries = useCallback((
-    entries: Array<{ level: "info" | "warn" | "error"; message: string }>,
+    entries: Array<{ level: AppLogLevel; message: string }>,
   ) => {
     if (!entries.length) return;
     const stamped = entries.map((entry) => ({
-      id: ++buildLogIdRef.current,
+      id: `local-${++buildLogIdRef.current}`,
       at: formatBackendLogTimestamp(new Date().toISOString()),
       timestampUtc: new Date().toISOString(),
       kind: "build",
@@ -107,7 +108,7 @@ export function useBuildNotifications({ currentRunIdRef }: UseBuildNotifications
     setBuildLogEntries((prev) => [
       ...prev,
       ...fresh.map((record) => ({
-        id: record.seq,
+        id: `backend-${record.seq}`,
         at: formatBackendLogTimestamp(record.timestamp_utc),
         timestampUtc: record.timestamp_utc,
         kind: (record.kind || "app").trim() || "app",
@@ -118,7 +119,7 @@ export function useBuildNotifications({ currentRunIdRef }: UseBuildNotifications
   }, []);
 
   const appendBuildLogEntries = useCallback((
-    entries: Array<{ level: "info" | "warn" | "error"; message: string }>,
+    entries: Array<{ level: AppLogLevel; message: string }>,
   ) => {
     if (!entries.length) return;
     for (const entry of entries) {
@@ -163,7 +164,7 @@ export function useBuildNotifications({ currentRunIdRef }: UseBuildNotifications
         lines: [...prev.lines, ...lines].slice(-8),
       }));
       appendBuildLogEntries(
-        lines.map((line) => ({ level: "info" as const, message: line })),
+        lines.map((line) => ({ level: "debug" as const, message: line })),
       );
     }
     setProgressUiUpdates((prev) => prev + 1);

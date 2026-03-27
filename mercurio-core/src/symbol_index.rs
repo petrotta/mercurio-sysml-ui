@@ -44,6 +44,9 @@ pub struct IndexedSymbolView {
     pub qualified_name: String,
     pub parent_qualified_name: Option<String>,
     pub kind: String,
+    pub semantic_kind: Option<String>,
+    pub structural_metatype_qname: Option<String>,
+    pub classification_qname: Option<String>,
     pub metatype_qname: Option<String>,
     pub file_path: String,
     pub start_line: u32,
@@ -105,8 +108,13 @@ fn to_view(
     lookup: Option<&ProjectSemanticLookup>,
 ) -> IndexedSymbolView {
     let file_path = normalize_symbol_display_path(&record);
+    let semantic_element = semantic_element_for_record(&record, &file_path, lookup);
     let projection = projection_for_record(&record, &file_path, lookup);
     let mut explorer_diagnostics = Vec::<String>::new();
+    let semantic_kind = semantic_kind_for_record(&record, semantic_element);
+    let structural_metatype_qname =
+        structural_metatype_qname_for_record(&record, projection, semantic_element);
+    let classification_qname = classification_qname_for_record(&record, semantic_element);
     let structural_type = projection.and_then(|value| derive_structural_type_view(&record, value));
     let directed_relationships = projection
         .map(|value| derive_directed_relationship_views(&record, value, &mut explorer_diagnostics))
@@ -123,6 +131,9 @@ fn to_view(
         qualified_name: record.qualified_name,
         parent_qualified_name: record.parent_qualified_name,
         kind: record.kind,
+        semantic_kind,
+        structural_metatype_qname,
+        classification_qname,
         metatype_qname: record.metatype_qname,
         file_path,
         start_line: record.start_line,
@@ -147,6 +158,90 @@ fn projection_for_record<'a>(
         .projections_by_file_qname
         .get(&(file_key, record.qualified_name.clone()))
         .or_else(|| lookup.best_projections_by_qname.get(&record.qualified_name))
+}
+
+fn semantic_element_for_record<'a>(
+    record: &SymbolRecord,
+    display_file_path: &str,
+    lookup: Option<&'a ProjectSemanticLookup>,
+) -> Option<&'a SemanticElementView> {
+    let lookup = lookup?;
+    let file_key = normalized_compare_key(Path::new(display_file_path));
+    lookup
+        .elements_by_file_qname
+        .get(&(file_key, record.qualified_name.clone()))
+        .or_else(|| lookup.best_elements_by_qname.get(&record.qualified_name))
+}
+
+fn first_non_empty_attribute(
+    element: Option<&SemanticElementView>,
+    names: &[&str],
+) -> Option<String> {
+    let element = element?;
+    for name in names {
+        let value = element
+            .attributes
+            .get(*name)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty());
+        if let Some(value) = value {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn semantic_kind_for_record(
+    record: &SymbolRecord,
+    element: Option<&SemanticElementView>,
+) -> Option<String> {
+    first_non_empty_attribute(element, &["core.semantic_kind", "semantic_kind"])
+        .or_else(|| {
+            let kind = record.kind.trim();
+            (!kind.is_empty()).then(|| kind.to_string())
+        })
+}
+
+fn structural_metatype_qname_for_record(
+    _record: &SymbolRecord,
+    projection: Option<&SemanticElementProjectionView>,
+    element: Option<&SemanticElementView>,
+) -> Option<String> {
+    projection
+        .and_then(|value| value.metatype_qname.as_ref())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            first_non_empty_attribute(
+                element,
+                &["structural_metatype_qname", "core.structural_metatype_qname"],
+            )
+        })
+}
+
+fn classification_qname_for_record(
+    record: &SymbolRecord,
+    element: Option<&SemanticElementView>,
+) -> Option<String> {
+    first_non_empty_attribute(
+        element,
+        &[
+            "classification_qname",
+            "core.classification_qname",
+            "metatype_qname",
+            "mercurio::metatype",
+            "Element::metatype",
+        ],
+    )
+    .or_else(|| {
+        record
+            .metatype_qname
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
 }
 
 fn normalized_leaf_name(value: Option<&str>, fallback: &str) -> String {
@@ -1102,6 +1197,8 @@ mod tests {
             qualified_name: qualified_name.to_string(),
             file_path: "model.sysml".to_string(),
             metatype_qname: metatype_qname.map(ToString::to_string),
+            classification_qname: None,
+            core: None,
             features,
         }
     }
@@ -1657,27 +1754,29 @@ mod tests {
             AppSettings::default(),
         );
         let project_root = "C:\\tmp\\semantic-candidate-pref".to_string();
-        let unresolved = mercurio_sysml_semantics::semantic_contract::SemanticElementView {
-            name: "P".to_string(),
-            qualified_name: "P".to_string(),
-            metatype_qname: None,
-            file_path: "C:\\tmp\\left.sysml".to_string(),
-            attributes: std::collections::HashMap::from([
+        let unresolved = mercurio_sysml_semantics::semantic_contract::SemanticElementView::new(
+            "P".to_string(),
+            "P".to_string(),
+            None,
+            None,
+            "C:\\tmp\\left.sysml".to_string(),
+            std::collections::HashMap::from([
                 ("metatype_source".to_string(), "unresolved".to_string()),
                 ("kind".to_string(), "Package".to_string()),
             ]),
-        };
-        let resolved = mercurio_sysml_semantics::semantic_contract::SemanticElementView {
-            name: "P".to_string(),
-            qualified_name: "P".to_string(),
-            metatype_qname: Some("sysml::Package".to_string()),
-            file_path: "C:\\tmp\\right.sysml".to_string(),
-            attributes: std::collections::HashMap::from([
+        );
+        let resolved = mercurio_sysml_semantics::semantic_contract::SemanticElementView::new(
+            "P".to_string(),
+            "P".to_string(),
+            Some("sysml::Package".to_string()),
+            None,
+            "C:\\tmp\\right.sysml".to_string(),
+            std::collections::HashMap::from([
                 ("metatype_source".to_string(), "inferred-kind".to_string()),
                 ("metatype_qname".to_string(), "sysml::Package".to_string()),
                 ("kind".to_string(), "Package".to_string()),
             ]),
-        };
+        );
         {
             let mut cache = state
                 .workspace_snapshot_cache
@@ -1729,7 +1828,9 @@ mod tests {
                 name: "w".to_string(),
                 qualified_name: "Example::w".to_string(),
                 metatype_qname: Some("sysml::PartUsage".to_string()),
+                classification_qname: None,
                 file_path: "C:\\tmp\\Example.sysml".to_string(),
+                core: None,
                 features: vec![
                     mercurio_sysml_semantics::semantic_contract::SemanticFeatureView {
                         name: "name".to_string(),
@@ -2090,7 +2191,9 @@ mod tests {
                         name: "Main".to_string(),
                         qualified_name: "Demo::Main".to_string(),
                         metatype_qname: Some("sysml::Package".to_string()),
+                        classification_qname: None,
                         file_path: "main.sysml".to_string(),
+                        core: None,
                         features: vec![
                             mercurio_sysml_semantics::semantic_contract::SemanticFeatureView {
                                 name: "name".to_string(),

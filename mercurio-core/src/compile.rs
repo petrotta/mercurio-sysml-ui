@@ -3,7 +3,8 @@ use mercurio_sysml_core::parser::Parser;
 use mercurio_sysml_pkg::compile_support::{
     build_canonical_symbol_rows_by_file, build_compile_workspace_files,
     build_stdlib_snapshot_with_progress as build_stdlib_snapshot_rows_with_progress,
-    build_workspace_semantic_elements_with_selection, build_workspace_semantic_projection_views,
+    build_workspace_semantic_elements_with_selection,
+    build_workspace_semantic_projection_views_with_progress,
     collect_stdlib_files, filter_out_library_files, group_prepared_symbols_by_file,
     is_library_symbol_path, load_stdlib_snapshot_with_cache,
     map_semantic_element_to_projected_symbol,
@@ -34,13 +35,13 @@ use crate::stdlib::{
 };
 use crate::symbol_index::{query_project_symbols, refresh_project_semantic_lookup};
 use crate::workspace::{collect_model_files, collect_project_files};
-use crate::workspace_ir_cache::schedule_workspace_ir_cache_persist;
 use crate::CoreState;
 
 #[cfg(test)]
 use mercurio_sysml_semantics::semantic_contract::SemanticElementView;
 use mercurio_sysml_semantics::semantic_contract::{
-    SemanticElementProjectionView, SemanticFeatureView, SemanticValueView,
+    SemanticElementCore, SemanticElementProjectionView, SemanticFeatureView,
+    SemanticProvenance, SemanticSpan, SemanticValueView,
 };
 
 pub use crate::state::{CompileDiagnosticView, CompileFileResult};
@@ -1313,7 +1314,17 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
         if projection_inputs.is_empty() {
             Arc::new(Vec::new())
         } else {
-            match build_workspace_semantic_projection_views(&projection_inputs) {
+            match build_workspace_semantic_projection_views_with_progress(
+                &projection_inputs,
+                |detail| {
+                    emit_progress(
+                        "analysis",
+                        Some(format!("projection warm detail: {detail}")),
+                        None,
+                        None,
+                    );
+                },
+            ) {
                 Ok(projection) => {
                     semantic_projection_needs_store = true;
                     Arc::new(projection)
@@ -1614,16 +1625,6 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
             false,
         );
     }
-    let persist_signature = if stdlib_signature.is_empty() {
-        None
-    } else {
-        Some(stdlib_signature.as_str())
-    };
-    schedule_workspace_ir_cache_persist(
-        state.clone(),
-        root.clone(),
-        persist_signature.map(|value| value.to_string()),
-    );
     emit_progress("complete", Some("compile done".to_string()), None, None);
     Ok(response)
 }
@@ -1871,16 +1872,6 @@ pub fn load_library_symbols_sync(
         stdlib_file_count,
         total_duration_ms: start.elapsed().as_millis(),
     };
-    let persist_signature = if stdlib_signature.is_empty() {
-        None
-    } else {
-        Some(stdlib_signature.as_str())
-    };
-    schedule_workspace_ir_cache_persist(
-        state.clone(),
-        root.clone(),
-        persist_signature.map(|value| value.to_string()),
-    );
     if !stdlib_signature.is_empty() {
         let _ = persist_stdlib_index_cache(state, &root, stdlib_path_for_log.as_deref(), &stdlib_signature);
     }
@@ -2128,11 +2119,14 @@ fn store_stdlib_semantic_projection_cache(
 fn stdlib_projection_view_from_projected_symbol(
     symbol: &ProjectedSemanticSymbol,
 ) -> SemanticElementProjectionView {
+    let metatype_qname = projected_symbol_metatype_qname(symbol);
     SemanticElementProjectionView {
         name: symbol.name.clone(),
         qualified_name: symbol.qualified_name.clone(),
         file_path: symbol.file_path.clone(),
-        metatype_qname: projected_symbol_metatype_qname(symbol),
+        metatype_qname: metatype_qname.clone(),
+        classification_qname: symbol.classification_qname.clone(),
+        core: Some(projected_symbol_core(symbol, metatype_qname.as_deref())),
         features: symbol
             .properties
             .iter()
@@ -2147,6 +2141,34 @@ fn stdlib_projection_view_from_projected_symbol(
                 diagnostics: Vec::new(),
             })
             .collect(),
+    }
+}
+
+fn projected_symbol_core(
+    symbol: &ProjectedSemanticSymbol,
+    structural_metatype_qname: Option<&str>,
+) -> SemanticElementCore {
+    SemanticElementCore {
+        name: symbol.name.clone(),
+        qualified_name: symbol.qualified_name.clone(),
+        semantic_kind: Some(symbol.kind.clone()),
+        structural_metatype_qname: structural_metatype_qname.map(ToString::to_string),
+        classification_qname: symbol.classification_qname.clone(),
+        declared_type_qname: None,
+        definition_qname: None,
+        owner_qname: projected_symbol_parent_qualified_name(symbol),
+        file_path: symbol.file_path.clone(),
+        span: ((symbol.start_line > 0)
+            || (symbol.start_col > 0)
+            || (symbol.end_line > 0)
+            || (symbol.end_col > 0))
+            .then_some(SemanticSpan {
+                start_line: (symbol.start_line > 0).then_some(symbol.start_line),
+                start_col: (symbol.start_col > 0).then_some(symbol.start_col),
+                end_line: (symbol.end_line > 0).then_some(symbol.end_line),
+                end_col: (symbol.end_col > 0).then_some(symbol.end_col),
+            }),
+        provenance: SemanticProvenance::default(),
     }
 }
 
@@ -2378,30 +2400,12 @@ fn unsaved_content_for_path<'a>(
 }
 
 fn augment_owned_relationships(symbols: &mut [SymbolView]) {
-    fn is_owned_attribute_symbol(symbol: &SymbolView) -> bool {
-        if symbol.kind.to_ascii_lowercase().contains("attribute") {
-            return true;
-        }
-        symbol_metatype_qname(symbol)
-            .map(|metatype| metatype.to_ascii_lowercase().contains("attribute"))
-            .unwrap_or(false)
-    }
-
     let mut qname_to_index = HashMap::<String, usize>::new();
     for (idx, symbol) in symbols.iter().enumerate() {
         qname_to_index
             .entry(symbol.qualified_name.clone())
             .or_insert(idx);
     }
-    let is_attribute_by_qname = symbols
-        .iter()
-        .map(|symbol| {
-            (
-                symbol.qualified_name.clone(),
-                is_owned_attribute_symbol(symbol),
-            )
-        })
-        .collect::<HashMap<_, _>>();
 
     let mut relationships_by_parent = HashMap::<usize, Vec<RelationshipView>>::new();
     for symbol in symbols.iter() {
@@ -2471,27 +2475,6 @@ fn augment_owned_relationships(symbols: &mut [SymbolView]) {
                 Some("connection"),
             );
         }
-        let mut owned_attributes = Vec::<String>::new();
-        for rel in parent
-            .relationships
-            .iter()
-            .filter(|rel| rel.kind == "ownedMember")
-        {
-            let Some(is_attribute) = is_attribute_by_qname.get(&rel.target) else {
-                continue;
-            };
-            if *is_attribute && !owned_attributes.iter().any(|target| target == &rel.target) {
-                owned_attributes.push(rel.target.clone());
-            }
-        }
-        if !owned_attributes.is_empty() {
-            upsert_list_property(
-                &mut parent.properties,
-                "ownedAttributes",
-                owned_attributes,
-                Some("ownership"),
-            );
-        }
     }
 }
 
@@ -2510,26 +2493,6 @@ fn upsert_number_property(
         name: name.to_string(),
         label: name.to_string(),
         value: PropertyValueView::Number { value },
-        hint: None,
-        group: group.map(|value| value.to_string()),
-    });
-}
-
-fn upsert_list_property(
-    properties: &mut Vec<PropertyItemView>,
-    name: &str,
-    items: Vec<String>,
-    group: Option<&str>,
-) {
-    if let Some(property) = properties.iter_mut().find(|prop| prop.name == name) {
-        property.value = PropertyValueView::List { items };
-        property.group = group.map(|value| value.to_string());
-        return;
-    }
-    properties.push(PropertyItemView {
-        name: name.to_string(),
-        label: name.to_string(),
-        value: PropertyValueView::List { items },
         hint: None,
         group: group.map(|value| value.to_string()),
     });
@@ -3740,161 +3703,6 @@ standard library package KerML {
     }
 
     #[test]
-    fn augment_owned_relationships_adds_owned_attributes_property() {
-        fn symbol(kind: &str, qualified_name: &str, start_line: u32) -> SymbolView {
-            let name = qualified_name
-                .rsplit("::")
-                .next()
-                .unwrap_or(qualified_name)
-                .to_string();
-            SymbolView {
-                file_path: "main.sysml".to_string(),
-                name,
-                short_name: None,
-                qualified_name: qualified_name.to_string(),
-                kind: kind.to_string(),
-                file: 0,
-                start_line,
-                start_col: 1,
-                end_line: start_line,
-                end_col: 10,
-                expr_start_line: None,
-                expr_start_col: None,
-                expr_end_line: None,
-                expr_end_col: None,
-                short_name_start_line: None,
-                short_name_start_col: None,
-                short_name_end_line: None,
-                short_name_end_col: None,
-                doc: None,
-                supertypes: Vec::new(),
-                relationships: Vec::new(),
-                type_refs: Vec::new(),
-                is_public: true,
-                properties: Vec::new(),
-            }
-        }
-
-        let mut symbols = vec![
-            symbol("PartDef", "Demo::ScenarioState", 1),
-            symbol("AttributeUsage", "Demo::ScenarioState::speed", 2),
-            symbol("AttributeUsage", "Demo::ScenarioState::heading", 3),
-            symbol("PartDef", "Demo::ScenarioState::nestedPart", 4),
-        ];
-        augment_owned_relationships(&mut symbols);
-
-        let parent = symbols
-            .iter()
-            .find(|symbol| symbol.qualified_name == "Demo::ScenarioState")
-            .expect("scenario state symbol");
-        let owned_attrs_prop = parent
-            .properties
-            .iter()
-            .find(|prop| prop.name == "ownedAttributes")
-            .expect("ownedAttributes property");
-        match &owned_attrs_prop.value {
-            PropertyValueView::List { items } => {
-                assert_eq!(
-                    items,
-                    &vec![
-                        "Demo::ScenarioState::speed".to_string(),
-                        "Demo::ScenarioState::heading".to_string()
-                    ]
-                );
-            }
-            _ => panic!("ownedAttributes should be a list"),
-        }
-    }
-
-    #[test]
-    fn augment_owned_relationships_detects_attribute_usage_via_metatype() {
-        fn symbol(
-            kind: &str,
-            qualified_name: &str,
-            start_line: u32,
-            metatype_qname: Option<&str>,
-        ) -> SymbolView {
-            let mut properties = Vec::new();
-            if let Some(metatype) = metatype_qname {
-                properties.push(PropertyItemView {
-                    name: "metatype_qname".to_string(),
-                    label: "metatype_qname".to_string(),
-                    value: PropertyValueView::Text {
-                        value: metatype.to_string(),
-                    },
-                    hint: None,
-                    group: None,
-                });
-            }
-            let name = qualified_name
-                .rsplit("::")
-                .next()
-                .unwrap_or(qualified_name)
-                .to_string();
-            SymbolView {
-                file_path: "main.sysml".to_string(),
-                name,
-                short_name: None,
-                qualified_name: qualified_name.to_string(),
-                kind: kind.to_string(),
-                file: 0,
-                start_line,
-                start_col: 1,
-                end_line: start_line,
-                end_col: 10,
-                expr_start_line: None,
-                expr_start_col: None,
-                expr_end_line: None,
-                expr_end_col: None,
-                short_name_start_line: None,
-                short_name_start_col: None,
-                short_name_end_line: None,
-                short_name_end_col: None,
-                doc: None,
-                supertypes: Vec::new(),
-                relationships: Vec::new(),
-                type_refs: Vec::new(),
-                is_public: true,
-                properties,
-            }
-        }
-
-        let mut symbols = vec![
-            symbol("PartDef", "Demo::ScenarioState", 1, None),
-            symbol(
-                "Usage",
-                "Demo::ScenarioState::speed",
-                2,
-                Some("sysml::AttributeUsage"),
-            ),
-            symbol(
-                "Usage",
-                "Demo::ScenarioState::sensor",
-                3,
-                Some("sysml::PartUsage"),
-            ),
-        ];
-        augment_owned_relationships(&mut symbols);
-
-        let parent = symbols
-            .iter()
-            .find(|symbol| symbol.qualified_name == "Demo::ScenarioState")
-            .expect("scenario state symbol");
-        let owned_attrs_prop = parent
-            .properties
-            .iter()
-            .find(|prop| prop.name == "ownedAttributes")
-            .expect("ownedAttributes property");
-        match &owned_attrs_prop.value {
-            PropertyValueView::List { items } => {
-                let expected = vec!["Demo::ScenarioState::speed".to_string()];
-                assert_eq!(items.as_slice(), expected.as_slice());
-            }
-            _ => panic!("ownedAttributes should be a list"),
-        }
-    }
-
-    #[test]
     fn map_semantic_element_parses_emf_owned_elements_as_list_property() {
         let mut attrs = HashMap::new();
         attrs.insert("emf::name".to_string(), "ScenarioState".to_string());
@@ -3906,13 +3714,14 @@ standard library package KerML {
             "emf::ownedElements".to_string(),
             "Demo::ScenarioState::speed, Demo::ScenarioState::heading".to_string(),
         );
-        let element = SemanticElementView {
-            name: "ScenarioState".to_string(),
-            qualified_name: "Demo::ScenarioState".to_string(),
-            metatype_qname: Some("sysml::PartDefinition".to_string()),
-            file_path: "main.sysml".to_string(),
-            attributes: attrs,
-        };
+        let element = SemanticElementView::new(
+            "ScenarioState".to_string(),
+            "Demo::ScenarioState".to_string(),
+            Some("sysml::PartDefinition".to_string()),
+            None,
+            "main.sysml".to_string(),
+            attrs,
+        );
         let symbol = map_semantic_element_to_symbol(element, &HashMap::new());
         let owned_elements = symbol
             .properties
@@ -3945,13 +3754,14 @@ standard library package KerML {
         attrs.insert("emf::startColumn".to_string(), "9".to_string());
         attrs.insert("emf::endLine".to_string(), "6".to_string());
         attrs.insert("emf::endColumn".to_string(), "10".to_string());
-        let element = SemanticElementView {
-            name: "x".to_string(),
-            qualified_name: "ActionTest::A::x".to_string(),
-            metatype_qname: Some("sysml::Usage".to_string()),
-            file_path: "ActionTest.sysml".to_string(),
-            attributes: attrs,
-        };
+        let element = SemanticElementView::new(
+            "x".to_string(),
+            "ActionTest::A::x".to_string(),
+            Some("sysml::Usage".to_string()),
+            None,
+            "ActionTest.sysml".to_string(),
+            attrs,
+        );
 
         let symbol = map_semantic_element_to_symbol(element, &HashMap::new());
         assert_eq!(symbol.start_line, 6);
@@ -3972,13 +3782,14 @@ standard library package KerML {
         attrs.insert("emf::startColumn".to_string(), "9".to_string());
         attrs.insert("emf::endLine".to_string(), "6".to_string());
         attrs.insert("emf::endColumn".to_string(), "10".to_string());
-        let element = SemanticElementView {
-            name: "x".to_string(),
-            qualified_name: "ActionTest::A::x".to_string(),
-            metatype_qname: Some("sysml::Usage".to_string()),
-            file_path: "ActionTest.sysml".to_string(),
-            attributes: attrs,
-        };
+        let element = SemanticElementView::new(
+            "x".to_string(),
+            "ActionTest::A::x".to_string(),
+            Some("sysml::Usage".to_string()),
+            None,
+            "ActionTest.sysml".to_string(),
+            attrs,
+        );
         let mut index = HashMap::new();
         index.insert(
             symbol_key("ActionTest.sysml", "ActionTest::A::x"),
@@ -4011,18 +3822,21 @@ package ConnectionTest {
 ";
         let mut attrs = HashMap::new();
         attrs.insert("emf::owner".to_string(), "ConnectionTest::C".to_string());
-        let element = SemanticElementView {
-            name: "end3".to_string(),
-            qualified_name: "ConnectionTest::C::end3".to_string(),
-            metatype_qname: Some("sysml::Feature".to_string()),
-            file_path: "ConnectionTest.sysml".to_string(),
-            attributes: attrs,
-        };
+        let element = SemanticElementView::new(
+            "end3".to_string(),
+            "ConnectionTest::C::end3".to_string(),
+            Some("sysml::Feature".to_string()),
+            None,
+            "ConnectionTest.sysml".to_string(),
+            attrs,
+        );
         let mut projected = ProjectedSemanticSymbol {
             file_path: "ConnectionTest.sysml".to_string(),
             name: "end3".to_string(),
             qualified_name: "ConnectionTest::C::end3".to_string(),
             kind: "OwnedEnd".to_string(),
+            structural_metatype_qname: None,
+            classification_qname: None,
             start_line: 0,
             start_col: 0,
             end_line: 0,
