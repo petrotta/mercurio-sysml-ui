@@ -1283,9 +1283,18 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
         ));
         computed
     };
+    let should_warm_semantic_projection_cache = include_symbols;
     let mut semantic_projection_needs_store = false;
     let semantic_projection = if let Some(cached) = semantic_projection {
         cached
+    } else if !should_warm_semantic_projection_cache {
+        emit_progress(
+            "analysis",
+            Some("semantic projection cache warm deferred".to_string()),
+            Some(0),
+            Some(project_semantic_inputs.len()),
+        );
+        Arc::new(Vec::new())
     } else {
         let projection_inputs = project_semantic_inputs
             .iter()
@@ -1398,13 +1407,15 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
                     WorkspaceSnapshotCacheEntry::ProjectSemantic(semantic_elements.clone()),
                 );
             }
-            for key in semantic_projection_cache_keys {
-                cache.insert(
-                    key,
-                    WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(
-                        semantic_projection.clone(),
-                    ),
-                );
+            if semantic_projection_needs_store {
+                for key in semantic_projection_cache_keys {
+                    cache.insert(
+                        key,
+                        WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(
+                            semantic_projection.clone(),
+                        ),
+                    );
+                }
             }
         }
     }

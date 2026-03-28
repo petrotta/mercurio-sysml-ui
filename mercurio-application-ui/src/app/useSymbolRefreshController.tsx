@@ -172,7 +172,7 @@ export function useSymbolRefreshController({
       compileRoot,
       sessionToken,
       reason: "post-compile",
-      hydrateLibrary: true,
+      hydrateLibrary: false,
     });
   }, [refreshWorkspaceSymbols]);
 

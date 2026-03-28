@@ -409,6 +409,38 @@ pub(crate) fn clear_all_workspace_ir_caches() -> Result<usize, String> {
     }
 }
 
+pub(crate) fn clear_workspace_ir_cache(project_root: &str) -> Result<usize, String> {
+    let root = canonical_project_root(project_root);
+    let mut deleted = 0usize;
+    let mut failures = Vec::<String>::new();
+    for path in [
+        startup_manifest_file_path(&root),
+        symbol_payload_file_path(&root),
+        legacy_monolithic_binary_cache_file_path(&root),
+        legacy_json_cache_file_path(&root),
+        legacy_symbol_index_binary_cache_file_path(&root),
+    ] {
+        if !path.exists() {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                deleted += 1;
+            }
+            Err(error) => failures.push(format!("{}: {}", path.to_string_lossy(), error)),
+        }
+    }
+    if failures.is_empty() {
+        Ok(deleted)
+    } else {
+        Err(format!(
+            "Failed to delete workspace IR cache files for root '{}': {}",
+            root,
+            failures.join("; ")
+        ))
+    }
+}
+
 pub(crate) fn load_workspace_ir_cache_snapshot(
     project_root: &str,
 ) -> Result<Option<WorkspaceIrCacheSnapshot>, String> {

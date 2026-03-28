@@ -10,7 +10,7 @@ use crate::symbol_index::{
     query_library_symbols_impl, query_project_symbols_impl, IndexedSymbolView,
 };
 use crate::workspace_ir_cache::{
-    describe_workspace_startup_cache_miss, load_workspace_ir_cache_snapshot,
+    clear_workspace_ir_cache, describe_workspace_startup_cache_miss, load_workspace_ir_cache_snapshot,
     persist_workspace_ir_cache,
     seed_workspace_symbol_state_from_workspace_ir_cache,
 };
@@ -72,6 +72,14 @@ fn snapshot_has_complete_library_symbols(
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false);
     !hydrate_library || !has_library_path || !snapshot.library_symbols.is_empty()
+}
+
+fn snapshot_has_any_symbols(snapshot: &WorkspaceSymbolSnapshotView) -> bool {
+    !snapshot.project_symbols.is_empty() || !snapshot.library_symbols.is_empty()
+}
+
+fn startup_restore_is_empty(snapshot: &WorkspaceSymbolSnapshotView) -> bool {
+    snapshot.project_symbols.is_empty() && snapshot.library_symbols.is_empty()
 }
 
 fn count_project_semantic_projections(state: &CoreState, root: &str) -> usize {
@@ -196,7 +204,9 @@ fn get_workspace_symbol_snapshot_with_options(
             library_metadata_ms,
         },
     };
-    if snapshot_has_complete_library_symbols(&snapshot, hydrate_library) {
+    if snapshot_has_any_symbols(&snapshot)
+        && snapshot_has_complete_library_symbols(&snapshot, hydrate_library)
+    {
         if let Err(error) = persist_workspace_ir_cache(state, &root, None) {
             snapshot
                 .diagnostics
@@ -294,6 +304,20 @@ pub fn get_workspace_startup_snapshot(
             symbol_snapshot = recovered_snapshot;
         }
     }
+    if cache_hit && startup_restore_is_empty(&symbol_snapshot) {
+        cache_hit = false;
+        diagnostics.push(
+            "Workspace cache miss reason: startup_cache_restored_no_symbols".to_string(),
+        );
+        match clear_workspace_ir_cache(&root) {
+            Ok(deleted) => diagnostics.push(format!(
+                "Cleared empty workspace startup cache artifacts: {deleted}"
+            )),
+            Err(error) => diagnostics.push(format!(
+                "Workspace cache invalidation failed after empty restore: {error}"
+            )),
+        }
+    }
     let symbol_snapshot_ms = elapsed_ms(symbol_snapshot_started_at);
     if library_path.is_none() {
         library_path = symbol_snapshot.library_path.clone();
@@ -325,6 +349,7 @@ mod tests {
     use crate::compile::{compile_workspace_sync, load_library_symbols_sync};
     use crate::settings::AppSettings;
     use crate::state::CoreState;
+    use crate::workspace_ir_cache::persist_workspace_ir_cache;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -569,6 +594,54 @@ mod tests {
             .expect("workspace startup snapshot");
         assert!(startup.cache_hit);
         assert!(!startup.library_symbols.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_startup_snapshot_rejects_empty_cache_restore() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("mercurio_workspace_startup_empty_restore_{stamp}"));
+        let library_dir = root.join("stdlib");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&library_dir).expect("create library dir");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(
+            library_dir.join("KerML.kerml"),
+            "standard library package KerML { package Kernel { metaclass Element {} } }",
+        )
+        .expect("write library file");
+        fs::write(project_dir.join("main.sysml"), "package P { part def A; }\n")
+            .expect("write project file");
+        fs::write(
+            project_dir.join(".project"),
+            format!(
+                "{{\"name\":\"empty-startup-cache\",\"library\":{{\"path\":\"{}\"}},\"src\":[\"*.sysml\"]}}",
+                library_dir.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let project_root = project_dir.to_string_lossy().to_string();
+        persist_workspace_ir_cache(&state, &project_root, None).expect("persist empty workspace cache");
+
+        let snapshot = get_workspace_startup_snapshot(&state, project_root.clone(), false, true)
+            .expect("workspace startup snapshot");
+        assert!(!snapshot.cache_hit);
+        assert!(snapshot.project_symbols.is_empty());
+        assert!(snapshot.library_symbols.is_empty());
+        assert!(snapshot.diagnostics.iter().any(|diagnostic| {
+            diagnostic == "Workspace cache miss reason: startup_cache_restored_no_symbols"
+        }));
+
+        let cache_dir = project_dir.join(".mercurio").join("cache");
+        assert!(!cache_dir.join("workspace-startup-v1.json").exists());
+        assert!(!cache_dir.join("workspace-symbols-v1.bin").exists());
 
         let _ = fs::remove_dir_all(root);
     }
