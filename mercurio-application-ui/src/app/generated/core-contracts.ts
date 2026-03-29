@@ -121,9 +121,12 @@ export type WorkspaceSymbolSnapshotResult = {
 
 export type WorkspaceStartupSnapshotTimingsView = {
   total_duration_ms: number;
-  cache_load_ms: number;
-  cache_seed_symbol_index_ms: number;
-  cache_seed_projection_ms: number;
+  project_cache_load_ms: number;
+  project_cache_seed_symbol_index_ms: number;
+  project_cache_seed_projection_ms: number;
+  library_cache_load_ms: number;
+  library_cache_seed_symbol_index_ms: number;
+  library_cache_seed_projection_ms: number;
   symbol_snapshot_ms: number;
 };
 
@@ -133,6 +136,10 @@ export type WorkspaceStartupSnapshotResult = {
   project_semantic_projection_count: number;
   library_path: string | null;
   cache_hit: boolean;
+  project_cache_hit: boolean;
+  library_cache_hit: boolean;
+  project_cache_miss_reason: string | null;
+  library_cache_miss_reason: string | null;
   diagnostics: string[];
   timings: WorkspaceStartupSnapshotTimingsView;
   symbol_timings: WorkspaceSymbolSnapshotTimingsView;

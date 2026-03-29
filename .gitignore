@@ -25,3 +25,4 @@ mercurio-application-ui/public/monaco
 *.sln
 *.sw?
 /mercurio-application-ui/.npm-cache/
+tmp_simpletests_current.json

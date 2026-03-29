@@ -13,7 +13,12 @@ pub struct SemanticEditContext {
 
 impl SemanticEditContext {
     pub fn file_path(&self) -> PathBuf {
-        PathBuf::from(self.target.file_path.trim())
+        let file_path = PathBuf::from(self.target.file_path.trim());
+        if file_path.is_absolute() {
+            file_path
+        } else {
+            self.root.join(file_path)
+        }
     }
 
     pub fn target_name(&self) -> Result<&str, String> {

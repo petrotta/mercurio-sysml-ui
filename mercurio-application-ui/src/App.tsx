@@ -1270,6 +1270,7 @@ export function App() {
     semanticRefreshVersion,
     applyWorkspaceSnapshot,
     resetWorkspaceSymbols,
+    refreshWorkspaceSymbols,
   } = useCompileRunner({ rootPath });
   const unresolvedCount = useMemo(
     () => compileToast.fileDiagnostics.reduce(
@@ -1513,7 +1514,7 @@ export function App() {
     return true;
   }, [hydrateLibraryTree, hydrateProjectTree, reportStartupEvent, resetWorkspaceSymbols]);
 
-  const loadCachedWorkspaceSymbols = useCallback(async (
+  const loadCachedProjectSymbols = useCallback(async (
     path: string,
   ): Promise<boolean> => {
     const trimmed = (path || "").trim();
@@ -1522,30 +1523,32 @@ export function App() {
       resetWorkspaceSymbols();
       return true;
     }
-    const snapshot = await getWorkspaceStartupSnapshot(trimmed, false, true);
+    const snapshot = await getWorkspaceStartupSnapshot(trimmed, {
+      hydrateLibrary: false,
+      preferCache: true,
+      includeProject: true,
+      includeLibrary: false,
+    });
     const durationMs = Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt);
     const diagnostics = snapshot?.diagnostics || [];
     const backendTimings = snapshot?.timings;
     const symbolTimings = snapshot?.symbol_timings;
-    const cacheMissReason = diagnostics
-      .find((diagnostic) => diagnostic.startsWith("Workspace cache miss reason: "))
-      ?.replace("Workspace cache miss reason: ", "")
-      ?.trim() || "";
+    const cacheMissReason = (snapshot?.project_cache_miss_reason || "").trim();
     for (const diagnostic of diagnostics) {
       if (/(failed|error)/i.test(`${diagnostic || ""}`)) {
         showErrorNotification(diagnostic);
       }
-      reportStartupEvent("debug", `workspace startup diagnostic root=${trimmed} message=${diagnostic}`);
+      reportStartupEvent("debug", `project startup diagnostic root=${trimmed} message=${diagnostic}`);
     }
     reportStartupEvent(
-      snapshot?.cache_hit ? "info" : "warn",
-      `workspace startup snapshot duration_ms=${durationMs} cache_hit=${snapshot?.cache_hit ? "true" : "false"} project_symbols=${snapshot?.project_symbols?.length || 0} library_symbols=${snapshot?.library_symbols?.length || 0} project_semantic_projections=${snapshot?.project_semantic_projection_count || 0} diagnostics=${diagnostics.length}${cacheMissReason ? ` cache_miss_reason=${cacheMissReason}` : ""}`,
+      snapshot?.project_cache_hit ? "info" : "warn",
+      `project startup snapshot duration_ms=${durationMs} cache_hit=${snapshot?.project_cache_hit ? "true" : "false"} project_symbols=${snapshot?.project_symbols?.length || 0} project_semantic_projections=${snapshot?.project_semantic_projection_count || 0} diagnostics=${diagnostics.length}${cacheMissReason ? ` cache_miss_reason=${cacheMissReason}` : ""}`,
     );
     if (backendTimings) {
       const frontendOverheadMs = Math.max(0, durationMs - (backendTimings.total_duration_ms || 0));
       reportStartupEvent(
         "debug",
-        `workspace startup backend timings total_ms=${backendTimings.total_duration_ms} frontend_overhead_ms=${frontendOverheadMs} cache_load_ms=${backendTimings.cache_load_ms} cache_seed_symbol_index_ms=${backendTimings.cache_seed_symbol_index_ms} cache_seed_projection_ms=${backendTimings.cache_seed_projection_ms} symbol_snapshot_ms=${backendTimings.symbol_snapshot_ms}`,
+        `project startup backend timings total_ms=${backendTimings.total_duration_ms} frontend_overhead_ms=${frontendOverheadMs} project_cache_load_ms=${backendTimings.project_cache_load_ms} project_cache_seed_symbol_index_ms=${backendTimings.project_cache_seed_symbol_index_ms} project_cache_seed_projection_ms=${backendTimings.project_cache_seed_projection_ms} symbol_snapshot_ms=${backendTimings.symbol_snapshot_ms}`,
       );
     }
     if (symbolTimings) {
@@ -1554,33 +1557,82 @@ export function App() {
         `workspace symbol snapshot timings total_ms=${symbolTimings.total_duration_ms} seed_symbol_index_ms=${symbolTimings.seed_symbol_index_ms} project_query_ms=${symbolTimings.project_query_ms} library_query_ms=${symbolTimings.library_query_ms} library_hydration_ms=${symbolTimings.library_hydration_ms} library_requery_ms=${symbolTimings.library_requery_ms} library_metadata_ms=${symbolTimings.library_metadata_ms}`,
       );
     }
-    if (snapshot?.cache_hit) {
+    if (snapshot?.project_cache_hit) {
       applyWorkspaceSnapshot({
         snapshot,
         sessionToken,
         reason: "startup-cache",
+        includeProject: true,
+        includeLibrary: false,
       });
-      setCompileStatus("Startup: workspace cache loaded");
       return true;
     }
-    setCompileStatus("Startup: no workspace cache; compiling project");
-    reportStartupEvent(
-      "warn",
-      `workspace cache miss root=${trimmed}${cacheMissReason ? ` reason=${cacheMissReason}` : ""}; compile fallback starting`,
-    );
-    const ok = await runCompile();
-    reportStartupEvent(
-      ok ? "info" : "warn",
-      `workspace compile fallback completed root=${trimmed} ok=${ok ? "true" : "false"}`,
-    );
-    return ok;
+    return false;
   }, [
     applyWorkspaceSnapshot,
     reportStartupEvent,
     resetWorkspaceSymbols,
-    runCompile,
     sessionToken,
-    setCompileStatus,
+    showErrorNotification,
+  ]);
+
+  const loadCachedLibrarySymbols = useCallback(async (
+    path: string,
+  ): Promise<boolean> => {
+    const trimmed = (path || "").trim();
+    const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
+    if (!trimmed) {
+      return true;
+    }
+    const snapshot = await getWorkspaceStartupSnapshot(trimmed, {
+      hydrateLibrary: false,
+      preferCache: true,
+      includeProject: false,
+      includeLibrary: true,
+    });
+    const durationMs = Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt);
+    const diagnostics = snapshot?.diagnostics || [];
+    const backendTimings = snapshot?.timings;
+    const symbolTimings = snapshot?.symbol_timings;
+    const cacheMissReason = (snapshot?.library_cache_miss_reason || "").trim();
+    for (const diagnostic of diagnostics) {
+      if (/(failed|error)/i.test(`${diagnostic || ""}`)) {
+        showErrorNotification(diagnostic);
+      }
+      reportStartupEvent("debug", `library startup diagnostic root=${trimmed} message=${diagnostic}`);
+    }
+    reportStartupEvent(
+      snapshot?.library_cache_hit ? "info" : "warn",
+      `library startup snapshot duration_ms=${durationMs} cache_hit=${snapshot?.library_cache_hit ? "true" : "false"} library_symbols=${snapshot?.library_symbols?.length || 0} diagnostics=${diagnostics.length}${cacheMissReason ? ` cache_miss_reason=${cacheMissReason}` : ""}`,
+    );
+    if (backendTimings) {
+      const frontendOverheadMs = Math.max(0, durationMs - (backendTimings.total_duration_ms || 0));
+      reportStartupEvent(
+        "debug",
+        `library startup backend timings total_ms=${backendTimings.total_duration_ms} frontend_overhead_ms=${frontendOverheadMs} library_cache_load_ms=${backendTimings.library_cache_load_ms} library_cache_seed_symbol_index_ms=${backendTimings.library_cache_seed_symbol_index_ms} library_cache_seed_projection_ms=${backendTimings.library_cache_seed_projection_ms} symbol_snapshot_ms=${backendTimings.symbol_snapshot_ms}`,
+      );
+    }
+    if (symbolTimings) {
+      reportStartupEvent(
+        "debug",
+        `workspace symbol snapshot timings total_ms=${symbolTimings.total_duration_ms} seed_symbol_index_ms=${symbolTimings.seed_symbol_index_ms} project_query_ms=${symbolTimings.project_query_ms} library_query_ms=${symbolTimings.library_query_ms} library_hydration_ms=${symbolTimings.library_hydration_ms} library_requery_ms=${symbolTimings.library_requery_ms} library_metadata_ms=${symbolTimings.library_metadata_ms}`,
+      );
+    }
+    if (snapshot?.library_cache_hit) {
+      applyWorkspaceSnapshot({
+        snapshot,
+        sessionToken,
+        reason: "startup-cache",
+        includeProject: false,
+        includeLibrary: true,
+      });
+      return true;
+    }
+    return false;
+  }, [
+    applyWorkspaceSnapshot,
+    reportStartupEvent,
+    sessionToken,
     showErrorNotification,
   ]);
 
@@ -1601,18 +1653,44 @@ export function App() {
       try {
         const startup = await runWorkspaceStartupSequence({
           loadLiveWorkspaceTrees: () => loadLiveWorkspaceTrees(rootPath),
-          loadCachedWorkspaceSymbols: () => loadCachedWorkspaceSymbols(rootPath),
-          onSymbolsReady: (elapsedMs) => {
-            reportStartupEvent("debug", `startup symbols ready root=${rootPath} duration_ms=${elapsedMs}`);
+          loadCachedProjectSymbols: () => loadCachedProjectSymbols(rootPath),
+          loadCachedLibrarySymbols: () => loadCachedLibrarySymbols(rootPath),
+          onProjectSymbolsReady: (elapsedMs) => {
+            reportStartupEvent("debug", `startup project symbols ready root=${rootPath} duration_ms=${elapsedMs}`);
+          },
+          onLibrarySymbolsReady: (elapsedMs) => {
+            reportStartupEvent("debug", `startup library symbols ready root=${rootPath} duration_ms=${elapsedMs}`);
           },
           onTreesReady: (elapsedMs) => {
             reportStartupEvent("debug", `startup trees ready root=${rootPath} duration_ms=${elapsedMs}`);
           },
         });
         if (!active) return;
+        if (!startup.projectStartupOk) {
+          setCompileStatus("Startup: no project cache; compiling project");
+          reportStartupEvent("warn", `project cache miss root=${rootPath}; compile fallback starting`);
+          const ok = await runCompile();
+          if (!active) return;
+          reportStartupEvent(
+            ok ? "info" : "warn",
+            `workspace compile fallback completed root=${rootPath} ok=${ok ? "true" : "false"}`,
+          );
+        } else if (!startup.libraryStartupOk) {
+          setCompileStatus("Startup: project cache loaded; hydrating library");
+          void refreshWorkspaceSymbols({
+            compileRoot: rootPath,
+            sessionToken,
+            reason: "startup-reconcile",
+            hydrateLibrary: true,
+            includeProject: false,
+            includeLibrary: true,
+          });
+        } else {
+          setCompileStatus("Startup: project and library caches loaded");
+        }
         reportStartupEvent(
           startup.startupOk ? "info" : "warn",
-          `startup sequence complete root=${rootPath} duration_ms=${startup.totalMs} ok=${startup.startupOk ? "true" : "false"} symbols_ready_ms=${startup.symbolsReadyMs} trees_ready_ms=${startup.treesReadyMs}`,
+          `startup sequence complete root=${rootPath} duration_ms=${startup.totalMs} ok=${startup.startupOk ? "true" : "false"} project_ok=${startup.projectStartupOk ? "true" : "false"} library_ok=${startup.libraryStartupOk ? "true" : "false"} project_symbols_ready_ms=${startup.projectSymbolsReadyMs} library_symbols_ready_ms=${startup.librarySymbolsReadyMs} trees_ready_ms=${startup.treesReadyMs}`,
         );
       } catch (error) {
         if (!active) return;
@@ -1630,11 +1708,15 @@ export function App() {
   }, [
     hydrateLibraryTree,
     hydrateProjectTree,
-    loadCachedWorkspaceSymbols,
+    loadCachedLibrarySymbols,
+    loadCachedProjectSymbols,
     loadLiveWorkspaceTrees,
     reportStartupEvent,
+    refreshWorkspaceSymbols,
     resetWorkspaceSymbols,
     rootPath,
+    runCompile,
+    sessionToken,
     setCompileStatus,
     showErrorNotification,
   ]);

@@ -3,17 +3,20 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::compile::load_library_symbols_sync;
+use crate::project::load_project_config;
 use crate::project_model_seed::seed_symbol_index_if_empty;
 use crate::project_root_key::canonical_project_root;
-use crate::stdlib::{is_stdlib_index_seeded_for_project, seed_stdlib_index_from_cache_for_project};
+use crate::stdlib::seed_stdlib_startup_cache_for_project;
 use crate::symbol_index::{
     query_library_symbols_impl, query_project_symbols_impl, IndexedSymbolView,
 };
+use crate::workspace::{collect_model_files, collect_project_files};
 use crate::workspace_ir_cache::{
-    clear_workspace_ir_cache, describe_workspace_startup_cache_miss, load_workspace_ir_cache_snapshot,
-    persist_workspace_ir_cache,
+    clear_workspace_ir_cache, describe_workspace_startup_cache_miss,
+    load_workspace_ir_cache_snapshot, persist_workspace_ir_cache,
     seed_workspace_symbol_state_from_workspace_ir_cache,
 };
+use crate::workspace_tree::resolve_workspace_library_path;
 use crate::CoreState;
 
 #[derive(Debug, Clone, Serialize)]
@@ -40,9 +43,12 @@ pub struct WorkspaceSymbolSnapshotView {
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkspaceStartupSnapshotTimingsView {
     pub total_duration_ms: u64,
-    pub cache_load_ms: u64,
-    pub cache_seed_symbol_index_ms: u64,
-    pub cache_seed_projection_ms: u64,
+    pub project_cache_load_ms: u64,
+    pub project_cache_seed_symbol_index_ms: u64,
+    pub project_cache_seed_projection_ms: u64,
+    pub library_cache_load_ms: u64,
+    pub library_cache_seed_symbol_index_ms: u64,
+    pub library_cache_seed_projection_ms: u64,
     pub symbol_snapshot_ms: u64,
 }
 
@@ -53,6 +59,10 @@ pub struct WorkspaceStartupSnapshotView {
     pub project_semantic_projection_count: usize,
     pub library_path: Option<String>,
     pub cache_hit: bool,
+    pub project_cache_hit: bool,
+    pub library_cache_hit: bool,
+    pub project_cache_miss_reason: Option<String>,
+    pub library_cache_miss_reason: Option<String>,
     pub diagnostics: Vec<String>,
     pub timings: WorkspaceStartupSnapshotTimingsView,
     pub symbol_timings: WorkspaceSymbolSnapshotTimingsView,
@@ -62,24 +72,46 @@ fn elapsed_ms(started_at: Instant) -> u64 {
     started_at.elapsed().as_millis() as u64
 }
 
-fn snapshot_has_complete_library_symbols(
+fn workspace_has_project_model_files(state: &CoreState, root: &str) -> bool {
+    let root_path = PathBuf::from(root);
+    if !root_path.exists() {
+        return false;
+    }
+
+    let project_config = load_project_config(&root_path).ok().flatten();
+    let mut files = Vec::<PathBuf>::new();
+    if let Some(src) = project_config.as_ref().and_then(|config| config.src.as_ref()) {
+        if let Ok(selected) = collect_project_files(&root_path, src) {
+            files = selected;
+        }
+    }
+    if files.is_empty() && collect_model_files(&root_path, &mut files).is_err() {
+        return false;
+    }
+
+    let library_root = resolve_workspace_library_path(state, &root_path)
+        .and_then(|path| path.canonicalize().ok().or(Some(path)));
+    files.into_iter().any(|path| {
+        let canonical = path.canonicalize().ok().unwrap_or(path);
+        if let Some(library_root) = library_root.as_ref() {
+            if canonical.starts_with(library_root) {
+                return false;
+            }
+        }
+        canonical
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("sysml") || ext.eq_ignore_ascii_case("kerml"))
+            .unwrap_or(false)
+    })
+}
+
+fn project_snapshot_is_persistable(
+    state: &CoreState,
+    root: &str,
     snapshot: &WorkspaceSymbolSnapshotView,
-    hydrate_library: bool,
 ) -> bool {
-    let has_library_path = snapshot
-        .library_path
-        .as_deref()
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false);
-    !hydrate_library || !has_library_path || !snapshot.library_symbols.is_empty()
-}
-
-fn snapshot_has_any_symbols(snapshot: &WorkspaceSymbolSnapshotView) -> bool {
-    !snapshot.project_symbols.is_empty() || !snapshot.library_symbols.is_empty()
-}
-
-fn startup_restore_is_empty(snapshot: &WorkspaceSymbolSnapshotView) -> bool {
-    snapshot.project_symbols.is_empty() && snapshot.library_symbols.is_empty()
+    !workspace_has_project_model_files(state, root) || !snapshot.project_symbols.is_empty()
 }
 
 fn count_project_semantic_projections(state: &CoreState, root: &str) -> usize {
@@ -105,20 +137,34 @@ pub fn get_workspace_symbol_snapshot(
     state: &CoreState,
     root: String,
     hydrate_library: bool,
+    include_project: bool,
+    include_library: bool,
 ) -> Result<WorkspaceSymbolSnapshotView, String> {
-    get_workspace_symbol_snapshot_with_options(state, root, hydrate_library, false, None)
+    get_workspace_symbol_snapshot_with_options(
+        state,
+        root,
+        hydrate_library,
+        include_project,
+        include_library,
+        false,
+        None,
+    )
 }
 
 fn get_workspace_symbol_snapshot_with_options(
     state: &CoreState,
     root: String,
     hydrate_library: bool,
+    include_project: bool,
+    include_library: bool,
     skip_seed_symbol_index: bool,
     known_library_path: Option<String>,
 ) -> Result<WorkspaceSymbolSnapshotView, String> {
     let total_started_at = Instant::now();
     let root = canonical_project_root(&root);
-    let seed_symbol_index_ms = if skip_seed_symbol_index {
+    let root_path = PathBuf::from(&root);
+    let seed_symbol_index_ms = if skip_seed_symbol_index || (!include_project && !include_library)
+    {
         0
     } else {
         let seed_symbol_index_started_at = Instant::now();
@@ -126,35 +172,48 @@ fn get_workspace_symbol_snapshot_with_options(
         elapsed_ms(seed_symbol_index_started_at)
     };
 
-    let project_query_started_at = Instant::now();
-    let project_symbols = query_project_symbols_impl(
-        state,
-        root.clone(),
-        None,
-        None,
-        None,
-        !skip_seed_symbol_index,
-    )?;
-    let project_query_ms = elapsed_ms(project_query_started_at);
+    let (project_symbols, project_query_ms) = if include_project {
+        let project_query_started_at = Instant::now();
+        let project_symbols = query_project_symbols_impl(
+            state,
+            root.clone(),
+            None,
+            None,
+            None,
+            !skip_seed_symbol_index,
+        )?;
+        (project_symbols, elapsed_ms(project_query_started_at))
+    } else {
+        (Vec::new(), 0)
+    };
 
-    let library_query_started_at = Instant::now();
-    let mut library_symbols = query_library_symbols_impl(
-        state,
-        root.clone(),
-        None,
-        None,
-        None,
-        !skip_seed_symbol_index,
-    )?;
-    let library_query_ms = elapsed_ms(library_query_started_at);
-    let mut library_path = known_library_path.filter(|value| !value.trim().is_empty());
+    let (mut library_symbols, library_query_ms) = if include_library {
+        let library_query_started_at = Instant::now();
+        let library_symbols = query_library_symbols_impl(
+            state,
+            root.clone(),
+            None,
+            None,
+            None,
+            !skip_seed_symbol_index,
+        )?;
+        (library_symbols, elapsed_ms(library_query_started_at))
+    } else {
+        (Vec::new(), 0)
+    };
+    let mut library_path = known_library_path
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            resolve_workspace_library_path(state, &root_path)
+                .map(|path| path.to_string_lossy().to_string())
+        });
     let mut library_hydrated = false;
     let mut diagnostics = Vec::<String>::new();
     let mut library_hydration_ms = 0;
     let mut library_requery_ms = 0;
-    let mut library_metadata_ms = 0;
+    let library_metadata_ms = 0;
 
-    if hydrate_library && library_symbols.is_empty() {
+    if include_library && hydrate_library && library_symbols.is_empty() {
         let hydration_started_at = Instant::now();
         match load_library_symbols_sync(state, root.clone(), None, true) {
             Ok(response) => {
@@ -177,17 +236,6 @@ fn get_workspace_symbol_snapshot_with_options(
         library_hydration_ms = elapsed_ms(hydration_started_at);
     }
 
-    if library_path.is_none() {
-        let metadata_started_at = Instant::now();
-        match load_library_symbols_sync(state, root.clone(), None, false) {
-            Ok(response) => {
-                library_path = response.library_path;
-            }
-            Err(error) => diagnostics.push(format!("Library metadata load failed: {error}")),
-        }
-        library_metadata_ms = elapsed_ms(metadata_started_at);
-    }
-
     let mut snapshot = WorkspaceSymbolSnapshotView {
         project_symbols,
         library_symbols,
@@ -204,9 +252,7 @@ fn get_workspace_symbol_snapshot_with_options(
             library_metadata_ms,
         },
     };
-    if snapshot_has_any_symbols(&snapshot)
-        && snapshot_has_complete_library_symbols(&snapshot, hydrate_library)
-    {
+    if include_project && project_snapshot_is_persistable(state, &root, &snapshot) {
         if let Err(error) = persist_workspace_ir_cache(state, &root, None) {
             snapshot
                 .diagnostics
@@ -222,6 +268,8 @@ pub fn get_workspace_startup_snapshot(
     root: String,
     hydrate_library: bool,
     prefer_cache: bool,
+    include_project: bool,
+    include_library: bool,
 ) -> Result<WorkspaceStartupSnapshotView, String> {
     let total_started_at = Instant::now();
     let root = canonical_project_root(&root);
@@ -231,84 +279,128 @@ pub fn get_workspace_startup_snapshot(
     }
 
     let mut diagnostics = Vec::<String>::new();
-    let mut cache_hit = false;
     let mut library_path = None;
-    let mut cache_load_ms = 0;
-    let mut cache_seed_symbol_index_ms = 0;
-    let mut cache_seed_projection_ms = 0;
-    if prefer_cache {
+    let mut project_cache_hit = false;
+    let mut library_cache_hit = false;
+    let mut project_cache_miss_reason = None::<String>;
+    let mut library_cache_miss_reason = None::<String>;
+    let mut project_cache_load_ms = 0;
+    let mut project_cache_seed_symbol_index_ms = 0;
+    let mut project_cache_seed_projection_ms = 0;
+    let mut library_cache_load_ms = 0;
+    let mut library_cache_seed_symbol_index_ms = 0;
+    let mut library_cache_seed_projection_ms = 0;
+
+    if prefer_cache && include_project {
         let cache_load_started_at = Instant::now();
-        let cache_miss_reason = describe_workspace_startup_cache_miss(&root)?;
+        project_cache_miss_reason = describe_workspace_startup_cache_miss(&root)?
+            .map(ToString::to_string);
         if let Some(cache) = load_workspace_ir_cache_snapshot(&root)? {
             let cache_seed_summary =
                 seed_workspace_symbol_state_from_workspace_ir_cache(state, &root)?;
             if cache_seed_summary.cache_hit {
-                cache_hit = true;
+                project_cache_hit = true;
+                project_cache_miss_reason = None;
                 library_path = cache.library_path;
-                let stdlib_signature = cache.stdlib_signature;
-                if let (Some(path), Some(signature)) =
-                    (library_path.as_deref(), stdlib_signature.as_deref())
-                {
-                    let library_root = PathBuf::from(path);
-                    let stdlib_seeded =
-                        is_stdlib_index_seeded_for_project(state, &root, &library_root, signature)
-                            .unwrap_or(false);
-                    if !stdlib_seeded {
-                        let _ = seed_stdlib_index_from_cache_for_project(
-                            state,
-                            &root,
-                            Some(&library_root),
-                            signature,
-                        );
-                    }
-                }
-                cache_seed_symbol_index_ms = cache_seed_summary.seed_symbol_index_ms;
-                cache_seed_projection_ms = cache_seed_summary.seed_projection_ms;
+                project_cache_seed_symbol_index_ms = cache_seed_summary.seed_symbol_index_ms;
+                project_cache_seed_projection_ms = cache_seed_summary.seed_projection_ms;
             }
         }
-        cache_load_ms = elapsed_ms(cache_load_started_at);
-        if !cache_hit {
-            if let Some(reason) = cache_miss_reason {
-                diagnostics.push(format!("Workspace cache miss reason: {reason}"));
-            }
+        project_cache_load_ms = elapsed_ms(cache_load_started_at);
+    }
+    if let Some(reason) = project_cache_miss_reason.as_deref() {
+        diagnostics.push(format!("Project cache miss reason: {reason}"));
+    }
+
+    if prefer_cache && include_library {
+        let cache_load_started_at = Instant::now();
+        let library_cache_summary = seed_stdlib_startup_cache_for_project(state, &root)?;
+        library_cache_load_ms = elapsed_ms(cache_load_started_at);
+        library_cache_hit = library_cache_summary.cache_hit;
+        library_cache_miss_reason = library_cache_summary.cache_miss_reason;
+        library_cache_seed_symbol_index_ms = library_cache_summary.seed_symbol_index_ms;
+        library_cache_seed_projection_ms = library_cache_summary.seed_projection_ms;
+        if library_path.is_none() {
+            library_path = library_cache_summary.library_path;
         }
+    }
+    if let Some(reason) = library_cache_miss_reason.as_deref() {
+        diagnostics.push(format!("Library cache miss reason: {reason}"));
     }
 
     let symbol_snapshot_started_at = Instant::now();
     let mut symbol_snapshot = get_workspace_symbol_snapshot_with_options(
         state,
         root.clone(),
-        hydrate_library,
-        cache_hit,
+        false,
+        include_project,
+        include_library,
+        true,
         library_path.clone(),
     )?;
-    if cache_hit
+    if include_library
+        && hydrate_library
+        && !library_cache_hit
         && symbol_snapshot.library_symbols.is_empty()
         && library_path
             .as_deref()
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false)
     {
-        // Recover from incomplete startup caches by hydrating stdlib once.
         let recovered_snapshot = get_workspace_symbol_snapshot_with_options(
             state,
             root.clone(),
+            true,
+            false,
             true,
             false,
             library_path.clone(),
         )?;
         if !recovered_snapshot.library_symbols.is_empty() {
             diagnostics.push(
-                "Recovered missing library symbols during startup-cache restore.".to_string(),
+                "Recovered missing library symbols during startup library hydrate.".to_string(),
             );
-            symbol_snapshot = recovered_snapshot;
+            library_cache_hit = false;
+            symbol_snapshot.library_symbols = recovered_snapshot.library_symbols;
+            if symbol_snapshot.library_path.is_none() {
+                symbol_snapshot.library_path = recovered_snapshot.library_path;
+            }
+            symbol_snapshot.library_hydrated = recovered_snapshot.library_hydrated;
+            symbol_snapshot
+                .diagnostics
+                .extend(recovered_snapshot.diagnostics);
+            symbol_snapshot.timings.library_query_ms = recovered_snapshot.timings.library_query_ms;
+            symbol_snapshot.timings.library_hydration_ms =
+                recovered_snapshot.timings.library_hydration_ms;
+            symbol_snapshot.timings.library_requery_ms =
+                recovered_snapshot.timings.library_requery_ms;
+            symbol_snapshot.timings.total_duration_ms =
+                symbol_snapshot.timings.total_duration_ms.max(
+                    recovered_snapshot.timings.total_duration_ms,
+                );
         }
     }
-    if cache_hit && startup_restore_is_empty(&symbol_snapshot) {
-        cache_hit = false;
-        diagnostics.push(
-            "Workspace cache miss reason: startup_cache_restored_no_symbols".to_string(),
-        );
+    if project_cache_hit
+        && workspace_has_project_model_files(state, &root)
+        && symbol_snapshot.project_symbols.is_empty()
+    {
+        project_cache_hit = false;
+        project_cache_miss_reason =
+            Some("startup_cache_restored_no_project_symbols".to_string());
+        diagnostics.push("Project cache miss reason: startup_cache_restored_no_project_symbols".to_string());
+        match clear_workspace_ir_cache(&root) {
+            Ok(deleted) => diagnostics.push(format!(
+                "Cleared incomplete workspace startup cache artifacts: {deleted}"
+            )),
+            Err(error) => diagnostics.push(format!(
+                "Workspace cache invalidation failed after incomplete project restore: {error}"
+            )),
+        }
+    }
+    if project_cache_hit && include_project && symbol_snapshot.project_symbols.is_empty() {
+        project_cache_hit = false;
+        project_cache_miss_reason = Some("startup_cache_restored_no_symbols".to_string());
+        diagnostics.push("Project cache miss reason: startup_cache_restored_no_symbols".to_string());
         match clear_workspace_ir_cache(&root) {
             Ok(deleted) => diagnostics.push(format!(
                 "Cleared empty workspace startup cache artifacts: {deleted}"
@@ -330,13 +422,20 @@ pub fn get_workspace_startup_snapshot(
         library_symbols: symbol_snapshot.library_symbols,
         project_semantic_projection_count: count_project_semantic_projections(state, &root),
         library_path,
-        cache_hit,
+        cache_hit: project_cache_hit || library_cache_hit,
+        project_cache_hit,
+        library_cache_hit,
+        project_cache_miss_reason,
+        library_cache_miss_reason,
         diagnostics,
         timings: WorkspaceStartupSnapshotTimingsView {
             total_duration_ms: elapsed_ms(total_started_at),
-            cache_load_ms,
-            cache_seed_symbol_index_ms,
-            cache_seed_projection_ms,
+            project_cache_load_ms,
+            project_cache_seed_symbol_index_ms,
+            project_cache_seed_projection_ms,
+            library_cache_load_ms,
+            library_cache_seed_symbol_index_ms,
+            library_cache_seed_projection_ms,
             symbol_snapshot_ms,
         },
         symbol_timings: symbol_snapshot.timings,
@@ -396,7 +495,13 @@ mod tests {
         .expect("compile workspace");
 
         let snapshot =
-            get_workspace_symbol_snapshot(&state, project_dir.to_string_lossy().to_string(), true)
+            get_workspace_symbol_snapshot(
+                &state,
+                project_dir.to_string_lossy().to_string(),
+                true,
+                true,
+                true,
+            )
                 .expect("workspace symbol snapshot");
         assert!(snapshot
             .project_symbols
@@ -462,15 +567,25 @@ mod tests {
             .clear_in_memory_caches_for_tests()
             .expect("clear in-memory caches");
 
-        let snapshot = get_workspace_startup_snapshot(&state, project_root, true, true)
+        let snapshot = get_workspace_startup_snapshot(&state, project_root, true, true, true, true)
             .expect("workspace startup snapshot");
-        assert!(snapshot.cache_hit);
+        assert!(snapshot.cache_hit, "{:?}", snapshot.diagnostics);
+        assert!(snapshot.project_cache_hit);
         assert!(snapshot
             .project_symbols
             .iter()
             .any(|symbol| symbol.qualified_name == "P"));
         assert!(!snapshot.library_symbols.is_empty());
         assert!(snapshot.library_path.is_some());
+        assert!(
+            snapshot.library_cache_hit
+                || snapshot.diagnostics.iter().any(|diagnostic| {
+                    diagnostic
+                        == "Recovered missing library symbols during startup library hydrate."
+                }),
+            "{:?}",
+            snapshot.diagnostics
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -481,8 +596,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir()
-            .join(format!("mercurio_workspace_startup_snapshot_reason_{stamp}"));
+        let root = std::env::temp_dir().join(format!(
+            "mercurio_workspace_startup_snapshot_reason_{stamp}"
+        ));
         let library_dir = root.join("stdlib");
         let project_dir = root.join("project");
         fs::create_dir_all(&library_dir).expect("create library dir");
@@ -492,8 +608,11 @@ mod tests {
             "standard library package KerML { package Kernel { metaclass Element {} } }",
         )
         .expect("write library file");
-        fs::write(project_dir.join("main.sysml"), "package P { part def A; }\n")
-            .expect("write project file");
+        fs::write(
+            project_dir.join("main.sysml"),
+            "package P { part def A; }\n",
+        )
+        .expect("write project file");
         fs::write(
             project_dir.join(".project"),
             format!(
@@ -523,20 +642,22 @@ mod tests {
             project_dir
                 .join(".mercurio")
                 .join("cache")
-                .join("workspace-symbols-v1.bin"),
+                .join("workspace-project-symbols-v2.json"),
         )
-        .expect("remove symbol payload");
+        .expect("remove project symbol manifest");
         state
             .clear_in_memory_caches_for_tests()
             .expect("clear in-memory caches");
 
-        let snapshot = get_workspace_startup_snapshot(&state, project_root, false, true)
+        let snapshot =
+            get_workspace_startup_snapshot(&state, project_root, false, true, true, true)
             .expect("workspace startup snapshot");
-        assert!(!snapshot.cache_hit);
+        assert!(!snapshot.project_cache_hit);
         assert!(snapshot
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic == "Workspace cache miss reason: symbol_payload_missing"));
+            .any(|diagnostic| diagnostic
+                == "Project cache miss reason: project_symbol_manifest_missing"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -547,8 +668,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("mercurio_workspace_symbol_snapshot_persist_{stamp}"));
+        let root = std::env::temp_dir().join(format!(
+            "mercurio_workspace_symbol_snapshot_persist_{stamp}"
+        ));
         let library_dir = root.join("stdlib");
         let project_dir = root.join("project");
         fs::create_dir_all(&library_dir).expect("create library dir");
@@ -558,8 +680,11 @@ mod tests {
             "standard library package KerML { package Kernel { metaclass Element {} } }",
         )
         .expect("write library file");
-        fs::write(project_dir.join("main.sysml"), "package P { part def A; }\n")
-            .expect("write project file");
+        fs::write(
+            project_dir.join("main.sysml"),
+            "package P { part def A; }\n",
+        )
+        .expect("write project file");
         fs::write(
             project_dir.join(".project"),
             format!(
@@ -582,7 +707,8 @@ mod tests {
         )
         .expect("compile workspace");
 
-        let snapshot = get_workspace_symbol_snapshot(&state, project_root.clone(), true)
+        let snapshot =
+            get_workspace_symbol_snapshot(&state, project_root.clone(), true, true, true)
             .expect("workspace symbol snapshot");
         assert!(!snapshot.library_symbols.is_empty());
 
@@ -590,10 +716,91 @@ mod tests {
             .clear_in_memory_caches_for_tests()
             .expect("clear in-memory caches");
 
-        let startup = get_workspace_startup_snapshot(&state, project_root, false, true)
+        let startup =
+            get_workspace_startup_snapshot(&state, project_root, false, true, true, true)
             .expect("workspace startup snapshot");
-        assert!(startup.cache_hit);
-        assert!(!startup.library_symbols.is_empty());
+        assert!(startup.cache_hit, "{:?}", startup.diagnostics);
+        assert!(startup.project_cache_hit);
+        assert!(
+            startup.library_cache_hit
+                || startup
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.starts_with("Library cache miss reason:")),
+            "{:?}",
+            startup.diagnostics
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_startup_snapshot_rejects_cache_without_project_symbols() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "mercurio_workspace_startup_missing_project_symbols_{stamp}"
+        ));
+        let library_dir = root.join("stdlib");
+        let project_dir = root.join("project");
+        fs::create_dir_all(&library_dir).expect("create library dir");
+        fs::create_dir_all(&project_dir).expect("create project dir");
+        fs::write(
+            library_dir.join("KerML.kerml"),
+            "standard library package KerML { package Kernel { metaclass Element {} } }",
+        )
+        .expect("write library file");
+        fs::write(
+            project_dir.join("main.sysml"),
+            "package P { part def A; }\n",
+        )
+        .expect("write project file");
+        fs::write(
+            project_dir.join(".project"),
+            format!(
+                "{{\"name\":\"missing-project-symbols\",\"library\":{{\"path\":\"{}\"}},\"src\":[\"*.sysml\"]}}",
+                library_dir.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .expect("write descriptor");
+
+        let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
+        let project_root = project_dir.to_string_lossy().to_string();
+
+        let library = load_library_symbols_sync(&state, project_root.clone(), None, true)
+            .expect("load library symbols");
+        assert!(library.ok);
+        assert!(!library.symbols.is_empty());
+
+        persist_workspace_ir_cache(&state, &project_root, None)
+            .expect("persist incomplete workspace cache");
+        state
+            .clear_in_memory_caches_for_tests()
+            .expect("clear in-memory caches");
+
+        let snapshot = get_workspace_startup_snapshot(
+            &state,
+            project_root.clone(),
+            false,
+            true,
+            true,
+            false,
+        )
+            .expect("workspace startup snapshot");
+        assert!(!snapshot.cache_hit);
+        assert!(!snapshot.project_cache_hit);
+        assert!(snapshot.project_symbols.is_empty());
+        assert!(snapshot.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                == "Project cache miss reason: startup_cache_restored_no_project_symbols"
+        }));
+
+        let cache_dir = project_dir.join(".mercurio").join("cache");
+        assert!(!cache_dir.join("workspace-startup-v1.json").exists());
+        assert!(!cache_dir.join("workspace-project-symbols-v2.json").exists());
+        assert!(!cache_dir.join("workspace-project-symbols-v2").exists());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -615,8 +822,11 @@ mod tests {
             "standard library package KerML { package Kernel { metaclass Element {} } }",
         )
         .expect("write library file");
-        fs::write(project_dir.join("main.sysml"), "package P { part def A; }\n")
-            .expect("write project file");
+        fs::write(
+            project_dir.join("main.sysml"),
+            "package P { part def A; }\n",
+        )
+        .expect("write project file");
         fs::write(
             project_dir.join(".project"),
             format!(
@@ -628,20 +838,29 @@ mod tests {
 
         let state = CoreState::new(root.join("unused_stdlib_root"), AppSettings::default());
         let project_root = project_dir.to_string_lossy().to_string();
-        persist_workspace_ir_cache(&state, &project_root, None).expect("persist empty workspace cache");
+        persist_workspace_ir_cache(&state, &project_root, None)
+            .expect("persist empty workspace cache");
 
-        let snapshot = get_workspace_startup_snapshot(&state, project_root.clone(), false, true)
+        let snapshot = get_workspace_startup_snapshot(
+            &state,
+            project_root.clone(),
+            false,
+            true,
+            true,
+            true,
+        )
             .expect("workspace startup snapshot");
         assert!(!snapshot.cache_hit);
         assert!(snapshot.project_symbols.is_empty());
         assert!(snapshot.library_symbols.is_empty());
         assert!(snapshot.diagnostics.iter().any(|diagnostic| {
-            diagnostic == "Workspace cache miss reason: startup_cache_restored_no_symbols"
-        }));
+            diagnostic == "Project cache miss reason: startup_cache_restored_no_project_symbols"
+        }), "{:?}", snapshot.diagnostics);
 
         let cache_dir = project_dir.join(".mercurio").join("cache");
         assert!(!cache_dir.join("workspace-startup-v1.json").exists());
-        assert!(!cache_dir.join("workspace-symbols-v1.bin").exists());
+        assert!(!cache_dir.join("workspace-project-symbols-v2.json").exists());
+        assert!(!cache_dir.join("workspace-project-symbols-v2").exists());
 
         let _ = fs::remove_dir_all(root);
     }

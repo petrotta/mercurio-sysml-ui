@@ -65,9 +65,13 @@ mod tests {
         let library_dir = root.join("stdlib");
         fs::create_dir_all(project_dir.join("sub")).expect("create project dirs");
         fs::create_dir_all(library_dir.join("Kernel")).expect("create library dirs");
-        fs::write(project_dir.join("sub").join("a.sysml"), "package A {}").expect("write project file");
-        fs::write(library_dir.join("Kernel").join("Kernel.kerml"), "package Kernel {}")
-            .expect("write library file");
+        fs::write(project_dir.join("sub").join("a.sysml"), "package A {}")
+            .expect("write project file");
+        fs::write(
+            library_dir.join("Kernel").join("Kernel.kerml"),
+            "package Kernel {}",
+        )
+        .expect("write library file");
         fs::write(
             project_dir.join(".project"),
             format!(
@@ -82,22 +86,18 @@ mod tests {
             get_workspace_tree_snapshot(&state, project_dir.to_string_lossy().to_string())
                 .expect("workspace tree snapshot");
 
-        assert!(
-            snapshot
-                .project_tree
-                .iter()
-                .any(|entry| entry.path.ends_with("a.sysml"))
-        );
+        assert!(snapshot
+            .project_tree
+            .iter()
+            .any(|entry| entry.path.ends_with("a.sysml")));
         assert_eq!(
             snapshot.project_root,
             canonical_project_root(&project_dir.to_string_lossy())
         );
-        assert!(
-            snapshot
-                .library_tree
-                .iter()
-                .any(|entry| entry.path.ends_with("Kernel.kerml"))
-        );
+        assert!(snapshot
+            .library_tree
+            .iter()
+            .any(|entry| entry.path.ends_with("Kernel.kerml")));
         assert_eq!(
             snapshot.library_path.as_deref(),
             Some(library_dir.to_string_lossy().as_ref())

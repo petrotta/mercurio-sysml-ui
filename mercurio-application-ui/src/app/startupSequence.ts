@@ -1,15 +1,20 @@
 export type StartupSequenceResult = {
   startupOk: boolean;
-  symbolsReadyMs: number;
+  projectStartupOk: boolean;
+  libraryStartupOk: boolean;
+  projectSymbolsReadyMs: number;
+  librarySymbolsReadyMs: number;
   treesReadyMs: number;
   totalMs: number;
 };
 
 type RunWorkspaceStartupSequenceOptions = {
   loadLiveWorkspaceTrees: () => Promise<boolean>;
-  loadCachedWorkspaceSymbols: () => Promise<boolean>;
+  loadCachedProjectSymbols: () => Promise<boolean>;
+  loadCachedLibrarySymbols: () => Promise<boolean>;
   now?: () => number;
-  onSymbolsReady?: (elapsedMs: number) => void;
+  onProjectSymbolsReady?: (elapsedMs: number) => void;
+  onLibrarySymbolsReady?: (elapsedMs: number) => void;
   onTreesReady?: (elapsedMs: number) => void;
 };
 
@@ -22,32 +27,47 @@ function defaultNow(): number {
 
 export async function runWorkspaceStartupSequence({
   loadLiveWorkspaceTrees,
-  loadCachedWorkspaceSymbols,
+  loadCachedProjectSymbols,
+  loadCachedLibrarySymbols,
   now = defaultNow,
-  onSymbolsReady,
+  onProjectSymbolsReady,
+  onLibrarySymbolsReady,
   onTreesReady,
 }: RunWorkspaceStartupSequenceOptions): Promise<StartupSequenceResult> {
   const startedAt = now();
 
-  let symbolsReadyMs = 0;
+  let projectSymbolsReadyMs = 0;
+  let librarySymbolsReadyMs = 0;
   let treesReadyMs = 0;
 
-  const liveTreesPromise = loadLiveWorkspaceTrees().then((value) => {
+  await loadLiveWorkspaceTrees().then((value) => {
     treesReadyMs = Math.round(now() - startedAt);
     onTreesReady?.(treesReadyMs);
     return value;
   });
 
-  const cachedSymbolsPromise = loadCachedWorkspaceSymbols().then((value) => {
-    symbolsReadyMs = Math.round(now() - startedAt);
-    onSymbolsReady?.(symbolsReadyMs);
+  const projectSymbolsPromise = loadCachedProjectSymbols().then((value) => {
+    projectSymbolsReadyMs = Math.round(now() - startedAt);
+    onProjectSymbolsReady?.(projectSymbolsReadyMs);
     return value;
   });
 
-  const [_, startupOk] = await Promise.all([liveTreesPromise, cachedSymbolsPromise]);
+  const librarySymbolsPromise = loadCachedLibrarySymbols().then((value) => {
+    librarySymbolsReadyMs = Math.round(now() - startedAt);
+    onLibrarySymbolsReady?.(librarySymbolsReadyMs);
+    return value;
+  });
+
+  const [projectStartupOk, libraryStartupOk] = await Promise.all([
+    projectSymbolsPromise,
+    librarySymbolsPromise,
+  ]);
   return {
-    startupOk,
-    symbolsReadyMs,
+    startupOk: projectStartupOk && libraryStartupOk,
+    projectStartupOk,
+    libraryStartupOk,
+    projectSymbolsReadyMs,
+    librarySymbolsReadyMs,
     treesReadyMs,
     totalMs: Math.round(now() - startedAt),
   };

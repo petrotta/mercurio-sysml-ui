@@ -47,17 +47,31 @@ export function useSymbolRefreshController({
     snapshot,
     sessionToken,
     reason,
+    includeProject,
+    includeLibrary,
   }: {
     snapshot: Pick<WorkspaceSymbolSnapshotResult, "project_symbols" | "library_symbols" | "library_path" | "diagnostics">;
     sessionToken: number;
     reason: "startup-cache" | "startup-reconcile" | "post-compile";
+    includeProject: boolean;
+    includeLibrary: boolean;
   }): boolean => {
     if (sessionTokenRef.current !== sessionToken) return false;
-    const nextProjectSymbols = (snapshot?.project_symbols || []).map((symbol) => indexedToSymbol(symbol));
-    const nextLibrarySymbols = (snapshot?.library_symbols || []).map((symbol) => indexedToSymbol(symbol));
-    setProjectSemanticSymbols(nextProjectSymbols);
-    setLibrarySemanticSymbols(nextLibrarySymbols);
-    setActiveLibraryPath((snapshot?.library_path || "").trim());
+    const nextProjectSymbols = includeProject
+      ? (snapshot?.project_symbols || []).map((symbol) => indexedToSymbol(symbol))
+      : null;
+    const nextLibrarySymbols = includeLibrary
+      ? (snapshot?.library_symbols || []).map((symbol) => indexedToSymbol(symbol))
+      : null;
+    if (nextProjectSymbols) {
+      setProjectSemanticSymbols(nextProjectSymbols);
+    }
+    if (nextLibrarySymbols) {
+      setLibrarySemanticSymbols(nextLibrarySymbols);
+    }
+    if (snapshot?.library_path !== undefined && snapshot?.library_path !== null) {
+      setActiveLibraryPath((snapshot.library_path || "").trim());
+    }
     setSymbolIndexError("");
     setSymbolsStatus("ready");
     const diagnostics = snapshot?.diagnostics || [];
@@ -69,7 +83,7 @@ export function useSymbolRefreshController({
     }
     appendBuildLogEntries([{
       level: "info",
-      message: `Workspace symbol snapshot complete (${reason}, project=${nextProjectSymbols.length}, library=${nextLibrarySymbols.length})`,
+      message: `Workspace symbol snapshot complete (${reason}, project=${nextProjectSymbols?.length ?? "preserved"}, library=${nextLibrarySymbols?.length ?? "preserved"})`,
     }]);
     setSemanticRefreshVersion((prev) => prev + 1);
     return true;
@@ -80,11 +94,15 @@ export function useSymbolRefreshController({
     sessionToken,
     reason,
     hydrateLibrary,
+    includeProject,
+    includeLibrary,
   }: {
     path: string;
     sessionToken: number;
     reason: "startup-cache" | "startup-reconcile" | "post-compile";
     hydrateLibrary: boolean;
+    includeProject: boolean;
+    includeLibrary: boolean;
   }): Promise<boolean> => {
     if (!path) {
       resetWorkspaceSymbols();
@@ -99,12 +117,18 @@ export function useSymbolRefreshController({
     }]);
 
     try {
-      const snapshot = await getWorkspaceSymbolSnapshot(path, hydrateLibrary);
+      const snapshot = await getWorkspaceSymbolSnapshot(path, {
+        hydrateLibrary,
+        includeProject,
+        includeLibrary,
+      });
       if (!isCurrentSession()) return false;
       const applied = applyWorkspaceSnapshot({
         snapshot,
         sessionToken,
         reason,
+        includeProject,
+        includeLibrary,
       });
       if (!applied) return false;
       appendBuildLogEntries([{
@@ -130,15 +154,21 @@ export function useSymbolRefreshController({
   const loadStartupSymbols = useCallback(async ({
     path,
     sessionToken,
+    includeProject,
+    includeLibrary,
   }: {
     path: string;
     sessionToken: number;
+    includeProject?: boolean;
+    includeLibrary?: boolean;
   }) => {
     await loadWorkspaceSymbols({
       path,
       sessionToken,
       reason: "startup-cache",
       hydrateLibrary: false,
+      includeProject: includeProject ?? true,
+      includeLibrary: includeLibrary ?? true,
     });
   }, [loadWorkspaceSymbols]);
 
@@ -147,17 +177,23 @@ export function useSymbolRefreshController({
     sessionToken,
     reason,
     hydrateLibrary,
+    includeProject,
+    includeLibrary,
   }: {
     compileRoot: string;
     sessionToken: number;
     reason: "startup-reconcile" | "post-compile";
     hydrateLibrary?: boolean;
+    includeProject?: boolean;
+    includeLibrary?: boolean;
   }) => {
     await loadWorkspaceSymbols({
       path: compileRoot,
       sessionToken,
       reason,
       hydrateLibrary: hydrateLibrary ?? true,
+      includeProject: includeProject ?? true,
+      includeLibrary: includeLibrary ?? true,
     });
   }, [loadWorkspaceSymbols]);
 
@@ -172,7 +208,9 @@ export function useSymbolRefreshController({
       compileRoot,
       sessionToken,
       reason: "post-compile",
-      hydrateLibrary: false,
+      hydrateLibrary: true,
+      includeProject: true,
+      includeLibrary: true,
     });
   }, [refreshWorkspaceSymbols]);
 

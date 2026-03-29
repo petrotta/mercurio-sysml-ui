@@ -65,23 +65,46 @@ export async function getExpressionsView(root: string, expression?: string | nul
 
 export async function getWorkspaceSymbolSnapshot(
   root: string,
-  hydrateLibrary = true,
+  options?: {
+    hydrateLibrary?: boolean;
+    includeProject?: boolean;
+    includeLibrary?: boolean;
+  },
 ): Promise<WorkspaceSymbolSnapshotResult> {
+  const {
+    hydrateLibrary = true,
+    includeProject = true,
+    includeLibrary = true,
+  } = options || {};
   return callTool<WorkspaceSymbolSnapshotResult>("core.get_workspace_symbol_snapshot@v1", {
     root,
     hydrate_library: hydrateLibrary,
+    include_project: includeProject,
+    include_library: includeLibrary,
   });
 }
 
 export async function getWorkspaceStartupSnapshot(
   root: string,
-  hydrateLibrary = true,
-  preferCache = true,
+  options?: {
+    hydrateLibrary?: boolean;
+    preferCache?: boolean;
+    includeProject?: boolean;
+    includeLibrary?: boolean;
+  },
 ): Promise<WorkspaceStartupSnapshotResult> {
+  const {
+    hydrateLibrary = true,
+    preferCache = true,
+    includeProject = true,
+    includeLibrary = true,
+  } = options || {};
   return callTool<WorkspaceStartupSnapshotResult>("core.get_workspace_startup_snapshot@v1", {
     root,
     hydrate_library: hydrateLibrary,
     prefer_cache: preferCache,
+    include_project: includeProject,
+    include_library: includeLibrary,
   });
 }
 

@@ -633,8 +633,16 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
         "core.get_workspace_symbol_snapshot@v1" => {
             let root = arg_string(&args, "root")?;
             let hydrate_library = arg_bool(&args, "hydrate_library", true);
+            let include_project = arg_bool(&args, "include_project", true);
+            let include_library = arg_bool(&args, "include_library", true);
             tauri::async_runtime::spawn_blocking(move || {
-                core_get_workspace_symbol_snapshot(&core, root, hydrate_library)
+                core_get_workspace_symbol_snapshot(
+                    &core,
+                    root,
+                    hydrate_library,
+                    include_project,
+                    include_library,
+                )
             })
             .await
             .map_err(|e| e.to_string())?
@@ -644,8 +652,17 @@ pub async fn execute_tool(core: CoreState, tool: &str, args: Value) -> Result<Va
             let root = arg_string(&args, "root")?;
             let hydrate_library = arg_bool(&args, "hydrate_library", true);
             let prefer_cache = arg_bool(&args, "prefer_cache", true);
+            let include_project = arg_bool(&args, "include_project", true);
+            let include_library = arg_bool(&args, "include_library", true);
             tauri::async_runtime::spawn_blocking(move || {
-                core_get_workspace_startup_snapshot(&core, root, hydrate_library, prefer_cache)
+                core_get_workspace_startup_snapshot(
+                    &core,
+                    root,
+                    hydrate_library,
+                    prefer_cache,
+                    include_project,
+                    include_library,
+                )
             })
             .await
             .map_err(|e| e.to_string())?

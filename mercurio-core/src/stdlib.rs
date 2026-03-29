@@ -20,7 +20,8 @@ use crate::workspace_tree::{collect_tree_manifest, WorkspaceTreeEntryView};
 use mercurio_sysml_pkg::mercurio_sysml_semantic_adapter::{ingest_text, Language};
 
 const STDLIB_INDEX_SCHEMA_VERSION: u32 = 2;
-const STDLIB_INDEX_CACHE_FILE_NAME: &str = "stdlib-index-v1.bin";
+const STDLIB_INDEX_CACHE_FILE_NAME: &str = "stdlib-index-v2.json";
+const STDLIB_INDEX_LEGACY_BINARY_CACHE_FILE_NAME: &str = "stdlib-index-v1.bin";
 const STDLIB_INDEX_LEGACY_JSON_CACHE_FILE_NAME: &str = "stdlib-index-v1.json";
 const STDLIB_INDEX_ROOT_REGISTRY_FILE_NAME: &str = "cache-stdlib-roots.json";
 
@@ -36,6 +37,26 @@ struct PersistedStdlibIndex {
     symbols: Vec<SymbolRecord>,
     #[serde(default)]
     semantic_projections: Vec<SemanticElementProjectionView>,
+}
+
+#[derive(Debug)]
+enum PersistedStdlibIndexStatus {
+    Valid(PersistedStdlibIndex),
+    Missing,
+    DeserializeFailed,
+    SchemaMismatch,
+    EngineMismatch,
+    RootMismatch,
+    SignatureMismatch,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StdlibStartupCacheSeedSummary {
+    pub(crate) cache_hit: bool,
+    pub(crate) cache_miss_reason: Option<String>,
+    pub(crate) library_path: Option<String>,
+    pub(crate) seed_symbol_index_ms: u64,
+    pub(crate) seed_projection_ms: u64,
 }
 
 pub fn list_stdlib_versions_from_root(stdlib_root: &Path) -> Result<Vec<String>, String> {
@@ -72,6 +93,13 @@ fn stdlib_index_cache_file_path(stdlib_root: &Path) -> PathBuf {
         .join(STDLIB_INDEX_CACHE_FILE_NAME)
 }
 
+fn stdlib_index_legacy_binary_cache_file_path(stdlib_root: &Path) -> PathBuf {
+    PathBuf::from(canonical_stdlib_root(stdlib_root))
+        .join(".mercurio")
+        .join("cache")
+        .join(STDLIB_INDEX_LEGACY_BINARY_CACHE_FILE_NAME)
+}
+
 fn stdlib_index_legacy_json_cache_file_path(stdlib_root: &Path) -> PathBuf {
     PathBuf::from(canonical_stdlib_root(stdlib_root))
         .join(".mercurio")
@@ -97,42 +125,70 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     }
 }
 
+#[cfg(test)]
 fn read_persisted_stdlib_index(stdlib_root: &Path) -> Result<Option<PersistedStdlibIndex>, String> {
+    match read_persisted_stdlib_index_status(stdlib_root, None)? {
+        PersistedStdlibIndexStatus::Valid(cache) => Ok(Some(cache)),
+        _ => Ok(None),
+    }
+}
+
+fn read_persisted_stdlib_index_status(
+    stdlib_root: &Path,
+    expected_signature: Option<&str>,
+) -> Result<PersistedStdlibIndexStatus, String> {
     let path = stdlib_index_cache_file_path(stdlib_root);
     if !path.exists() {
-        return Ok(None);
+        return Ok(PersistedStdlibIndexStatus::Missing);
     }
-    let raw = fs::read(&path).map_err(|e| e.to_string())?;
-    let parsed = match bincode::deserialize(&raw) {
+    let raw = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let parsed: PersistedStdlibIndex = match serde_json::from_str(&raw) {
         Ok(parsed) => parsed,
         Err(_) => {
             let _ = fs::remove_file(&path);
-            return Ok(None);
+            return Ok(PersistedStdlibIndexStatus::DeserializeFailed);
         }
     };
-    Ok(Some(parsed))
+    if parsed.schema_version != STDLIB_INDEX_SCHEMA_VERSION {
+        return Ok(PersistedStdlibIndexStatus::SchemaMismatch);
+    }
+    if parsed.engine_version != env!("CARGO_PKG_VERSION") {
+        return Ok(PersistedStdlibIndexStatus::EngineMismatch);
+    }
+    if canonical_stdlib_root(stdlib_root) != canonical_stdlib_root(Path::new(&parsed.stdlib_root)) {
+        return Ok(PersistedStdlibIndexStatus::RootMismatch);
+    }
+    if let Some(signature) = expected_signature {
+        if parsed.signature != signature {
+            return Ok(PersistedStdlibIndexStatus::SignatureMismatch);
+        }
+    }
+    Ok(PersistedStdlibIndexStatus::Valid(parsed))
 }
 
 fn read_validated_persisted_stdlib_index(
     stdlib_root: &Path,
     signature: &str,
 ) -> Result<Option<PersistedStdlibIndex>, String> {
-    let Some(cache) = read_persisted_stdlib_index(stdlib_root)? else {
-        return Ok(None);
-    };
-    if cache.schema_version != STDLIB_INDEX_SCHEMA_VERSION {
-        return Ok(None);
+    match read_persisted_stdlib_index_status(stdlib_root, Some(signature))? {
+        PersistedStdlibIndexStatus::Valid(cache) => Ok(Some(cache)),
+        _ => Ok(None),
     }
-    if cache.engine_version != env!("CARGO_PKG_VERSION") {
-        return Ok(None);
-    }
-    if cache.signature != signature {
-        return Ok(None);
-    }
-    if canonical_stdlib_root(stdlib_root) != canonical_stdlib_root(Path::new(&cache.stdlib_root)) {
-        return Ok(None);
-    }
-    Ok(Some(cache))
+}
+
+fn describe_stdlib_index_cache_miss(
+    stdlib_root: &Path,
+    signature: &str,
+) -> Result<Option<&'static str>, String> {
+    Ok(match read_persisted_stdlib_index_status(stdlib_root, Some(signature))? {
+        PersistedStdlibIndexStatus::Valid(_) => None,
+        PersistedStdlibIndexStatus::Missing => Some("library_cache_missing"),
+        PersistedStdlibIndexStatus::DeserializeFailed => Some("library_cache_deserialize_failed"),
+        PersistedStdlibIndexStatus::SchemaMismatch => Some("library_cache_schema_mismatch"),
+        PersistedStdlibIndexStatus::EngineMismatch => Some("library_cache_engine_mismatch"),
+        PersistedStdlibIndexStatus::RootMismatch => Some("library_cache_root_mismatch"),
+        PersistedStdlibIndexStatus::SignatureMismatch => Some("library_cache_signature_mismatch"),
+    })
 }
 
 fn stdlib_cache_root_registry_path() -> Result<PathBuf, String> {
@@ -189,6 +245,7 @@ pub(crate) fn clear_all_persisted_stdlib_indexes() -> Result<usize, String> {
         let mut root_failed = false;
         for path in [
             stdlib_index_cache_file_path(Path::new(&root)),
+            stdlib_index_legacy_binary_cache_file_path(Path::new(&root)),
             stdlib_index_legacy_json_cache_file_path(Path::new(&root)),
         ] {
             if !path.exists() {
@@ -293,7 +350,7 @@ pub(crate) fn persist_stdlib_index_cache(
         symbols,
         semantic_projections,
     };
-    let bytes = bincode::serialize(&snapshot).map_err(|e| e.to_string())?;
+    let bytes = serde_json::to_vec(&snapshot).map_err(|e| e.to_string())?;
     write_atomic(&stdlib_index_cache_file_path(stdlib_root), &bytes)?;
     register_stdlib_cache_root(stdlib_root)?;
     Ok(())
@@ -327,7 +384,10 @@ pub(crate) fn seed_stdlib_index_from_cache_for_project(
         symbol.project_root = project_root.clone();
         symbol.scope = Scope::Stdlib;
         symbol.library_key = Some(library_key.clone());
-        grouped.entry(symbol.file_path.clone()).or_default().push(symbol);
+        grouped
+            .entry(symbol.file_path.clone())
+            .or_default()
+            .push(symbol);
     }
     let mut store = state
         .symbol_index
@@ -340,21 +400,6 @@ pub(crate) fn seed_stdlib_index_from_cache_for_project(
     store.rebuild_symbol_mappings(&project_root);
     drop(store);
     Ok(true)
-}
-
-pub(crate) fn is_stdlib_index_seeded_for_project(
-    state: &CoreState,
-    project_root: &str,
-    stdlib_root: &Path,
-    stdlib_signature: &str,
-) -> Result<bool, String> {
-    let project_root = canonical_project_root(project_root);
-    let library_key = normalized_compare_key(stdlib_root);
-    let store = state
-        .symbol_index
-        .lock()
-        .map_err(|_| "Symbol index lock poisoned".to_string())?;
-    Ok(store.is_stdlib_index_fresh(&project_root, &library_key, stdlib_signature))
 }
 
 pub(crate) fn seed_stdlib_semantic_projection_cache_for_project(
@@ -469,12 +514,91 @@ pub(crate) fn seed_stdlib_index_if_missing(
         return Ok(false);
     }
     let signature = stdlib_signature_key(&stdlib_files)?;
-    seed_stdlib_index_from_cache_for_project(
-        state,
-        &project_root,
-        Some(&stdlib_path),
-        &signature,
-    )
+    seed_stdlib_index_from_cache_for_project(state, &project_root, Some(&stdlib_path), &signature)
+}
+
+pub(crate) fn seed_stdlib_startup_cache_for_project(
+    state: &CoreState,
+    project_root: &str,
+) -> Result<StdlibStartupCacheSeedSummary, String> {
+    let project_root = canonical_project_root(project_root);
+    if project_root.trim().is_empty() {
+        return Ok(StdlibStartupCacheSeedSummary::default());
+    }
+
+    let root_path = PathBuf::from(&project_root);
+    if !root_path.exists() {
+        return Ok(StdlibStartupCacheSeedSummary::default());
+    }
+
+    let default_stdlib = state
+        .settings
+        .lock()
+        .ok()
+        .and_then(|settings| settings.default_stdlib.clone());
+    let project_config = load_project_config(&root_path).ok().flatten();
+    let library_config = project_config
+        .as_ref()
+        .and_then(|config| config.library.as_ref());
+    let stdlib_override = project_config
+        .as_ref()
+        .and_then(|config| config.stdlib.as_ref());
+    let (_loader, stdlib_path) = resolve_stdlib_path(
+        &state.stdlib_root,
+        default_stdlib.as_deref(),
+        library_config,
+        stdlib_override,
+        &root_path,
+    );
+    let Some(stdlib_path) = stdlib_path else {
+        return Ok(StdlibStartupCacheSeedSummary {
+            cache_miss_reason: Some("library_path_unresolved".to_string()),
+            ..StdlibStartupCacheSeedSummary::default()
+        });
+    };
+
+    let library_path = Some(stdlib_path.to_string_lossy().to_string());
+    let stdlib_files = collect_stdlib_files(Some(&stdlib_path))?;
+    if stdlib_files.is_empty() {
+        return Ok(StdlibStartupCacheSeedSummary {
+            cache_miss_reason: Some("library_files_missing".to_string()),
+            library_path,
+            ..StdlibStartupCacheSeedSummary::default()
+        });
+    }
+    let signature = stdlib_signature_key(&stdlib_files)?;
+    let cache_miss_reason = describe_stdlib_index_cache_miss(&stdlib_path, &signature)?
+        .map(ToString::to_string);
+    if cache_miss_reason.is_some() {
+        return Ok(StdlibStartupCacheSeedSummary {
+            cache_miss_reason,
+            library_path,
+            ..StdlibStartupCacheSeedSummary::default()
+        });
+    }
+
+    let seed_symbol_started_at = Instant::now();
+    let seeded_symbols =
+        seed_stdlib_index_from_cache_for_project(state, &project_root, Some(&stdlib_path), &signature)?;
+    let seed_symbol_index_ms = seed_symbol_started_at.elapsed().as_millis() as u64;
+    let seed_projection_started_at = Instant::now();
+    let seeded_projection = seed_stdlib_semantic_projection_cache_for_project(state, &project_root)?;
+    let seed_projection_ms = seed_projection_started_at.elapsed().as_millis() as u64;
+    let cache_hit = seeded_symbols;
+
+    Ok(StdlibStartupCacheSeedSummary {
+        cache_hit,
+        cache_miss_reason: if cache_hit {
+            None
+        } else if seeded_projection {
+            Some("library_cache_missing_symbols".to_string())
+        } else {
+            Some("library_cache_empty".to_string())
+        },
+        library_path,
+        seed_symbol_index_ms,
+        seed_projection_ms,
+    })
 }
 
 #[derive(Serialize, Clone)]

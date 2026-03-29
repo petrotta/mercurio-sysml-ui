@@ -7,6 +7,7 @@ pub enum SemanticEditFieldType {
     Text,
     Textarea,
     Checkbox,
+    #[allow(dead_code)]
     Select,
     Readonly,
 }
@@ -45,6 +46,7 @@ pub struct SemanticEditAppliesToView {
     pub include_subtypes: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SemanticEditTargetPayload {
     pub symbol_id: Option<String>,

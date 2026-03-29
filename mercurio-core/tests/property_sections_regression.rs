@@ -9,7 +9,8 @@ fn constrainttest_component_owned_attribute_is_populated() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("mercurio_constrainttest_property_sections_{stamp}"));
+    let root =
+        std::env::temp_dir().join(format!("mercurio_constrainttest_property_sections_{stamp}"));
     let project_dir = root.join("project");
     std::fs::create_dir_all(&project_dir).expect("create project dir");
 
@@ -49,7 +50,10 @@ fn constrainttest_component_owned_attribute_is_populated() {
         .sections
         .iter()
         .flat_map(|section| section.rows.iter())
-        .find(|row| row.label.starts_with("ownedAttribute : AttributeUsage[0..*]"))
+        .find(|row| {
+            row.label
+                .starts_with("ownedAttribute : AttributeUsage[0..*]")
+        })
         .expect("ownedAttribute row");
 
     assert_eq!(owned_attribute.value, "ConstraintTest::Component::mass");

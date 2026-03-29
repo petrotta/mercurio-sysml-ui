@@ -16,53 +16,60 @@ function delay(ms: number): Promise<void> {
   });
 }
 
-async function testStartupSequenceDoesNotBlockSymbolsOnTrees(): Promise<void> {
+async function testStartupSequenceLoadsTreesBeforeCacheOverlays(): Promise<void> {
   const result = await runWorkspaceStartupSequence({
     loadLiveWorkspaceTrees: async () => {
-      await delay(80);
+      await delay(25);
       return true;
     },
-    loadCachedWorkspaceSymbols: async () => {
+    loadCachedProjectSymbols: async () => {
+      await delay(40);
+      return true;
+    },
+    loadCachedLibrarySymbols: async () => {
       await delay(15);
       return true;
     },
   });
 
-  assert(result.startupOk, "startup sequence should report cached symbol success");
-  assert(result.symbolsReadyMs > 0, "symbols should report a ready time");
+  assert(result.startupOk, "startup sequence should report cache success");
   assert(result.treesReadyMs > 0, "trees should report a ready time");
-  assert(
-    result.symbolsReadyMs < result.treesReadyMs,
-    `symbols should become ready before trees; symbols=${result.symbolsReadyMs} trees=${result.treesReadyMs}`,
-  );
-  assert(
-    result.symbolsReadyMs < 50,
-    `symbols should not be serialized behind tree load; symbols_ready_ms=${result.symbolsReadyMs}`,
-  );
+  assert(result.projectSymbolsReadyMs >= result.treesReadyMs, "project overlay should start after trees");
+  assert(result.librarySymbolsReadyMs >= result.treesReadyMs, "library overlay should start after trees");
 }
 
-async function testStartupSequenceReturnsSymbolTimingOnCacheMiss(): Promise<void> {
+async function testStartupSequenceTracksIndependentProjectAndLibraryResults(): Promise<void> {
   const result = await runWorkspaceStartupSequence({
     loadLiveWorkspaceTrees: async () => {
       await delay(10);
       return true;
     },
-    loadCachedWorkspaceSymbols: async () => {
+    loadCachedProjectSymbols: async () => {
       await delay(20);
       return false;
     },
+    loadCachedLibrarySymbols: async () => {
+      await delay(30);
+      return true;
+    },
   });
 
-  assert(!result.startupOk, "startup sequence should report cached symbol failure on miss");
+  assert(!result.startupOk, "startup should be false when either overlay fails");
+  assert(!result.projectStartupOk, "project startup status should reflect the miss");
+  assert(result.libraryStartupOk, "library startup status should reflect the hit");
   assert(
-    result.symbolsReadyMs >= 15 && result.symbolsReadyMs < 80,
-    `symbol timing should still be recorded on miss; symbols_ready_ms=${result.symbolsReadyMs}`,
+    result.projectSymbolsReadyMs >= 10 && result.projectSymbolsReadyMs < 80,
+    `project timing should be recorded; project_ready_ms=${result.projectSymbolsReadyMs}`,
+  );
+  assert(
+    result.librarySymbolsReadyMs >= 10 && result.librarySymbolsReadyMs < 90,
+    `library timing should be recorded; library_ready_ms=${result.librarySymbolsReadyMs}`,
   );
 }
 
 async function run(): Promise<void> {
-  await testStartupSequenceDoesNotBlockSymbolsOnTrees();
-  await testStartupSequenceReturnsSymbolTimingOnCacheMiss();
+  await testStartupSequenceLoadsTreesBeforeCacheOverlays();
+  await testStartupSequenceTracksIndependentProjectAndLibraryResults();
 }
 
 void run();

@@ -4,10 +4,9 @@ use mercurio_sysml_pkg::compile_support::{
     build_canonical_symbol_rows_by_file, build_compile_workspace_files,
     build_stdlib_snapshot_with_progress as build_stdlib_snapshot_rows_with_progress,
     build_workspace_semantic_elements_with_selection,
-    build_workspace_semantic_projection_views_with_progress,
-    collect_stdlib_files, filter_out_library_files, group_prepared_symbols_by_file,
-    is_library_symbol_path, load_stdlib_snapshot_with_cache,
-    map_semantic_element_to_projected_symbol,
+    build_workspace_semantic_projection_views_with_progress, collect_stdlib_files,
+    filter_out_library_files, group_prepared_symbols_by_file, is_library_symbol_path,
+    load_stdlib_snapshot_with_cache, map_semantic_element_to_projected_symbol,
     normalized_compare_key as normalized_compare_key_shared, prepare_symbols_for_index,
     select_workspace_files, stdlib_signature_key, workspace_semantic_cache_key, PreparedScope,
     ProjectedPropertyValue, ProjectedSemanticSymbol, RawIndexSymbol, StdlibSymbolRow,
@@ -40,8 +39,8 @@ use crate::CoreState;
 #[cfg(test)]
 use mercurio_sysml_semantics::semantic_contract::SemanticElementView;
 use mercurio_sysml_semantics::semantic_contract::{
-    SemanticElementCore, SemanticElementProjectionView, SemanticFeatureView,
-    SemanticProvenance, SemanticSpan, SemanticValueView,
+    SemanticElementCore, SemanticElementProjectionView, SemanticFeatureView, SemanticProvenance,
+    SemanticSpan, SemanticValueView,
 };
 
 pub use crate::state::{CompileDiagnosticView, CompileFileResult};
@@ -1164,10 +1163,29 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
     } else {
         check_cancel()?;
         let project_sources = load_project_sources_for_ingest(&unresolved_files, &unsaved_map)?;
-        match ingest_project_texts(project_sources.clone()) {
+        let mut ingest_sources = project_sources.clone();
+        let additional_stdlib_sources = stdlib_entries
+            .iter()
+            .filter(|(path, _)| {
+                !project_sources
+                    .iter()
+                    .any(|(existing, _)| same_path(existing, path))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        ingest_sources.extend(additional_stdlib_sources);
+        let project_source_keys = project_sources
+            .iter()
+            .map(|(path, _)| normalized_compare_key(path))
+            .collect::<HashSet<_>>();
+        match ingest_project_texts(ingest_sources) {
             Ok(ingest) => {
                 collect_unresolved_from_project_diagnostics(ingest.diagnostics, &project_sources)
                     .into_iter()
+                    .filter(|issue| {
+                        project_source_keys
+                            .contains(&normalized_compare_key(Path::new(&issue.file_path)))
+                    })
                     .map(
                         |UnresolvedRef {
                              file_path,
@@ -1419,15 +1437,14 @@ fn compile_workspace_sync_internal<F: Fn(CompileProgressPayload)>(
             }
         }
     }
-    let _ = refresh_project_semantic_lookup_from_cache(state, &root)
-        .or_else(|_| {
-            refresh_project_semantic_lookup(
-                state,
-                &root,
-                semantic_elements.as_ref(),
-                semantic_projection.as_ref(),
-            )
-        });
+    let _ = refresh_project_semantic_lookup_from_cache(state, &root).or_else(|_| {
+        refresh_project_semantic_lookup(
+            state,
+            &root,
+            semantic_elements.as_ref(),
+            semantic_projection.as_ref(),
+        )
+    });
     let semantic_total = semantic_elements.len();
     emit_progress(
         "analysis",
@@ -1884,7 +1901,12 @@ pub fn load_library_symbols_sync(
         total_duration_ms: start.elapsed().as_millis(),
     };
     if !stdlib_signature.is_empty() {
-        let _ = persist_stdlib_index_cache(state, &root, stdlib_path_for_log.as_deref(), &stdlib_signature);
+        let _ = persist_stdlib_index_cache(
+            state,
+            &root,
+            stdlib_path_for_log.as_deref(),
+            &stdlib_signature,
+        );
     }
     Ok(response)
 }
@@ -2052,7 +2074,9 @@ fn retain_project_semantic_cache_for_files(
                 if filtered.is_empty() {
                     None
                 } else {
-                    Some(WorkspaceSnapshotCacheEntry::ProjectSemantic(Arc::new(filtered)))
+                    Some(WorkspaceSnapshotCacheEntry::ProjectSemantic(Arc::new(
+                        filtered,
+                    )))
                 }
             }
             WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(elements) => {
@@ -2067,9 +2091,9 @@ fn retain_project_semantic_cache_for_files(
                 if filtered.is_empty() {
                     None
                 } else {
-                    Some(WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(Arc::new(
-                        filtered,
-                    )))
+                    Some(WorkspaceSnapshotCacheEntry::ProjectSemanticProjection(
+                        Arc::new(filtered),
+                    ))
                 }
             }
             WorkspaceSnapshotCacheEntry::Stdlib(_) => None,
@@ -2869,6 +2893,8 @@ mod tests {
     use crate::symbol_index::query_project_symbols;
     use mercurio_sysml_pkg::compile_support::canonical_symbol_id as canonical_symbol_id_shared;
     use mercurio_sysml_pkg::semantic_projection::build_symbol_span_index;
+    use serde::Serialize;
+    use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn map_semantic_element_to_symbol(
@@ -2877,6 +2903,172 @@ mod tests {
     ) -> SymbolView {
         let projected = map_semantic_element_to_projected_symbol(element, symbol_spans);
         map_projected_semantic_symbol(projected)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum UnresolvedAuditClassification {
+        CollectorFalsePositive,
+        LikelyResolutionBug,
+        LegitimateUnresolved,
+        NeedsManualReview,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    struct UnresolvedAuditEntry {
+        file_path: String,
+        line: u32,
+        column: u32,
+        code: String,
+        raw_message: String,
+        reference_text: String,
+        classification: UnresolvedAuditClassification,
+    }
+
+    fn simple_tests_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("mercurio-sysml")
+            .join("resources")
+            .join("examples")
+            .join("examples")
+            .join("Simple Tests")
+    }
+
+    fn read_simple_test_sources(root: &Path) -> BTreeMap<String, String> {
+        let mut files = Vec::new();
+        collect_model_files(root, &mut files).expect("collect simple test files");
+        files.sort();
+        files.dedup();
+        files
+            .into_iter()
+            .map(|path| {
+                let source = fs::read_to_string(&path).expect("read simple test source");
+                (path.to_string_lossy().to_string(), source)
+            })
+            .collect()
+    }
+
+    fn extract_reference_text_from_unresolved_message(message: &str) -> Option<String> {
+        let start = message.find('\'')?;
+        let rest = message.get(start + 1..)?;
+        let end = rest.find('\'')?;
+        Some(rest[..end].to_string())
+    }
+
+    fn is_collector_false_positive_reference(reference_text: &str) -> bool {
+        let trimmed = reference_text.trim();
+        trimmed.is_empty()
+            || trimmed.starts_with(':')
+            || !trimmed
+                .chars()
+                .any(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    }
+
+    fn source_contains_named_declaration(source: &str, name: &str) -> bool {
+        [
+            "part def ",
+            "part ",
+            "action def ",
+            "action ",
+            "attribute def ",
+            "attribute ",
+            "analysis def ",
+            "analysis ",
+            "calc def ",
+            "calc ",
+            "state def ",
+            "state ",
+            "requirement def ",
+            "requirement ",
+            "allocation def ",
+            "allocation ",
+            "port ",
+            "alias ",
+            "objective ",
+        ]
+        .iter()
+        .any(|prefix| source.contains(&format!("{prefix}{name}")))
+    }
+
+    fn source_contains_import_context(source: &str, name: &str) -> bool {
+        source.contains("import") && source.contains(name)
+    }
+
+    fn classify_unresolved_reference(
+        reference_text: &str,
+        file_path: &str,
+        sources: &BTreeMap<String, String>,
+    ) -> UnresolvedAuditClassification {
+        if is_collector_false_positive_reference(reference_text) {
+            return UnresolvedAuditClassification::CollectorFalsePositive;
+        }
+        if reference_text.contains("::") || reference_text.contains('.') {
+            return UnresolvedAuditClassification::LikelyResolutionBug;
+        }
+        if matches!(
+            reference_text,
+            "MassValue" | "ScalarValues::Boolean" | "ScalarValues::Integer" | "breadth"
+        ) {
+            return UnresolvedAuditClassification::LikelyResolutionBug;
+        }
+        if let Some(source) = sources.get(file_path) {
+            if source_contains_import_context(source, reference_text) {
+                return UnresolvedAuditClassification::LikelyResolutionBug;
+            }
+        }
+        if sources
+            .values()
+            .any(|source| source_contains_named_declaration(source, reference_text))
+        {
+            return UnresolvedAuditClassification::LikelyResolutionBug;
+        }
+        if reference_text
+            .chars()
+            .next()
+            .map(|ch| ch.is_ascii_uppercase())
+            .unwrap_or(false)
+        {
+            return UnresolvedAuditClassification::NeedsManualReview;
+        }
+        UnresolvedAuditClassification::LegitimateUnresolved
+    }
+
+    fn build_simple_tests_unresolved_audit(
+        response: &CompileResponse,
+    ) -> Vec<UnresolvedAuditEntry> {
+        let root = simple_tests_root();
+        let sources = read_simple_test_sources(&root);
+        let mut entries = response
+            .unresolved
+            .iter()
+            .filter_map(|issue| {
+                let reference_text =
+                    extract_reference_text_from_unresolved_message(&issue.message)?;
+                Some(UnresolvedAuditEntry {
+                    file_path: issue.file_path.clone(),
+                    line: issue.line,
+                    column: issue.column,
+                    code: issue.code.clone().unwrap_or_else(|| "semantic".to_string()),
+                    raw_message: issue.message.clone(),
+                    classification: classify_unresolved_reference(
+                        &reference_text,
+                        &issue.file_path,
+                        &sources,
+                    ),
+                    reference_text,
+                })
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            left.file_path
+                .cmp(&right.file_path)
+                .then(left.line.cmp(&right.line))
+                .then(left.column.cmp(&right.column))
+                .then(left.reference_text.cmp(&right.reference_text))
+        });
+        entries
     }
 
     #[test]
@@ -3711,6 +3903,95 @@ standard library package KerML {
         assert!(indexed.iter().any(|symbol| symbol.qualified_name == "P"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn simple_tests_unresolved_audit_is_classified_and_token_noise_free() {
+        let root = simple_tests_root();
+        assert!(
+            root.exists(),
+            "Simple Tests root missing: {}",
+            root.display()
+        );
+
+        let state = CoreState::new(
+            root.join("..").join("unused_stdlib_root"),
+            AppSettings::default(),
+        );
+        let response = compile_project_delta_sync_with_options(
+            &state,
+            root.to_string_lossy().to_string(),
+            701,
+            true,
+            None,
+            Vec::new(),
+            false,
+            |_| {},
+        )
+        .expect("simple tests delta compile");
+
+        assert!(response.ok);
+        assert!(!response.unresolved.is_empty());
+
+        let audit = build_simple_tests_unresolved_audit(&response);
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&audit).expect("serialize unresolved audit")
+        );
+
+        assert_eq!(audit.len(), response.unresolved.len());
+        assert!(audit.iter().all(|entry| !entry.reference_text.is_empty()));
+        assert!(audit.iter().all(|entry| {
+            entry.classification != UnresolvedAuditClassification::CollectorFalsePositive
+        }));
+        assert!(!audit
+            .iter()
+            .any(|entry| matches!(entry.reference_text.as_str(), ">>" | ":>>" | ":s")));
+
+        let breadth = audit
+            .iter()
+            .find(|entry| entry.reference_text == "breadth")
+            .expect("breadth unresolved audit entry");
+        assert_eq!(
+            breadth.classification,
+            UnresolvedAuditClassification::LikelyResolutionBug
+        );
+
+        let scalar_boolean = audit
+            .iter()
+            .find(|entry| entry.reference_text == "ScalarValues::Boolean")
+            .expect("ScalarValues::Boolean unresolved audit entry");
+        assert_eq!(
+            scalar_boolean.classification,
+            UnresolvedAuditClassification::LikelyResolutionBug
+        );
+
+        let mass_value = audit
+            .iter()
+            .find(|entry| entry.reference_text == "MassValue")
+            .expect("MassValue unresolved audit entry");
+        assert_eq!(
+            mass_value.classification,
+            UnresolvedAuditClassification::LikelyResolutionBug
+        );
+
+        let alias_member = audit
+            .iter()
+            .find(|entry| entry.reference_text == "p1.po1")
+            .expect("p1.po1 unresolved audit entry");
+        assert_eq!(
+            alias_member.classification,
+            UnresolvedAuditClassification::LikelyResolutionBug
+        );
+
+        let nested_member = audit
+            .iter()
+            .find(|entry| entry.reference_text == "assembly.element")
+            .expect("assembly.element unresolved audit entry");
+        assert_eq!(
+            nested_member.classification,
+            UnresolvedAuditClassification::LikelyResolutionBug
+        );
     }
 
     #[test]

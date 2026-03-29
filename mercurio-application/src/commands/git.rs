@@ -19,6 +19,7 @@ pub struct GitStatus {
     untracked: Vec<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Serialize)]
 pub struct GitBranches {
     current: String,
@@ -260,6 +261,7 @@ pub fn git_push(repo_root: String, remote: Option<String>) -> Result<(), String>
     Ok(())
 }
 
+#[allow(dead_code)]
 #[tauri::command]
 pub fn git_list_branches(repo_root: String) -> Result<GitBranches, String> {
     let repo = Repository::discover(&repo_root).map_err(|e| e.to_string())?;
@@ -278,6 +280,7 @@ pub fn git_list_branches(repo_root: String) -> Result<GitBranches, String> {
     Ok(GitBranches { current, branches })
 }
 
+#[allow(dead_code)]
 #[tauri::command]
 pub fn git_create_branch(repo_root: String, name: String, checkout: bool) -> Result<(), String> {
     let repo = Repository::discover(&repo_root).map_err(|e| e.to_string())?;
@@ -296,6 +299,7 @@ pub fn git_create_branch(repo_root: String, name: String, checkout: bool) -> Res
     Ok(())
 }
 
+#[allow(dead_code)]
 #[tauri::command]
 pub fn git_checkout_branch(repo_root: String, name: String) -> Result<(), String> {
     let repo = Repository::discover(&repo_root).map_err(|e| e.to_string())?;

@@ -103,10 +103,7 @@ struct ProjectionRefTarget {
     metatype_qname: Option<String>,
 }
 
-fn to_view(
-    record: SymbolRecord,
-    lookup: Option<&ProjectSemanticLookup>,
-) -> IndexedSymbolView {
+fn to_view(record: SymbolRecord, lookup: Option<&ProjectSemanticLookup>) -> IndexedSymbolView {
     let file_path = normalize_symbol_display_path(&record);
     let semantic_element = semantic_element_for_record(&record, &file_path, lookup);
     let projection = projection_for_record(&record, &file_path, lookup);
@@ -195,11 +192,10 @@ fn semantic_kind_for_record(
     record: &SymbolRecord,
     element: Option<&SemanticElementView>,
 ) -> Option<String> {
-    first_non_empty_attribute(element, &["core.semantic_kind", "semantic_kind"])
-        .or_else(|| {
-            let kind = record.kind.trim();
-            (!kind.is_empty()).then(|| kind.to_string())
-        })
+    first_non_empty_attribute(element, &["core.semantic_kind", "semantic_kind"]).or_else(|| {
+        let kind = record.kind.trim();
+        (!kind.is_empty()).then(|| kind.to_string())
+    })
 }
 
 fn structural_metatype_qname_for_record(
@@ -215,7 +211,10 @@ fn structural_metatype_qname_for_record(
         .or_else(|| {
             first_non_empty_attribute(
                 element,
-                &["structural_metatype_qname", "core.structural_metatype_qname"],
+                &[
+                    "structural_metatype_qname",
+                    "core.structural_metatype_qname",
+                ],
             )
         })
 }
@@ -434,7 +433,10 @@ fn derive_directed_relationship_views(
         if source_feature_for_kind(canonical_kind, feature) {
             source_targets.extend(refs.into_iter().map(|value| {
                 (
-                    feature.metamodel_feature_qname.clone().or_else(|| Some(feature.name.clone())),
+                    feature
+                        .metamodel_feature_qname
+                        .clone()
+                        .or_else(|| Some(feature.name.clone())),
                     value,
                 )
             }));
@@ -443,7 +445,10 @@ fn derive_directed_relationship_views(
         if target_feature_for_kind(canonical_kind, feature) {
             relation_targets.extend(refs.into_iter().map(|value| {
                 (
-                    feature.metamodel_feature_qname.clone().or_else(|| Some(feature.name.clone())),
+                    feature
+                        .metamodel_feature_qname
+                        .clone()
+                        .or_else(|| Some(feature.name.clone())),
                     value,
                 )
             }));
@@ -929,9 +934,12 @@ pub fn query_project_semantic_projection_by_qualified_name(
         return Ok(Some(projection_element_to_indexed_view(projection)));
     }
 
-    if let Some(legacy) =
-        query_project_semantic_element_by_qualified_name(state, project_root.clone(), qualified_name.clone(), file_path.clone())?
-    {
+    if let Some(legacy) = query_project_semantic_element_by_qualified_name(
+        state,
+        project_root.clone(),
+        qualified_name.clone(),
+        file_path.clone(),
+    )? {
         return Ok(Some(fallback_projection_view_from_legacy_element(legacy)));
     }
 
@@ -1239,7 +1247,8 @@ mod tests {
             }],
         );
 
-        let structural = derive_structural_type_view(&record, &projection).expect("structural type");
+        let structural =
+            derive_structural_type_view(&record, &projection).expect("structural type");
         assert_eq!(structural.label, "engine");
         assert_eq!(structural.target, "Engine");
         assert_eq!(
@@ -2057,8 +2066,11 @@ mod tests {
         let right_file = project_dir.join("right.sysml");
         fs::write(&left_file, "package LeftPkg { action def OldAction; }\n")
             .expect("write left file");
-        fs::write(&right_file, "package RightPkg { action def StableAction; }\n")
-            .expect("write right file");
+        fs::write(
+            &right_file,
+            "package RightPkg { action def StableAction; }\n",
+        )
+        .expect("write right file");
         fs::write(
             project_dir.join(".project"),
             "{\"name\":\"projection-file-scope\",\"src\":[\"*.sysml\"]}",
@@ -2239,7 +2251,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("mercurio_projection_symbol_fallback_{stamp}"));
+        let root =
+            std::env::temp_dir().join(format!("mercurio_projection_symbol_fallback_{stamp}"));
         let project_dir = root.join("project");
         fs::create_dir_all(&project_dir).expect("create project dir");
         let main_file = project_dir.join("main.sysml");

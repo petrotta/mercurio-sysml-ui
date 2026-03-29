@@ -90,6 +90,16 @@ impl SymbolIndex {
             SymbolIndex::InMemory(store) => store.restore_root_from_snapshot(snapshot),
         }
     }
+
+    pub fn replace_project_symbols_for_root(
+        &mut self,
+        project_root: &str,
+        files: Vec<(String, Vec<SymbolRecord>)>,
+    ) {
+        match self {
+            SymbolIndex::InMemory(store) => store.replace_project_symbols_for_root(project_root, files),
+        }
+    }
 }
 
 impl SymbolIndexStore for SymbolIndex {
@@ -319,6 +329,42 @@ impl InMemorySymbolIndex {
                 (normalized_root.clone(), mapping.symbol_id.clone()),
                 mapping,
             );
+        }
+    }
+
+    pub fn replace_project_symbols_for_root(
+        &mut self,
+        project_root: &str,
+        files: Vec<(String, Vec<SymbolRecord>)>,
+    ) {
+        let normalized_root = normalized_root_key(project_root);
+        self.by_project_file.retain(|(root, _), items| {
+            if root != &normalized_root {
+                return true;
+            }
+            items.retain(|symbol| symbol.scope != Scope::Project);
+            !items.is_empty()
+        });
+        self.mappings_by_symbol
+            .retain(|(root, _), _| root != &normalized_root);
+        self.project_symbols_cache
+            .borrow_mut()
+            .remove(&normalized_root);
+        self.library_symbols_cache
+            .borrow_mut()
+            .remove(&normalized_root);
+
+        for (file_path, mut symbols) in files {
+            symbols.retain(|symbol| symbol.scope == Scope::Project);
+            if symbols.is_empty() {
+                continue;
+            }
+            let key = (normalized_root.clone(), file_path);
+            if let Some(existing) = self.by_project_file.get_mut(&key) {
+                existing.extend(symbols);
+            } else {
+                self.by_project_file.insert(key, symbols);
+            }
         }
     }
 }

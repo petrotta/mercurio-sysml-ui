@@ -90,6 +90,7 @@ pub fn create_project(
     Ok(root.to_string_lossy().to_string())
 }
 
+#[allow(dead_code)]
 #[command]
 /// Builds a project model view and binds project elements to stdlib metamodel elements.
 pub async fn get_project_model(
@@ -102,6 +103,7 @@ pub async fn get_project_model(
         .map_err(|e| e.to_string())?
 }
 
+#[allow(dead_code)]
 #[command]
 /// Returns explicit and inherited attributes for a project element qualified name.
 pub async fn get_project_element_attributes(
@@ -118,6 +120,7 @@ pub async fn get_project_element_attributes(
     .map_err(|e| e.to_string())?
 }
 
+#[allow(dead_code)]
 #[command]
 /// Queries semantic attributes extracted from the project model (e.g., short_name, body).
 pub async fn query_semantic(
@@ -131,6 +134,7 @@ pub async fn query_semantic(
         .map_err(|e| e.to_string())?
 }
 
+#[allow(dead_code)]
 #[command]
 /// Queries semantic elements and projects them to UI SymbolView records in core.
 pub async fn query_semantic_symbols(
